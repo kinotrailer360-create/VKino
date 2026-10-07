@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import random
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
 
@@ -101,6 +101,45 @@ class PoiskKino:
             params["isSeries"] = str(series).lower()
         data = await self._get("/movie", **params)
         return [self.normalize(x) for x in (data.get("docs") or [])[:limit]]
+
+    async def new_releases(
+        self,
+        series: bool,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        today = date.today()
+        start = today - timedelta(days=180)
+        date_range = (
+            f"{start.strftime('%d.%m.%Y')}-"
+            f"{today.strftime('%d.%m.%Y')}"
+        )
+
+        data = await self._get(
+            "/movie",
+            page=1,
+            limit=max(limit, 20),
+            isSeries=str(series).lower(),
+            **{
+                "premiere.world": date_range,
+                "sortField": "premiere.world",
+                "sortType": "-1",
+            },
+        )
+
+        items = [
+            self.normalize(item)
+            for item in (data.get("docs") or [])
+            if isinstance(item, dict)
+        ]
+
+        def release_key(item: dict[str, Any]) -> str:
+            premiere = item.get("premiere") or {}
+            if not isinstance(premiere, dict):
+                return ""
+            return str(premiere.get("world") or "")
+
+        items.sort(key=release_key, reverse=True)
+        return items[:limit]
 
     async def seasons(self, movie_id: int) -> list[dict[str, Any]]:
         data = await self._get("/season", page=1, limit=50, movieId=movie_id)
@@ -406,9 +445,10 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🔎 Найти фильм или сериал")],
             [
+                KeyboardButton(text="🆕 Новинки"),
                 KeyboardButton(text="🔥 Популярное"),
-                KeyboardButton(text="🎲 Что посмотреть?"),
             ],
+            [KeyboardButton(text="🎲 Что посмотреть?")],
             [
                 KeyboardButton(text="🎬 Подборки"),
                 KeyboardButton(text="⭐ Избранное"),
@@ -441,6 +481,54 @@ def results_keyboard(
             ]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def new_releases_keyboard(
+    items: list[dict[str, Any]],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for item in items:
+        title = kp.title(item)
+        icon = (
+            "📺"
+            if item.get("media_type") == "series"
+            else "🎬"
+        )
+
+        premiere = item.get("premiere") or {}
+        raw_date = (
+            premiere.get("world")
+            if isinstance(premiere, dict)
+            else None
+        )
+
+        date_label = ""
+        if raw_date:
+            try:
+                parsed = datetime.fromisoformat(
+                    str(raw_date).replace("Z", "+00:00")
+                )
+                date_label = parsed.strftime("%d.%m")
+            except (TypeError, ValueError):
+                pass
+
+        label = f"{icon} {title}"
+        if date_label:
+            label += f" • {date_label}"
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:60],
+                    callback_data=f"open:{item['id']}",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
 
 def stored_keyboard(
@@ -1259,6 +1347,83 @@ async def watch(
     await callback.message.answer(
         text,
         disable_web_page_preview=True,
+    )
+
+
+@router.message(F.text == "🆕 Новинки")
+async def new_releases_menu(
+    message: Message,
+) -> None:
+    await remember(message)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎬 Новые фильмы",
+                    callback_data="new:movies",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📺 Новые сериалы",
+                    callback_data="new:series",
+                )
+            ],
+        ]
+    )
+
+    await message.answer(
+        "🆕 <b>Самые свежие релизы</b>\n\n"
+        "Выбери категорию:",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("new:"))
+async def new_releases_list(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    kind = callback.data.split(":", 1)[1]
+    series = kind == "series"
+
+    try:
+        items = await kp.new_releases(
+            series=series,
+            limit=20,
+        )
+    except Exception as exc:
+        logging.exception(
+            "Load new releases failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось загрузить новинки."
+        )
+        return
+
+    if not items:
+        await callback.message.answer(
+            "Свежих релизов пока не найдено."
+        )
+        return
+
+    title = (
+        "📺 <b>Самые новые сериалы</b>"
+        if series
+        else "🎬 <b>Самые новые фильмы</b>"
+    )
+
+    await callback.message.answer(
+        title,
+        reply_markup=new_releases_keyboard(
+            items
+        ),
     )
 
 
