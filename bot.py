@@ -52,6 +52,12 @@ class SearchState(StatesGroup):
     query = State()
 
 
+class AdminSourceState(StatesGroup):
+    search_media = State()
+    voice = State()
+    url = State()
+
+
 class PoiskKino:
     BASE_URL = "https://api.poiskkino.dev/v1.5"
 
@@ -578,6 +584,37 @@ async def global_stats() -> tuple[int, int, int]:
 async def all_user_ids() -> list[int]:
     rows = await db().fetch("SELECT user_id FROM users")
     return [int(x["user_id"]) for x in rows]
+
+
+def admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить фильм",
+                    callback_data="admin:add:movie",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить серию",
+                    callback_data="admin:add:episode",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Источники",
+                    callback_data="admin:list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Закрыть",
+                    callback_data="admin:cancel",
+                )
+            ],
+        ]
+    )
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -2115,6 +2152,7 @@ async def about(
 @router.message(Command("admin"))
 async def admin(
     message: Message,
+    state: FSMContext,
 ) -> None:
     if (
         not message.from_user
@@ -2122,17 +2160,883 @@ async def admin(
     ):
         return
 
+    await state.clear()
+
     users, favs, history = (
         await global_stats()
+    )
+    sources = int(
+        await db().fetchval(
+            """
+            SELECT COUNT(*)
+            FROM playback_sources
+            WHERE is_active=TRUE
+            """
+        )
     )
 
     await message.answer(
         "🛠 <b>VKino — админка</b>\n\n"
-        f"👥 Пользователей: {users}\n"
-        f"⭐ Избранное: {favs}\n"
-        f"🕘 История: {history}\n\n"
-        "<code>/broadcast текст</code> — "
-        "рассылка"
+        f"👥 Пользователей: <b>{users}</b>\n"
+        f"⭐ Избранное: <b>{favs}</b>\n"
+        f"🕘 История: <b>{history}</b>\n"
+        f"▶️ Активных видеоисточников: <b>{sources}</b>\n\n"
+        "Добавляй только видео, на которые у тебя есть право "
+        "распространения.\n\n"
+        "<code>/broadcast текст</code> — рассылка",
+        reply_markup=admin_menu(),
+    )
+
+
+@router.callback_query(F.data == "admin:cancel")
+async def admin_cancel(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await state.clear()
+    await callback.answer("Закрыто")
+
+    if callback.message:
+        await callback.message.answer(
+            "Админ-режим закрыт."
+        )
+
+
+@router.message(Command("cancel"))
+async def cancel_flow(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    await state.clear()
+    await message.answer(
+        "Текущее действие отменено."
+    )
+
+
+@router.callback_query(
+    F.data.in_(
+        {
+            "admin:add:movie",
+            "admin:add:episode",
+        }
+    )
+)
+async def admin_add_source_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    mode = (
+        "episode"
+        if callback.data.endswith("episode")
+        else "movie"
+    )
+
+    await state.clear()
+    await state.update_data(mode=mode)
+    await state.set_state(
+        AdminSourceState.search_media
+    )
+
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            (
+                "📺 Напиши название сериала:"
+                if mode == "episode"
+                else "🎬 Напиши название фильма:"
+            )
+        )
+
+
+@router.message(
+    AdminSourceState.search_media,
+    F.text,
+)
+async def admin_search_media(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    query = (message.text or "").strip()
+    if len(query) < 2:
+        await message.answer(
+            "Напиши хотя бы 2 символа."
+        )
+        return
+
+    data = await state.get_data()
+    mode = data.get("mode", "movie")
+
+    try:
+        results = await kp.search(
+            query,
+            limit=10,
+        )
+    except Exception as exc:
+        logging.exception(
+            "Admin search failed: %s",
+            exc,
+        )
+        await message.answer(
+            "Не удалось выполнить поиск."
+        )
+        return
+
+    if mode == "episode":
+        results = [
+            item
+            for item in results
+            if item.get("media_type") == "series"
+        ]
+    else:
+        results = [
+            item
+            for item in results
+            if item.get("media_type") == "movie"
+        ]
+
+    if not results:
+        await message.answer(
+            "Ничего подходящего не найдено."
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for item in results[:8]:
+        title = kp.title(item)
+        year = item.get("year") or "—"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{title} ({year})"[:60],
+                    callback_data=(
+                        f"adminpick:{mode}:{item['id']}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="admin:cancel",
+            )
+        ]
+    )
+
+    await message.answer(
+        "Выбери нужный вариант:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("adminpick:")
+)
+async def admin_pick_media(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        _, mode, raw_movie_id = (
+            callback.data.split(":", 2)
+        )
+        movie_id = int(raw_movie_id)
+        item = await kp.details(movie_id)
+        title = kp.title(item)
+    except Exception as exc:
+        logging.exception(
+            "Admin pick media failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось открыть выбранный проект."
+        )
+        return
+
+    await state.update_data(
+        mode=mode,
+        movie_id=movie_id,
+        title=title,
+    )
+
+    if mode == "movie":
+        await state.update_data(
+            season_number=None,
+            episode_number=None,
+        )
+        await state.set_state(
+            AdminSourceState.voice
+        )
+        await callback.message.answer(
+            f"🎬 <b>{escape(title)}</b>\n\n"
+            "Напиши название озвучки.\n"
+            "Например: <code>Дубляж</code>, "
+            "<code>LostFilm</code>, "
+            "<code>Original</code>."
+        )
+        return
+
+    try:
+        seasons = await kp.seasons(movie_id)
+    except Exception as exc:
+        logging.exception(
+            "Admin load seasons failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось загрузить сезоны."
+        )
+        return
+
+    if not seasons:
+        await callback.message.answer(
+            "У сериала не найдены сезоны."
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for season in seasons[:30]:
+        try:
+            number = int(season.get("number"))
+        except (TypeError, ValueError):
+            continue
+
+        episodes = season.get("episodes") or []
+        count = len(episodes)
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"Сезон {number}"
+                        + (
+                            f" • {count} серий"
+                            if count
+                            else ""
+                        )
+                    ),
+                    callback_data=(
+                        f"adminseason:{movie_id}:{number}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="admin:cancel",
+            )
+        ]
+    )
+
+    await callback.message.answer(
+        f"📺 <b>{escape(title)}</b>\n"
+        "Выбери сезон:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("adminseason:")
+)
+async def admin_pick_season(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        _, raw_movie, raw_season = (
+            callback.data.split(":", 2)
+        )
+        movie_id = int(raw_movie)
+        season_number = int(raw_season)
+        season = await kp.season(
+            movie_id,
+            season_number,
+        )
+    except Exception as exc:
+        logging.exception(
+            "Admin season failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось загрузить серии."
+        )
+        return
+
+    if not season:
+        await callback.message.answer(
+            "Сезон не найден."
+        )
+        return
+
+    episodes = [
+        episode
+        for episode in (season.get("episodes") or [])
+        if isinstance(episode, dict)
+    ]
+
+    if not episodes:
+        await callback.message.answer(
+            "Список серий отсутствует."
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for episode in episodes[:40]:
+        try:
+            number = int(episode.get("number"))
+        except (TypeError, ValueError):
+            continue
+
+        name = str(
+            episode.get("name")
+            or episode.get("enName")
+            or ""
+        ).strip()
+
+        label = f"{number} серия"
+        if name:
+            label += f" — {name}"
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:60],
+                    callback_data=(
+                        f"adminepisode:{movie_id}:"
+                        f"{season_number}:{number}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="admin:cancel",
+            )
+        ]
+    )
+
+    await callback.message.answer(
+        f"📺 Сезон {season_number}\n"
+        "Выбери серию:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("adminepisode:")
+)
+async def admin_pick_episode(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        (
+            _,
+            raw_movie,
+            raw_season,
+            raw_episode,
+        ) = callback.data.split(":", 3)
+
+        movie_id = int(raw_movie)
+        season_number = int(raw_season)
+        episode_number = int(raw_episode)
+    except (TypeError, ValueError):
+        await callback.message.answer(
+            "Некорректная серия."
+        )
+        return
+
+    await state.update_data(
+        movie_id=movie_id,
+        season_number=season_number,
+        episode_number=episode_number,
+    )
+    await state.set_state(
+        AdminSourceState.voice
+    )
+
+    data = await state.get_data()
+    title = data.get("title", "Сериал")
+
+    await callback.message.answer(
+        f"📺 <b>{escape(str(title))}</b>\n"
+        f"Сезон {season_number}, "
+        f"серия {episode_number}\n\n"
+        "Напиши название озвучки."
+    )
+
+
+@router.message(
+    AdminSourceState.voice,
+    F.text,
+)
+async def admin_voice(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    voice = (message.text or "").strip()
+
+    if not voice or len(voice) > 50:
+        await message.answer(
+            "Название озвучки должно быть "
+            "от 1 до 50 символов."
+        )
+        return
+
+    await state.update_data(
+        voice_name=voice
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="360p",
+                    callback_data="adminquality:360",
+                ),
+                InlineKeyboardButton(
+                    text="480p",
+                    callback_data="adminquality:480",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="720p",
+                    callback_data="adminquality:720",
+                ),
+                InlineKeyboardButton(
+                    text="1080p",
+                    callback_data="adminquality:1080",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="admin:cancel",
+                )
+            ],
+        ]
+    )
+
+    await message.answer(
+        f"🎙 Озвучка: <b>{escape(voice)}</b>\n"
+        "Выбери качество:",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(
+    F.data.startswith("adminquality:")
+)
+async def admin_quality(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        quality = int(
+            callback.data.split(":", 1)[1]
+        )
+    except ValueError:
+        return
+
+    if quality not in {
+        360,
+        480,
+        720,
+        1080,
+    }:
+        return
+
+    await state.update_data(
+        quality=quality
+    )
+    await state.set_state(
+        AdminSourceState.url
+    )
+
+    await callback.message.answer(
+        f"📺 Качество: <b>{quality}p</b>\n\n"
+        "Теперь пришли прямую HTTPS-ссылку "
+        "на разрешённый HLS (.m3u8), MP4 "
+        "или другой видеопоток."
+    )
+
+
+@router.message(
+    AdminSourceState.url,
+    F.text,
+)
+async def admin_save_source(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    url = (message.text or "").strip()
+
+    if not url.startswith("https://"):
+        await message.answer(
+            "Нужна HTTPS-ссылка. "
+            "Попробуй ещё раз."
+        )
+        return
+
+    if len(url) > 2000:
+        await message.answer(
+            "Ссылка слишком длинная."
+        )
+        return
+
+    data = await state.get_data()
+
+    try:
+        movie_id = int(data["movie_id"])
+        season_number = data.get("season_number")
+        episode_number = data.get("episode_number")
+        voice_name = str(data["voice_name"])
+        quality = int(data["quality"])
+
+        source_type = "link"
+        lowered = url.lower().split("?", 1)[0]
+        if lowered.endswith(".m3u8"):
+            source_type = "hls"
+        elif lowered.endswith(".mp4"):
+            source_type = "mp4"
+
+        await db().execute(
+            """
+            UPDATE playback_sources
+            SET is_active=FALSE
+            WHERE movie_id=$1
+              AND season_number IS NOT DISTINCT FROM $2
+              AND episode_number IS NOT DISTINCT FROM $3
+              AND voice_name=$4
+              AND quality=$5
+              AND is_active=TRUE
+            """,
+            movie_id,
+            season_number,
+            episode_number,
+            voice_name,
+            quality,
+        )
+
+        source_id = await db().fetchval(
+            """
+            INSERT INTO playback_sources(
+                movie_id,
+                season_number,
+                episode_number,
+                voice_name,
+                quality,
+                playback_url,
+                source_type,
+                is_active
+            )
+            VALUES($1, $2, $3, $4, $5, $6, $7, TRUE)
+            RETURNING id
+            """,
+            movie_id,
+            season_number,
+            episode_number,
+            voice_name,
+            quality,
+            url,
+            source_type,
+        )
+
+    except Exception as exc:
+        logging.exception(
+            "Admin save source failed: %s",
+            exc,
+        )
+        await message.answer(
+            "Не удалось сохранить источник."
+        )
+        return
+
+    title = str(
+        data.get("title") or f"ID {movie_id}"
+    )
+
+    target = "Фильм"
+    if season_number is not None:
+        target = (
+            f"Сезон {season_number}, "
+            f"серия {episode_number}"
+        )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Источник сохранён</b>\n\n"
+        f"🎬 {escape(title)}\n"
+        f"📍 {target}\n"
+        f"🎙 {escape(voice_name)}\n"
+        f"📺 {quality}p\n"
+        f"🆔 Source ID: <code>{source_id}</code>",
+        reply_markup=admin_menu(),
+    )
+
+
+@router.callback_query(F.data == "admin:list")
+async def admin_list_sources(
+    callback: CallbackQuery,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    rows = await db().fetch(
+        """
+        SELECT
+            id,
+            movie_id,
+            season_number,
+            episode_number,
+            voice_name,
+            quality,
+            source_type
+        FROM playback_sources
+        WHERE is_active=TRUE
+        ORDER BY id DESC
+        LIMIT 20
+        """
+    )
+
+    if not rows:
+        await callback.message.answer(
+            "Активных видеоисточников пока нет.",
+            reply_markup=admin_menu(),
+        )
+        return
+
+    lines = [
+        "📋 <b>Последние активные источники</b>",
+        "",
+    ]
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    for row in rows:
+        source_id = int(row["id"])
+        movie_id = int(row["movie_id"])
+        season_number = row["season_number"]
+        episode_number = row["episode_number"]
+        voice_name = str(row["voice_name"])
+        quality = int(row["quality"])
+
+        target = f"movie:{movie_id}"
+        if season_number is not None:
+            target += (
+                f" • S{season_number}"
+                f"E{episode_number}"
+            )
+
+        lines.append(
+            f"#{source_id} • {target} • "
+            f"{escape(voice_name)} • {quality}p"
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 Удалить #{source_id}",
+                    callback_data=(
+                        f"adminsourcedel:{source_id}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В админку",
+                callback_data="admin:home",
+            )
+        ]
+    )
+
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("adminsourcedel:")
+)
+async def admin_delete_source(
+    callback: CallbackQuery,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    try:
+        source_id = int(
+            callback.data.split(":", 1)[1]
+        )
+    except ValueError:
+        await callback.answer(
+            "Некорректный ID",
+            show_alert=True,
+        )
+        return
+
+    result = await db().execute(
+        """
+        UPDATE playback_sources
+        SET is_active=FALSE
+        WHERE id=$1
+          AND is_active=TRUE
+        """,
+        source_id,
+    )
+
+    if result.endswith("0"):
+        await callback.answer(
+            "Источник уже удалён",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer(
+        "Источник удалён"
+    )
+
+    if callback.message:
+        await callback.message.answer(
+            f"🗑 Источник #{source_id} отключён.",
+            reply_markup=admin_menu(),
+        )
+
+
+@router.callback_query(F.data == "admin:home")
+async def admin_home(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer()
+        return
+
+    await state.clear()
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    users, favs, history = (
+        await global_stats()
+    )
+    sources = int(
+        await db().fetchval(
+            """
+            SELECT COUNT(*)
+            FROM playback_sources
+            WHERE is_active=TRUE
+            """
+        )
+    )
+
+    await callback.message.answer(
+        "🛠 <b>VKino — админка</b>\n\n"
+        f"👥 Пользователей: <b>{users}</b>\n"
+        f"⭐ Избранное: <b>{favs}</b>\n"
+        f"🕘 История: <b>{history}</b>\n"
+        f"▶️ Источников: <b>{sources}</b>",
+        reply_markup=admin_menu(),
     )
 
 
