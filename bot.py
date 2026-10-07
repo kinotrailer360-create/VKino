@@ -266,6 +266,40 @@ async def init_db() -> None:
                 viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (user_id, media_type, movie_id)
             );
+
+            CREATE TABLE IF NOT EXISTS playback_sources (
+                id BIGSERIAL PRIMARY KEY,
+                movie_id BIGINT NOT NULL,
+                season_number INTEGER,
+                episode_number INTEGER,
+                voice_name TEXT NOT NULL,
+                language TEXT NOT NULL DEFAULT 'ru',
+                quality INTEGER NOT NULL
+                    CHECK (quality IN (360, 480, 720, 1080)),
+                playback_url TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'hls',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_playback_sources_media
+            ON playback_sources(
+                movie_id,
+                season_number,
+                episode_number,
+                is_active
+            );
+
+            CREATE TABLE IF NOT EXISTS user_playback_preferences (
+                user_id BIGINT PRIMARY KEY,
+                preferred_voice TEXT,
+                preferred_quality INTEGER
+                    CHECK (
+                        preferred_quality IS NULL
+                        OR preferred_quality IN (360, 480, 720, 1080)
+                    ),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             """
         )
     logging.info("PostgreSQL connected")
@@ -397,6 +431,112 @@ async def list_history(
         limit,
     )
     return [dict(x) for x in rows]
+
+
+async def playback_voices(
+    movie_id: int,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+) -> list[str]:
+    rows = await db().fetch(
+        """
+        SELECT DISTINCT voice_name
+        FROM playback_sources
+        WHERE movie_id=$1
+          AND season_number IS NOT DISTINCT FROM $2
+          AND episode_number IS NOT DISTINCT FROM $3
+          AND is_active=TRUE
+        ORDER BY voice_name
+        """,
+        movie_id,
+        season_number,
+        episode_number,
+    )
+    return [str(row["voice_name"]) for row in rows]
+
+
+async def playback_qualities(
+    movie_id: int,
+    voice_name: str,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+) -> list[int]:
+    rows = await db().fetch(
+        """
+        SELECT DISTINCT quality
+        FROM playback_sources
+        WHERE movie_id=$1
+          AND season_number IS NOT DISTINCT FROM $2
+          AND episode_number IS NOT DISTINCT FROM $3
+          AND voice_name=$4
+          AND is_active=TRUE
+        ORDER BY quality
+        """,
+        movie_id,
+        season_number,
+        episode_number,
+        voice_name,
+    )
+    return [int(row["quality"]) for row in rows]
+
+
+async def playback_url(
+    movie_id: int,
+    voice_name: str,
+    quality: int,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+) -> str | None:
+    value = await db().fetchval(
+        """
+        SELECT playback_url
+        FROM playback_sources
+        WHERE movie_id=$1
+          AND season_number IS NOT DISTINCT FROM $2
+          AND episode_number IS NOT DISTINCT FROM $3
+          AND voice_name=$4
+          AND quality=$5
+          AND is_active=TRUE
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        movie_id,
+        season_number,
+        episode_number,
+        voice_name,
+        quality,
+    )
+    return str(value) if value else None
+
+
+async def save_playback_preference(
+    user_id: int,
+    voice_name: str | None = None,
+    quality: int | None = None,
+) -> None:
+    await db().execute(
+        """
+        INSERT INTO user_playback_preferences(
+            user_id,
+            preferred_voice,
+            preferred_quality
+        )
+        VALUES($1, $2, $3)
+        ON CONFLICT(user_id) DO UPDATE SET
+            preferred_voice=COALESCE(
+                EXCLUDED.preferred_voice,
+                user_playback_preferences.preferred_voice
+            ),
+            preferred_quality=COALESCE(
+                EXCLUDED.preferred_quality,
+                user_playback_preferences.preferred_quality
+            ),
+            updated_at=NOW()
+        """,
+        user_id,
+        voice_name,
+        quality,
+    )
 
 
 async def profile_stats(user_id: int) -> tuple[Any, int, int]:
@@ -545,6 +685,30 @@ def stored_keyboard(
             ]
             for item in items
         ]
+    )
+
+
+async def playback_button_for_movie(
+    movie_id: int,
+) -> InlineKeyboardButton | None:
+    has_source = await db().fetchval(
+        """
+        SELECT 1
+        FROM playback_sources
+        WHERE movie_id=$1
+          AND season_number IS NULL
+          AND episode_number IS NULL
+          AND is_active=TRUE
+        LIMIT 1
+        """,
+        movie_id,
+    )
+    if not has_source:
+        return None
+
+    return InlineKeyboardButton(
+        text="▶️ Смотреть",
+        callback_data=f"playvoices:{movie_id}:0:0",
     )
 
 
@@ -831,15 +995,27 @@ async def send_card(
 
     poster = kp.poster(item)
 
+    keyboard = card_keyboard(
+        item,
+        favorite,
+    )
+
+    if media_type == "movie":
+        play_button = await playback_button_for_movie(
+            movie_id
+        )
+        if play_button:
+            keyboard.inline_keyboard.insert(
+                0,
+                [play_button],
+            )
+
     if poster:
         try:
             await message.answer_photo(
                 poster,
                 caption=format_card(item),
-                reply_markup=card_keyboard(
-                    item,
-                    favorite,
-                ),
+                reply_markup=keyboard,
             )
             return
         except Exception:
@@ -847,10 +1023,7 @@ async def send_card(
 
     await message.answer(
         format_card(item),
-        reply_markup=card_keyboard(
-            item,
-            favorite,
-        ),
+        reply_markup=keyboard,
     )
 
 
@@ -1196,8 +1369,27 @@ async def show_episode(
 
     text = "\n".join(lines)
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
+    episode_rows: list[list[InlineKeyboardButton]] = []
+
+    if await playback_voices(
+        movie_id,
+        season_number,
+        episode_number,
+    ):
+        episode_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="▶️ Смотреть серию",
+                    callback_data=(
+                        f"playvoices:{movie_id}:"
+                        f"{season_number}:{episode_number}"
+                    ),
+                )
+            ]
+        )
+
+    episode_rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="⬅️ К сериям",
@@ -1216,6 +1408,10 @@ async def show_episode(
                 )
             ],
         ]
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=episode_rows
     )
 
     still = episode.get("still") or {}
@@ -1244,6 +1440,251 @@ async def show_episode(
     await callback.message.answer(
         text,
         reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("playvoices:"))
+async def play_voice_menu(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        _, raw_movie, raw_season, raw_episode = (
+            callback.data.split(":", 3)
+        )
+        movie_id = int(raw_movie)
+        season_number = int(raw_season) or None
+        episode_number = int(raw_episode) or None
+
+        rows = await db().fetch(
+            """
+            SELECT
+                MIN(id) AS source_id,
+                voice_name
+            FROM playback_sources
+            WHERE movie_id=$1
+              AND season_number IS NOT DISTINCT FROM $2
+              AND episode_number IS NOT DISTINCT FROM $3
+              AND is_active=TRUE
+            GROUP BY voice_name
+            ORDER BY voice_name
+            """,
+            movie_id,
+            season_number,
+            episode_number,
+        )
+
+    except Exception as exc:
+        logging.exception(
+            "Load playback voices failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось загрузить варианты озвучки."
+        )
+        return
+
+    if not rows:
+        await callback.message.answer(
+            "Для этого видео пока нет доступных источников."
+        )
+        return
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+    for row in rows:
+        source_id = int(row["source_id"])
+        voice_name = str(row["voice_name"])
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🎙 {voice_name}",
+                    callback_data=(
+                        f"playquality:{source_id}:"
+                        f"{movie_id}:"
+                        f"{season_number or 0}:"
+                        f"{episode_number or 0}"
+                    ),
+                )
+            ]
+        )
+
+    await callback.message.answer(
+        "🎙 <b>Выбери озвучку:</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=keyboard_rows
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("playquality:"))
+async def play_quality_menu(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        (
+            _,
+            raw_source_id,
+            raw_movie,
+            raw_season,
+            raw_episode,
+        ) = callback.data.split(":", 4)
+
+        source_id = int(raw_source_id)
+        movie_id = int(raw_movie)
+        season_number = int(raw_season) or None
+        episode_number = int(raw_episode) or None
+
+        voice_name = await db().fetchval(
+            """
+            SELECT voice_name
+            FROM playback_sources
+            WHERE id=$1
+            """,
+            source_id,
+        )
+
+        if not voice_name:
+            raise ValueError("Voice not found")
+
+        qualities = await playback_qualities(
+            movie_id,
+            str(voice_name),
+            season_number,
+            episode_number,
+        )
+
+    except Exception as exc:
+        logging.exception(
+            "Load playback qualities failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось загрузить качество видео."
+        )
+        return
+
+    if not qualities:
+        await callback.message.answer(
+            "Доступные качества пока не найдены."
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for quality in qualities:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📺 {quality}p",
+                    callback_data=(
+                        f"playopen:{source_id}:"
+                        f"{quality}:"
+                        f"{movie_id}:"
+                        f"{season_number or 0}:"
+                        f"{episode_number or 0}"
+                    ),
+                )
+            ]
+        )
+
+    await callback.message.answer(
+        f"🎙 <b>{escape(str(voice_name))}</b>\n"
+        "📺 Выбери качество:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("playopen:"))
+async def play_open(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        (
+            _,
+            raw_source_id,
+            raw_quality,
+            raw_movie,
+            raw_season,
+            raw_episode,
+        ) = callback.data.split(":", 5)
+
+        source_id = int(raw_source_id)
+        quality = int(raw_quality)
+        movie_id = int(raw_movie)
+        season_number = int(raw_season) or None
+        episode_number = int(raw_episode) or None
+
+        voice_name = await db().fetchval(
+            """
+            SELECT voice_name
+            FROM playback_sources
+            WHERE id=$1
+            """,
+            source_id,
+        )
+
+        if not voice_name:
+            raise ValueError("Voice not found")
+
+        url = await playback_url(
+            movie_id,
+            str(voice_name),
+            quality,
+            season_number,
+            episode_number,
+        )
+
+        if not url:
+            raise ValueError("Playback URL not found")
+
+        await save_playback_preference(
+            callback.from_user.id,
+            str(voice_name),
+            quality,
+        )
+
+    except Exception as exc:
+        logging.exception(
+            "Open playback failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Источник видео сейчас недоступен."
+        )
+        return
+
+    await callback.message.answer(
+        f"🎙 <b>{escape(str(voice_name))}</b>\n"
+        f"📺 <b>{quality}p</b>\n\n"
+        "Выбор сохранён в профиле.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"▶️ Смотреть • {quality}p",
+                        url=url,
+                    )
+                ]
+            ]
+        ),
     )
 
 
@@ -1622,6 +2063,26 @@ async def profile(
         else "не указан"
     )
 
+    preference = await db().fetchrow(
+        """
+        SELECT preferred_voice, preferred_quality
+        FROM user_playback_preferences
+        WHERE user_id=$1
+        """,
+        message.from_user.id,
+    )
+
+    preferred_voice = (
+        escape(str(preference["preferred_voice"]))
+        if preference and preference["preferred_voice"]
+        else "не выбрана"
+    )
+    preferred_quality = (
+        f"{int(preference['preferred_quality'])}p"
+        if preference and preference["preferred_quality"]
+        else "не выбрано"
+    )
+
     await message.answer(
         "👤 <b>Профиль VKino</b>\n\n"
         f"🆔 ID: <code>"
@@ -1629,8 +2090,9 @@ async def profile(
         f"🔗 Username: {username}\n"
         f"📅 С нами с: <b>{created}</b>\n"
         f"⭐ В избранном: <b>{fav_count}</b>\n"
-        f"🕘 В истории: "
-        f"<b>{history_count}</b>"
+        f"🕘 В истории: <b>{history_count}</b>\n"
+        f"🎙 Любимая озвучка: <b>{preferred_voice}</b>\n"
+        f"📺 Качество: <b>{preferred_quality}</b>"
     )
 
 
