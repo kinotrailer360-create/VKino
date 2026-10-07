@@ -4,12 +4,11 @@ import asyncio
 import logging
 import os
 import random
-from datetime import datetime
 from html import escape
 from typing import Any
 
 import aiohttp
-import asyncpg
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -30,7 +29,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 KINOPOISK_TOKEN = os.getenv("KINOPOISK_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_PATH = os.getenv("DB_PATH", "vkino.db").strip() or "vkino.db"
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "803444545").split(",")
@@ -41,15 +40,6 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not configured")
 if not KINOPOISK_TOKEN:
     raise RuntimeError("KINOPOISK_TOKEN is not configured")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not configured")
-
-pool: asyncpg.Pool | None = None
-router = Router()
-
-
-class SearchState(StatesGroup):
-    query = State()
 
 
 class PoiskKino:
@@ -131,179 +121,104 @@ class PoiskKino:
         providers = watchability.get("items", []) if isinstance(watchability, dict) else []
         result: list[tuple[str, str]] = []
         for p in providers:
-            if isinstance(p, dict) and p.get("url"):
-                result.append((str(p.get("name") or "Площадка"), str(p["url"])))
+            if not isinstance(p, dict) or not p.get("url"):
+                continue
+            result.append((str(p.get("name") or "Площадка"), str(p["url"])))
         return result
 
 
 kp = PoiskKino(KINOPOISK_TOKEN)
+router = Router()
 
 
-def db() -> asyncpg.Pool:
-    if pool is None:
-        raise RuntimeError("Database pool is not initialized")
-    return pool
+class SearchState(StatesGroup):
+    query = State()
 
 
-async def init_db() -> None:
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with db().acquire() as conn:
-        await conn.execute(
+async def db_init() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
+                user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
-
             CREATE TABLE IF NOT EXISTS favorites (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 media_type TEXT NOT NULL,
-                movie_id BIGINT NOT NULL,
+                movie_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (user_id, media_type, movie_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS history (
-                user_id BIGINT NOT NULL,
-                media_type TEXT NOT NULL,
-                movie_id BIGINT NOT NULL,
-                title TEXT NOT NULL,
-                viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, media_type, movie_id)
             );
             """
         )
-    logging.info("PostgreSQL connected")
+        await db.commit()
 
 
 async def remember(message: Message) -> None:
     if not message.from_user:
         return
-    await db().execute(
-        """
-        INSERT INTO users(user_id, username, first_name)
-        VALUES($1, $2, $3)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=EXCLUDED.username,
-            first_name=EXCLUDED.first_name,
-            last_seen_at=NOW()
-        """,
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name,
-    )
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO users(user_id, username, first_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              username=excluded.username,
+              first_name=excluded.first_name,
+              last_seen_at=CURRENT_TIMESTAMP
+            """,
+            (message.from_user.id, message.from_user.username, message.from_user.first_name),
+        )
+        await db.commit()
 
 
 async def is_favorite(user_id: int, media_type: str, movie_id: int) -> bool:
-    value = await db().fetchval(
-        "SELECT 1 FROM favorites WHERE user_id=$1 AND media_type=$2 AND movie_id=$3",
-        user_id,
-        media_type,
-        movie_id,
-    )
-    return bool(value)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM favorites WHERE user_id=? AND media_type=? AND movie_id=?",
+            (user_id, media_type, movie_id),
+        )
+        return await cur.fetchone() is not None
 
 
 async def add_favorite(user_id: int, media_type: str, movie_id: int, title: str) -> None:
-    await db().execute(
-        """
-        INSERT INTO favorites(user_id, media_type, movie_id, title)
-        VALUES($1, $2, $3, $4)
-        ON CONFLICT(user_id, media_type, movie_id)
-        DO UPDATE SET title=EXCLUDED.title
-        """,
-        user_id,
-        media_type,
-        movie_id,
-        title,
-    )
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO favorites(user_id,media_type,movie_id,title) VALUES (?,?,?,?)",
+            (user_id, media_type, movie_id, title),
+        )
+        await db.commit()
 
 
 async def delete_favorite(user_id: int, media_type: str, movie_id: int) -> None:
-    await db().execute(
-        "DELETE FROM favorites WHERE user_id=$1 AND media_type=$2 AND movie_id=$3",
-        user_id,
-        media_type,
-        movie_id,
-    )
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM favorites WHERE user_id=? AND media_type=? AND movie_id=?",
+            (user_id, media_type, movie_id),
+        )
+        await db.commit()
 
 
-async def list_favorites(user_id: int, limit: int = 30) -> list[dict[str, Any]]:
-    rows = await db().fetch(
-        """
-        SELECT media_type, movie_id, title
-        FROM favorites
-        WHERE user_id=$1
-        ORDER BY created_at DESC
-        LIMIT $2
-        """,
-        user_id,
-        limit,
-    )
-    return [dict(x) for x in rows]
+async def favorites(user_id: int) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT media_type,movie_id,title FROM favorites WHERE user_id=? ORDER BY created_at DESC LIMIT 30",
+            (user_id,),
+        )
+        return [dict(x) for x in await cur.fetchall()]
 
 
-async def record_history(user_id: int, media_type: str, movie_id: int, title: str) -> None:
-    await db().execute(
-        """
-        INSERT INTO history(user_id, media_type, movie_id, title)
-        VALUES($1, $2, $3, $4)
-        ON CONFLICT(user_id, media_type, movie_id)
-        DO UPDATE SET title=EXCLUDED.title, viewed_at=NOW()
-        """,
-        user_id,
-        media_type,
-        movie_id,
-        title,
-    )
-
-
-async def list_history(user_id: int, limit: int = 20) -> list[dict[str, Any]]:
-    rows = await db().fetch(
-        """
-        SELECT media_type, movie_id, title
-        FROM history
-        WHERE user_id=$1
-        ORDER BY viewed_at DESC
-        LIMIT $2
-        """,
-        user_id,
-        limit,
-    )
-    return [dict(x) for x in rows]
-
-
-async def profile_stats(user_id: int) -> tuple[Any, int, int]:
-    row = await db().fetchrow(
-        """
-        SELECT
-            u.created_at,
-            (SELECT COUNT(*) FROM favorites f WHERE f.user_id=u.user_id) AS favorites_count,
-            (SELECT COUNT(*) FROM history h WHERE h.user_id=u.user_id) AS history_count
-        FROM users u
-        WHERE u.user_id=$1
-        """,
-        user_id,
-    )
-    if not row:
-        return None, 0, 0
-    return row["created_at"], int(row["favorites_count"]), int(row["history_count"])
-
-
-async def global_stats() -> tuple[int, int, int]:
-    users = int(await db().fetchval("SELECT COUNT(*) FROM users"))
-    favs = int(await db().fetchval("SELECT COUNT(*) FROM favorites"))
-    history = int(await db().fetchval("SELECT COUNT(*) FROM history"))
-    return users, favs, history
-
-
-async def all_user_ids() -> list[int]:
-    return [int(x["user_id"]) for x in await db().fetch("SELECT user_id FROM users")]
+async def stats() -> tuple[int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        users = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+        favs = (await (await db.execute("SELECT COUNT(*) FROM favorites")).fetchone())[0]
+        return int(users), int(favs)
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -312,8 +227,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🔎 Найти фильм или сериал")],
             [KeyboardButton(text="🔥 Популярное"), KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎬 Подборки"), KeyboardButton(text="⭐ Избранное")],
-            [KeyboardButton(text="🕘 История"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="ℹ️ О VKino")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="ℹ️ О VKino")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Что будем смотреть? 🍿",
@@ -321,38 +235,22 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 def results_keyboard(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    rows = []
     for item in items:
         title = kp.title(item)
         year = item.get("year") or "—"
         icon = "📺" if item.get("media_type") == "series" else "🎬"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{icon} {title} ({year})",
-                callback_data=f"open:{item['id']}",
-            )
-        ])
+        rows.append([InlineKeyboardButton(text=f"{icon} {title} ({year})", callback_data=f"open:{item['id']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def stored_keyboard(items: list[dict[str, Any]], icon: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"{icon} {x['title']}", callback_data=f"open:{x['movie_id']}")]
-            for x in items
-        ]
-    )
 
 
 def card_keyboard(item: dict[str, Any], favorite: bool) -> InlineKeyboardMarkup:
     media_type = item.get("media_type", "movie")
     movie_id = int(item["id"])
     rows: list[list[InlineKeyboardButton]] = []
-
     trailer = kp.trailer(item)
     if trailer:
         rows.append([InlineKeyboardButton(text="🎞 Трейлер", url=trailer)])
-
     rows.append([InlineKeyboardButton(text="▶️ Где смотреть", callback_data=f"watch:{movie_id}")])
     rows.append([
         InlineKeyboardButton(
@@ -366,33 +264,17 @@ def card_keyboard(item: dict[str, Any], favorite: bool) -> InlineKeyboardMarkup:
 
 def format_card(item: dict[str, Any]) -> str:
     rating = item.get("rating") or {}
-    genres = ", ".join(
-        x.get("name", "")
-        for x in (item.get("genres") or [])[:4]
-        if x.get("name")
-    )
-    countries = ", ".join(
-        x.get("name", "")
-        for x in (item.get("countries") or [])[:3]
-        if x.get("name")
-    )
-    description = (
-        item.get("description")
-        or item.get("shortDescription")
-        or "Описание пока отсутствует."
-    ).strip()
+    genres = ", ".join(x.get("name", "") for x in (item.get("genres") or [])[:4] if x.get("name"))
+    countries = ", ".join(x.get("name", "") for x in (item.get("countries") or [])[:3] if x.get("name"))
+    description = (item.get("description") or item.get("shortDescription") or "Описание пока отсутствует.").strip()
     if len(description) > 850:
         description = description[:847].rstrip() + "…"
-
     kind = "Сериал" if item.get("media_type") == "series" else "Фильм"
     lines = [
         f"<b>{escape(kp.title(item))}</b>",
         f"{kind} • {item.get('year') or '—'}",
-        f"⭐ Кинопоиск: <b>{float(rating.get('kp')):.1f}</b>/10"
-        if rating.get("kp")
-        else "⭐ Кинопоиск: —",
+        f"⭐ Кинопоиск: <b>{float(rating.get('kp')):.1f}</b>/10" if rating.get("kp") else "⭐ Кинопоиск: —",
     ]
-
     if rating.get("imdb"):
         lines.append(f"⭐ IMDb: <b>{float(rating['imdb']):.1f}</b>/10")
     if genres:
@@ -401,35 +283,20 @@ def format_card(item: dict[str, Any]) -> str:
         lines.append(f"🌍 {escape(countries)}")
     if item.get("ageRating"):
         lines.append(f"🔞 {item['ageRating']}+")
-
     lines += ["", escape(description)]
     return "\n".join(lines)
 
 
 async def send_card(message: Message, item: dict[str, Any], user_id: int) -> None:
-    media_type = item.get("media_type", "movie")
-    movie_id = int(item["id"])
-    title = kp.title(item)
-
-    await record_history(user_id, media_type, movie_id, title)
-    favorite = await is_favorite(user_id, media_type, movie_id)
-
+    favorite = await is_favorite(user_id, item.get("media_type", "movie"), int(item["id"]))
     poster = kp.poster(item)
     if poster:
         try:
-            await message.answer_photo(
-                poster,
-                caption=format_card(item),
-                reply_markup=card_keyboard(item, favorite),
-            )
+            await message.answer_photo(poster, caption=format_card(item), reply_markup=card_keyboard(item, favorite))
             return
         except Exception:
             pass
-
-    await message.answer(
-        format_card(item),
-        reply_markup=card_keyboard(item, favorite),
-    )
+    await message.answer(format_card(item), reply_markup=card_keyboard(item, favorite))
 
 
 @router.message(CommandStart())
@@ -468,18 +335,15 @@ async def do_search(message: Message, state: FSMContext) -> None:
     if len(query) < 2:
         await message.answer("Напиши хотя бы 2 символа.")
         return
-
     try:
         items = await kp.search(query)
     except Exception as exc:
         logging.exception("Search failed: %s", exc)
         await message.answer("Не удалось связаться с каталогом. Попробуй позже.")
         return
-
     if not items:
         await message.answer("Ничего не нашёл 😕 Попробуй другое название.")
         return
-
     await state.clear()
     await message.answer("Вот что нашёл:", reply_markup=results_keyboard(items))
 
@@ -501,17 +365,10 @@ async def open_movie(callback: CallbackQuery) -> None:
 async def fav_add(callback: CallbackQuery) -> None:
     _, media_type, raw_id = callback.data.split(":", 2)
     item = await kp.details(int(raw_id))
-    await add_favorite(
-        callback.from_user.id,
-        media_type,
-        int(raw_id),
-        kp.title(item),
-    )
+    await add_favorite(callback.from_user.id, media_type, int(raw_id), kp.title(item))
     await callback.answer("Добавлено ⭐")
     if callback.message:
-        await callback.message.edit_reply_markup(
-            reply_markup=card_keyboard(item, True)
-        )
+        await callback.message.edit_reply_markup(reply_markup=card_keyboard(item, True))
 
 
 @router.callback_query(F.data.startswith("favdel:"))
@@ -521,9 +378,7 @@ async def fav_del(callback: CallbackQuery) -> None:
     await callback.answer("Удалено")
     if callback.message:
         item = await kp.details(int(raw_id))
-        await callback.message.edit_reply_markup(
-            reply_markup=card_keyboard(item, False)
-        )
+        await callback.message.edit_reply_markup(reply_markup=card_keyboard(item, False))
 
 
 @router.callback_query(F.data.startswith("watch:"))
@@ -531,22 +386,16 @@ async def watch(callback: CallbackQuery) -> None:
     await callback.answer()
     if not callback.message:
         return
-
     try:
         item = await kp.details(int(callback.data.split(":", 1)[1]))
         links = kp.watch_links(item)
     except Exception:
         links = []
-
     if not links:
-        await callback.message.answer(
-            "Для этого фильма площадки просмотра пока не указаны."
-        )
+        await callback.message.answer("Для этого фильма площадки просмотра пока не указаны.")
         return
-
     text = "▶️ <b>Где посмотреть:</b>\n" + "\n".join(
-        f'• <a href="{escape(url)}">{escape(name)}</a>'
-        for name, url in links[:8]
+        f'• <a href="{escape(url)}">{escape(name)}</a>' for name, url in links[:8]
     )
     await callback.message.answer(text, disable_web_page_preview=True)
 
@@ -556,10 +405,7 @@ async def popular(message: Message) -> None:
     await remember(message)
     try:
         items = await kp.popular()
-        await message.answer(
-            "🔥 Популярное сейчас:",
-            reply_markup=results_keyboard(items),
-        )
+        await message.answer("🔥 Популярное сейчас:", reply_markup=results_keyboard(items))
     except Exception:
         await message.answer("Не удалось загрузить популярное.")
 
@@ -580,12 +426,10 @@ async def random_movie(message: Message) -> None:
 @router.message(F.text == "🎬 Подборки")
 async def collections(message: Message) -> None:
     await remember(message)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎬 Популярные фильмы", callback_data="collection:movies")],
-            [InlineKeyboardButton(text="📺 Популярные сериалы", callback_data="collection:series")],
-        ]
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Популярные фильмы", callback_data="collection:movies")],
+        [InlineKeyboardButton(text="📺 Популярные сериалы", callback_data="collection:series")],
+    ])
     await message.answer("Что показать?", reply_markup=kb)
 
 
@@ -594,14 +438,11 @@ async def collection(callback: CallbackQuery) -> None:
     await callback.answer()
     if not callback.message:
         return
-
     kind = callback.data.split(":", 1)[1]
     try:
         items = await kp.popular(series=(kind == "series"))
         await callback.message.answer(
-            "📺 Популярные сериалы"
-            if kind == "series"
-            else "🎬 Популярные фильмы",
+            "📺 Популярные сериалы" if kind == "series" else "🎬 Популярные фильмы",
             reply_markup=results_keyboard(items),
         )
     except Exception:
@@ -611,57 +452,22 @@ async def collection(callback: CallbackQuery) -> None:
 @router.message(F.text == "⭐ Избранное")
 async def favorites_menu(message: Message) -> None:
     await remember(message)
-    rows = await list_favorites(message.from_user.id)
+    rows = await favorites(message.from_user.id)
     if not rows:
         await message.answer("В избранном пока пусто ⭐")
         return
-    await message.answer(
-        "⭐ Твоё избранное:",
-        reply_markup=stored_keyboard(rows, "⭐"),
-    )
-
-
-@router.message(F.text == "🕘 История")
-async def history_menu(message: Message) -> None:
-    await remember(message)
-    rows = await list_history(message.from_user.id)
-    if not rows:
-        await message.answer(
-            "История пока пустая. Открой карточку фильма или сериала 🍿"
-        )
-        return
-    await message.answer(
-        "🕘 Недавно смотрел:",
-        reply_markup=stored_keyboard(rows, "🕘"),
-    )
+    items = [
+        {"id": x["movie_id"], "name": x["title"], "year": "—", "media_type": x["media_type"]}
+        for x in rows
+    ]
+    await message.answer("⭐ Твоё избранное:", reply_markup=results_keyboard(items))
 
 
 @router.message(F.text == "👤 Профиль")
 async def profile(message: Message) -> None:
     await remember(message)
-    created_at, fav_count, history_count = await profile_stats(message.from_user.id)
-
-    if isinstance(created_at, datetime):
-        created = created_at.strftime("%d.%m.%Y")
-    elif created_at:
-        created = str(created_at)[:10]
-    else:
-        created = "сегодня"
-
-    username = (
-        f"@{escape(message.from_user.username)}"
-        if message.from_user.username
-        else "не указан"
-    )
-
-    await message.answer(
-        "👤 <b>Профиль VKino</b>\n\n"
-        f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"🔗 Username: {username}\n"
-        f"📅 С нами с: <b>{created}</b>\n"
-        f"⭐ В избранном: <b>{fav_count}</b>\n"
-        f"🕘 В истории: <b>{history_count}</b>"
-    )
+    count = len(await favorites(message.from_user.id))
+    await message.answer(f"👤 <b>Профиль VKino</b>\n\n🆔 ID: <code>{message.from_user.id}</code>\n⭐ В избранном: {count}")
 
 
 @router.message(F.text == "ℹ️ О VKino")
@@ -669,8 +475,7 @@ async def about(message: Message) -> None:
     await remember(message)
     await message.answer(
         "🎬 <b>VKino</b> — кино-гид в Telegram.\n\n"
-        "Поиск, рейтинги, русские описания, трейлеры, "
-        "подборки, история и избранное.\n"
+        "Поиск, рейтинги, русские описания, трейлеры, подборки и избранное.\n"
         "Метаданные: ПоискКино API."
     )
 
@@ -679,13 +484,9 @@ async def about(message: Message) -> None:
 async def admin(message: Message) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         return
-
-    users, favs, history = await global_stats()
+    users, favs = await stats()
     await message.answer(
-        "🛠 <b>VKino — админка</b>\n\n"
-        f"👥 Пользователей: {users}\n"
-        f"⭐ Избранное: {favs}\n"
-        f"🕘 История: {history}\n\n"
+        f"🛠 <b>VKino — админка</b>\n\n👥 Пользователей: {users}\n⭐ Избранное: {favs}\n\n"
         "<code>/broadcast текст</code> — рассылка"
     )
 
@@ -694,38 +495,29 @@ async def admin(message: Message) -> None:
 async def broadcast(message: Message) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         return
-
     text = (message.text or "").partition(" ")[2].strip()
     if not text:
         await message.answer("Использование: /broadcast текст")
         return
-
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute("SELECT user_id FROM users")).fetchall()
     ok = failed = 0
-    for user_id in await all_user_ids():
+    for (user_id,) in rows:
         try:
-            await message.bot.send_message(user_id, text)
+            await message.bot.send_message(int(user_id), text)
             ok += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)
-
     await message.answer(f"Рассылка завершена. ✅ {ok}  ❌ {failed}")
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-    await init_db()
-
-    bot = Bot(
-        BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    await db_init()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
-
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("VKino started")
     await dp.start_polling(bot)
