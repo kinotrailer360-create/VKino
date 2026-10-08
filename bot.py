@@ -390,6 +390,33 @@ async def init_db() -> None:
                 PRIMARY KEY (user_id, media_type, movie_id)
             );
 
+            CREATE TABLE IF NOT EXISTS search_history (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                query TEXT NOT NULL,
+                searched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_search_history_user_time
+            ON search_history(user_id, searched_at DESC);
+
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                media_type TEXT NOT NULL,
+                movie_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                action TEXT NOT NULL
+                    CHECK (action IN ('open', 'trailer', 'watch')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_activity_user_time
+            ON user_activity(user_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_user_activity_user_movie
+            ON user_activity(user_id, movie_id, action);
+
             CREATE TABLE IF NOT EXISTS playback_sources (
                 id BIGSERIAL PRIMARY KEY,
                 movie_id BIGINT NOT NULL,
@@ -610,6 +637,166 @@ async def list_history(
         limit,
     )
     return [dict(x) for x in rows]
+
+
+async def record_search(
+    user_id: int,
+    query: str,
+) -> None:
+    clean = query.strip()[:200]
+    if not clean:
+        return
+    await db().execute(
+        """
+        INSERT INTO search_history(user_id, query)
+        SELECT $1, $2
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM search_history
+            WHERE user_id=$1
+              AND LOWER(query)=LOWER($2)
+              AND searched_at > NOW() - INTERVAL '2 minutes'
+        )
+        """,
+        user_id,
+        clean,
+    )
+
+
+async def list_search_history(
+    user_id: int,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    rows = await db().fetch(
+        """
+        SELECT query, searched_at
+        FROM search_history
+        WHERE user_id=$1
+        ORDER BY searched_at DESC
+        LIMIT $2
+        """,
+        user_id,
+        limit,
+    )
+    return [dict(row) for row in rows]
+
+
+async def record_activity(
+    user_id: int,
+    media_type: str,
+    movie_id: int,
+    title: str,
+    action: str,
+) -> None:
+    if action not in {"open", "trailer", "watch"}:
+        return
+    await db().execute(
+        """
+        INSERT INTO user_activity(
+            user_id, media_type, movie_id, title, action
+        )
+        SELECT $1, $2, $3, $4, $5
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM user_activity
+            WHERE user_id=$1
+              AND movie_id=$3
+              AND action=$5
+              AND created_at > NOW() - INTERVAL '10 minutes'
+        )
+        """,
+        user_id,
+        media_type,
+        movie_id,
+        title[:300],
+        action,
+    )
+
+
+async def activity_media_snapshot(
+    user_id: int,
+    movie_id: int,
+) -> tuple[str, str]:
+    row = await db().fetchrow(
+        """
+        SELECT media_type, title
+        FROM history
+        WHERE user_id=$1 AND movie_id=$2
+        ORDER BY viewed_at DESC
+        LIMIT 1
+        """,
+        user_id,
+        movie_id,
+    )
+    if row:
+        return str(row["media_type"]), str(row["title"])
+
+    free_row = await db().fetchrow(
+        """
+        SELECT title
+        FROM free_catalog
+        WHERE movie_id=$1
+        """,
+        movie_id,
+    )
+    if free_row:
+        return "movie", str(free_row["title"])
+
+    return "movie", f"ID {movie_id}"
+
+
+async def user_stats_summary(
+    user_id: int,
+) -> dict[str, int]:
+    row = await db().fetchrow(
+        """
+        SELECT
+            (
+                SELECT COUNT(*)
+                FROM search_history
+                WHERE user_id=$1
+            ) AS searches,
+            COUNT(*) FILTER (WHERE action='open') AS opens,
+            COUNT(*) FILTER (WHERE action='trailer') AS trailers,
+            COUNT(*) FILTER (WHERE action='watch') AS watches
+        FROM user_activity
+        WHERE user_id=$1
+        """,
+        user_id,
+    )
+    return {
+        "searches": int(row["searches"] or 0) if row else 0,
+        "opens": int(row["opens"] or 0) if row else 0,
+        "trailers": int(row["trailers"] or 0) if row else 0,
+        "watches": int(row["watches"] or 0) if row else 0,
+    }
+
+
+async def top_user_activity(
+    user_id: int,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    rows = await db().fetch(
+        """
+        SELECT
+            movie_id,
+            MAX(title) AS title,
+            MAX(media_type) AS media_type,
+            COUNT(*) FILTER (WHERE action='open') AS opens,
+            COUNT(*) FILTER (WHERE action='trailer') AS trailers,
+            COUNT(*) FILTER (WHERE action='watch') AS watches,
+            COUNT(*) AS total,
+            MAX(created_at) AS last_activity
+        FROM user_activity
+        WHERE user_id=$1
+        GROUP BY movie_id
+        ORDER BY total DESC, last_activity DESC
+        LIMIT $2
+        """,
+        user_id,
+        limit,
+    )
+    return [dict(row) for row in rows]
 
 
 async def playback_voices(
@@ -1715,6 +1902,18 @@ async def api_trailer(request: web.Request) -> web.Response:
     if not result:
         return web.json_response({"error": "not found"}, status=404)
 
+    media_type, title = await activity_media_snapshot(
+        int(user["id"]),
+        movie_id,
+    )
+    await record_activity(
+        int(user["id"]),
+        media_type,
+        movie_id,
+        title,
+        "trailer",
+    )
+
     return web.json_response({
         "provider": result.get("provider"),
         "youtube_id": result.get("youtube_id"),
@@ -1808,6 +2007,20 @@ async def api_playback(request: web.Request) -> web.Response:
                 "type": str(row["source_type"] or "link"),
             }
         )
+
+    if rows:
+        media_type, title = await activity_media_snapshot(
+            int(user["id"]),
+            movie_id,
+        )
+        await record_activity(
+            int(user["id"]),
+            media_type,
+            movie_id,
+            title,
+            "watch",
+        )
+
     pref = await db().fetchrow(
         """
         SELECT preferred_voice, preferred_quality
@@ -2462,12 +2675,13 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [
                 KeyboardButton(text="🎬 Подборки"),
-                KeyboardButton(text="⭐ Избранное"),
+                KeyboardButton(text="❤️ Избранное"),
             ],
             [
                 KeyboardButton(text="🕘 История"),
-                KeyboardButton(text="👤 Профиль"),
+                KeyboardButton(text="📊 Статистика"),
             ],
+            [KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="ℹ️ О VKino")],
         ],
         resize_keyboard=True,
@@ -2657,7 +2871,7 @@ def card_keyboard(
                 text=(
                     "💔 Убрать из избранного"
                     if favorite
-                    else "⭐ В избранное"
+                    else "❤️ В избранное"
                 ),
                 callback_data=(
                     f"{'favdel' if favorite else 'favadd'}:"
@@ -2901,6 +3115,13 @@ async def send_card(
         movie_id,
         title,
     )
+    await record_activity(
+        user_id,
+        media_type,
+        movie_id,
+        title,
+        "open",
+    )
 
     favorite = await is_favorite(
         user_id,
@@ -3005,6 +3226,12 @@ async def do_search(
             "Напиши хотя бы 2 символа."
         )
         return
+
+    if message.from_user:
+        await record_search(
+            message.from_user.id,
+            query,
+        )
 
     try:
         items = await kp.search(query)
@@ -3902,7 +4129,22 @@ async def free_catalog_open(
         )
         return
 
-    title = escape(str(row["title"]))
+    raw_title = str(row["title"])
+    await record_history(
+        callback.from_user.id,
+        "movie",
+        movie_id,
+        raw_title,
+    )
+    await record_activity(
+        callback.from_user.id,
+        "movie",
+        movie_id,
+        raw_title,
+        "open",
+    )
+
+    title = escape(raw_title)
     original_title = escape(str(row["original_title"]))
 
     description = str(row["description"] or "").strip()
@@ -4289,7 +4531,10 @@ async def collection(
         )
 
 
-@router.message(F.text == "⭐ Избранное")
+@router.message(
+    (F.text == "⭐ Избранное")
+    | (F.text == "❤️ Избранное")
+)
 async def favorites_menu(
     message: Message,
 ) -> None:
@@ -4301,15 +4546,15 @@ async def favorites_menu(
 
     if not rows:
         await message.answer(
-            "В избранном пока пусто ⭐"
+            "В избранном пока пусто ❤️"
         )
         return
 
     await message.answer(
-        "⭐ Твоё избранное:",
+        "❤️ Твоё избранное:",
         reply_markup=stored_keyboard(
             rows,
-            "⭐",
+            "❤️",
         ),
     )
 
@@ -4323,21 +4568,99 @@ async def history_menu(
     rows = await list_history(
         message.from_user.id
     )
+    searches = await list_search_history(
+        message.from_user.id
+    )
 
-    if not rows:
+    if not rows and not searches:
         await message.answer(
             "История пока пустая. "
-            "Открой карточку фильма "
-            "или сериала 🍿"
+            "Найди или открой фильм/сериал 🍿"
         )
         return
 
+    lines = ["🕘 <b>История VKino</b>"]
+
+    if searches:
+        lines += ["", "🔎 <b>Последние поиски:</b>"]
+        for item in searches[:8]:
+            lines.append(
+                f"• {escape(str(item['query']))}"
+            )
+
+    if rows:
+        lines += ["", "🎬 <b>Недавно открывал:</b>"]
+
     await message.answer(
-        "🕘 Недавно смотрел:",
-        reply_markup=stored_keyboard(
-            rows,
-            "🕘",
+        "\n".join(lines),
+        reply_markup=(
+            stored_keyboard(rows, "🕘")
+            if rows
+            else None
         ),
+    )
+
+
+@router.message(F.text == "📊 Статистика")
+async def statistics_menu(
+    message: Message,
+) -> None:
+    await remember(message)
+
+    summary = await user_stats_summary(
+        message.from_user.id
+    )
+    top = await top_user_activity(
+        message.from_user.id
+    )
+
+    lines = [
+        "📊 <b>Твоя статистика VKino</b>",
+        "",
+        f"🔎 Поисков: <b>{summary['searches']}</b>",
+        f"🎬 Открытий карточек: <b>{summary['opens']}</b>",
+        f"🎞 Трейлеров: <b>{summary['trailers']}</b>",
+        f"▶️ Запусков просмотра: <b>{summary['watches']}</b>",
+    ]
+
+    if top:
+        lines += ["", "🏆 <b>Чаще всего:</b>"]
+        for index, item in enumerate(top[:10], start=1):
+            lines.append(
+                f"{index}. {escape(str(item['title']))} — "
+                f"<b>{int(item['total'])}</b>"
+            )
+    else:
+        lines += [
+            "",
+            "Пока мало данных. "
+            "Поищи несколько фильмов и открой их карточки 🍿",
+        ]
+
+    keyboard = None
+    if top:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=(
+                            f"{index}. {str(item['title'])}"
+                        )[:60],
+                        callback_data=(
+                            f"open:{int(item['movie_id'])}"
+                        ),
+                    )
+                ]
+                for index, item in enumerate(
+                    top[:10],
+                    start=1,
+                )
+            ]
+        )
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=keyboard,
     )
 
 
@@ -4412,7 +4735,7 @@ async def about(
         "кино-гид в Telegram.\n\n"
         "Поиск, рейтинги, русские описания, "
         "трейлеры, сезоны и серии, "
-        "подборки, история и избранное.\n"
+        "подборки, история, избранное и статистика.\n"
         "Метаданные: ПоискКино API."
     )
 
