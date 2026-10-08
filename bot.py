@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from datetime import date, datetime, timedelta
 from html import escape
@@ -54,6 +55,10 @@ VIDEO_PROVIDER_API_TOKEN = os.getenv(
     "VIDEO_PROVIDER_API_TOKEN",
     "",
 ).strip()
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+
 try:
     VIDEO_PROVIDER_SYNC_SECONDS = max(
         60,
@@ -375,6 +380,15 @@ async def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_free_catalog_provider
             ON free_catalog(provider, provider_id);
+
+            CREATE TABLE IF NOT EXISTS trailer_cache (
+                movie_id BIGINT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                youtube_id TEXT,
+                direct_url TEXT,
+                title TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
 
             CREATE TABLE IF NOT EXISTS user_playback_preferences (
                 user_id BIGINT PRIMARY KEY,
@@ -1046,6 +1060,452 @@ def build_webapp_url(
     return f"{WEBAPP_URL}/app?{query}"
 
 
+def build_trailer_url(movie_id: int) -> str:
+    if not WEBAPP_URL:
+        return ""
+    query = urlencode({"movie_id": movie_id})
+    return f"{WEBAPP_URL}/trailer?{query}"
+
+
+def youtube_video_id(url: str) -> str | None:
+    if not url:
+        return None
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([A-Za-z0-9_-]{6,})",
+        r"[?&]v=([A-Za-z0-9_-]{6,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+async def cache_trailer(
+    movie_id: int,
+    provider: str,
+    youtube_id: str | None = None,
+    direct_url: str | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    await db().execute(
+        """
+        INSERT INTO trailer_cache(
+            movie_id, provider, youtube_id, direct_url, title
+        )
+        VALUES($1,$2,$3,$4,$5)
+        ON CONFLICT(movie_id) DO UPDATE SET
+            provider=EXCLUDED.provider,
+            youtube_id=EXCLUDED.youtube_id,
+            direct_url=EXCLUDED.direct_url,
+            title=EXCLUDED.title,
+            updated_at=NOW()
+        """,
+        movie_id,
+        provider,
+        youtube_id,
+        direct_url,
+        title,
+    )
+    return {
+        "provider": provider,
+        "youtube_id": youtube_id,
+        "direct_url": direct_url,
+        "title": title,
+    }
+
+
+async def cached_trailer(movie_id: int) -> dict[str, Any] | None:
+    row = await db().fetchrow(
+        """
+        SELECT provider, youtube_id, direct_url, title, updated_at
+        FROM trailer_cache
+        WHERE movie_id=$1
+          AND updated_at > NOW() - INTERVAL '30 days'
+        """,
+        movie_id,
+    )
+    return dict(row) if row else None
+
+
+async def tmdb_movie_id(item: dict[str, Any]) -> tuple[str, int] | None:
+    media_type = item.get("media_type", "movie")
+    tmdb_kind = "tv" if media_type == "series" else "movie"
+
+    external = item.get("externalId") or {}
+    if isinstance(external, dict):
+        raw_tmdb = external.get("tmdb")
+        try:
+            if raw_tmdb:
+                return tmdb_kind, int(raw_tmdb)
+        except (TypeError, ValueError):
+            pass
+
+    if not TMDB_API_KEY:
+        return None
+
+    title = kp.title(item)
+    year = item.get("year")
+    params: dict[str, Any] = {
+        "api_key": TMDB_API_KEY,
+        "query": title,
+        "language": "ru-RU",
+        "include_adult": "false",
+    }
+    if year:
+        if tmdb_kind == "tv":
+            params["first_air_date_year"] = int(year)
+        else:
+            params["year"] = int(year)
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            f"https://api.themoviedb.org/3/search/{tmdb_kind}",
+            params=params,
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json()
+
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results:
+        return None
+
+    try:
+        return tmdb_kind, int(results[0]["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def trailer_from_tmdb(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not TMDB_API_KEY:
+        return None
+
+    resolved = await tmdb_movie_id(item)
+    if not resolved:
+        return None
+
+    tmdb_kind, tmdb_id = resolved
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for language in ("ru-RU", "en-US", ""):
+            params: dict[str, Any] = {"api_key": TMDB_API_KEY}
+            if language:
+                params["language"] = language
+
+            async with session.get(
+                f"https://api.themoviedb.org/3/{tmdb_kind}/{tmdb_id}/videos",
+                params=params,
+            ) as response:
+                if response.status != 200:
+                    continue
+                payload = await response.json()
+
+            videos = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(videos, list):
+                continue
+
+            candidates = [
+                v for v in videos
+                if isinstance(v, dict)
+                and str(v.get("site") or "").casefold() == "youtube"
+                and v.get("key")
+            ]
+            if not candidates:
+                continue
+
+            def score(v: dict[str, Any]) -> tuple[int, int, int]:
+                vtype = str(v.get("type") or "").casefold()
+                name = str(v.get("name") or "").casefold()
+                official = 1 if v.get("official") is True else 0
+                trailer = 1 if vtype == "trailer" else 0
+                ru_hint = 1 if any(x in name for x in ("рус", "дуб", "трейлер")) else 0
+                return (trailer, official, ru_hint)
+
+            candidates.sort(key=score, reverse=True)
+            best = candidates[0]
+            return {
+                "provider": "tmdb",
+                "youtube_id": str(best["key"]),
+                "direct_url": None,
+                "title": str(best.get("name") or "Трейлер"),
+            }
+
+    return None
+
+
+async def trailer_from_youtube(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not YOUTUBE_API_KEY:
+        return None
+
+    title = kp.title(item)
+    year = item.get("year") or ""
+    query = f"{title} {year} официальный трейлер".strip()
+
+    params = {
+        "part": "snippet",
+        "type": "video",
+        "videoEmbeddable": "true",
+        "maxResults": 5,
+        "q": query,
+        "relevanceLanguage": "ru",
+        "safeSearch": "moderate",
+        "key": YOUTUBE_API_KEY,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params=params,
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json()
+
+    results = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results:
+        return None
+
+    def score(entry: dict[str, Any]) -> tuple[int, int]:
+        snippet = entry.get("snippet") or {}
+        name = str(snippet.get("title") or "").casefold()
+        official = 1 if any(
+            marker in name
+            for marker in ("официальный трейлер", "official trailer", "official teaser")
+        ) else 0
+        trailer = 1 if any(marker in name for marker in ("трейлер", "trailer", "teaser")) else 0
+        return (official, trailer)
+
+    valid = [
+        entry for entry in results
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), dict)
+        and entry["id"].get("videoId")
+    ]
+    if not valid:
+        return None
+
+    valid.sort(key=score, reverse=True)
+    best = valid[0]
+    snippet = best.get("snippet") or {}
+    return {
+        "provider": "youtube",
+        "youtube_id": str(best["id"]["videoId"]),
+        "direct_url": None,
+        "title": str(snippet.get("title") or "Трейлер"),
+    }
+
+
+async def resolve_trailer(movie_id: int) -> dict[str, Any] | None:
+    cached = await cached_trailer(movie_id)
+    if cached:
+        return cached
+
+    try:
+        item = await kp.details(movie_id)
+    except Exception as exc:
+        logging.info("Trailer movie lookup failed: %s", exc)
+        return None
+
+    # 1. PoiskKino first.
+    url = kp.trailer(item)
+    if url:
+        yt_id = youtube_video_id(url)
+        if yt_id:
+            return await cache_trailer(
+                movie_id,
+                "poiskkino",
+                youtube_id=yt_id,
+                title="Трейлер",
+            )
+        if str(url).startswith("https://"):
+            return await cache_trailer(
+                movie_id,
+                "poiskkino",
+                direct_url=str(url),
+                title="Трейлер",
+            )
+
+    # 2. TMDb official videos.
+    try:
+        tmdb_result = await trailer_from_tmdb(item)
+        if tmdb_result:
+            return await cache_trailer(movie_id, **tmdb_result)
+    except Exception as exc:
+        logging.info("TMDb trailer fallback failed: %s", exc)
+
+    # 3. YouTube Data API search fallback.
+    try:
+        yt_result = await trailer_from_youtube(item)
+        if yt_result:
+            return await cache_trailer(movie_id, **yt_result)
+    except Exception as exc:
+        logging.info("YouTube trailer fallback failed: %s", exc)
+
+    return None
+
+
+TRAILER_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>VKino360 Trailer</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #000;
+      --text: var(--tg-theme-text-color, #fff);
+      --hint: var(--tg-theme-hint-color, #a7a7a7);
+      --button: var(--tg-theme-button-color, #2aabee);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: max(10px, env(safe-area-inset-top)) 10px max(12px, env(safe-area-inset-bottom));
+      background: #000;
+      color: var(--text);
+      font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    .head { display:flex; gap:10px; align-items:center; margin-bottom:10px; }
+    .title { font-size:16px; font-weight:800; flex:1; }
+    button {
+      border:0; border-radius:999px; padding:10px 14px;
+      background:var(--button); color:#fff; font-weight:700;
+    }
+    .frame {
+      position:relative; width:100%; aspect-ratio:16/9;
+      background:#000; overflow:hidden; border-radius:12px;
+    }
+    iframe, video {
+      width:100%; height:100%; border:0; background:#000;
+      object-fit:contain;
+    }
+    #status { color:var(--hint); font-size:13px; margin-top:10px; }
+    body.cinema { padding:0; overflow:hidden; }
+    body.cinema .head, body.cinema #status { display:none; }
+    body.cinema .frame {
+      position:fixed; inset:0; width:100vw; height:100vh;
+      aspect-ratio:auto; border-radius:0; z-index:9999;
+    }
+    #exit {
+      display:none; position:fixed; z-index:10001;
+      right:10px; top:max(10px,env(safe-area-inset-top));
+      width:auto; background:rgba(0,0,0,.7);
+    }
+    body.cinema #exit { display:block; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <div class="title" id="title">Трейлер</div>
+    <button id="fullscreen">⛶</button>
+  </div>
+  <div class="frame" id="frame"></div>
+  <button id="exit">✕</button>
+  <div id="status">Ищем официальный трейлер…</div>
+<script>
+(() => {
+  const tg = window.Telegram?.WebApp;
+  if (!tg) return;
+  tg.ready(); tg.expand();
+  const p = new URLSearchParams(location.search);
+  const movieId = Number(p.get('movie_id') || 0);
+  const frame = document.getElementById('frame');
+  const status = document.getElementById('status');
+  const title = document.getElementById('title');
+
+  async function api(path) {
+    const r = await fetch(path, {
+      headers: {'X-Telegram-Init-Data': tg.initData || ''}
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  }
+
+  async function boot() {
+    try {
+      const data = await api('/api/trailer?movie_id=' + movieId);
+      if (data.title) title.textContent = data.title;
+      if (data.youtube_id) {
+        const id = encodeURIComponent(data.youtube_id);
+        frame.innerHTML =
+          '<iframe allow="autoplay; encrypted-media; picture-in-picture; fullscreen" ' +
+          'allowfullscreen src="https://www.youtube-nocookie.com/embed/' + id +
+          '?autoplay=1&rel=0&modestbranding=1"></iframe>';
+      } else if (data.direct_url) {
+        const v = document.createElement('video');
+        v.controls = true; v.autoplay = true; v.playsInline = true;
+        v.src = data.direct_url;
+        frame.appendChild(v);
+      } else {
+        throw new Error('Трейлер не найден');
+      }
+      status.textContent = data.provider ? ('Источник: ' + data.provider) : '';
+    } catch (e) {
+      status.textContent = 'Трейлер пока не найден.';
+    }
+  }
+
+  async function enter() {
+    document.body.classList.add('cinema');
+    try { if (tg.requestFullscreen) tg.requestFullscreen(); } catch (_) {}
+    try {
+      if (screen.orientation && screen.orientation.lock) {
+        screen.orientation.lock('landscape').catch(()=>{});
+      }
+    } catch (_) {}
+  }
+  async function leave() {
+    document.body.classList.remove('cinema');
+    try { if (tg.exitFullscreen) tg.exitFullscreen(); } catch (_) {}
+    try {
+      if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+    } catch (_) {}
+  }
+  document.getElementById('fullscreen').onclick = enter;
+  document.getElementById('exit').onclick = leave;
+  boot();
+})();
+</script>
+</body>
+</html>"""
+
+
+async def trailer_page(_: web.Request) -> web.Response:
+    return web.Response(
+        text=TRAILER_HTML,
+        content_type="text/html",
+        charset="utf-8",
+    )
+
+
+async def api_trailer(request: web.Request) -> web.Response:
+    user = request_telegram_user(request)
+    if not user:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    try:
+        movie_id = int(request.query.get("movie_id", "0"))
+    except ValueError:
+        return web.json_response({"error": "bad movie_id"}, status=400)
+
+    result = await resolve_trailer(movie_id)
+    if not result:
+        return web.json_response({"error": "not found"}, status=404)
+
+    return web.json_response({
+        "provider": result.get("provider"),
+        "youtube_id": result.get("youtube_id"),
+        "direct_url": result.get("direct_url"),
+        "title": result.get("title") or "Трейлер",
+    })
+
+
 def validate_webapp_init_data(raw: str, max_age: int = 86400) -> dict[str, Any] | None:
     if not raw:
         return None
@@ -1231,6 +1691,8 @@ async def start_miniapp_server() -> web.AppRunner:
     app = web.Application(client_max_size=1024 * 1024)
     app.router.add_get("/", miniapp_page)
     app.router.add_get("/app", miniapp_page)
+    app.router.add_get("/trailer", trailer_page)
+    app.router.add_get("/api/trailer", api_trailer)
     app.router.add_get("/api/playback", api_playback)
     app.router.add_post("/api/progress", api_progress)
     runner = web.AppRunner(app)
@@ -1798,11 +2260,22 @@ def card_keyboard(
             ]
         )
 
-    trailer = kp.trailer(item)
-    if trailer:
+    trailer_app_url = build_trailer_url(movie_id)
+    if trailer_app_url:
         rows.append(
-            [InlineKeyboardButton(text="🎞 Трейлер", url=trailer)]
+            [
+                InlineKeyboardButton(
+                    text="🎞 Трейлер",
+                    web_app=WebAppInfo(url=trailer_app_url),
+                )
+            ]
         )
+    else:
+        trailer = kp.trailer(item)
+        if trailer:
+            rows.append(
+                [InlineKeyboardButton(text="🎞 Трейлер", url=trailer)]
+            )
 
     rows.append(
         [
