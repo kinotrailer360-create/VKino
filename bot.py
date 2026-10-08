@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import random
+import time
 from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
 
 import aiohttp
 import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -23,6 +29,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 
@@ -31,6 +38,30 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 KINOPOISK_TOKEN = os.getenv("KINOPOISK_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
+RAILWAY_PUBLIC_DOMAIN = os.getenv(
+    "RAILWAY_PUBLIC_DOMAIN",
+    "",
+).strip()
+if not WEBAPP_URL and RAILWAY_PUBLIC_DOMAIN:
+    WEBAPP_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}".rstrip("/")
+
+VIDEO_PROVIDER_API_URL = os.getenv(
+    "VIDEO_PROVIDER_API_URL",
+    "",
+).strip()
+VIDEO_PROVIDER_API_TOKEN = os.getenv(
+    "VIDEO_PROVIDER_API_TOKEN",
+    "",
+).strip()
+try:
+    VIDEO_PROVIDER_SYNC_SECONDS = max(
+        60,
+        int(os.getenv("VIDEO_PROVIDER_SYNC_SECONDS", "900")),
+    )
+except ValueError:
+    VIDEO_PROVIDER_SYNC_SECONDS = 900
+
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "803444545").split(",")
@@ -305,6 +336,22 @@ async def init_db() -> None:
                         OR preferred_quality IN (360, 480, 720, 1080)
                     ),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS playback_progress (
+                user_id BIGINT NOT NULL,
+                movie_id BIGINT NOT NULL,
+                season_number INTEGER NOT NULL DEFAULT 0,
+                episode_number INTEGER NOT NULL DEFAULT 0,
+                position_seconds INTEGER NOT NULL DEFAULT 0,
+                duration_seconds INTEGER,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (
+                    user_id,
+                    movie_id,
+                    season_number,
+                    episode_number
+                )
             );
             """
         )
@@ -586,6 +633,451 @@ async def all_user_ids() -> list[int]:
     return [int(x["user_id"]) for x in rows]
 
 
+PLAYER_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>VKino360 Player</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--tg-theme-bg-color, #111318);
+      --text: var(--tg-theme-text-color, #ffffff);
+      --hint: var(--tg-theme-hint-color, #8d96a5);
+      --button: var(--tg-theme-button-color, #2aabee);
+      --button-text: var(--tg-theme-button-text-color, #ffffff);
+      --secondary: var(--tg-theme-secondary-bg-color, #1b1e25);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: max(14px, env(safe-area-inset-top)) 14px max(18px, env(safe-area-inset-bottom));
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .brand { font-weight: 800; font-size: 20px; margin-bottom: 4px; }
+    .subtitle { color: var(--hint); font-size: 13px; margin-bottom: 14px; }
+    .card { background: var(--secondary); border-radius: 16px; padding: 12px; }
+    video { width: 100%; background: #000; border-radius: 12px; max-height: 62vh; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+    label { font-size: 12px; color: var(--hint); display: block; margin-bottom: 5px; }
+    select, button {
+      width: 100%; border: 0; border-radius: 12px; padding: 12px;
+      background: var(--bg); color: var(--text); font-size: 15px;
+    }
+    button.primary { background: var(--button); color: var(--button-text); font-weight: 700; }
+    #status { color: var(--hint); font-size: 13px; margin-top: 10px; min-height: 18px; }
+    #next { margin-top: 12px; display: none; }
+    @media (max-width: 420px) { .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="brand">VKino360 🎬</div>
+  <div class="subtitle" id="title">Плеер внутри Telegram</div>
+  <div class="card">
+    <video id="video" controls playsinline preload="metadata"></video>
+    <div class="row">
+      <div><label>Озвучка</label><select id="voice"></select></div>
+      <div><label>Качество</label><select id="quality"></select></div>
+    </div>
+    <div id="status">Загрузка…</div>
+    <button id="next" class="primary">Следующая серия ▶</button>
+  </div>
+<script>
+(() => {
+  const tg = window.Telegram?.WebApp;
+  if (!tg) { document.getElementById('status').textContent = 'Открой плеер из Telegram.'; return; }
+  tg.ready(); tg.expand();
+  try { tg.setHeaderColor('bg_color'); } catch (_) {}
+  const p = new URLSearchParams(location.search);
+  const movieId = Number(p.get('movie_id') || 0);
+  const season = Number(p.get('season') || 0);
+  const episode = Number(p.get('episode') || 0);
+  const video = document.getElementById('video');
+  const voice = document.getElementById('voice');
+  const quality = document.getElementById('quality');
+  const status = document.getElementById('status');
+  const next = document.getElementById('next');
+  let model = null, hls = null, saveTimer = null;
+
+  async function api(path, options = {}) {
+    options.headers = Object.assign({}, options.headers || {}, {
+      'X-Telegram-Init-Data': tg.initData || ''
+    });
+    const r = await fetch(path, options);
+    if (!r.ok) throw new Error((await r.text()) || ('HTTP ' + r.status));
+    return r.json();
+  }
+  function currentVoice() { return model.voices.find(v => v.name === voice.value) || model.voices[0]; }
+  function fillQualities(preferred) {
+    const v = currentVoice(); quality.innerHTML = '';
+    for (const q of v.qualities) {
+      const o = document.createElement('option'); o.value = String(q.quality); o.textContent = q.quality + 'p'; quality.appendChild(o);
+    }
+    const desired = preferred && v.qualities.some(q => q.quality === preferred) ? preferred : v.qualities[v.qualities.length - 1].quality;
+    quality.value = String(desired);
+  }
+  function selectedSource() {
+    const v = currentVoice();
+    return v.qualities.find(q => String(q.quality) === quality.value) || v.qualities[0];
+  }
+  function destroyHls() { if (hls) { hls.destroy(); hls = null; } }
+  function loadVideo(keepTime = true) {
+    const src = selectedSource(); if (!src) return;
+    const t = keepTime ? (video.currentTime || 0) : (model.resume || 0);
+    destroyHls();
+    const url = src.url;
+    if ((src.type === 'hls' || /\.m3u8($|\?)/i.test(url)) && window.Hls && Hls.isSupported()) {
+      hls = new Hls({ enableWorker: true }); hls.loadSource(url); hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (t > 2) video.currentTime = t; video.play().catch(() => {}); });
+    } else {
+      video.src = url; video.addEventListener('loadedmetadata', function once() {
+        video.removeEventListener('loadedmetadata', once); if (t > 2) video.currentTime = t; video.play().catch(() => {});
+      });
+    }
+    status.textContent = voice.value + ' • ' + quality.value + 'p';
+  }
+  async function saveProgress() {
+    if (!video.duration || !isFinite(video.duration)) return;
+    try {
+      await api('/api/progress', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({movie_id:movieId, season, episode, position:Math.floor(video.currentTime||0), duration:Math.floor(video.duration||0), voice:voice.value, quality:Number(quality.value||0)})
+      });
+    } catch (_) {}
+  }
+  async function boot() {
+    try {
+      const qs = new URLSearchParams({movie_id:String(movieId), season:String(season), episode:String(episode)});
+      model = await api('/api/playback?' + qs.toString());
+      if (!model.voices.length) throw new Error('Источники не найдены');
+      voice.innerHTML = '';
+      for (const v of model.voices) { const o=document.createElement('option'); o.value=v.name; o.textContent=v.name; voice.appendChild(o); }
+      if (model.preferred?.voice && model.voices.some(v=>v.name===model.preferred.voice)) voice.value = model.preferred.voice;
+      fillQualities(model.preferred?.quality || null);
+      loadVideo(false);
+      if (model.next) {
+        next.style.display='block';
+        next.onclick = () => {
+          const q = new URLSearchParams({movie_id:String(movieId), season:String(model.next.season), episode:String(model.next.episode)});
+          location.href = '/app?' + q.toString();
+        };
+      }
+      saveTimer = setInterval(saveProgress, 10000);
+      video.addEventListener('pause', saveProgress);
+      video.addEventListener('ended', async () => { await saveProgress(); if (model.next) next.style.display='block'; });
+      voice.onchange = () => { fillQualities(model.preferred?.quality || null); loadVideo(true); };
+      quality.onchange = () => loadVideo(true);
+    } catch (e) { status.textContent = 'Ошибка: ' + e.message; }
+  }
+  window.addEventListener('beforeunload', () => { if (saveTimer) clearInterval(saveTimer); saveProgress(); destroyHls(); });
+  boot();
+})();
+</script>
+</body>
+</html>"""
+
+
+def build_webapp_url(
+    movie_id: int,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+) -> str:
+    if not WEBAPP_URL:
+        return ""
+    query = urlencode(
+        {
+            "movie_id": movie_id,
+            "season": season_number or 0,
+            "episode": episode_number or 0,
+        }
+    )
+    return f"{WEBAPP_URL}/app?{query}"
+
+
+def validate_webapp_init_data(raw: str, max_age: int = 86400) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        pairs = dict(parse_qsl(raw, keep_blank_values=True))
+        received_hash = pairs.pop("hash", "")
+        if not received_hash:
+            return None
+        data_check = "\n".join(
+            f"{key}={value}"
+            for key, value in sorted(pairs.items())
+        )
+        secret_key = hmac.new(
+            b"WebAppData",
+            BOT_TOKEN.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        calculated = hmac.new(
+            secret_key,
+            data_check.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
+            return None
+        auth_date = int(pairs.get("auth_date", "0"))
+        if auth_date <= 0 or abs(int(time.time()) - auth_date) > max_age:
+            return None
+        user_raw = pairs.get("user")
+        user = json.loads(user_raw) if user_raw else None
+        if not isinstance(user, dict) or not user.get("id"):
+            return None
+        return {"user": user, "fields": pairs}
+    except Exception:
+        return None
+
+
+async def miniapp_page(_: web.Request) -> web.Response:
+    return web.Response(
+        text=PLAYER_HTML,
+        content_type="text/html",
+        charset="utf-8",
+    )
+
+
+def request_telegram_user(request: web.Request) -> dict[str, Any] | None:
+    raw = request.headers.get("X-Telegram-Init-Data", "")
+    validated = validate_webapp_init_data(raw)
+    return validated["user"] if validated else None
+
+
+async def api_playback(request: web.Request) -> web.Response:
+    user = request_telegram_user(request)
+    if not user:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        movie_id = int(request.query.get("movie_id", "0"))
+        season = int(request.query.get("season", "0") or 0)
+        episode = int(request.query.get("episode", "0") or 0)
+    except ValueError:
+        return web.json_response({"error": "bad_request"}, status=400)
+    season_db = season or None
+    episode_db = episode or None
+    rows = await db().fetch(
+        """
+        SELECT voice_name, quality, playback_url, source_type
+        FROM playback_sources
+        WHERE movie_id=$1
+          AND season_number IS NOT DISTINCT FROM $2
+          AND episode_number IS NOT DISTINCT FROM $3
+          AND is_active=TRUE
+        ORDER BY voice_name, quality
+        """,
+        movie_id,
+        season_db,
+        episode_db,
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["voice_name"]), []).append(
+            {
+                "quality": int(row["quality"]),
+                "url": str(row["playback_url"]),
+                "type": str(row["source_type"] or "link"),
+            }
+        )
+    pref = await db().fetchrow(
+        """
+        SELECT preferred_voice, preferred_quality
+        FROM user_playback_preferences
+        WHERE user_id=$1
+        """,
+        int(user["id"]),
+    )
+    resume = await db().fetchval(
+        """
+        SELECT position_seconds
+        FROM playback_progress
+        WHERE user_id=$1 AND movie_id=$2
+          AND season_number=$3 AND episode_number=$4
+        """,
+        int(user["id"]), movie_id, season, episode,
+    )
+    next_item = None
+    if season and episode:
+        next_row = await db().fetchrow(
+            """
+            SELECT season_number, episode_number
+            FROM playback_sources
+            WHERE movie_id=$1
+              AND season_number IS NOT NULL
+              AND episode_number IS NOT NULL
+              AND is_active=TRUE
+              AND (
+                    season_number > $2
+                    OR (season_number=$2 AND episode_number > $3)
+                  )
+            GROUP BY season_number, episode_number
+            ORDER BY season_number, episode_number
+            LIMIT 1
+            """,
+            movie_id, season, episode,
+        )
+        if next_row:
+            next_item = {
+                "season": int(next_row["season_number"]),
+                "episode": int(next_row["episode_number"]),
+            }
+    return web.json_response(
+        {
+            "voices": [
+                {"name": name, "qualities": qualities}
+                for name, qualities in grouped.items()
+            ],
+            "preferred": {
+                "voice": str(pref["preferred_voice"]) if pref and pref["preferred_voice"] else None,
+                "quality": int(pref["preferred_quality"]) if pref and pref["preferred_quality"] else None,
+            },
+            "resume": int(resume or 0),
+            "next": next_item,
+        }
+    )
+
+
+async def api_progress(request: web.Request) -> web.Response:
+    user = request_telegram_user(request)
+    if not user:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        payload = await request.json()
+        movie_id = int(payload.get("movie_id", 0))
+        season = int(payload.get("season", 0) or 0)
+        episode = int(payload.get("episode", 0) or 0)
+        position = max(0, int(payload.get("position", 0) or 0))
+        duration = max(0, int(payload.get("duration", 0) or 0))
+        voice_name = str(payload.get("voice") or "").strip()[:80]
+        quality = int(payload.get("quality", 0) or 0)
+    except Exception:
+        return web.json_response({"error": "bad_request"}, status=400)
+    if voice_name and quality in {360, 480, 720, 1080}:
+        await save_playback_preference(
+            int(user["id"]),
+            voice_name,
+            quality,
+        )
+    await db().execute(
+        """
+        INSERT INTO playback_progress(
+            user_id, movie_id, season_number, episode_number,
+            position_seconds, duration_seconds
+        ) VALUES($1,$2,$3,$4,$5,$6)
+        ON CONFLICT(user_id,movie_id,season_number,episode_number)
+        DO UPDATE SET
+            position_seconds=EXCLUDED.position_seconds,
+            duration_seconds=EXCLUDED.duration_seconds,
+            updated_at=NOW()
+        """,
+        int(user["id"]), movie_id, season, episode, position, duration,
+    )
+    return web.json_response({"ok": True})
+
+
+async def start_miniapp_server() -> web.AppRunner:
+    app = web.Application(client_max_size=1024 * 1024)
+    app.router.add_get("/", miniapp_page)
+    app.router.add_get("/app", miniapp_page)
+    app.router.add_get("/api/playback", api_playback)
+    app.router.add_post("/api/progress", api_progress)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("VKino Mini App server started on port %s", port)
+    return runner
+
+
+async def sync_video_provider_once() -> int:
+    if not VIDEO_PROVIDER_API_URL:
+        return 0
+    headers = {"Accept": "application/json"}
+    if VIDEO_PROVIDER_API_TOKEN:
+        headers["Authorization"] = f"Bearer {VIDEO_PROVIDER_API_TOKEN}"
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.get(VIDEO_PROVIDER_API_URL) as response:
+            response.raise_for_status()
+            payload = await response.json()
+    items = payload.get("items") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise ValueError("Provider response must be a list or {'items': [...]} object")
+    synced = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            movie_id = int(item.get("kinopoisk_id") or item.get("movie_id"))
+            voice_name = str(item.get("voice") or item.get("voice_name") or "Original").strip()[:80]
+            quality = int(item.get("quality"))
+            playback_url = str(item.get("url") or item.get("playback_url") or "").strip()
+            if quality not in {360, 480, 720, 1080} or not playback_url.startswith("https://"):
+                continue
+            season = item.get("season")
+            episode = item.get("episode")
+            season_number = int(season) if season not in (None, "", 0, "0") else None
+            episode_number = int(episode) if episode not in (None, "", 0, "0") else None
+            source_type = str(item.get("type") or item.get("source_type") or "link")[:20]
+            active = bool(item.get("active", True))
+        except Exception:
+            continue
+        existing_id = await db().fetchval(
+            """
+            SELECT id FROM playback_sources
+            WHERE movie_id=$1
+              AND season_number IS NOT DISTINCT FROM $2
+              AND episode_number IS NOT DISTINCT FROM $3
+              AND voice_name=$4 AND quality=$5
+            ORDER BY id DESC LIMIT 1
+            """,
+            movie_id, season_number, episode_number, voice_name, quality,
+        )
+        if existing_id:
+            await db().execute(
+                """
+                UPDATE playback_sources
+                SET playback_url=$2, source_type=$3, is_active=$4
+                WHERE id=$1
+                """,
+                int(existing_id), playback_url, source_type, active,
+            )
+        else:
+            await db().execute(
+                """
+                INSERT INTO playback_sources(
+                    movie_id, season_number, episode_number,
+                    voice_name, quality, playback_url, source_type, is_active
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                """,
+                movie_id, season_number, episode_number, voice_name,
+                quality, playback_url, source_type, active,
+            )
+        synced += 1
+    return synced
+
+
+async def video_provider_sync_loop() -> None:
+    if not VIDEO_PROVIDER_API_URL:
+        logging.info("Automatic video-provider sync is not configured")
+        return
+    while True:
+        try:
+            count = await sync_video_provider_once()
+            logging.info("Video provider sync complete: %s sources", count)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.exception("Video provider sync failed: %s", exc)
+        await asyncio.sleep(VIDEO_PROVIDER_SYNC_SECONDS)
+
+
 def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -742,6 +1234,13 @@ async def playback_button_for_movie(
     )
     if not has_source:
         return None
+
+    app_url = build_webapp_url(movie_id)
+    if app_url:
+        return InlineKeyboardButton(
+            text="▶️ Смотреть",
+            web_app=WebAppInfo(url=app_url),
+        )
 
     return InlineKeyboardButton(
         text="▶️ Смотреть",
@@ -1417,9 +1916,24 @@ async def show_episode(
             [
                 InlineKeyboardButton(
                     text="▶️ Смотреть серию",
+                    web_app=(
+                        WebAppInfo(
+                            url=build_webapp_url(
+                                movie_id,
+                                season_number,
+                                episode_number,
+                            )
+                        )
+                        if WEBAPP_URL
+                        else None
+                    ),
                     callback_data=(
-                        f"playvoices:{movie_id}:"
-                        f"{season_number}:{episode_number}"
+                        None
+                        if WEBAPP_URL
+                        else (
+                            f"playvoices:{movie_id}:"
+                            f"{season_number}:{episode_number}"
+                        )
                     ),
                 )
             ]
@@ -3094,6 +3608,10 @@ async def main() -> None:
     )
 
     await init_db()
+    web_runner = await start_miniapp_server()
+    provider_task = asyncio.create_task(
+        video_provider_sync_loop()
+    )
 
     bot = Bot(
         BOT_TOKEN,
@@ -3111,7 +3629,15 @@ async def main() -> None:
 
     logging.info("VKino started")
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        provider_task.cancel()
+        try:
+            await provider_task
+        except asyncio.CancelledError:
+            pass
+        await web_runner.cleanup()
 
 
 if __name__ == "__main__":
