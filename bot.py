@@ -62,6 +62,37 @@ try:
 except ValueError:
     VIDEO_PROVIDER_SYNC_SECONDS = 900
 
+BLENDER_OPEN_MOVIES_API = (
+    "https://video.blender.org/api/v1/"
+    "video-channels/blender_open_movies/videos"
+    "?count=100&sort=-publishedAt"
+)
+BLENDER_VIDEO_API = "https://video.blender.org/api/v1/videos"
+BLENDER_SYNC_SECONDS = 21600
+
+# Curated official Blender Open Movies only.
+# This prevents importing teasers, making-of videos or unrelated uploads.
+BLENDER_OPEN_MOVIE_TITLES: list[tuple[str, str]] = [
+    ("elephants dream", "Сон слонов"),
+    ("big buck bunny", "Большой Бак"),
+    ("sintel", "Синтел"),
+    ("tears of steel", "Слёзы стали"),
+    ("caminandes 2", "Каминандес: Gran Dillama"),
+    ("gran dillama", "Каминандес: Gran Dillama"),
+    ("caminandes 3", "Каминандес: Llamigos"),
+    ("llamigos", "Каминандес: Llamigos"),
+    ("cosmos laundromat", "Космическая прачечная"),
+    ("glass half", "Наполовину полный"),
+    ("the daily dweebs", "The Daily Dweebs"),
+    ("agent 327", "Агент 327: Операция «Барбершоп»"),
+    ("hero", "HERO"),
+    ("spring", "Весна"),
+    ("coffee run", "Coffee Run"),
+    ("sprite fright", "Sprite Fright"),
+    ("charge", "Charge"),
+    ("wing it", "Wing It!"),
+]
+
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "803444545").split(",")
@@ -326,6 +357,24 @@ async def init_db() -> None:
                 episode_number,
                 is_active
             );
+
+            CREATE TABLE IF NOT EXISTS free_catalog (
+                movie_id BIGINT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                provider_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                original_title TEXT NOT NULL,
+                description TEXT,
+                poster_url TEXT,
+                source_page TEXT NOT NULL,
+                license_label TEXT NOT NULL,
+                attribution TEXT NOT NULL,
+                duration_seconds INTEGER,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_free_catalog_provider
+            ON free_catalog(provider, provider_id);
 
             CREATE TABLE IF NOT EXISTS user_playback_preferences (
                 user_id BIGINT PRIMARY KEY,
@@ -1276,6 +1325,290 @@ async def video_provider_sync_loop() -> None:
         await asyncio.sleep(VIDEO_PROVIDER_SYNC_SECONDS)
 
 
+def blender_catalog_title(name: str) -> str | None:
+    normalized = name.casefold().strip()
+    blocked = (
+        "making of",
+        "making-of",
+        "behind the scenes",
+        "behind-the-scenes",
+        "trailer",
+        "teaser",
+        "breakdown",
+        "documentary",
+    )
+    if any(marker in normalized for marker in blocked):
+        return None
+
+    for marker, russian_title in BLENDER_OPEN_MOVIE_TITLES:
+        if marker in normalized:
+            return russian_title
+    return None
+
+
+def blender_synthetic_movie_id(video_id: int) -> int:
+    # Negative IDs can never collide with positive Kinopoisk IDs.
+    return -2_000_000_000 - int(video_id)
+
+
+async def sync_blender_open_movies_once() -> int:
+    timeout = aiohttp.ClientTimeout(total=45)
+    synced_movies = 0
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            BLENDER_OPEN_MOVIES_API,
+            headers={"Accept": "application/json"},
+        ) as response:
+            response.raise_for_status()
+            channel_payload = await response.json()
+
+        summaries = (
+            channel_payload.get("data", [])
+            if isinstance(channel_payload, dict)
+            else []
+        )
+
+        for summary in summaries:
+            if not isinstance(summary, dict):
+                continue
+
+            original_title = str(summary.get("name") or "").strip()
+            russian_title = blender_catalog_title(original_title)
+            if not russian_title:
+                continue
+
+            uuid = str(summary.get("uuid") or "").strip()
+            if not uuid:
+                continue
+
+            try:
+                async with session.get(
+                    f"{BLENDER_VIDEO_API}/{uuid}",
+                    headers={"Accept": "application/json"},
+                ) as response:
+                    response.raise_for_status()
+                    detail = await response.json()
+            except Exception as exc:
+                logging.info(
+                    "Blender detail fetch skipped for %s: %s",
+                    uuid,
+                    exc,
+                )
+                continue
+
+            if not isinstance(detail, dict):
+                continue
+
+            account = detail.get("account") or {}
+            channel = detail.get("channel") or {}
+            privacy = detail.get("privacy") or {}
+
+            if (
+                not isinstance(account, dict)
+                or str(account.get("name") or "") != "blender"
+                or not isinstance(channel, dict)
+                or str(channel.get("name") or "") != "blender_open_movies"
+                or not isinstance(privacy, dict)
+                or int(privacy.get("id") or 0) != 1
+            ):
+                continue
+
+            files = [
+                item
+                for item in (detail.get("files") or [])
+                if isinstance(item, dict)
+            ]
+            supported_files: list[tuple[int, str]] = []
+
+            for item in files:
+                resolution = item.get("resolution") or {}
+                if not isinstance(resolution, dict):
+                    continue
+
+                try:
+                    quality = int(resolution.get("id"))
+                except (TypeError, ValueError):
+                    continue
+
+                file_url = str(item.get("fileUrl") or "").strip()
+
+                if (
+                    quality in {360, 480, 720, 1080}
+                    and file_url.startswith("https://")
+                    and item.get("hasVideo") is not False
+                ):
+                    supported_files.append((quality, file_url))
+
+            if not supported_files:
+                continue
+
+            peer_id = int(detail.get("id") or 0)
+            if peer_id <= 0:
+                continue
+
+            movie_id = blender_synthetic_movie_id(peer_id)
+
+            thumbnails = [
+                item
+                for item in (detail.get("thumbnails") or [])
+                if isinstance(item, dict)
+                and str(item.get("fileUrl") or "").startswith("https://")
+            ]
+            poster_url = ""
+            if thumbnails:
+                thumbnails.sort(
+                    key=lambda item: int(item.get("width") or 0),
+                    reverse=True,
+                )
+                poster_url = str(thumbnails[0].get("fileUrl") or "")
+
+            description = str(
+                detail.get("description")
+                or detail.get("truncatedDescription")
+                or ""
+            ).strip()
+
+            source_page = str(
+                detail.get("url")
+                or f"https://video.blender.org/videos/watch/{uuid}"
+            )
+
+            licence = detail.get("licence") or {}
+            licence_label = (
+                str(licence.get("label") or "")
+                if isinstance(licence, dict)
+                else ""
+            )
+            if not licence_label or licence_label.casefold() == "unknown":
+                licence_label = "Creative Commons Attribution"
+
+            attribution = (
+                "Blender Foundation / Blender Studio — "
+                "Creative Commons Attribution"
+            )
+
+            await db().execute(
+                """
+                INSERT INTO free_catalog(
+                    movie_id,
+                    provider,
+                    provider_id,
+                    title,
+                    original_title,
+                    description,
+                    poster_url,
+                    source_page,
+                    license_label,
+                    attribution,
+                    duration_seconds
+                )
+                VALUES(
+                    $1, 'blender', $2, $3, $4, $5,
+                    $6, $7, $8, $9, $10
+                )
+                ON CONFLICT(movie_id) DO UPDATE SET
+                    title=EXCLUDED.title,
+                    original_title=EXCLUDED.original_title,
+                    description=EXCLUDED.description,
+                    poster_url=EXCLUDED.poster_url,
+                    source_page=EXCLUDED.source_page,
+                    license_label=EXCLUDED.license_label,
+                    attribution=EXCLUDED.attribution,
+                    duration_seconds=EXCLUDED.duration_seconds,
+                    updated_at=NOW()
+                """,
+                movie_id,
+                uuid,
+                russian_title,
+                original_title,
+                description,
+                poster_url or None,
+                source_page,
+                licence_label,
+                attribution,
+                int(detail.get("duration") or 0) or None,
+            )
+
+            for quality, file_url in supported_files:
+                existing_id = await db().fetchval(
+                    """
+                    SELECT id
+                    FROM playback_sources
+                    WHERE movie_id=$1
+                      AND season_number IS NULL
+                      AND episode_number IS NULL
+                      AND voice_name='Original'
+                      AND quality=$2
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    movie_id,
+                    quality,
+                )
+
+                if existing_id:
+                    await db().execute(
+                        """
+                        UPDATE playback_sources
+                        SET playback_url=$2,
+                            source_type='mp4',
+                            language='original',
+                            is_active=TRUE
+                        WHERE id=$1
+                        """,
+                        int(existing_id),
+                        file_url,
+                    )
+                else:
+                    await db().execute(
+                        """
+                        INSERT INTO playback_sources(
+                            movie_id,
+                            season_number,
+                            episode_number,
+                            voice_name,
+                            language,
+                            quality,
+                            playback_url,
+                            source_type,
+                            is_active
+                        )
+                        VALUES(
+                            $1, NULL, NULL,
+                            'Original', 'original',
+                            $2, $3, 'mp4', TRUE
+                        )
+                        """,
+                        movie_id,
+                        quality,
+                        file_url,
+                    )
+
+            synced_movies += 1
+
+    return synced_movies
+
+
+async def blender_open_movies_sync_loop() -> None:
+    while True:
+        try:
+            count = await sync_blender_open_movies_once()
+            logging.info(
+                "Blender Open Movies sync complete: %s movies",
+                count,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.exception(
+                "Blender Open Movies sync failed: %s",
+                exc,
+            )
+
+        await asyncio.sleep(BLENDER_SYNC_SECONDS)
+
+
 def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1315,6 +1648,7 @@ def main_menu() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="🆕 Новинки"),
                 KeyboardButton(text="🔥 Популярное"),
             ],
+            [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [
                 KeyboardButton(text="🎬 Подборки"),
@@ -2537,6 +2871,215 @@ async def watch(
     await callback.message.answer(
         text,
         disable_web_page_preview=True,
+    )
+
+
+@router.message(F.text == "🆓 Смотреть бесплатно")
+async def free_catalog_menu(
+    message: Message,
+) -> None:
+    await remember(message)
+
+    rows = await db().fetch(
+        """
+        SELECT movie_id, title, original_title
+        FROM free_catalog
+        ORDER BY title
+        LIMIT 40
+        """
+    )
+
+    if not rows:
+        await message.answer(
+            "🆓 Каталог открытых фильмов ещё синхронизируется. "
+            "Попробуй через минуту."
+        )
+        return
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+    for row in rows:
+        title = str(row["title"])
+        original_title = str(row["original_title"])
+        label = title
+        if original_title.casefold() != title.casefold():
+            label += f" / {original_title}"
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🎬 {label}"[:60],
+                    callback_data=f"freeopen:{int(row['movie_id'])}",
+                )
+            ]
+        )
+
+    await message.answer(
+        "🆓 <b>Смотреть бесплатно и легально</b>\n\n"
+        "Официальные Blender Open Movies. "
+        "Фильмы распространяются по открытым лицензиям "
+        "Creative Commons Attribution.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=keyboard_rows
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("freeopen:"))
+async def free_catalog_open(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    try:
+        movie_id = int(
+            callback.data.split(":", 1)[1]
+        )
+    except ValueError:
+        return
+
+    row = await db().fetchrow(
+        """
+        SELECT
+            movie_id,
+            title,
+            original_title,
+            description,
+            poster_url,
+            source_page,
+            license_label,
+            attribution,
+            duration_seconds
+        FROM free_catalog
+        WHERE movie_id=$1
+        """,
+        movie_id,
+    )
+
+    if not row:
+        await callback.message.answer(
+            "Фильм не найден в бесплатном каталоге."
+        )
+        return
+
+    title = escape(str(row["title"]))
+    original_title = escape(str(row["original_title"]))
+
+    description = str(row["description"] or "").strip()
+    if len(description) > 850:
+        description = description[:847].rstrip() + "…"
+
+    duration = row["duration_seconds"]
+    duration_text = ""
+    if duration:
+        minutes = max(1, int(duration) // 60)
+        duration_text = f"\n⏱ {minutes} мин."
+
+    text = (
+        f"<b>{title}</b>\n"
+        f"🎬 {original_title}"
+        f"{duration_text}\n\n"
+        f"{escape(description) if description else 'Открытый фильм Blender Studio.'}"
+        "\n\n"
+        f"🆓 <b>{escape(str(row['license_label']))}</b>\n"
+        f"© {escape(str(row['attribution']))}"
+    )
+
+    play_button = await playback_button_for_movie(
+        movie_id
+    )
+
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    if play_button:
+        buttons.append([play_button])
+
+    source_page = str(row["source_page"] or "")
+    if source_page.startswith("https://"):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="ℹ️ Источник и лицензия",
+                    url=source_page,
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К бесплатным фильмам",
+                callback_data="free:list",
+            )
+        ]
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=buttons
+    )
+
+    poster_url = str(row["poster_url"] or "")
+    if poster_url.startswith("https://"):
+        try:
+            await callback.message.answer_photo(
+                poster_url,
+                caption=text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            pass
+
+    await callback.message.answer(
+        text,
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "free:list")
+async def free_catalog_back(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    rows = await db().fetch(
+        """
+        SELECT movie_id, title, original_title
+        FROM free_catalog
+        ORDER BY title
+        LIMIT 40
+        """
+    )
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+    for row in rows:
+        title = str(row["title"])
+        original_title = str(row["original_title"])
+        label = title
+        if original_title.casefold() != title.casefold():
+            label += f" / {original_title}"
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🎬 {label}"[:60],
+                    callback_data=f"freeopen:{int(row['movie_id'])}",
+                )
+            ]
+        )
+
+    await callback.message.answer(
+        "🆓 <b>Смотреть бесплатно и легально</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=keyboard_rows
+        ),
     )
 
 
@@ -3810,6 +4353,9 @@ async def main() -> None:
     provider_task = asyncio.create_task(
         video_provider_sync_loop()
     )
+    blender_task = asyncio.create_task(
+        blender_open_movies_sync_loop()
+    )
 
     bot = Bot(
         BOT_TOKEN,
@@ -3831,10 +4377,18 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         provider_task.cancel()
+        blender_task.cancel()
+
         try:
             await provider_task
         except asyncio.CancelledError:
             pass
+
+        try:
+            await blender_task
+        except asyncio.CancelledError:
+            pass
+
         await web_runner.cleanup()
 
 
