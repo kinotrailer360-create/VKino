@@ -662,7 +662,100 @@ PLAYER_HTML = r"""<!doctype html>
     .brand { font-weight: 800; font-size: 20px; margin-bottom: 4px; }
     .subtitle { color: var(--hint); font-size: 13px; margin-bottom: 14px; }
     .card { background: var(--secondary); border-radius: 16px; padding: 12px; }
-    video { width: 100%; background: #000; border-radius: 12px; max-height: 62vh; }
+    .player-wrap {
+      position: relative;
+      width: 100%;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    video {
+      display: block;
+      width: 100%;
+      background: #000;
+      border-radius: 12px;
+      max-height: 62vh;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+    }
+    .player-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    #fullscreen {
+      background: var(--button);
+      color: var(--button-text);
+      font-weight: 700;
+    }
+    #exitFullscreen {
+      display: none;
+      position: fixed;
+      top: max(10px, env(safe-area-inset-top));
+      right: 10px;
+      z-index: 10001;
+      width: auto;
+      padding: 10px 14px;
+      background: rgba(0,0,0,.7);
+      color: #fff;
+      border-radius: 999px;
+      font-size: 18px;
+    }
+    body.cinema-mode {
+      overflow: hidden;
+      padding: 0;
+      background: #000;
+    }
+    body.cinema-mode .brand,
+    body.cinema-mode .subtitle,
+    body.cinema-mode .row,
+    body.cinema-mode #status,
+    body.cinema-mode #next,
+    body.cinema-mode .player-actions {
+      display: none !important;
+    }
+    body.cinema-mode .card {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      padding: 0;
+      border-radius: 0;
+      background: #000;
+    }
+    body.cinema-mode .player-wrap {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      border-radius: 0;
+      background: #000;
+    }
+    body.cinema-mode video {
+      width: 100vw;
+      height: 100vh;
+      max-height: none;
+      aspect-ratio: auto;
+      border-radius: 0;
+      object-fit: contain;
+      background: #000;
+    }
+    body.cinema-mode #exitFullscreen {
+      display: block;
+    }
+    .player-wrap:fullscreen,
+    .player-wrap:-webkit-full-screen {
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+    }
+    .player-wrap:fullscreen video,
+    .player-wrap:-webkit-full-screen video {
+      width: 100vw;
+      height: 100vh;
+      max-height: none;
+      object-fit: contain;
+      border-radius: 0;
+    }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
     label { font-size: 12px; color: var(--hint); display: block; margin-bottom: 5px; }
     select, button {
@@ -679,7 +772,13 @@ PLAYER_HTML = r"""<!doctype html>
   <div class="brand">VKino360 🎬</div>
   <div class="subtitle" id="title">Плеер внутри Telegram</div>
   <div class="card">
-    <video id="video" controls playsinline preload="metadata"></video>
+    <div class="player-wrap" id="playerWrap">
+      <video id="video" controls playsinline preload="metadata"></video>
+      <button id="exitFullscreen" type="button" aria-label="Выйти из полноэкранного режима">✕</button>
+    </div>
+    <div class="player-actions">
+      <button id="fullscreen" class="primary" type="button">⛶ На весь экран</button>
+    </div>
     <div class="row">
       <div><label>Озвучка</label><select id="voice"></select></div>
       <div><label>Качество</label><select id="quality"></select></div>
@@ -691,18 +790,107 @@ PLAYER_HTML = r"""<!doctype html>
 (() => {
   const tg = window.Telegram?.WebApp;
   if (!tg) { document.getElementById('status').textContent = 'Открой плеер из Telegram.'; return; }
-  tg.ready(); tg.expand();
+  tg.ready();
+  tg.expand();
   try { tg.setHeaderColor('bg_color'); } catch (_) {}
+  try { tg.setBackgroundColor('#000000'); } catch (_) {}
   const p = new URLSearchParams(location.search);
   const movieId = Number(p.get('movie_id') || 0);
   const season = Number(p.get('season') || 0);
   const episode = Number(p.get('episode') || 0);
   const video = document.getElementById('video');
+  const playerWrap = document.getElementById('playerWrap');
+  const fullscreen = document.getElementById('fullscreen');
+  const exitFullscreen = document.getElementById('exitFullscreen');
   const voice = document.getElementById('voice');
   const quality = document.getElementById('quality');
   const status = document.getElementById('status');
   const next = document.getElementById('next');
   let model = null, hls = null, saveTimer = null;
+
+  function lockLandscape() {
+    try {
+      if (screen.orientation && screen.orientation.lock) {
+        screen.orientation.lock('landscape').catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  function unlockOrientation() {
+    try {
+      if (screen.orientation && screen.orientation.unlock) {
+        screen.orientation.unlock();
+      }
+    } catch (_) {}
+  }
+
+  async function enterCinemaMode() {
+    document.body.classList.add('cinema-mode');
+    try { tg.expand(); } catch (_) {}
+
+    // Telegram Mini App fullscreen (supported in newer clients).
+    try {
+      if (typeof tg.requestFullscreen === 'function') {
+        tg.requestFullscreen();
+      }
+    } catch (_) {}
+
+    lockLandscape();
+
+    // Native element fullscreen where WebView/browser permits it.
+    try {
+      if (playerWrap.requestFullscreen) {
+        await playerWrap.requestFullscreen();
+      } else if (playerWrap.webkitRequestFullscreen) {
+        playerWrap.webkitRequestFullscreen();
+      } else if (video.webkitEnterFullscreen) {
+        video.webkitEnterFullscreen();
+      }
+    } catch (_) {
+      // CSS cinema-mode already fills the available Telegram viewport.
+    }
+  }
+
+  async function leaveCinemaMode() {
+    document.body.classList.remove('cinema-mode');
+
+    try {
+      if (document.fullscreenElement && document.exitFullscreen) {
+        await document.exitFullscreen();
+      } else if (document.webkitFullscreenElement && document.webkitExitFullscreen) {
+        document.webkitExitFullscreen();
+      }
+    } catch (_) {}
+
+    try {
+      if (typeof tg.exitFullscreen === 'function') {
+        tg.exitFullscreen();
+      }
+    } catch (_) {}
+
+    unlockOrientation();
+  }
+
+  fullscreen.addEventListener('click', enterCinemaMode);
+  exitFullscreen.addEventListener('click', leaveCinemaMode);
+
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && document.body.classList.contains('cinema-mode')) {
+      // Keep cinema-mode only when Telegram itself is still fullscreen.
+      // The visible close button lets the user exit explicitly.
+    }
+  });
+
+  if (typeof tg.onEvent === 'function') {
+    try {
+      tg.onEvent('fullscreenChanged', () => {
+        if (tg.isFullscreen === false) {
+          document.body.classList.remove('cinema-mode');
+          unlockOrientation();
+        }
+      });
+    } catch (_) {}
+  }
 
   async function api(path, options = {}) {
     options.headers = Object.assign({}, options.headers || {}, {
@@ -774,7 +962,17 @@ PLAYER_HTML = r"""<!doctype html>
       quality.onchange = () => loadVideo(true);
     } catch (e) { status.textContent = 'Ошибка: ' + e.message; }
   }
-  window.addEventListener('beforeunload', () => { if (saveTimer) clearInterval(saveTimer); saveProgress(); destroyHls(); });
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && document.body.classList.contains('cinema-mode')) {
+      leaveCinemaMode();
+    }
+  });
+  window.addEventListener('beforeunload', () => {
+    if (saveTimer) clearInterval(saveTimer);
+    saveProgress();
+    destroyHls();
+    unlockOrientation();
+  });
   boot();
 })();
 </script>
