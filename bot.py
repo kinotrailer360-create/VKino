@@ -151,9 +151,19 @@ class PoiskKino:
         result["media_type"] = self.media_type(item)
         return result
 
-    async def search(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        data = await self._get("/movie/search", query=query, page=1, limit=limit)
-        return [self.normalize(x) for x in (data.get("docs") or [])[:limit]]
+    async def search(self, query: str, limit: int = 12) -> list[dict[str, Any]]:
+        # Search intentionally has no release-date filter:
+        # already released and announced/future projects are both returned.
+        data = await self._get(
+            "/movie/search",
+            query=query,
+            page=1,
+            limit=limit,
+        )
+        return [
+            self.normalize(x)
+            for x in (data.get("docs") or [])[:limit]
+        ]
 
     async def details(self, movie_id: int) -> dict[str, Any]:
         return self.normalize(await self._get(f"/movie/{movie_id}"))
@@ -212,6 +222,46 @@ class PoiskKino:
             return str(premiere.get("world") or "")
 
         items.sort(key=release_key, reverse=True)
+        return items[:limit]
+
+    async def upcoming_releases(
+        self,
+        series: bool,
+        limit: int = 20,
+        days_ahead: int = 730,
+    ) -> list[dict[str, Any]]:
+        today = date.today()
+        end = today + timedelta(days=days_ahead)
+        date_range = (
+            f"{today.strftime('%d.%m.%Y')}-"
+            f"{end.strftime('%d.%m.%Y')}"
+        )
+
+        data = await self._get(
+            "/movie",
+            page=1,
+            limit=max(limit, 50),
+            isSeries=str(series).lower(),
+            **{
+                "premiere.world": date_range,
+                "sortField": "premiere.world",
+                "sortType": "1",
+            },
+        )
+
+        items = [
+            self.normalize(item)
+            for item in (data.get("docs") or [])
+            if isinstance(item, dict)
+        ]
+
+        def premiere_key(item: dict[str, Any]) -> str:
+            premiere = item.get("premiere") or {}
+            if not isinstance(premiere, dict):
+                return ""
+            return str(premiere.get("world") or "")
+
+        items.sort(key=premiere_key)
         return items[:limit]
 
     async def seasons(self, movie_id: int) -> list[dict[str, Any]]:
@@ -2102,6 +2152,33 @@ def admin_menu() -> InlineKeyboardMarkup:
     )
 
 
+def premiere_date(item: dict[str, Any]) -> date | None:
+    premiere = item.get("premiere") or {}
+    if not isinstance(premiere, dict):
+        return None
+
+    raw = premiere.get("world")
+    if not raw:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            str(raw).replace("Z", "+00:00")
+        ).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def is_upcoming(item: dict[str, Any]) -> bool:
+    value = premiere_date(item)
+    return bool(value and value > date.today())
+
+
+def premiere_label(item: dict[str, Any]) -> str:
+    value = premiere_date(item)
+    return value.strftime("%d.%m.%Y") if value else ""
+
+
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -2110,6 +2187,7 @@ def main_menu() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="🆕 Новинки"),
                 KeyboardButton(text="🔥 Популярное"),
             ],
+            [KeyboardButton(text="🔜 Скоро")],
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [
@@ -2135,10 +2213,18 @@ def results_keyboard(
         title = kp.title(item)
         year = item.get("year") or "—"
         icon = "📺" if item.get("media_type") == "series" else "🎬"
+
+        if is_upcoming(item):
+            release = premiere_label(item)
+            suffix = f" • 🔜 {release}" if release else " • 🔜 Скоро"
+            label = f"{icon} {title} ({year}){suffix}"
+        else:
+            label = f"{icon} {title} ({year})"
+
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{icon} {title} ({year})",
+                    text=label[:64],
                     callback_data=f"open:{item['id']}",
                 )
             ]
@@ -2499,6 +2585,14 @@ def format_card(item: dict[str, Any]) -> str:
             f"⭐ IMDb: <b>{float(rating['imdb']):.1f}</b>/10"
         )
 
+    release = premiere_label(item)
+    if release:
+        if is_upcoming(item):
+            lines.append(f"🔜 <b>Ещё не вышел</b>")
+            lines.append(f"📅 Премьера: <b>{release}</b>")
+        else:
+            lines.append(f"📅 Премьера: {release}")
+
     if genres:
         lines.append(f"🎭 {escape(genres)}")
 
@@ -2584,7 +2678,8 @@ async def cmd_start(
 
     await message.answer(
         f"🎬 <b>Привет, {name}! Это VKino.</b>\n\n"
-        "🔎 Поиск фильмов и сериалов\n"
+        "🔎 Поиск вышедших и будущих фильмов/сериалов\n"
+        "🔜 Календарь будущих премьер\n"
         "⭐ Рейтинги Кинопоиска и IMDb\n"
         "🎞 Трейлеры и описания\n"
         "🍿 Подборки и рекомендации",
@@ -3553,6 +3648,82 @@ async def free_catalog_back(
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=keyboard_rows
         ),
+    )
+
+
+@router.message(F.text == "🔜 Скоро")
+async def upcoming_menu(
+    message: Message,
+) -> None:
+    await remember(message)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎬 Будущие фильмы",
+                    callback_data="upcoming:movies",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📺 Будущие сериалы",
+                    callback_data="upcoming:series",
+                )
+            ],
+        ]
+    )
+
+    await message.answer(
+        "🔜 <b>Скоро выйдет</b>\n\n"
+        "Будущие премьеры на ближайшие два года. "
+        "Выбери категорию:",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("upcoming:"))
+async def upcoming_list(
+    callback: CallbackQuery,
+) -> None:
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    kind = callback.data.split(":", 1)[1]
+    series = kind == "series"
+
+    try:
+        items = await kp.upcoming_releases(
+            series=series,
+            limit=20,
+        )
+    except Exception as exc:
+        logging.exception(
+            "Load upcoming releases failed: %s",
+            exc,
+        )
+        await callback.message.answer(
+            "Не удалось загрузить будущие премьеры."
+        )
+        return
+
+    if not items:
+        await callback.message.answer(
+            "Будущих премьер пока не найдено."
+        )
+        return
+
+    title = (
+        "📺 <b>Скоро: сериалы</b>"
+        if series
+        else "🎬 <b>Скоро: фильмы</b>"
+    )
+
+    await callback.message.answer(
+        title,
+        reply_markup=new_releases_keyboard(items),
     )
 
 
