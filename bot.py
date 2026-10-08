@@ -440,6 +440,19 @@ async def init_db() -> None:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS premiere_reminders (
+                user_id BIGINT NOT NULL,
+                movie_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                premiere_date DATE NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                sent_at TIMESTAMPTZ,
+                PRIMARY KEY (user_id, movie_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_premiere_reminders_due
+            ON premiere_reminders(premiere_date, sent_at);
+
             CREATE TABLE IF NOT EXISTS user_playback_preferences (
                 user_id BIGINT PRIMARY KEY,
                 preferred_voice TEXT,
@@ -1228,7 +1241,10 @@ async def tmdb_movie_id(item: dict[str, Any]) -> tuple[str, int] | None:
         return None
 
 
-async def trailer_from_tmdb(item: dict[str, Any]) -> dict[str, Any] | None:
+async def trailer_from_tmdb_language(
+    item: dict[str, Any],
+    language: str,
+) -> dict[str, Any] | None:
     if not TMDB_API_KEY:
         return None
 
@@ -1238,69 +1254,89 @@ async def trailer_from_tmdb(item: dict[str, Any]) -> dict[str, Any] | None:
 
     tmdb_kind, tmdb_id = resolved
     timeout = aiohttp.ClientTimeout(total=15)
+    params: dict[str, Any] = {
+        "api_key": TMDB_API_KEY,
+        "language": language,
+    }
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for language in ("ru-RU", "en-US", ""):
-            params: dict[str, Any] = {"api_key": TMDB_API_KEY}
-            if language:
-                params["language"] = language
+        async with session.get(
+            f"https://api.themoviedb.org/3/{tmdb_kind}/{tmdb_id}/videos",
+            params=params,
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json()
 
-            async with session.get(
-                f"https://api.themoviedb.org/3/{tmdb_kind}/{tmdb_id}/videos",
-                params=params,
-            ) as response:
-                if response.status != 200:
-                    continue
-                payload = await response.json()
+    videos = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(videos, list):
+        return None
 
-            videos = payload.get("results") if isinstance(payload, dict) else None
-            if not isinstance(videos, list):
-                continue
+    candidates = [
+        video
+        for video in videos
+        if isinstance(video, dict)
+        and str(video.get("site") or "").casefold() == "youtube"
+        and video.get("key")
+    ]
+    if not candidates:
+        return None
 
-            candidates = [
-                v for v in videos
-                if isinstance(v, dict)
-                and str(v.get("site") or "").casefold() == "youtube"
-                and v.get("key")
-            ]
-            if not candidates:
-                continue
+    def score(video: dict[str, Any]) -> tuple[int, int, int]:
+        video_type = str(video.get("type") or "").casefold()
+        name = str(video.get("name") or "").casefold()
+        official = 1 if video.get("official") is True else 0
+        trailer = 1 if video_type == "trailer" else 0
+        language_hint = 1 if any(
+            marker in name
+            for marker in (
+                "рус",
+                "дуб",
+                "трейлер",
+                "official trailer",
+            )
+        ) else 0
+        return (official, trailer, language_hint)
 
-            def score(v: dict[str, Any]) -> tuple[int, int, int]:
-                vtype = str(v.get("type") or "").casefold()
-                name = str(v.get("name") or "").casefold()
-                official = 1 if v.get("official") is True else 0
-                trailer = 1 if vtype == "trailer" else 0
-                ru_hint = 1 if any(x in name for x in ("рус", "дуб", "трейлер")) else 0
-                return (trailer, official, ru_hint)
+    candidates.sort(key=score, reverse=True)
+    best = candidates[0]
 
-            candidates.sort(key=score, reverse=True)
-            best = candidates[0]
-            return {
-                "provider": "tmdb",
-                "youtube_id": str(best["key"]),
-                "direct_url": None,
-                "title": str(best.get("name") or "Трейлер"),
-            }
-
-    return None
+    return {
+        "provider": f"tmdb:{language}",
+        "youtube_id": str(best["key"]),
+        "direct_url": None,
+        "title": str(best.get("name") or "Трейлер"),
+    }
 
 
-async def trailer_from_youtube(item: dict[str, Any]) -> dict[str, Any] | None:
+async def trailer_from_youtube(
+    item: dict[str, Any],
+    russian: bool = True,
+) -> dict[str, Any] | None:
     if not YOUTUBE_API_KEY:
         return None
 
     title = kp.title(item)
     year = item.get("year") or ""
-    query = f"{title} {year} официальный трейлер".strip()
+
+    if russian:
+        query = (
+            f"{title} {year} официальный трейлер русский"
+        ).strip()
+        relevance_language = "ru"
+    else:
+        query = (
+            f"{title} {year} official trailer"
+        ).strip()
+        relevance_language = "en"
 
     params = {
         "part": "snippet",
         "type": "video",
         "videoEmbeddable": "true",
-        "maxResults": 5,
+        "maxResults": 8,
         "q": query,
-        "relevanceLanguage": "ru",
+        "relevanceLanguage": relevance_language,
         "safeSearch": "moderate",
         "key": YOUTUBE_API_KEY,
     }
@@ -1319,18 +1355,9 @@ async def trailer_from_youtube(item: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(results, list) or not results:
         return None
 
-    def score(entry: dict[str, Any]) -> tuple[int, int]:
-        snippet = entry.get("snippet") or {}
-        name = str(snippet.get("title") or "").casefold()
-        official = 1 if any(
-            marker in name
-            for marker in ("официальный трейлер", "official trailer", "official teaser")
-        ) else 0
-        trailer = 1 if any(marker in name for marker in ("трейлер", "trailer", "teaser")) else 0
-        return (official, trailer)
-
     valid = [
-        entry for entry in results
+        entry
+        for entry in results
         if isinstance(entry, dict)
         and isinstance(entry.get("id"), dict)
         and entry["id"].get("videoId")
@@ -1338,29 +1365,151 @@ async def trailer_from_youtube(item: dict[str, Any]) -> dict[str, Any] | None:
     if not valid:
         return None
 
+    def score(entry: dict[str, Any]) -> tuple[int, int, int]:
+        snippet = entry.get("snippet") or {}
+        name = str(snippet.get("title") or "").casefold()
+        channel = str(
+            snippet.get("channelTitle") or ""
+        ).casefold()
+
+        official_title = 1 if any(
+            marker in name
+            for marker in (
+                "официальный трейлер",
+                "official trailer",
+                "official teaser",
+            )
+        ) else 0
+
+        trailer = 1 if any(
+            marker in name
+            for marker in (
+                "трейлер",
+                "trailer",
+                "teaser",
+            )
+        ) else 0
+
+        if russian:
+            language_match = 1 if any(
+                marker in name
+                for marker in (
+                    "рус",
+                    "дуб",
+                    "на русском",
+                    "трейлер",
+                )
+            ) else 0
+        else:
+            language_match = 1 if any(
+                marker in name
+                for marker in (
+                    "official",
+                    "trailer",
+                    "teaser",
+                )
+            ) else 0
+
+        official_channel = 1 if any(
+            marker in channel
+            for marker in (
+                "warner",
+                "universal",
+                "paramount",
+                "sony",
+                "disney",
+                "marvel",
+                "20th century",
+                "a24",
+                "netflix",
+                "hbo",
+            )
+        ) else 0
+
+        return (
+            official_title + official_channel,
+            trailer,
+            language_match,
+        )
+
     valid.sort(key=score, reverse=True)
     best = valid[0]
     snippet = best.get("snippet") or {}
+
     return {
-        "provider": "youtube",
+        "provider": (
+            "youtube:ru"
+            if russian
+            else "youtube:en"
+        ),
         "youtube_id": str(best["id"]["videoId"]),
         "direct_url": None,
-        "title": str(snippet.get("title") or "Трейлер"),
+        "title": str(
+            snippet.get("title") or "Трейлер"
+        ),
     }
 
 
-async def resolve_trailer(movie_id: int) -> dict[str, Any] | None:
+async def resolve_trailer(
+    movie_id: int,
+) -> dict[str, Any] | None:
     cached = await cached_trailer(movie_id)
-    if cached:
+
+    # Reuse an already cached Russian trailer immediately.
+    if cached and str(cached.get("provider") or "") in {
+        "tmdb:ru-RU",
+        "youtube:ru",
+    }:
         return cached
 
     try:
         item = await kp.details(movie_id)
     except Exception as exc:
-        logging.info("Trailer movie lookup failed: %s", exc)
-        return None
+        logging.info(
+            "Trailer movie lookup failed: %s",
+            exc,
+        )
+        return cached
 
-    # 1. PoiskKino first.
+    # 1. Russian official TMDb video first.
+    try:
+        result = await trailer_from_tmdb_language(
+            item,
+            "ru-RU",
+        )
+        if result:
+            return await cache_trailer(
+                movie_id,
+                **result,
+            )
+    except Exception as exc:
+        logging.info(
+            "TMDb RU trailer lookup failed: %s",
+            exc,
+        )
+
+    # 2. Russian YouTube trailer search.
+    try:
+        result = await trailer_from_youtube(
+            item,
+            russian=True,
+        )
+        if result:
+            return await cache_trailer(
+                movie_id,
+                **result,
+            )
+    except Exception as exc:
+        logging.info(
+            "YouTube RU trailer lookup failed: %s",
+            exc,
+        )
+
+    # Old cached trailer can be used only after Russian attempts.
+    if cached:
+        return cached
+
+    # 3. Trailer supplied by PoiskKino.
     url = kp.trailer(item)
     if url:
         yt_id = youtube_video_id(url)
@@ -1371,6 +1520,7 @@ async def resolve_trailer(movie_id: int) -> dict[str, Any] | None:
                 youtube_id=yt_id,
                 title="Трейлер",
             )
+
         if str(url).startswith("https://"):
             return await cache_trailer(
                 movie_id,
@@ -1379,21 +1529,38 @@ async def resolve_trailer(movie_id: int) -> dict[str, Any] | None:
                 title="Трейлер",
             )
 
-    # 2. TMDb official videos.
+    # 4. English official trailer only when Russian is unavailable.
     try:
-        tmdb_result = await trailer_from_tmdb(item)
-        if tmdb_result:
-            return await cache_trailer(movie_id, **tmdb_result)
+        result = await trailer_from_tmdb_language(
+            item,
+            "en-US",
+        )
+        if result:
+            return await cache_trailer(
+                movie_id,
+                **result,
+            )
     except Exception as exc:
-        logging.info("TMDb trailer fallback failed: %s", exc)
+        logging.info(
+            "TMDb EN trailer lookup failed: %s",
+            exc,
+        )
 
-    # 3. YouTube Data API search fallback.
     try:
-        yt_result = await trailer_from_youtube(item)
-        if yt_result:
-            return await cache_trailer(movie_id, **yt_result)
+        result = await trailer_from_youtube(
+            item,
+            russian=False,
+        )
+        if result:
+            return await cache_trailer(
+                movie_id,
+                **result,
+            )
     except Exception as exc:
-        logging.info("YouTube trailer fallback failed: %s", exc)
+        logging.info(
+            "YouTube EN trailer lookup failed: %s",
+            exc,
+        )
 
     return None
 
@@ -2121,6 +2288,109 @@ async def blender_open_movies_sync_loop() -> None:
         await asyncio.sleep(BLENDER_SYNC_SECONDS)
 
 
+async def premiere_reminder_loop(
+    bot: Bot,
+) -> None:
+    while True:
+        try:
+            rows = await db().fetch(
+                """
+                SELECT
+                    user_id,
+                    movie_id,
+                    title,
+                    premiere_date
+                FROM premiere_reminders
+                WHERE sent_at IS NULL
+                  AND premiere_date <= CURRENT_DATE
+                ORDER BY premiere_date, user_id
+                LIMIT 100
+                """
+            )
+
+            for row in rows:
+                user_id = int(row["user_id"])
+                movie_id = int(row["movie_id"])
+                title = str(row["title"])
+                stored_date = row["premiere_date"]
+
+                try:
+                    item = await kp.details(movie_id)
+                    current_date = premiere_date(item)
+
+                    if (
+                        current_date
+                        and current_date > date.today()
+                    ):
+                        await db().execute(
+                            """
+                            UPDATE premiere_reminders
+                            SET premiere_date=$3
+                            WHERE user_id=$1
+                              AND movie_id=$2
+                            """,
+                            user_id,
+                            movie_id,
+                            current_date,
+                        )
+                        continue
+
+                    release_date = current_date or stored_date
+
+                except Exception:
+                    release_date = stored_date
+
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "🎬 <b>Сегодня премьера!</b>\n\n"
+                        f"<b>{escape(title)}</b>\n"
+                        f"📅 {release_date.strftime('%d.%m.%Y')}\n\n"
+                        "Проект уже можно найти через поиск "
+                        "или проверить в разделе 🆕 Новинки.",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="🎬 Открыть карточку",
+                                        callback_data=f"open:{movie_id}",
+                                    )
+                                ]
+                            ]
+                        ),
+                    )
+
+                    await db().execute(
+                        """
+                        UPDATE premiere_reminders
+                        SET sent_at=NOW()
+                        WHERE user_id=$1
+                          AND movie_id=$2
+                        """,
+                        user_id,
+                        movie_id,
+                    )
+
+                except Exception as exc:
+                    logging.info(
+                        "Premiere reminder send failed "
+                        "for user %s movie %s: %s",
+                        user_id,
+                        movie_id,
+                        exc,
+                    )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.exception(
+                "Premiere reminder loop failed: %s",
+                exc,
+            )
+
+        await asyncio.sleep(3600)
+
+
 def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2335,6 +2605,16 @@ def card_keyboard(
     media_type = item.get("media_type", "movie")
     movie_id = int(item["id"])
     rows: list[list[InlineKeyboardButton]] = []
+
+    if is_upcoming(item):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔔 Напомнить о премьере",
+                    callback_data=f"premiereremind:{movie_id}",
+                )
+            ]
+        )
 
     if media_type == "series":
         rows.append(
@@ -2782,6 +3062,95 @@ async def open_movie(
             await callback.message.answer(
                 "Не удалось открыть карточку."
             )
+
+
+@router.callback_query(
+    F.data.startswith("premiereremind:")
+)
+async def premiere_remind(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    try:
+        movie_id = int(
+            callback.data.split(":", 1)[1]
+        )
+        item = await kp.details(movie_id)
+        release_date = premiere_date(item)
+
+        if not release_date:
+            await callback.answer(
+                "Дата премьеры пока неизвестна",
+                show_alert=True,
+            )
+            return
+
+        if release_date <= date.today():
+            await callback.answer(
+                "Проект уже вышел",
+                show_alert=True,
+            )
+            return
+
+        title = kp.title(item)
+
+        existing = await db().fetchval(
+            """
+            SELECT 1
+            FROM premiere_reminders
+            WHERE user_id=$1
+              AND movie_id=$2
+              AND sent_at IS NULL
+            """,
+            callback.from_user.id,
+            movie_id,
+        )
+
+        await db().execute(
+            """
+            INSERT INTO premiere_reminders(
+                user_id,
+                movie_id,
+                title,
+                premiere_date,
+                sent_at
+            )
+            VALUES($1,$2,$3,$4,NULL)
+            ON CONFLICT(user_id, movie_id)
+            DO UPDATE SET
+                title=EXCLUDED.title,
+                premiere_date=EXCLUDED.premiere_date,
+                sent_at=NULL
+            """,
+            callback.from_user.id,
+            movie_id,
+            title,
+            release_date,
+        )
+
+        if existing:
+            await callback.answer(
+                f"🔔 Уже напомню {release_date.strftime('%d.%m.%Y')}",
+                show_alert=True,
+            )
+        else:
+            await callback.answer(
+                f"🔔 Напомню {release_date.strftime('%d.%m.%Y')}",
+                show_alert=True,
+            )
+
+    except Exception as exc:
+        logging.exception(
+            "Premiere reminder failed: %s",
+            exc,
+        )
+        await callback.answer(
+            "Не удалось сохранить напоминание",
+            show_alert=True,
+        )
 
 
 @router.callback_query(F.data.startswith("seasons:"))
@@ -5008,6 +5377,10 @@ async def main() -> None:
         ),
     )
 
+    reminder_task = asyncio.create_task(
+        premiere_reminder_loop(bot)
+    )
+
     dp = Dispatcher()
     dp.include_router(router)
 
@@ -5022,6 +5395,7 @@ async def main() -> None:
     finally:
         provider_task.cancel()
         blender_task.cancel()
+        reminder_task.cancel()
 
         try:
             await provider_task
@@ -5030,6 +5404,11 @@ async def main() -> None:
 
         try:
             await blender_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await reminder_task
         except asyncio.CancelledError:
             pass
 
