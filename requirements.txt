@@ -2,3 +2,4 @@ aiogram==3.31.0
 aiohttp==3.13.2
 asyncpg==0.30.0
 python-dotenv==1.1.1
+git+https://github.com/kristal374/hdrezka-api.git@cdb7250cfad671774aa5821c41751bfa60820028

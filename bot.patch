@@ -1,0 +1,495 @@
+--- /mnt/data/vkino_current/bot.py	2026-10-08 10:29:40.000000000 +0000
++++ /mnt/data/vkino_current/bot_work.py	2026-10-10 03:05:59.963558638 +0000
+@@ -34,6 +34,8 @@
+ )
+ from dotenv import load_dotenv
+ 
++from hdrezka_provider import HDRezkaProvider, HDRezkaProviderError
++
+ load_dotenv()
+ 
+ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+@@ -59,6 +61,30 @@
+ TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+ 
++HDREZKA_ENABLED = os.getenv(
++    "HDREZKA_ENABLED",
++    "false",
++).strip().lower() in {"1", "true", "yes", "on"}
++HDREZKA_MIRROR = os.getenv("HDREZKA_MIRROR", "").strip().rstrip("/")
++HDREZKA_DEFAULT_VOICE = os.getenv(
++    "HDREZKA_DEFAULT_VOICE",
++    "",
++).strip()
++try:
++    HDREZKA_MAX_VOICES = max(
++        1,
++        min(24, int(os.getenv("HDREZKA_MAX_VOICES", "8"))),
++    )
++except ValueError:
++    HDREZKA_MAX_VOICES = 8
++try:
++    HDREZKA_REFRESH_MINUTES = max(
++        5,
++        int(os.getenv("HDREZKA_REFRESH_MINUTES", "30")),
++    )
++except ValueError:
++    HDREZKA_REFRESH_MINUTES = 30
++
+ try:
+     VIDEO_PROVIDER_SYNC_SECONDS = max(
+         60,
+@@ -114,6 +140,30 @@
+ pool: asyncpg.Pool | None = None
+ router = Router()
+ 
++hdrezka_provider = HDRezkaProvider(
++    enabled=HDREZKA_ENABLED,
++    mirror=HDREZKA_MIRROR,
++    default_voice=HDREZKA_DEFAULT_VOICE,
++    max_voices=HDREZKA_MAX_VOICES,
++)
++hdrezka_lock = asyncio.Lock()
++
++MAIN_MENU_LABELS = {
++    "🔎 Найти фильм или сериал",
++    "🆕 Новинки",
++    "🔥 Популярное",
++    "🔜 Скоро",
++    "🆓 Смотреть бесплатно",
++    "🎲 Что посмотреть?",
++    "🎬 Подборки",
++    "❤️ Избранное",
++    "⭐ Избранное",
++    "🕘 История",
++    "📊 Статистика",
++    "👤 Профиль",
++    "ℹ️ О VKino",
++}
++
+ 
+ class SearchState(StatesGroup):
+     query = State()
+@@ -428,10 +478,14 @@
+                     CHECK (quality IN (360, 480, 720, 1080)),
+                 playback_url TEXT NOT NULL,
+                 source_type TEXT NOT NULL DEFAULT 'hls',
++                provider TEXT NOT NULL DEFAULT 'manual',
+                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+ 
++            ALTER TABLE playback_sources
++            ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'manual';
++
+             CREATE INDEX IF NOT EXISTS idx_playback_sources_media
+             ON playback_sources(
+                 movie_id,
+@@ -458,6 +512,14 @@
+             CREATE INDEX IF NOT EXISTS idx_free_catalog_provider
+             ON free_catalog(provider, provider_id);
+ 
++            CREATE TABLE IF NOT EXISTS hdrezka_cache (
++                movie_id BIGINT PRIMARY KEY,
++                source_url TEXT NOT NULL,
++                source_title TEXT,
++                source_year INTEGER,
++                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++            );
++
+             CREATE TABLE IF NOT EXISTS trailer_cache (
+                 movie_id BIGINT PRIMARY KEY,
+                 provider TEXT NOT NULL,
+@@ -511,6 +573,171 @@
+     logging.info("PostgreSQL connected")
+ 
+ 
++def _kp_titles(item: dict[str, Any]) -> list[str]:
++    result: list[str] = []
++    for key in ("name", "alternativeName", "enName"):
++        value = str(item.get(key) or "").strip()
++        if value and value not in result:
++            result.append(value)
++    return result or [kp.title(item)]
++
++
++async def refresh_hdrezka_sources(
++    movie_id: int,
++    season_number: int | None = None,
++    episode_number: int | None = None,
++) -> int:
++    if not HDREZKA_ENABLED:
++        return 0
++
++    item = await kp.details(movie_id)
++    if is_upcoming(item):
++        return 0
++
++    cached = await db().fetchrow(
++        """
++        SELECT source_url
++        FROM hdrezka_cache
++        WHERE movie_id=$1
++        """,
++        movie_id,
++    )
++    cached_url = str(cached["source_url"]) if cached else ""
++
++    year_value = item.get("year")
++    try:
++        year = int(year_value) if year_value else None
++    except (TypeError, ValueError):
++        year = None
++
++    try:
++        async with hdrezka_lock:
++            resolved = await asyncio.to_thread(
++                hdrezka_provider.resolve,
++                titles=_kp_titles(item),
++                year=year,
++                media_type=str(item.get("media_type") or "movie"),
++                season=season_number,
++                episode=episode_number,
++                cached_url=cached_url,
++            )
++    except HDRezkaProviderError as exc:
++        logging.info(
++            "HDRezka unavailable for movie %s: %s",
++            movie_id,
++            type(exc).__name__,
++        )
++        return 0
++    except Exception as exc:
++        logging.warning(
++            "HDRezka refresh failed for movie %s: %s",
++            movie_id,
++            type(exc).__name__,
++        )
++        return 0
++
++    if not resolved.sources:
++        return 0
++
++    async with db().acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                """
++                INSERT INTO hdrezka_cache(
++                    movie_id, source_url, source_title, source_year
++                )
++                VALUES($1,$2,$3,$4)
++                ON CONFLICT(movie_id) DO UPDATE SET
++                    source_url=EXCLUDED.source_url,
++                    source_title=EXCLUDED.source_title,
++                    source_year=EXCLUDED.source_year,
++                    updated_at=NOW()
++                """,
++                movie_id,
++                resolved.source_url,
++                resolved.matched_title,
++                resolved.matched_year,
++            )
++
++            await conn.execute(
++                """
++                UPDATE playback_sources
++                SET is_active=FALSE
++                WHERE movie_id=$1
++                  AND season_number IS NOT DISTINCT FROM $2
++                  AND episode_number IS NOT DISTINCT FROM $3
++                  AND provider='hdrezka'
++                  AND is_active=TRUE
++                """,
++                movie_id,
++                season_number,
++                episode_number,
++            )
++
++            for source in resolved.sources:
++                await conn.execute(
++                    """
++                    INSERT INTO playback_sources(
++                        movie_id,
++                        season_number,
++                        episode_number,
++                        voice_name,
++                        language,
++                        quality,
++                        playback_url,
++                        source_type,
++                        provider,
++                        is_active
++                    )
++                    VALUES($1,$2,$3,$4,'ru',$5,$6,$7,'hdrezka',TRUE)
++                    """,
++                    movie_id,
++                    season_number,
++                    episode_number,
++                    str(source["voice_name"])[:80],
++                    int(source["quality"]),
++                    str(source["playback_url"]),
++                    str(source.get("source_type") or "mp4")[:20],
++                )
++
++    return len(resolved.sources)
++
++
++async def ensure_hdrezka_sources(
++    movie_id: int,
++    season_number: int | None = None,
++    episode_number: int | None = None,
++) -> int:
++    if not HDREZKA_ENABLED:
++        return 0
++
++    fresh = await db().fetchval(
++        """
++        SELECT 1
++        FROM playback_sources
++        WHERE movie_id=$1
++          AND season_number IS NOT DISTINCT FROM $2
++          AND episode_number IS NOT DISTINCT FROM $3
++          AND provider='hdrezka'
++          AND is_active=TRUE
++          AND created_at > NOW() - ($4::int * INTERVAL '1 minute')
++        LIMIT 1
++        """,
++        movie_id,
++        season_number,
++        episode_number,
++        HDREZKA_REFRESH_MINUTES,
++    )
++    if fresh:
++        return 0
++
++    return await refresh_hdrezka_sources(
++        movie_id,
++        season_number,
++        episode_number,
++    )
++
++
+ async def remember(message: Message) -> None:
+     if not message.from_user:
+         return
+@@ -1984,25 +2211,48 @@
+         return web.json_response({"error": "bad_request"}, status=400)
+     season_db = season or None
+     episode_db = episode or None
++
++    if HDREZKA_ENABLED:
++        await ensure_hdrezka_sources(
++            movie_id,
++            season_db,
++            episode_db,
++        )
++
+     rows = await db().fetch(
+         """
+-        SELECT voice_name, quality, playback_url, source_type
++        SELECT voice_name, quality, playback_url, source_type, provider
+         FROM playback_sources
+         WHERE movie_id=$1
+           AND season_number IS NOT DISTINCT FROM $2
+           AND episode_number IS NOT DISTINCT FROM $3
+           AND is_active=TRUE
+-        ORDER BY voice_name, quality
++        ORDER BY
++            voice_name,
++            quality,
++            CASE
++                WHEN provider='manual' THEN 0
++                WHEN provider='api' THEN 1
++                WHEN provider='hdrezka' THEN 2
++                ELSE 3
++            END
+         """,
+         movie_id,
+         season_db,
+         episode_db,
+     )
+     grouped: dict[str, list[dict[str, Any]]] = {}
++    seen_sources: set[tuple[str, int]] = set()
+     for row in rows:
+-        grouped.setdefault(str(row["voice_name"]), []).append(
++        voice = str(row["voice_name"])
++        quality_value = int(row["quality"])
++        source_key = (voice, quality_value)
++        if source_key in seen_sources:
++            continue
++        seen_sources.add(source_key)
++        grouped.setdefault(voice, []).append(
+             {
+-                "quality": int(row["quality"]),
++                "quality": quality_value,
+                 "url": str(row["playback_url"]),
+                 "type": str(row["source_type"] or "link"),
+             }
+@@ -2063,6 +2313,36 @@
+                 "season": int(next_row["season_number"]),
+                 "episode": int(next_row["episode_number"]),
+             }
++        elif HDREZKA_ENABLED:
++            try:
++                seasons = await kp.seasons(movie_id)
++                episode_pairs: list[tuple[int, int]] = []
++                for season_item in seasons:
++                    try:
++                        sn = int(season_item.get("number"))
++                    except (TypeError, ValueError):
++                        continue
++                    for episode_item in season_item.get("episodes") or []:
++                        if not isinstance(episode_item, dict):
++                            continue
++                        try:
++                            en = int(episode_item.get("number"))
++                        except (TypeError, ValueError):
++                            continue
++                        episode_pairs.append((sn, en))
++                episode_pairs.sort()
++                current = (season, episode)
++                candidate = next(
++                    (pair for pair in episode_pairs if pair > current),
++                    None,
++                )
++                if candidate:
++                    next_item = {
++                        "season": candidate[0],
++                        "episode": candidate[1],
++                    }
++            except Exception:
++                pass
+     return web.json_response(
+         {
+             "voices": [
+@@ -2182,7 +2462,7 @@
+             await db().execute(
+                 """
+                 UPDATE playback_sources
+-                SET playback_url=$2, source_type=$3, is_active=$4
++                SET playback_url=$2, source_type=$3, provider='api', is_active=$4
+                 WHERE id=$1
+                 """,
+                 int(existing_id), playback_url, source_type, active,
+@@ -2192,8 +2472,8 @@
+                 """
+                 INSERT INTO playback_sources(
+                     movie_id, season_number, episode_number,
+-                    voice_name, quality, playback_url, source_type, is_active
+-                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
++                    voice_name, quality, playback_url, source_type, provider, is_active
++                ) VALUES($1,$2,$3,$4,$5,$6,$7,'api',$8)
+                 """,
+                 movie_id, season_number, episode_number, voice_name,
+                 quality, playback_url, source_type, active,
+@@ -2446,6 +2726,7 @@
+                         SET playback_url=$2,
+                             source_type='mp4',
+                             language='original',
++                            provider='blender',
+                             is_active=TRUE
+                         WHERE id=$1
+                         """,
+@@ -2464,12 +2745,13 @@
+                             quality,
+                             playback_url,
+                             source_type,
++                            provider,
+                             is_active
+                         )
+                         VALUES(
+                             $1, NULL, NULL,
+                             'Original', 'original',
+-                            $2, $3, 'mp4', TRUE
++                            $2, $3, 'mp4', 'blender', TRUE
+                         )
+                         """,
+                         movie_id,
+@@ -2796,7 +3078,7 @@
+         """,
+         movie_id,
+     )
+-    if not has_source:
++    if not has_source and not HDREZKA_ENABLED:
+         return None
+ 
+     app_url = build_webapp_url(movie_id)
+@@ -3136,7 +3418,7 @@
+         favorite,
+     )
+ 
+-    if media_type == "movie":
++    if media_type == "movie" and not is_upcoming(item):
+         play_button = await playback_button_for_movie(
+             movie_id
+         )
+@@ -3221,6 +3503,39 @@
+ ) -> None:
+     query = (message.text or "").strip()
+ 
++    if query in MAIN_MENU_LABELS:
++        if query == "🔎 Найти фильм или сериал":
++            await message.answer(
++                "Напиши название фильма или сериала 👇"
++            )
++            return
++
++        await state.clear()
++        target_handlers = {
++            "🆕 Новинки": "new_releases_menu",
++            "🔥 Популярное": "popular",
++            "🔜 Скоро": "upcoming_menu",
++            "🆓 Смотреть бесплатно": "free_catalog_menu",
++            "🎲 Что посмотреть?": "random_movie",
++            "🎬 Подборки": "collections",
++            "❤️ Избранное": "favorites_menu",
++            "⭐ Избранное": "favorites_menu",
++            "🕘 История": "history_menu",
++            "📊 Статистика": "statistics_menu",
++            "👤 Профиль": "profile",
++            "ℹ️ О VKino": "about",
++        }
++        handler_name = target_handlers.get(query)
++        handler = globals().get(handler_name or "")
++        if callable(handler):
++            await handler(message)
++        else:
++            await message.answer(
++                "Режим поиска закрыт.",
++                reply_markup=main_menu(),
++            )
++        return
++
+     if len(query) < 2:
+         await message.answer(
+             "Напиши хотя бы 2 символа."
+@@ -3603,10 +3918,13 @@
+ 
+     episode_rows: list[list[InlineKeyboardButton]] = []
+ 
+-    if await playback_voices(
+-        movie_id,
+-        season_number,
+-        episode_number,
++    if (
++        await playback_voices(
++            movie_id,
++            season_number,
++            episode_number,
++        )
++        or HDREZKA_ENABLED
+     ):
+         episode_rows.append(
+             [
+@@ -5712,6 +6030,10 @@
+     )
+ 
+     logging.info("VKino started")
++    logging.info(
++        "HDRezka provider: %s",
++        "enabled" if HDREZKA_ENABLED else "disabled",
++    )
+ 
+     try:
+         await dp.start_polling(bot)
