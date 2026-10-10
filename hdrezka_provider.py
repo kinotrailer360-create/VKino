@@ -301,6 +301,32 @@ class HDRezkaProvider:
             raise HDRezkaProviderError("No playable qualities were returned")
         return sources
 
+    def find_page(
+        self,
+        *,
+        titles: list[str],
+        year: int | None,
+        media_type: str,
+        cached_url: str = "",
+    ) -> tuple[str, str, int | None]:
+        """Return the matched HDRezka page without resolving video streams."""
+        if not self.enabled:
+            raise HDRezkaProviderError("HDRezka provider is disabled")
+
+        if cached_url:
+            page_url = self._rewrite_page_url(cached_url)
+            return (
+                page_url,
+                titles[0] if titles else "",
+                year,
+            )
+
+        return self._search_page(
+            titles=titles,
+            year=year,
+            media_type=media_type,
+        )
+
     def resolve(
         self,
         *,

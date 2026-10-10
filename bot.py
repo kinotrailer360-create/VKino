@@ -582,6 +582,84 @@ def _kp_titles(item: dict[str, Any]) -> list[str]:
     return result or [kp.title(item)]
 
 
+async def hdrezka_watch_button(
+    item: dict[str, Any],
+) -> InlineKeyboardButton | None:
+    """Build a direct HDRezka page button for a matched title."""
+    if not HDREZKA_ENABLED or is_upcoming(item):
+        return None
+
+    movie_id = int(item["id"])
+
+    cached = await db().fetchrow(
+        """
+        SELECT source_url
+        FROM hdrezka_cache
+        WHERE movie_id=$1
+        """,
+        movie_id,
+    )
+    if cached:
+        cached_url = str(cached["source_url"] or "").strip()
+        if cached_url.startswith(("https://", "http://")):
+            return InlineKeyboardButton(
+                text="▶️ Смотреть HDRezka",
+                url=cached_url,
+            )
+
+    year_value = item.get("year")
+    try:
+        year = int(year_value) if year_value else None
+    except (TypeError, ValueError):
+        year = None
+
+    try:
+        async with hdrezka_lock:
+            page_url, matched_title, matched_year = await asyncio.wait_for(
+                asyncio.to_thread(
+                    hdrezka_provider.find_page,
+                    titles=_kp_titles(item),
+                    year=year,
+                    media_type=str(item.get("media_type") or "movie"),
+                ),
+                timeout=12,
+            )
+    except Exception as exc:
+        logging.info(
+            "HDRezka page not found for movie %s: %s",
+            movie_id,
+            type(exc).__name__,
+        )
+        return None
+
+    page_url = str(page_url or "").strip()
+    if not page_url.startswith(("https://", "http://")):
+        return None
+
+    await db().execute(
+        """
+        INSERT INTO hdrezka_cache(
+            movie_id, source_url, source_title, source_year
+        )
+        VALUES($1,$2,$3,$4)
+        ON CONFLICT(movie_id) DO UPDATE SET
+            source_url=EXCLUDED.source_url,
+            source_title=EXCLUDED.source_title,
+            source_year=EXCLUDED.source_year,
+            updated_at=NOW()
+        """,
+        movie_id,
+        page_url,
+        str(matched_title or kp.title(item))[:300],
+        matched_year,
+    )
+
+    return InlineKeyboardButton(
+        text="▶️ Смотреть HDRezka",
+        url=page_url,
+    )
+
+
 async def refresh_hdrezka_sources(
     movie_id: int,
     season_number: int | None = None,
@@ -3084,12 +3162,12 @@ async def playback_button_for_movie(
     app_url = build_webapp_url(movie_id)
     if app_url:
         return InlineKeyboardButton(
-            text="▶️ Смотреть",
+            text="▶️ Смотреть в VKino",
             web_app=WebAppInfo(url=app_url),
         )
 
     return InlineKeyboardButton(
-        text="▶️ Смотреть",
+        text="▶️ Смотреть в VKino",
         callback_data=f"playvoices:{movie_id}:0:0",
     )
 
@@ -3417,6 +3495,13 @@ async def send_card(
         item,
         favorite,
     )
+
+    hdrezka_button = await hdrezka_watch_button(item)
+    if hdrezka_button:
+        keyboard.inline_keyboard.insert(
+            0,
+            [hdrezka_button],
+        )
 
     if media_type == "movie" and not is_upcoming(item):
         play_button = await playback_button_for_movie(
