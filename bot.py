@@ -12,7 +12,7 @@ import time
 from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote_plus, urlencode
 
 import aiohttp
 import asyncpg
@@ -585,7 +585,7 @@ def _kp_titles(item: dict[str, Any]) -> list[str]:
 async def hdrezka_watch_button(
     item: dict[str, Any],
 ) -> InlineKeyboardButton | None:
-    """Build a direct HDRezka page button for a matched title."""
+    """Direct HDRezka page when matched; search-page fallback otherwise."""
     if not HDREZKA_ENABLED or is_upcoming(item):
         return None
 
@@ -622,41 +622,54 @@ async def hdrezka_watch_button(
                     year=year,
                     media_type=str(item.get("media_type") or "movie"),
                 ),
-                timeout=12,
+                timeout=10,
             )
+
+        page_url = str(page_url or "").strip()
+        if page_url.startswith(("https://", "http://")):
+            await db().execute(
+                """
+                INSERT INTO hdrezka_cache(
+                    movie_id, source_url, source_title, source_year
+                )
+                VALUES($1,$2,$3,$4)
+                ON CONFLICT(movie_id) DO UPDATE SET
+                    source_url=EXCLUDED.source_url,
+                    source_title=EXCLUDED.source_title,
+                    source_year=EXCLUDED.source_year,
+                    updated_at=NOW()
+                """,
+                movie_id,
+                page_url,
+                str(matched_title or kp.title(item))[:300],
+                matched_year,
+            )
+            return InlineKeyboardButton(
+                text="▶️ Смотреть HDRezka",
+                url=page_url,
+            )
+
     except Exception as exc:
         logging.info(
-            "HDRezka page not found for movie %s: %s",
+            "HDRezka exact page unavailable for movie %s: %s",
             movie_id,
             type(exc).__name__,
         )
-        return None
 
-    page_url = str(page_url or "").strip()
-    if not page_url.startswith(("https://", "http://")):
-        return None
+    # Fallback: never hide the button merely because Railway cannot parse
+    # HDRezka. Open the provider's own search page in the user's browser.
+    base = (HDREZKA_MIRROR or "https://rezka.ag").rstrip("/")
+    query = kp.title(item).strip()
+    if year:
+        query = f"{query} {year}"
 
-    await db().execute(
-        """
-        INSERT INTO hdrezka_cache(
-            movie_id, source_url, source_title, source_year
-        )
-        VALUES($1,$2,$3,$4)
-        ON CONFLICT(movie_id) DO UPDATE SET
-            source_url=EXCLUDED.source_url,
-            source_title=EXCLUDED.source_title,
-            source_year=EXCLUDED.source_year,
-            updated_at=NOW()
-        """,
-        movie_id,
-        page_url,
-        str(matched_title or kp.title(item))[:300],
-        matched_year,
+    search_url = (
+        f"{base}/search/"
+        f"?do=search&subaction=search&q={quote_plus(query)}"
     )
-
     return InlineKeyboardButton(
         text="▶️ Смотреть HDRezka",
-        url=page_url,
+        url=search_url,
     )
 
 
