@@ -2,32 +2,77 @@
 
 Telegram-бот `@vkino_bot` для поиска фильмов и сериалов на русском языке.
 
-## Что уже есть
+## Что умеет
 
-- поиск фильмов и сериалов через ПоискКино API;
-- карточки с постером, годом, жанрами и описанием;
-- рейтинги Кинопоиска и IMDb;
-- трейлеры;
-- популярное и случайная рекомендация;
-- подборки фильмов и сериалов;
-- избранное;
-- профиль пользователя;
-- простая админка и рассылка.
+- поиск фильмов и сериалов через ПоискКино API, включая будущие премьеры;
+- карточки с постером, годом, жанрами, описанием и рейтингами Кинопоиска и IMDb;
+- трейлеры (TMDB / YouTube) во встроенном Mini App;
+- новинки, популярное, «Скоро», подборки и случайная рекомендация;
+- напоминания о премьерах;
+- бесплатные открытые фильмы Blender Studio;
+- Mini App-плеер для источников, добавленных вручную или через API провайдера
+  (выбор озвучки и качества, продолжение просмотра, следующая серия);
+- избранное, история, статистика и профиль;
+- админка (`/admin`) и рассылка (`/broadcast текст`).
 
 ## Переменные окружения
 
 Никогда не добавляйте `.env` и реальные токены в GitHub.
 
-Нужны:
+Обязательные:
 
 ```env
 BOT_TOKEN=...
 KINOPOISK_TOKEN=...
+DATABASE_URL=postgresql://user:password@host:5432/dbname
 ADMIN_IDS=803444545
-DB_PATH=vkino.db
 ```
 
+Необязательные:
+
+```env
+WEBAPP_URL=https://your-domain        # на Railway берётся из RAILWAY_PUBLIC_DOMAIN
+TMDB_API_KEY=...                      # трейлеры из TMDB
+YOUTUBE_API_KEY=...                   # поиск трейлеров на YouTube
+VIDEO_PROVIDER_API_URL=https://legal-provider.example/api/catalog
+VIDEO_PROVIDER_API_TOKEN=...
+VIDEO_PROVIDER_SYNC_SECONDS=900
+PORT=8080                             # порт Mini App, Railway задаёт сам
+```
+
+## Видеопровайдер
+
+Если задан `VIDEO_PROVIDER_API_URL`, бот периодически забирает каталог в формате:
+
+```json
+{
+  "items": [
+    {
+      "kinopoisk_id": 12345,
+      "season": null,
+      "episode": null,
+      "voice": "Official dub",
+      "quality": 1080,
+      "url": "https://cdn.example/video/master.m3u8",
+      "type": "hls",
+      "active": true
+    }
+  ]
+}
+```
+
+`quality` — одно из 360, 480, 720, 1080; ссылки принимаются только `https://`.
+Используйте только источники, которые вы вправе распространять.
+
+## Рассылка
+
+`/broadcast текст` поддерживает HTML-разметку Telegram (`<b>`, `<i>`, `<a href="...">`).
+Сначала бот присылает предпросмотр админу; если разметка неверная, рассылка не начнётся.
+Символы `<`, `>`, `&` в обычном тексте пишите как `&lt;`, `&gt;`, `&amp;`.
+
 ## Запуск локально
+
+Нужен PostgreSQL.
 
 ```bash
 pip install -r requirements.txt
@@ -36,4 +81,6 @@ python bot.py
 
 ## Railway
 
-Репозиторий готов к Docker-деплою на Railway. После создания сервиса добавьте секреты `BOT_TOKEN`, `KINOPOISK_TOKEN`, `ADMIN_IDS` в Variables.
+Репозиторий готов к Docker-деплою на Railway. Подключите PostgreSQL
+(переменная `DATABASE_URL`) и добавьте `BOT_TOKEN`, `KINOPOISK_TOKEN`,
+`ADMIN_IDS` в Variables.

@@ -20,6 +20,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -2133,6 +2134,15 @@ async def api_progress(request: web.Request) -> web.Response:
         quality = int(payload.get("quality", 0) or 0)
     except Exception:
         return web.json_response({"error": "bad_request"}, status=400)
+    int_max = 2_147_483_647
+    if not (
+        0 < movie_id < 2**63
+        and 0 <= season <= int_max
+        and 0 <= episode <= int_max
+        and position <= int_max
+        and duration <= int_max
+    ):
+        return web.json_response({"error": "bad_request"}, status=400)
     if voice_name and quality in {360, 480, 720, 1080}:
         await save_playback_preference(
             int(user["id"]),
@@ -2623,6 +2633,30 @@ async def premiere_reminder_loop(
                         """,
                         user_id,
                         movie_id,
+                    )
+
+                except (
+                    TelegramForbiddenError,
+                    TelegramBadRequest,
+                ) as exc:
+                    # User blocked the bot or the chat is gone: retrying
+                    # would only clog the queue for everyone else.
+                    await db().execute(
+                        """
+                        UPDATE premiere_reminders
+                        SET sent_at=NOW()
+                        WHERE user_id=$1
+                          AND movie_id=$2
+                        """,
+                        user_id,
+                        movie_id,
+                    )
+                    logging.info(
+                        "Premiere reminder dropped "
+                        "for user %s movie %s: %s",
+                        user_id,
+                        movie_id,
+                        exc,
                     )
 
                 except Exception as exc:
@@ -3123,7 +3157,7 @@ def format_card(item: dict[str, Any]) -> str:
     release = premiere_label(item)
     if release:
         if is_upcoming(item):
-            lines.append(f"🔜 <b>Ещё не вышел</b>")
+            lines.append("🔜 <b>Ещё не вышел</b>")
             lines.append(f"📅 Премьера: <b>{release}</b>")
         else:
             lines.append(f"📅 Премьера: {release}")
@@ -5727,10 +5761,26 @@ async def broadcast(
         )
         return
 
+    try:
+        await message.answer(text)
+    except TelegramBadRequest as exc:
+        await message.answer(
+            "Рассылка не отправлена: ошибка HTML-разметки.\n"
+            "Символы &lt; &gt; &amp; пиши как "
+            "<code>&amp;lt;</code> <code>&amp;gt;</code> "
+            "<code>&amp;amp;</code>.\n\n"
+            f"<code>{escape(str(exc))}</code>"
+        )
+        return
+
     ok = 0
     failed = 0
 
     for user_id in await all_user_ids():
+        if user_id == message.from_user.id:
+            # Already received the preview above.
+            ok += 1
+            continue
         try:
             await message.bot.send_message(
                 user_id,
