@@ -60,6 +60,21 @@ VIDEO_PROVIDER_API_TOKEN = os.getenv(
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+RUTUBE_ENABLED = os.getenv(
+    "RUTUBE_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+# Extra Rutube author (channel) IDs trusted as official rights holders,
+# in addition to videos Rutube itself marks as official.
+RUTUBE_OFFICIAL_AUTHORS = {
+    x.strip()
+    for x in os.getenv("RUTUBE_OFFICIAL_AUTHORS", "").split(",")
+    if x.strip()
+}
+RUTUBE_SEARCH_API = "https://rutube.ru/api/search/video/"
+RUTUBE_MIN_MOVIE_SECONDS = 40 * 60
+RUTUBE_RECHECK_DAYS = 7
+
 try:
     VIDEO_PROVIDER_SYNC_SECONDS = max(
         60,
@@ -482,6 +497,14 @@ async def init_db() -> None:
             DROP TABLE IF EXISTS hdrezka_cache;
 
             DELETE FROM playback_sources WHERE provider='hdrezka';
+
+            CREATE TABLE IF NOT EXISTS rutube_cache (
+                movie_id BIGINT PRIMARY KEY,
+                video_id TEXT,
+                title TEXT,
+                author TEXT,
+                checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
 
             CREATE TABLE IF NOT EXISTS trailer_cache (
                 movie_id BIGINT PRIMARY KEY,
@@ -1342,6 +1365,201 @@ def build_trailer_url(movie_id: int) -> str:
     return f"{WEBAPP_URL}/trailer?{query}"
 
 
+RUTUBE_TRAILER_WORDS = (
+    "трейлер",
+    "тизер",
+    "trailer",
+    "teaser",
+    "обзор",
+    "review",
+    "фрагмент",
+    "отрывок",
+    "клип",
+    "making of",
+    "со съемок",
+)
+
+
+def _rutube_norm(value: Any) -> str:
+    text = str(value or "").lower().replace("ё", "е")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _rutube_is_official(video: dict[str, Any]) -> bool:
+    if video.get("is_official") is True:
+        return True
+    author = video.get("author") or {}
+    if not isinstance(author, dict):
+        return False
+    if author.get("is_official") is True:
+        return True
+    return str(author.get("id") or "") in RUTUBE_OFFICIAL_AUTHORS
+
+
+def _rutube_video_id(video: dict[str, Any]) -> str | None:
+    value = str(video.get("id") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9]{8,64}", value):
+        return value
+    return None
+
+
+def _rutube_score(
+    video: dict[str, Any],
+    titles: list[str],
+    year: int | None,
+) -> int | None:
+    """Return a match score, or None when the video must not be used."""
+    if not _rutube_is_official(video):
+        return None
+    if (
+        video.get("is_hidden")
+        or video.get("is_adult")
+        or video.get("is_livestream")
+        or video.get("is_paid")
+    ):
+        return None
+    if not _rutube_video_id(video):
+        return None
+
+    try:
+        duration = int(video.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if duration < RUTUBE_MIN_MOVIE_SECONDS:
+        return None
+
+    name = _rutube_norm(video.get("title"))
+    if not name or any(word in name for word in RUTUBE_TRAILER_WORDS):
+        return None
+
+    padded = f" {name} "
+    matched = [t for t in titles if t and f" {t} " in padded]
+    if not matched:
+        return None
+
+    score = 1
+    if any(name.startswith(t) for t in matched):
+        score += 1
+    if year:
+        text = f"{name} {_rutube_norm(video.get('description'))}"
+        years = {int(y) for y in re.findall(r"\b(19\d\d|20\d\d)\b", text)}
+        if year in years:
+            score += 2
+        elif years and all(abs(y - year) > 1 for y in years):
+            # Mentions another year only: likely a remake or other film.
+            return None
+    return score
+
+
+async def search_rutube_movie(
+    item: dict[str, Any],
+) -> dict[str, Any] | None:
+    titles: list[str] = []
+    for key in ("name", "alternativeName", "enName"):
+        value = _rutube_norm(item.get(key))
+        if value and value not in titles:
+            titles.append(value)
+    if not titles:
+        return None
+
+    year_value = item.get("year")
+    try:
+        year = int(year_value) if year_value else None
+    except (TypeError, ValueError):
+        year = None
+
+    best: tuple[int, dict[str, Any]] | None = None
+    timeout = aiohttp.ClientTimeout(total=6)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for raw_title in titles[:2]:
+            query = f"{raw_title} {year}" if year else raw_title
+            async with session.get(
+                RUTUBE_SEARCH_API,
+                params={"query": query, "format": "json"},
+                headers={"accept": "application/json"},
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+            for video in (data or {}).get("results") or []:
+                if not isinstance(video, dict):
+                    continue
+                score = _rutube_score(video, titles, year)
+                if score is not None and (best is None or score > best[0]):
+                    best = (score, video)
+            if best and best[0] >= 3:
+                break
+
+    if not best:
+        return None
+    video = best[1]
+    author = video.get("author") or {}
+    return {
+        "video_id": _rutube_video_id(video),
+        "title": str(video.get("title") or "")[:300],
+        "author": str(
+            author.get("name") if isinstance(author, dict) else ""
+        )[:200],
+    }
+
+
+async def rutube_movie(
+    item: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Cached official Rutube full movie for a Kinopoisk item."""
+    if not RUTUBE_ENABLED:
+        return None
+    movie_id = int(item["id"])
+
+    cached = await db().fetchrow(
+        """
+        SELECT video_id, title, author
+        FROM rutube_cache
+        WHERE movie_id=$1
+          AND checked_at > NOW() - ($2::int * INTERVAL '1 day')
+        """,
+        movie_id,
+        RUTUBE_RECHECK_DAYS,
+    )
+    if cached:
+        return dict(cached) if cached["video_id"] else None
+
+    try:
+        found = await search_rutube_movie(item)
+    except Exception as exc:
+        # Network errors are not cached so the next open retries.
+        logging.info(
+            "Rutube search failed for movie %s: %s",
+            movie_id,
+            type(exc).__name__,
+        )
+        return None
+
+    await db().execute(
+        """
+        INSERT INTO rutube_cache(movie_id, video_id, title, author)
+        VALUES($1,$2,$3,$4)
+        ON CONFLICT(movie_id) DO UPDATE SET
+            video_id=EXCLUDED.video_id,
+            title=EXCLUDED.title,
+            author=EXCLUDED.author,
+            checked_at=NOW()
+        """,
+        movie_id,
+        found["video_id"] if found else None,
+        found["title"] if found else None,
+        found["author"] if found else None,
+    )
+    return found
+
+
+def build_rutube_url(movie_id: int) -> str:
+    if not WEBAPP_URL:
+        return ""
+    query = urlencode({"movie_id": movie_id, "kind": "rutube"})
+    return f"{WEBAPP_URL}/trailer?{query}"
+
+
 def youtube_video_id(url: str) -> str | None:
     if not url:
         return None
@@ -1844,7 +2062,12 @@ TRAILER_HTML = r"""<!doctype html>
   tg.ready(); tg.expand();
   const p = new URLSearchParams(location.search);
   const movieId = Number(p.get('movie_id') || 0);
+  const isRutube = p.get('kind') === 'rutube';
   const frame = document.getElementById('frame');
+  if (isRutube) {
+    document.getElementById('title').textContent = 'Фильм';
+    document.getElementById('status').textContent = 'Загружаем видео…';
+  }
   const status = document.getElementById('status');
   const title = document.getElementById('title');
 
@@ -1858,9 +2081,16 @@ TRAILER_HTML = r"""<!doctype html>
 
   async function boot() {
     try {
-      const data = await api('/api/trailer?movie_id=' + movieId);
+      const data = await api(
+        (isRutube ? '/api/rutube' : '/api/trailer') + '?movie_id=' + movieId
+      );
       if (data.title) title.textContent = data.title;
-      if (data.youtube_id) {
+      if (data.rutube_id) {
+        const id = encodeURIComponent(data.rutube_id);
+        frame.innerHTML =
+          '<iframe allow="clipboard-write; autoplay; fullscreen" ' +
+          'allowfullscreen src="https://rutube.ru/play/embed/' + id + '"></iframe>';
+      } else if (data.youtube_id) {
         const id = encodeURIComponent(data.youtube_id);
         frame.innerHTML =
           '<iframe allow="autoplay; encrypted-media; picture-in-picture; fullscreen" ' +
@@ -1876,7 +2106,9 @@ TRAILER_HTML = r"""<!doctype html>
       }
       status.textContent = data.provider ? ('Источник: ' + data.provider) : '';
     } catch (e) {
-      status.textContent = 'Трейлер пока не найден.';
+      status.textContent = isRutube
+        ? 'Видео пока недоступно.'
+        : 'Трейлер пока не найден.';
     }
   }
 
@@ -1944,6 +2176,46 @@ async def api_trailer(request: web.Request) -> web.Response:
         "youtube_id": result.get("youtube_id"),
         "direct_url": result.get("direct_url"),
         "title": result.get("title") or "Трейлер",
+    })
+
+
+async def api_rutube(request: web.Request) -> web.Response:
+    user = request_telegram_user(request)
+    if not user:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    try:
+        movie_id = int(request.query.get("movie_id", "0"))
+    except ValueError:
+        return web.json_response({"error": "bad movie_id"}, status=400)
+
+    row = await db().fetchrow(
+        """
+        SELECT video_id, title, author
+        FROM rutube_cache
+        WHERE movie_id=$1 AND video_id IS NOT NULL
+        """,
+        movie_id,
+    )
+    if not row:
+        return web.json_response({"error": "not found"}, status=404)
+
+    media_type, title = await activity_media_snapshot(
+        int(user["id"]),
+        movie_id,
+    )
+    await record_activity(
+        int(user["id"]),
+        media_type,
+        movie_id,
+        title,
+        "watch",
+    )
+
+    return web.json_response({
+        "provider": f"Rutube • {row['author']}" if row["author"] else "Rutube",
+        "rutube_id": row["video_id"],
+        "title": row["title"] or title,
     })
 
 
@@ -2172,6 +2444,7 @@ async def start_miniapp_server() -> web.AppRunner:
     app.router.add_get("/app", miniapp_page)
     app.router.add_get("/trailer", trailer_page)
     app.router.add_get("/api/trailer", api_trailer)
+    app.router.add_get("/api/rutube", api_rutube)
     app.router.add_get("/api/playback", api_playback)
     app.router.add_post("/api/progress", api_progress)
     runner = web.AppRunner(app)
@@ -3175,6 +3448,33 @@ def format_card(item: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def rutube_watch_button(
+    item: dict[str, Any],
+) -> InlineKeyboardButton | None:
+    try:
+        found = await rutube_movie(item)
+    except Exception as exc:
+        logging.warning(
+            "Rutube lookup failed for movie %s: %s",
+            item.get("id"),
+            exc,
+        )
+        return None
+    if not found:
+        return None
+
+    app_url = build_rutube_url(int(item["id"]))
+    if app_url:
+        return InlineKeyboardButton(
+            text="▶️ Смотреть бесплатно (Rutube)",
+            web_app=WebAppInfo(url=app_url),
+        )
+    return InlineKeyboardButton(
+        text="▶️ Смотреть бесплатно (Rutube)",
+        url=f"https://rutube.ru/video/{found['video_id']}/",
+    )
+
+
 async def send_card(
     message: Message,
     item: dict[str, Any],
@@ -3220,6 +3520,13 @@ async def send_card(
                 0,
                 [play_button],
             )
+        else:
+            rutube_button = await rutube_watch_button(item)
+            if rutube_button:
+                keyboard.inline_keyboard.insert(
+                    0,
+                    [rutube_button],
+                )
 
     if poster:
         try:
