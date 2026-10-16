@@ -74,6 +74,7 @@ RUTUBE_OFFICIAL_AUTHORS = {
 RUTUBE_SEARCH_API = "https://rutube.ru/api/search/video/"
 RUTUBE_MIN_MOVIE_SECONDS = 40 * 60
 RUTUBE_RECHECK_DAYS = 7
+RUTUBE_MISS_RECHECK_HOURS = 24
 
 try:
     VIDEO_PROVIDER_SYNC_SECONDS = max(
@@ -505,6 +506,8 @@ async def init_db() -> None:
                 author TEXT,
                 checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            DELETE FROM rutube_cache WHERE video_id IS NULL;
 
             CREATE TABLE IF NOT EXISTS trailer_cache (
                 movie_id BIGINT PRIMARY KEY,
@@ -1491,6 +1494,11 @@ async def search_rutube_movie(
                 break
 
     if not best:
+        logging.info(
+            "Rutube: no official full movie for %r (%s)",
+            titles[0],
+            year,
+        )
         return None
     video = best[1]
     author = video.get("author") or {}
@@ -1516,10 +1524,17 @@ async def rutube_movie(
         SELECT video_id, title, author
         FROM rutube_cache
         WHERE movie_id=$1
-          AND checked_at > NOW() - ($2::int * INTERVAL '1 day')
+          AND checked_at > NOW() - (
+                CASE
+                    WHEN video_id IS NULL
+                    THEN $3::int * INTERVAL '1 hour'
+                    ELSE $2::int * INTERVAL '1 day'
+                END
+              )
         """,
         movie_id,
         RUTUBE_RECHECK_DAYS,
+        RUTUBE_MISS_RECHECK_HOURS,
     )
     if cached:
         return dict(cached) if cached["video_id"] else None
@@ -6044,6 +6059,83 @@ async def admin_home(
         f"▶️ Источников: <b>{sources}</b>",
         reply_markup=admin_menu(),
     )
+
+
+@router.message(Command("rutube"))
+async def rutube_debug(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    query = (message.text or "").partition(" ")[2].strip()
+    if not query:
+        await message.answer(
+            "Использование: /rutube название фильма"
+        )
+        return
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                RUTUBE_SEARCH_API,
+                params={"query": query, "format": "json"},
+                headers={"accept": "application/json"},
+            ) as resp:
+                status = resp.status
+                body = await resp.text()
+    except Exception as exc:
+        await message.answer(
+            "❌ Rutube недоступен с сервера:\n"
+            f"<code>{escape(type(exc).__name__)}: "
+            f"{escape(str(exc)[:300])}</code>"
+        )
+        return
+
+    try:
+        data = json.loads(body)
+    except ValueError:
+        await message.answer(
+            f"❌ HTTP {status}, ответ не JSON:\n"
+            f"<code>{escape(body[:500])}</code>"
+        )
+        return
+
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        keys = list(data)[:20] if isinstance(data, dict) else type(data).__name__
+        await message.answer(
+            f"⚠️ HTTP {status}, нет поля results.\n"
+            f"Ключи: <code>{escape(str(keys))}</code>"
+        )
+        return
+
+    lines = [f"✅ HTTP {status}, результатов: {len(results)}"]
+    if results and isinstance(results[0], dict):
+        lines.append(
+            "Поля: <code>"
+            + escape(", ".join(sorted(results[0]))[:900])
+            + "</code>"
+        )
+    for video in results[:6]:
+        if not isinstance(video, dict):
+            continue
+        author = video.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        lines.append(
+            "\n• " + escape(str(video.get("title") or "—")[:120])
+            + f"\n  ⏱ {video.get('duration')} с"
+            + f" | official={video.get('is_official')}"
+            + f" | paid={video.get('is_paid')}"
+            + "\n  👤 " + escape(str(author.get("name") or "—")[:60])
+            + f" (id {escape(str(author.get('id')))})"
+        )
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("broadcast"))
