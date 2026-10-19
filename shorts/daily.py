@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
+from . import tmdb
 from .cards import make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -300,6 +301,19 @@ async def _download(session: aiohttp.ClientSession, url: str) -> Image.Image:
         return Image.open(io.BytesIO(await resp.read())).convert("RGB")
 
 
+async def _download_first(session: aiohttp.ClientSession, urls: list[str | None]) -> Image.Image:
+    """Первая картинка, которая скачалась (TMDB, потом Кинопоиск)."""
+    last: Exception | None = None
+    for url in urls:
+        if not url:
+            continue
+        try:
+            return await _download(session, url)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise RuntimeError(f"Не скачалась ни одна картинка: {last}")
+
+
 # ---------------------------------------------------------------- факты о фильме
 
 FACTS = 5
@@ -556,14 +570,16 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
 
 
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
-                           music: Path | None = None) -> ShortResult:
+                           music: Path | None = None, tmdb_key: str = "") -> ShortResult:
     film, facts = await pick_fact_film(fetch, query, exclude or set())
     t, n, kind = _title(film), len(facts), _kind(film)
     hook = f"{n} {_facts_word(n)} о {kind} «{t}»"
     theme = Theme("facts", "ФАКТЫ", t.upper(), hook, hook, [])
 
     cards = []
-    urls = await _stills(fetch, film)
+    # кадры без надписей с TMDB, затем кадры/фон/постер с Кинопоиска
+    backdrops, _ = await tmdb.images(tmdb_key, film, limit=12)
+    urls = tmdb.pick_varied(backdrops, n) + await _stills(fetch, film)
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         cover_src = await _download(session, _poster_url(film))
@@ -602,7 +618,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 
 async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = None,
                            exclude: set[int] | None = None, music: Path | None = None,
-                           today: date | None = None) -> ShortResult:
+                           today: date | None = None, tmdb_key: str = "") -> ShortResult:
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
@@ -610,7 +626,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     if theme_key.startswith("facts"):
         query = theme_key.partition(":")[2].strip()
         try:
-            return await make_facts_short(fetch, work, query, exclude, music)
+            return await make_facts_short(fetch, work, query, exclude, music, tmdb_key)
         except RuntimeError:
             if query:
                 raise
@@ -633,9 +649,13 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     cards = []
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        cover_src = await _download(session, _poster_url(films[0]))
+        posters_tmdb: list[str] = []
         for i, f in enumerate(films, 1):
-            img = await _download(session, _image_url(f))
+            # кадр без надписей с TMDB, если нет — фон/постер Кинопоиска
+            backdrops, posters = await tmdb.images(tmdb_key, f, limit=1)
+            if i == 1:
+                posters_tmdb = posters
+            img = await _download_first(session, backdrops + [_image_url(f)])
             rating, src = _rating(f)
             badge = None if rating else "НОВИНКА"
             if theme.upcoming:
@@ -648,6 +668,8 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
             cards.append({"image": path.name, "caption": caption, "info": info_rows(f)})
+        # обложка: русский постер Кинопоиска, запасной — постер TMDB
+        cover_src = await _download_first(session, [_poster_url(films[0])] + posters_tmdb)
 
     headline = theme.hook.replace(", ", ",\n", 1)
     cover = await asyncio.to_thread(make_cover, cover_src, theme.tag, headline)
