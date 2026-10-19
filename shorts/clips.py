@@ -58,3 +58,59 @@ async def download_clip(url: str, out: Path, start: float = 20.0, length: float 
     if proc.returncode:
         raise RuntimeError(f"ffmpeg: {err.decode(errors='ignore')[-300:]}")
     return out
+
+
+RUTUBE_SEARCH = "https://rutube.ru/api/search/video/"
+TRAILER_WORDS = ("трейлер", "тизер", "trailer", "teaser")
+
+
+def _norm(text: object) -> str:
+    import re
+    text = str(text or "").lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text)).strip()
+
+
+async def rutube_trailer(titles: list[str], year: int | None = None) -> dict | None:
+    """Лучший трейлер на Rutube: название фильма + «трейлер», не платный, не 18+, 30–400 с.
+
+    Возвращает {"url", "duration", "title"} или None. Поиск работает не из всех стран:
+    с серверов в США Rutube отдаёт пустой список, из Европы — нормально.
+    """
+    import aiohttp
+
+    names = [_norm(t) for t in titles if t]
+    if not names:
+        return None
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(RUTUBE_SEARCH, params={"query": f"{titles[0]} трейлер", "format": "json"},
+                               headers={"accept": "application/json"}) as resp:
+            data = await resp.json(content_type=None)
+
+    best, best_score = None, 0.0
+    for v in (data.get("results") or [])[:30]:
+        if not isinstance(v, dict) or v.get("is_paid") or v.get("is_adult") or v.get("is_hidden"):
+            continue
+        title, dur = _norm(v.get("title")), float(v.get("duration") or 0)
+        if not 30 <= dur <= 400 or not any(n in title for n in names):
+            continue
+        if not any(w in title for w in TRAILER_WORDS):
+            continue
+        score = 1.0
+        score += 3 if v.get("is_official") else 0
+        score += 1 if "русск" in title or "дубл" in title else 0
+        score += 1 if year and str(year) in title else 0
+        score -= 2 if any(w in title for w in ("обзор", "реакция", "разбор", "фанатск", "fan")) else 0
+        if score > best_score:
+            best, best_score = v, score
+    if not best:
+        return None
+    url = best.get("video_url") or f"https://rutube.ru/video/{best.get('id')}/"
+    return {"url": str(url), "duration": float(best.get("duration") or 0), "title": str(best.get("title") or "")}
+
+
+def clip_start(duration: float, length: float) -> float:
+    """Откуда резать: ~30% трейлера — после логотипов студий и возрастных плашек."""
+    if duration <= 0:
+        return 20.0
+    return max(8.0, min(duration * 0.3, duration - length - 8))
