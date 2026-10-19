@@ -627,7 +627,11 @@ def _rank_key(item: dict[str, Any]) -> tuple[float, int]:
 async def _run(*cmd: str) -> str:
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent)
-    out, err = await proc.communicate()
+    try:
+        out, err = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.kill()  # сборку прервали по таймауту — не оставляем рендер жрать память
+        raise
     if proc.returncode:
         raise RuntimeError(f"{cmd[0]} failed: {err.decode(errors='ignore')[-800:]}")
     return out.decode(errors="ignore")
