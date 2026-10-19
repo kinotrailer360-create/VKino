@@ -27,6 +27,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     FSInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -160,6 +162,15 @@ MAIN_MENU_LABELS = {
 
 class SearchState(StatesGroup):
     query = State()
+
+
+class ShortsState(StatesGroup):
+    facts_title = State()
+    say_entry = State()
+    voice_text = State()
+    trailer_query = State()
+    feed_url = State()
+    music_file = State()
 
 
 class AdminSourceState(StatesGroup):
@@ -3006,6 +3017,12 @@ def admin_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="📋 Источники",
                     callback_data="admin:list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎬 Шортсы",
+                    callback_data="sh:menu",
                 )
             ],
             [
@@ -6404,8 +6421,11 @@ async def short_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
+    await start_short(message, (message.text or "").partition(" ")[2].strip())
 
-    theme = (message.text or "").partition(" ")[2].strip()
+
+async def start_short(message: Message, theme: str) -> None:
+    """Собрать шортс по теме (как в /short) и прислать в этот чат — для команды и кнопок."""
     if theme.lower().startswith("facts"):
         # /short facts Матрица — название фильма оставляем как есть
         query = theme[5:].strip(" :")
@@ -6455,8 +6475,11 @@ async def feeds_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
+    await feeds_action(message, (message.text or "").partition(" ")[2].strip())
 
-    action, _, arg = (message.text or "").partition(" ")[2].strip().partition(" ")
+
+async def feeds_action(message: Message, text: str) -> None:
+    action, _, arg = text.partition(" ")
     feeds = await news_feeds()
     if action == "add" and arg.startswith(("http://", "https://")):
         if arg not in feeds:
@@ -6496,8 +6519,10 @@ async def say_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
+    await say_action(message, (message.text or "").partition(" ")[2].strip())
 
-    arg = (message.text or "").partition(" ")[2].strip()
+
+async def say_action(message: Message, arg: str) -> None:
     table = dict(await load_pronunciations())
     if arg.lower().startswith("del "):
         word = arg[4:].strip()
@@ -6543,13 +6568,15 @@ async def voice_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
+    await voice_action(message, (message.text or "").partition(" ")[2].strip())
 
-    text = (message.text or "").partition(" ")[2].strip()
+
+async def voice_action(message: Message, text: str) -> None:
     if not text:
         await message.answer("Использование: <code>/voice Премьера в IMAX уже завтра</code>")
         return
     await message.answer("⏳ Озвучиваю…")
-    path = SHORTS_DIR / f"voice_test_{message.from_user.id}.mp3"
+    path = SHORTS_DIR / f"voice_test_{message.chat.id}.mp3"
     try:
         await load_pronunciations()
         spoken = shorts_pronounce.apply(text[:500])
@@ -6628,8 +6655,10 @@ async def trailer_test_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
+    await trailer_action(message, (message.text or "").partition(" ")[2].strip())
 
-    query = (message.text or "").partition(" ")[2].strip()
+
+async def trailer_action(message: Message, query: str) -> None:
     if not query:
         await message.answer(
             "Использование: <code>/trailer Интерстеллар</code>\n"
@@ -6639,7 +6668,7 @@ async def trailer_test_command(
     if query.startswith(("http://", "https://")):
         # проверка конкретной ссылки: качается ли с этого сервера
         await message.answer("⏳ Пробую скачать 4 секунды по ссылке…")
-        out = SHORTS_DIR / f"clip_test_{message.from_user.id}_link.mp4"
+        out = SHORTS_DIR / f"clip_test_{message.chat.id}_link.mp4"
         out.parent.mkdir(parents=True, exist_ok=True)
         try:
             await shorts_download_clip(query, out, start=5.0)
@@ -6666,7 +6695,7 @@ async def trailer_test_command(
     sources, notes = await trailer_sources(item)
     report = [f"🎬 <b>{escape(kp.title(item))}</b>"] + [f"ℹ️ {escape(n)}" for n in notes]
     for name, url in sources:
-        out = SHORTS_DIR / f"clip_test_{message.from_user.id}_{name}.mp4"
+        out = SHORTS_DIR / f"clip_test_{message.chat.id}_{name}.mp4"
         out.parent.mkdir(parents=True, exist_ok=True)
         try:
             await shorts_download_clip(url, out)
@@ -6734,6 +6763,196 @@ async def music_command(
     await message.answer("✅ Музыка для шортсов обновлена — со следующего ролика.")
 
 
+# ---------------------------------------------------------------- панель шортсов (кнопки)
+
+SHORTS_GENRES = ["фантастика", "ужасы", "триллер", "комедия", "боевик", "детектив"]
+
+
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def shorts_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
+        [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+        [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
+        [_btn("🎭 Топ жанра ▸", "sh:genres")],
+        [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("💡 Факты о фильме…", "sh:ask:facts")],
+        [_btn("⚙️ Настройки ▸", "sh:settings")],
+        [_btn("⬅️ В админку", "admin:home")],
+    ])
+
+
+def shorts_genres_menu() -> InlineKeyboardMarkup:
+    rows = [[_btn(g.capitalize(), f"sh:go:genre:{g}") for g in SHORTS_GENRES[k:k + 2]]
+            for k in range(0, len(SHORTS_GENRES), 2)]
+    rows.append([_btn("🎲 Случайный жанр", "sh:go:genre")])
+    rows.append([_btn("⬅️ Назад", "sh:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def shorts_settings_menu() -> InlineKeyboardMarkup:
+    clips_on = await shorts_setting("clips") != "off"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
+        [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
+        [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
+        [_btn("🔊 Проверить голос", "sh:ask:voice")],
+        [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
+        [_btn("🎬 Проверить трейлер", "sh:ask:trailer")],
+        [_btn("⬅️ Назад", "sh:menu")],
+    ])
+
+
+SHORTS_MENU_TEXT = (
+    "🎬 <b>Шортсы KinoMir360</b>\n\n"
+    "Нажми тему — ролик соберётся за 2–5 минут и придёт сюда вместе с обложкой и SEO.\n"
+    "Каждый день в 8:00 по Москве ролик приходит сам."
+)
+
+SHORTS_ASKS = {
+    "facts": (ShortsState.facts_title, "💡 Напиши название фильма или сериала — соберу 5 фактов о нём."),
+    "say": (ShortsState.say_entry,
+            "🗣 Напиши слово и как его читать через «=».\n"
+            "Например: <code>IMAX = Аймакс</code>\n"
+            "Ударение — заглавной гласной: <code>замок = замОк</code>"),
+    "voice": (ShortsState.voice_text, "🔊 Напиши фразу — пришлю, как она прозвучит в озвучке."),
+    "trailer": (ShortsState.trailer_query,
+                "🎬 Напиши название фильма или пришли ссылку на видео (VK, Rutube) — проверю, качается ли трейлер."),
+    "feed": (ShortsState.feed_url, "📡 Пришли ссылку на RSS-ленту новостей кино."),
+    "music": (ShortsState.music_file, "🎵 Пришли аудиофайл (mp3) — он станет фоновой музыкой. Только музыка без АП!"),
+}
+
+
+@router.message(Command("shorts"))
+async def shorts_panel_command(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+    await state.clear()
+    await message.answer(SHORTS_MENU_TEXT, reply_markup=shorts_menu())
+
+
+@router.callback_query(F.data.startswith("sh:"))
+async def shorts_panel(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    message = callback.message
+    data = callback.data or ""
+    await callback.answer()
+
+    async def show(text: str, markup: InlineKeyboardMarkup) -> None:
+        try:
+            await message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await message.answer(text, reply_markup=markup)
+
+    if data == "sh:menu":
+        await state.clear()
+        await show(SHORTS_MENU_TEXT, shorts_menu())
+    elif data == "sh:genres":
+        await show("🎭 <b>Топ какого жанра собрать?</b>", shorts_genres_menu())
+    elif data == "sh:settings":
+        await show("⚙️ <b>Настройки шортсов</b>", await shorts_settings_menu())
+    elif data.startswith("sh:go:"):
+        await start_short(message, data[len("sh:go:"):])
+    elif data.startswith("sh:ask:"):
+        target, prompt = SHORTS_ASKS[data[len("sh:ask:"):]]
+        await state.set_state(target)
+        await message.answer(prompt + "\n\n<i>Передумал — /cancel</i>")
+    elif data == "sh:clips":
+        off = await shorts_setting("clips") == "off"
+        await set_shorts_setting("clips", None if off else "off")
+        await show("⚙️ <b>Настройки шортсов</b>", await shorts_settings_menu())
+    elif data == "sh:music_default":
+        await set_shorts_setting("music_file_id", None)
+        await message.answer("✅ Вернул стандартную музыку для шортсов.")
+    elif data == "sh:say":
+        await say_action(message, "")
+    elif data == "sh:feeds":
+        await feeds_action(message, "")
+
+
+def _typed(message: Message) -> str:
+    """Текст ответа на вопрос панели (команды не перехватываем)."""
+    return (message.text or "").strip()
+
+
+@router.message(ShortsState.facts_title, F.text, ~F.text.startswith("/"))
+async def shorts_facts_title(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await start_short(message, f"facts {_typed(message)}")
+
+
+@router.message(ShortsState.say_entry, F.text, ~F.text.startswith("/"))
+async def shorts_say_entry(message: Message, state: FSMContext) -> None:
+    if "=" not in _typed(message):
+        await message.answer("Нужен формат «слово = как читать», например <code>IMAX = Аймакс</code>.")
+        return
+    await state.clear()
+    await say_action(message, _typed(message))
+
+
+@router.message(ShortsState.voice_text, F.text, ~F.text.startswith("/"))
+async def shorts_voice_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await voice_action(message, _typed(message))
+
+
+@router.message(ShortsState.trailer_query, F.text, ~F.text.startswith("/"))
+async def shorts_trailer_query(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await trailer_action(message, _typed(message))
+
+
+@router.message(ShortsState.feed_url, F.text, ~F.text.startswith("/"))
+async def shorts_feed_url(message: Message, state: FSMContext) -> None:
+    if not _typed(message).startswith(("http://", "https://")):
+        await message.answer("Нужна ссылка, начинается с https://")
+        return
+    await state.clear()
+    await feeds_action(message, f"add {_typed(message)}")
+
+
+@router.message(ShortsState.music_file, F.audio | F.document | F.voice)
+async def shorts_music_file(message: Message, state: FSMContext) -> None:
+    media = message.audio or message.document or message.voice
+    await state.clear()
+    await set_shorts_setting("music_file_id", media.file_id)
+    await message.answer("✅ Музыка для шортсов обновлена — со следующего ролика.")
+
+
+async def set_admin_commands(bot: Bot) -> None:
+    """Подсказки команд в меню «/» — только у админов."""
+    commands = [
+        BotCommand(command="shorts", description="🎬 Панель шортсов (кнопки)"),
+        BotCommand(command="short", description="Собрать шортс: /short [тема]"),
+        BotCommand(command="admin", description="Админка"),
+        BotCommand(command="voice", description="Проверить озвучку фразы"),
+        BotCommand(command="say", description="Произношение слов в озвучке"),
+        BotCommand(command="feeds", description="Ленты новостей кино"),
+        BotCommand(command="trailer", description="Проверить скачивание трейлера"),
+        BotCommand(command="clips", description="Трейлеры в роликах: on/off"),
+        BotCommand(command="music", description="Сменить фоновую музыку"),
+        BotCommand(command="cancel", description="Отменить ввод"),
+    ]
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            logging.exception("Failed to set admin commands for %s", admin_id)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -6769,6 +6988,7 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(router)
+    await set_admin_commands(bot)
 
     await bot.delete_webhook(
         drop_pending_updates=True
