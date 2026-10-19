@@ -957,6 +957,46 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
     return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
 
 
+# ---------------------------------------------------------------- TikTok
+
+# в TikTok нет названия и кликабельных ссылок: короткая подпись с ключевыми словами + 6–10 хэштегов
+TIKTOK_BASE = ["#кино", "#фильмы", "#чтопосмотреть", "#киноманы", "#KinoMir360"]
+TIKTOK_THEME = {
+    "online": ["#новинкикино", "#онлайнкинотеатр"],
+    "cinema": ["#кинопрокат", "#вкино"],
+    "upcoming": ["#скоровкино", "#премьеры"],
+    "series": ["#сериалы", "#новыесериалы"],
+    "genre": ["#топфильмов", "#подборкафильмов"],
+    "facts": ["#фактыокино", "#интересныефакты"],
+    "news": ["#новостикино", "#киноновости"],
+    "birthday": ["#деньрождения", "#актеры"],
+}
+
+
+def _hashtag(text: str) -> str | None:
+    """«Мастер и Маргарита» -> #МастерИМаргарита; слишком длинное — не берём."""
+    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text)
+    tag = "".join(w[:1].upper() + w[1:] for w in words)
+    return f"#{tag}" if 2 < len(tag) <= 24 else None
+
+
+def tiktok_caption(result: ShortResult) -> str:
+    """Подпись для TikTok: заголовок, вопрос для комментариев, призыв подписаться и хэштеги."""
+    seo, key = result.seo, result.theme.key
+    title = re.sub(r"\s*#shorts\s*", " ", seo.get("title", "")).strip()
+    question = next((ln.strip() for ln in seo.get("pinned", "").splitlines() if ln.strip().endswith("👇")),
+                    "Пиши в комментариях 👇")
+    tags = list(TIKTOK_THEME.get(key, []))
+    if key != "news":  # в новостях «фильмы» — это заголовки новостей
+        names = [str(f.get("name") or "") for f in result.films] if key == "birthday" else \
+            [_title(f) for f in result.films][::-1]  # в подборке №1 — последний
+        tags += [t for t in (_hashtag(n) for n in names) if t][:3]
+    tags += TIKTOK_BASE
+    unique = list(dict.fromkeys(tags))[:10]
+    return "\n".join([title, "", question, "Подпишись, чтобы не пропустить новые ролики 🔔",
+                      "Ещё больше — в нашем Telegram KinoMir360 (ссылка в профиле)", "", " ".join(unique)])
+
+
 # ---------------------------------------------------------------- сборка
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],

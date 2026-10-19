@@ -6327,6 +6327,10 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
             chat_id,
             f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>",
         )
+    await bot.send_message(
+        chat_id,
+        f"<b>TikTok — подпись с хэштегами:</b>\n<pre>{escape(shorts_daily.tiktok_caption(result))}</pre>",
+    )
     if seo.get("warning"):
         await bot.send_message(chat_id, escape(seo["warning"]))
 
