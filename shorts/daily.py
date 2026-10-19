@@ -584,8 +584,8 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
     if ai.last_error:
         result.seo["warning"] = f"⚠️ ИИ не пересказал новости: {ai.last_error}"
-    if not voiced:
-        result.seo["warning"] = no_voice_note()
+    if not voiced or tts_error:
+        result.seo["warning"] = no_voice_note(voiced)
     return result
 
 
@@ -634,8 +634,10 @@ async def _duration(path: Path) -> float:
     return float(out.strip())
 
 
-def no_voice_note() -> str:
+def no_voice_note(voiced: bool = False) -> str:
     reason = f" Причина: {tts_error}." if tts_error else ""
+    if voiced:
+        return f"⚠️ Часть фраз без голоса.{reason}"
     return f"⚠️ Голос не синтезировался — ролик собран только с музыкой.{reason} Попробуй собрать ещё раз."
 
 
@@ -684,27 +686,40 @@ async def say_to_file(text: str, path: Path) -> list[float]:
     raise AssertionError("unreachable")
 
 
+def _speakable(text: str) -> str:
+    """Убираем эмодзи и редкие символы — на них сервис голоса может ответить «No audio»."""
+    text = re.sub(rf"[^\w\s.,!?:;«»\"'()%+\-–—{pronounce.STRESS}]", " ", text)
+    text = re.sub(r"\s+([.,!?:;])", r"\1", re.sub(r"\s+", " ", text))
+    return text.strip() or "…"
+
+
 async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     parts: list[Path] = []
     words: list[list[float]] = []
     global tts_error
-    voiced, tts_error = True, None
-    try:
-        for i, text in enumerate(lines):
-            part = work / f"voice_{i}.mp3"
-            words.append(await say_to_file(pronounce.apply(text), part))
-            parts.append(part)
-    except Exception as exc:  # noqa: BLE001 — без голоса ролик всё равно собираем
-        log.warning("shorts: TTS failed, using silence: %r", exc)
-        voiced, tts_error = False, (str(exc) or type(exc).__name__)[:200]
-        parts, words = [], [[] for _ in lines]
-        for i in range(len(lines)):
-            part = work / f"voice_{i}.mp3"
-            sec = 3.5 if 0 < i < len(lines) - 1 else 4.5
+    tts_error = None
+    failed: list[int] = []
+    for i, text in enumerate(lines):
+        part = work / f"voice_{i}.mp3"
+        spoken = _speakable(pronounce.apply(text))
+        try:
+            if len(failed) == i >= 2:
+                raise RuntimeError("пропуск")  # первые фразы не озвучились — сервис недоступен, не ждём впустую
+            words.append(await say_to_file(spoken, part))
+        except Exception as exc:  # noqa: BLE001 — неудачная фраза идёт тишиной, остальные с голосом
+            log.warning("shorts: TTS failed for %r: %r", spoken[:60], exc)
+            failed.append(i)
+            if str(exc) != "пропуск":
+                tts_error = f"{str(exc).rstrip('.') or type(exc).__name__} (фраза: «{text[:40]}…»)"[:250]
+            sec = max(2.5, min(len(text) / 14, 8.0))  # примерно столько звучала бы фраза
             await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-                       "-t", str(sec), str(part))
-            parts.append(part)
+                       "-t", f"{sec:.2f}", str(part))
+            words.append([])
+        parts.append(part)
+    voiced = len(failed) < len(lines)
+    if failed and voiced:
+        tts_error = f"не озвучено фраз: {len(failed)} из {len(lines)} — {tts_error}"
 
     starts, spans, t = [], [], 0.0
     inputs, chains = [], []
@@ -964,8 +979,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         notes.append(f"🎞 Видео из трейлера не вставлено: {video_note}.")
     if ai.last_error:
         notes.append(f"⚠️ ИИ не помог подобрать кадры: {ai.last_error}")
-    if not voiced:
-        notes.append(no_voice_note())
+    if not voiced or tts_error:
+        notes.append(no_voice_note(voiced))
     if notes:
         result.seo["warning"] = "\n".join(notes)
     return result
@@ -1059,6 +1074,6 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                            "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
-    if not voiced:
-        result.seo["warning"] = no_voice_note()
+    if not voiced or tts_error:
+        result.seo["warning"] = no_voice_note(voiced)
     return result
