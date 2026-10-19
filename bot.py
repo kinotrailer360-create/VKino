@@ -46,6 +46,7 @@ from dotenv import load_dotenv
 from shorts import news as shorts_news
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
+from shorts import daily as shorts_daily
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
@@ -6585,13 +6586,16 @@ async def voice_action(message: Message, text: str) -> None:
         spoken = shorts_pronounce.apply(text[:500])
         path.parent.mkdir(parents=True, exist_ok=True)
         await shorts_say_to_file(spoken, path)
+        shorts_daily.piper_unload()
+        engine = shorts_daily.last_engine
+        note = "" if engine == "edge" else f"\n\n⚠️ Основной голос не ответил — это запасной голос: {escape(engine[:300])}"
         await message.answer_audio(
             FSInputFile(path, filename="voice.mp3"),
-            caption=f"🗣 {escape(spoken[:900])}",
+            caption=f"🗣 {escape(spoken[:800])}{note}",
         )
     except Exception as exc:
         logging.exception("Voice test failed")
-        reason = "сервис голоса не ответил за 40 секунд" if isinstance(exc, asyncio.TimeoutError) else str(exc)
+        reason = "сервис голоса не ответил вовремя" if isinstance(exc, asyncio.TimeoutError) else str(exc)
         await message.answer(
             f"❌ Не получилось озвучить: <code>{escape(type(exc).__name__)}: {escape(reason[:300])}</code>"
         )
