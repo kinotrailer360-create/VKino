@@ -6630,7 +6630,27 @@ async def trailer_test_command(
 
     query = (message.text or "").partition(" ")[2].strip()
     if not query:
-        await message.answer("Использование: <code>/trailer Интерстеллар</code>")
+        await message.answer(
+            "Использование: <code>/trailer Интерстеллар</code>\n"
+            "или ссылка на видео (VK, Rutube, YouTube…): <code>/trailer https://vkvideo.ru/video-…</code>"
+        )
+        return
+    if query.startswith(("http://", "https://")):
+        # проверка конкретной ссылки: качается ли с этого сервера
+        await message.answer("⏳ Пробую скачать 4 секунды по ссылке…")
+        out = SHORTS_DIR / f"clip_test_{message.from_user.id}_link.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await shorts_download_clip(query, out, start=5.0)
+            await message.answer_video(FSInputFile(out), caption="✅ Скачалось с этого сервера")
+        except Exception as exc:
+            logging.exception("Clip link test failed for %s", query)
+            await message.answer(
+                f"❌ <code>{escape(type(exc).__name__)}: {escape(str(exc)[:300])}</code>",
+                disable_web_page_preview=True,
+            )
+        finally:
+            out.unlink(missing_ok=True)
         return
     await message.answer("⏳ Ищу трейлер и пробую скачать 4 секунды…")
     try:
