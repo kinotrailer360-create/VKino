@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -44,8 +45,8 @@ def _version(name: str) -> tuple[int, ...]:
     return tuple(int(n) for n in re.findall(r"\d+", name))  # 3.10 новее 3.9
 
 
-async def _newest_flash(session: aiohttp.ClientSession, key: str) -> str | None:
-    """Самая свежая стабильная модель Flash, доступная этому ключу (если нашу модель отключили)."""
+async def _flash_models(session: aiohttp.ClientSession, key: str, lite: bool = False) -> list[str]:
+    """Стабильные модели Flash, доступные этому ключу, новейшие первыми (lite=True — и облегчённые)."""
     async with session.get(MODELS, params={"pageSize": 200}, headers={"x-goog-api-key": key}) as resp:
         data = await resp.json(content_type=None)
     names = [
@@ -53,9 +54,26 @@ async def _newest_flash(session: aiohttp.ClientSession, key: str) -> str | None:
         for m in (data.get("models") or [] if isinstance(data, dict) else [])
         if "generateContent" in (m.get("supportedGenerationMethods") or [])
     ]
-    skip = ("lite", "image", "tts", "live", "audio", "preview", "exp", "thinking", "latest")
+    skip = ("image", "tts", "live", "audio", "preview", "exp", "thinking", "latest") + (() if lite else ("lite",))
     flash = [n for n in names if n.startswith("gemini-") and "flash" in n and not any(w in n for w in skip)]
-    return max(flash, key=_version) if flash else None
+    # при равной версии полная модель раньше облегчённой
+    return sorted(flash, key=lambda n: (_version(n), "lite" not in n), reverse=True)
+
+
+BUSY = {429, 500, 503}  # перегрузка у Google — обычно проходит за секунды
+RETRY_DELAYS = (4, 10)
+
+
+async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any]) -> tuple[int, Any]:
+    """Запрос к модели; при перегрузке ждём и повторяем."""
+    for delay in (*RETRY_DELAYS, None):
+        async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
+            status, data = resp.status, await resp.json(content_type=None)
+        if status not in BUSY or delay is None:
+            return status, data
+        log.info("shorts: Gemini %s busy (HTTP %s), retry in %ss", model, status, delay)
+        await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 async def _ask(key: str, parts: list[dict[str, Any]]) -> Any:
@@ -64,23 +82,27 @@ async def _ask(key: str, parts: list[dict[str, Any]]) -> Any:
         "contents": [{"parts": parts}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(2):
-            async with session.post(API.format(model=MODEL), json=body, headers={"x-goog-api-key": key}) as resp:
-                data = await resp.json(content_type=None)
-                status = resp.status
-            if status == 404 and attempt == 0:
-                # модель сняли с поддержки — берём новейшую Flash из списка доступных и повторяем
-                newer = await _newest_flash(session, key)
-                if newer and newer != MODEL:
-                    log.warning("shorts: Gemini model %s unavailable, switching to %s", MODEL, newer)
-                    MODEL = newer
-                    continue
-            break
+        model = MODEL
+        status, data = await _post(session, key, model, body)
+        if status == 404:
+            # модель сняли с поддержки — переходим на новейшую Flash насовсем
+            newer = next(iter(await _flash_models(session, key)), None)
+            if newer and newer != MODEL:
+                log.warning("shorts: Gemini model %s unavailable, switching to %s", MODEL, newer)
+                MODEL = model = newer
+                status, data = await _post(session, key, model, body)
+        if status in BUSY:
+            # модель перегружена — разово пробуем другую Flash (в т.ч. облегчённую)
+            backup = next((m for m in await _flash_models(session, key, lite=True) if m != model), None)
+            if backup:
+                log.warning("shorts: Gemini %s overloaded, trying %s", model, backup)
+                model = backup
+                status, data = await _post(session, key, model, body)
         if status != 200:
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
-            raise AIError(f"Gemini HTTP {status} ({MODEL}): {str(msg)[:200]}")
+            raise AIError(f"Gemini HTTP {status} ({model}): {str(msg)[:200]}")
     try:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(text)

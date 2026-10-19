@@ -585,7 +585,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     if gemini_key and ai.last_error:
         result.seo["warning"] = f"⚠️ Gemini не пересказал новости: {ai.last_error}"
     if not voiced:
-        result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
+        result.seo["warning"] = no_voice_note()
     return result
 
 
@@ -634,6 +634,11 @@ async def _duration(path: Path) -> float:
     return float(out.strip())
 
 
+def no_voice_note() -> str:
+    reason = f" Причина: {tts_error}." if tts_error else ""
+    return f"⚠️ Голос не синтезировался — ролик собран только с музыкой.{reason} Попробуй собрать ещё раз."
+
+
 TTS_TIMEOUT = 40  # сек на фразу: без лимита запрос к сервису голоса может висеть бесконечно
 
 
@@ -651,8 +656,12 @@ async def _tts(text: str, path: Path) -> list[float]:
     return words
 
 
-async def say_to_file(text: str, path: Path) -> list[float]:
-    """Озвучить фразу в mp3 (время слов в ответе). Не принял знак ударения — повторяем без него."""
+TTS_RETRY_DELAYS = (3, 8)  # сервис голоса иногда сбоит на секунды — повторяем, а не сдаёмся
+tts_error: str | None = None  # причина, если голос так и не получился — показываем админу
+
+
+async def _say_once(text: str, path: Path) -> list[float]:
+    """Одна попытка; не принял знак ударения — сразу повторяем без него."""
     try:
         return await asyncio.wait_for(_tts(text, path), timeout=TTS_TIMEOUT)
     except Exception:
@@ -662,19 +671,33 @@ async def say_to_file(text: str, path: Path) -> list[float]:
         return await asyncio.wait_for(_tts(text.replace(pronounce.STRESS, ""), path), timeout=TTS_TIMEOUT)
 
 
+async def say_to_file(text: str, path: Path) -> list[float]:
+    """Озвучить фразу в mp3 (время слов в ответе), с повторами при сбое сервиса."""
+    for delay in (*TTS_RETRY_DELAYS, None):
+        try:
+            return await _say_once(text, path)
+        except Exception as exc:  # noqa: BLE001
+            if delay is None:
+                raise
+            log.warning("shorts: TTS attempt failed (%r), retry in %ss", exc, delay)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     parts: list[Path] = []
     words: list[list[float]] = []
-    voiced = True
+    global tts_error
+    voiced, tts_error = True, None
     try:
         for i, text in enumerate(lines):
             part = work / f"voice_{i}.mp3"
             words.append(await say_to_file(pronounce.apply(text), part))
             parts.append(part)
     except Exception as exc:  # noqa: BLE001 — без голоса ролик всё равно собираем
-        log.warning("shorts: TTS failed, using silence: %s", exc)
-        voiced = False
+        log.warning("shorts: TTS failed, using silence: %r", exc)
+        voiced, tts_error = False, (str(exc) or type(exc).__name__)[:200]
         parts, words = [], [[] for _ in lines]
         for i in range(len(lines)):
             part = work / f"voice_{i}.mp3"
@@ -942,7 +965,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     if gemini_key and ai.last_error:
         notes.append(f"⚠️ Gemini не помог подобрать кадры: {ai.last_error}")
     if not voiced:
-        notes.append("⚠️ Голос не синтезировался — ролик собран только с музыкой.")
+        notes.append(no_voice_note())
     if notes:
         result.seo["warning"] = "\n".join(notes)
     return result
@@ -1037,5 +1060,5 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
     if not voiced:
-        result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
+        result.seo["warning"] = no_voice_note()
     return result
