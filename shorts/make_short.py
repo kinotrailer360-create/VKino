@@ -149,31 +149,38 @@ class IntroSlide(Slide):
         return zoom(self.base, 1.0 + 0.07 * t / max(dur, 1), W, H)
 
 
-class ClipReader:
-    """Кадры видео трейлера по одному (ffmpeg -> raw RGB), по кругу, подогнанные под карточку."""
+def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
+    """Кадры трейлера в JPEG на диск заранее, до запуска кодировщика.
 
-    def __init__(self, path: Path, w: int, h: int):
-        self.w, self.h = w, h
-        self.size = w * h * 3
-        self.proc = subprocess.Popen(
-            # один поток декодера и фильтров — иначе ffmpeg держит в памяти кадры на каждый поток
-            ["ffmpeg", "-v", "error", "-threads", "1", "-filter_threads", "1",
-             "-stream_loop", "-1", "-i", str(path), "-an",
-             "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS}",
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    Раньше кадры шли из ffmpeg прямо во время монтажа: два живых декодера (текущий и прошлый слайд)
+    держали ~150 МБ, и вместе с ботом сервер на 0,5 ГБ падал по памяти.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-threads", "1", "-filter_threads", "1", "-i", str(path), "-an",
+         "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS}",
+         "-q:v", "3", str(out_dir / "f%04d.jpg")],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out_dir
+
+
+class ClipReader:
+    """Кадры трейлера по одному из заранее нарезанных JPEG, по кругу."""
+
+    def __init__(self, frames_dir: Path):
+        self.frames = sorted(frames_dir.glob("f*.jpg"))
+        self.k = 0
         self.last: Image.Image | None = None
 
     def next(self) -> Image.Image | None:
-        data = self.proc.stdout.read(self.size) if self.proc.stdout else b""
-        if len(data) == self.size:
-            self.last = Image.frombytes("RGB", (self.w, self.h), data)
-        return self.last  # видео кончилось/сломалось — держим последний кадр
+        if self.frames:
+            with Image.open(self.frames[self.k % len(self.frames)]) as im:
+                self.last = im.convert("RGB")
+            self.k += 1
+        return self.last  # кадров нет — держим последний (или None — тогда статичная карточка)
 
     def close(self):
-        if self.proc.poll() is None:
-            self.proc.kill()
-        self.proc.wait()
+        self.frames = []
 
 
 class CardSlide(Slide):
@@ -183,9 +190,9 @@ class CardSlide(Slide):
         self.card = card
         # фрагмент трейлера под оформлением карточки (рейтинг, №, название)
         self.clip = self.card_overlay = None
-        if clip and overlay and Path(clip).exists() and Path(overlay).exists():
+        if clip and overlay and Path(clip).is_dir() and Path(overlay).exists():
             self.card_overlay = Image.open(overlay).convert("RGBA").resize(card.size)
-            self.clip = ClipReader(Path(clip), card.width, card.height)
+            self.clip = ClipReader(Path(clip))
         bg = cover(card, int(W * 1.1), int(H * 1.1)).filter(ImageFilter.GaussianBlur(40))
         self.bg = Image.blend(bg, Image.new("RGB", bg.size), 0.55)
         self.card_y = 380
@@ -393,11 +400,18 @@ def render(cfg: dict, base: Path) -> Path:
     logo = load_logo(p(cfg["logo"]))
 
     cards = cfg["cards"]
+    # кадры трейлеров — на диск заранее, пока кодировщик ещё не запущен (так меньше пик памяти)
+    clip_dirs: dict[int, Path] = {}
+    for i, c in enumerate(cards):
+        if c.get("clip") and p(c["clip"]).exists():
+            with Image.open(p(c["image"])) as im:
+                ch = round(im.height * W / im.width)
+            clip_dirs[i] = extract_clip(p(c["clip"]), W, ch, p(c["clip"]).with_suffix(".frames"))
     # слайды создаются по мере надобности и выгружаются после показа — экономим память
     makers = [lambda: IntroSlide(cfg, p(cfg["intro"]))]
     makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"),
                                           c.get("karaoke"),
-                                          p(c["clip"]) if c.get("clip") else None,
+                                          clip_dirs.get(i),
                                           p(c["overlay"]) if c.get("overlay") else None)
                for i, c in enumerate(cards)]
     makers.append(lambda: OutroSlide(cfg, p(cfg["intro"]), logo))
