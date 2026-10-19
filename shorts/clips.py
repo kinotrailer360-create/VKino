@@ -114,3 +114,56 @@ def clip_start(duration: float, length: float) -> float:
     if duration <= 0:
         return 20.0
     return max(8.0, min(duration * 0.3, duration - length - 8))
+
+
+async def download_full(url: str, out_dir: Path, timeout: float = 150) -> Path:
+    """Скачать трейлер целиком (видео без звука, до 720p, до 80 МБ) в out_dir; путь к файлу."""
+
+    def run() -> Path:
+        import yt_dlp
+
+        opts = {
+            "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
+            "format": CLIP_FORMAT,
+            "outtmpl": str(out_dir / "trailer_full.%(ext)s"),
+            "max_filesize": 80 * 1024 * 1024,
+            "socket_timeout": 20, "retries": 1,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return Path(ydl.prepare_filename(info))
+
+    return await asyncio.wait_for(asyncio.to_thread(run), timeout=timeout)
+
+
+async def sample_frames(src: Path, out_dir: Path, every: float = 4.0, duration: float = 0.0,
+                        limit: int = 40) -> list[tuple[float, Path]]:
+    """Кадры трейлера каждые every секунд (без начала с логотипами и финальных титров) для выбора ИИ."""
+    head = max(6.0, duration * 0.08) if duration else 6.0
+    tail = duration * 0.9 if duration else 0.0
+    if duration and (tail - head) / every > limit:
+        every = (tail - head) / limit
+    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{head:.2f}"]
+    if tail:
+        cmd += ["-to", f"{tail:.2f}"]
+    cmd += ["-i", str(src), "-vf", f"fps=1/{every:.3f},scale=448:-2", "-q:v", "4",
+            str(out_dir / "frame_%03d.jpg")]
+    proc = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode:
+        raise RuntimeError(f"ffmpeg frames: {err.decode(errors='ignore')[-200:]}")
+    frames = sorted(out_dir.glob("frame_*.jpg"))[:limit]
+    # кадр k снят примерно на head + k*every (+ полшага от фильтра fps)
+    return [(head + k * every + every / 2, f) for k, f in enumerate(frames)]
+
+
+async def cut_clip(src: Path, out: Path, start: float, length: float) -> Path:
+    """Вырезать кусок из уже скачанного видео (mp4 h264, без звука, 720p)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-v", "error", "-y", "-ss", f"{max(start, 0):.2f}", "-i", str(src), "-t", str(length), "-an",
+        "-vf", "scale=-2:720", "-c:v", "libx264", "-preset", "veryfast", "-threads", "1", str(out),
+        stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode:
+        raise RuntimeError(f"ffmpeg cut: {err.decode(errors='ignore')[-200:]}")
+    return out
