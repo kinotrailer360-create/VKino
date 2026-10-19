@@ -80,3 +80,25 @@ def pick_varied(urls: list[str], n: int) -> list[str]:
     """Для фактов: n разных кадров из лучших, в случайном порядке."""
     top = urls[: max(n * 2, n)]
     return random.sample(top, min(n, len(top)))
+
+
+async def people(key: str, item: dict[str, Any]) -> dict[str, str]:
+    """Фото актёров и режиссёров фильма с TMDB: {английское имя в нижнем регистре: url портрета}."""
+    if not key:
+        return {}
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            found = await _resolve(session, key, item)
+            if not found:
+                return {}
+            kind, tmdb_id = found
+            data = await _get(session, key, f"/{kind}/{tmdb_id}/credits")
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: TMDB credits for %s failed: %s", item.get("id"), exc)
+        return {}
+    out: dict[str, str] = {}
+    for person in (data.get("cast") or [])[:20] + (data.get("crew") or []):
+        if person.get("profile_path") and person.get("name"):
+            out.setdefault(str(person["name"]).lower(), f"{IMG}h632{person['profile_path']}")
+    return out
