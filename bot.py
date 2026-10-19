@@ -64,6 +64,7 @@ VIDEO_PROVIDER_API_TOKEN = os.getenv(
 ).strip()
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 RUTUBE_ENABLED = os.getenv(
@@ -6331,6 +6332,7 @@ async def run_short(
                 TMDB_API_KEY,
                 await news_feeds(),
                 manual=theme_key is not None,
+                gemini_key=GEMINI_API_KEY,
             )
             await db().executemany(
                 """

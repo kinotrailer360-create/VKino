@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import news, tmdb, wiki
+from . import ai, news, tmdb, wiki
 from .cards import make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -429,7 +429,7 @@ def _placeholder() -> Image.Image:
 
 async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: set[int] | None = None,
                           music: Path | None = None, tmdb_key: str = "",
-                          today: date | None = None) -> ShortResult:
+                          today: date | None = None, gemini_key: str = "") -> ShortResult:
     today = today or date.today()
     items = await news.latest_news(feeds, exclude or set())
     # сначала новости с картинкой (кадр фильма или фото из ленты), потом остальные
@@ -476,7 +476,11 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         title = item.title if item.title[-1] in ".!?…" else item.title + "."
         return f"{title} {item.lead}".strip()
 
-    lines = ([f"Главные новости кино на {day}!"] + [say(it) for it, _ in chosen]
+    # Gemini пересказывает своими словами; без ИИ — заголовок и лид как есть
+    ai.last_error = None
+    retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
+    spoken = retold or [say(it) for it, _ in chosen]
+    lines = ([f"Главные новости кино на {day}!"] + spoken
              + ["Какая новость удивила больше всего? Пиши в комментариях "
                 "и подписывайся на КиноМир триста шестьдесят!"])
     voiced = await _render(work, cover_path, cards, lines, "НОВОСТИ", "НОВОСТИ КИНО",
@@ -503,6 +507,8 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     theme = Theme("news", "НОВОСТИ", "НОВОСТИ КИНО", f"Главные новости кино на {day}", title, [])
     result = ShortResult(work / "short.mp4", cover_path, theme,
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
+    if gemini_key and ai.last_error:
+        result.seo["warning"] = f"⚠️ Gemini не пересказал новости: {ai.last_error}"
     if not voiced:
         result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
     return result
@@ -683,8 +689,38 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     return voiced
 
 
+def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
+    """Актёр или режиссёр, чья фамилия есть в тексте (с учётом падежей: Хиддлстона, Нолану)."""
+    for p in (item.get("persons") or [])[:25]:
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        if str(p.get("enProfession") or "") not in ("actor", "director"):
+            continue
+        surname = str(p["name"]).split()[-1]
+        if len(surname) < 4:
+            continue
+        stem = surname[:-1] if len(surname) >= 5 and surname[-1].lower() in "аеёиоуыэюяйь" else surname
+        if re.search(rf"(?<!\w){re.escape(stem)}\w{{0,3}}(?!\w)", text, re.IGNORECASE):
+            return p
+    return None
+
+
+def _portrait(img: Image.Image, w: int = 1080, h: int = 780) -> Image.Image:
+    """Портрет целиком по центру на размытом фоне из него же (иначе обрезка срежет лицо)."""
+    from PIL import ImageFilter
+    s = max(w / img.width, h / img.height)
+    bg = img.resize((round(img.width * s), round(img.height * s)))
+    bg = bg.crop(((bg.width - w) // 2, (bg.height - h) // 2, (bg.width - w) // 2 + w, (bg.height - h) // 2 + h))
+    bg = Image.blend(bg.filter(ImageFilter.GaussianBlur(30)), Image.new("RGB", (w, h)), 0.45)
+    fg = img.copy()
+    fg.thumbnail((w, h - 40))
+    bg.paste(fg, ((w - fg.width) // 2, (h - fg.height) // 2 + 20))
+    return bg
+
+
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
-                           music: Path | None = None, tmdb_key: str = "") -> ShortResult:
+                           music: Path | None = None, tmdb_key: str = "",
+                           gemini_key: str = "") -> ShortResult:
     film, facts = await pick_fact_film(fetch, query, exclude or set())
     # награды из Викиданных — первым фактом
     award_fact = wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -695,25 +731,52 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     theme = Theme("facts", "ФАКТЫ", t.upper(), hook, hook, [])
 
     cards = []
-    # кадры без надписей с TMDB, затем кадры/фон/постер с Кинопоиска
+    # пул кадров: без надписей с TMDB, затем кадры/фон/постер с Кинопоиска
     backdrops, _ = await tmdb.images(tmdb_key, film, limit=12)
-    urls = tmdb.pick_varied(backdrops, n) + await _stills(fetch, film)
+    urls = tmdb.pick_varied(backdrops, 12) + await _stills(fetch, film)
+    photos = await tmdb.people(tmdb_key, film)
+    pool_size = 12 if gemini_key else n
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         cover_src = await _download(session, _poster_url(film))
         images: list[Image.Image] = []
         for url in urls:
-            if len(images) >= n:
+            if len(images) >= pool_size:
                 break
             try:
                 images.append(await _download(session, url))
             except Exception:  # noqa: BLE001
                 continue
+        # факт про актёра/режиссёра — его фото (TMDB, запасной — Кинопоиск)
+        portraits: dict[int, Image.Image] = {}
+        for i, fact in enumerate(facts):
+            person = _mentioned_person(fact, film)
+            if not person:
+                continue
+            urls_p = [photos.get(str(person.get("enName") or "").lower()), person.get("photo")]
+            try:
+                portraits[i] = _portrait(await _download_first(session, urls_p))
+            except Exception:  # noqa: BLE001
+                continue
     if not images:
         raise RuntimeError(f"Не скачались картинки для «{t}»")
+
+    # остальные факты — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
+    rest = [i for i in range(n) if i not in portraits]
+    ai.last_error = None
+    choices = await ai.match_images(gemini_key, [facts[i] for i in rest], images) if rest else None
+    used: set[int] = set()
+    picked: dict[int, Image.Image] = dict(portraits)
+    for k, i in enumerate(rest):
+        c = choices[k] if choices else -1
+        if c < 0 or c in used:
+            c = next((j for j in range(len(images)) if j not in used), k % len(images))
+        used.add(c)
+        picked[i] = images[c]
+
     for i, fact in enumerate(facts, 1):
         # название уже в заголовке слайда — на карточке не повторяем
-        card = await asyncio.to_thread(make_card, images[(i - 1) % len(images)], "", i, n,
+        card = await asyncio.to_thread(make_card, picked[i - 1], "", i, n,
                                        None, "IMDb", None, f"ФАКТ №{i}", 780)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
@@ -729,6 +792,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     voiced = await _render(work, cover_path, cards, lines, "ФАКТЫ", t.upper(),
                            "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_facts_seo(film, facts))
+    if gemini_key and ai.last_error:
+        result.seo["warning"] = f"⚠️ Gemini не помог подобрать кадры: {ai.last_error}"
     if not voiced:
         result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
     return result
@@ -737,7 +802,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = None,
                            exclude: set[int] | None = None, music: Path | None = None,
                            today: date | None = None, tmdb_key: str = "",
-                           news_feeds: list[str] | None = None, manual: bool = False) -> ShortResult:
+                           news_feeds: list[str] | None = None, manual: bool = False,
+                           gemini_key: str = "") -> ShortResult:
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
@@ -745,7 +811,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     if theme_key == "news":
         try:
             return await make_news_short(fetch, work, news_feeds or news.DEFAULT_FEEDS, exclude, music,
-                                         tmdb_key, today)
+                                         tmdb_key, today, gemini_key)
         except RuntimeError:
             if manual:
                 raise
@@ -754,7 +820,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     if theme_key.startswith("facts"):
         query = theme_key.partition(":")[2].strip()
         try:
-            return await make_facts_short(fetch, work, query, exclude, music, tmdb_key)
+            return await make_facts_short(fetch, work, query, exclude, music, tmdb_key, gemini_key)
         except RuntimeError:
             if query:
                 raise
