@@ -6568,34 +6568,53 @@ async def voice_command(
         path.unlink(missing_ok=True)
 
 
-async def trailer_sources(item: dict[str, Any]) -> list[tuple[str, str]]:
-    """Откуда можно взять фрагмент трейлера: [(название источника, url)]."""
+TRAILER_WORDS = ("трейлер", "тизер", "trailer", "teaser")
+
+
+async def trailer_sources(item: dict[str, Any]) -> tuple[list[tuple[str, str]], list[str]]:
+    """Откуда можно взять фрагмент трейлера: ([(источник, url)], заметки для отчёта)."""
     sources: list[tuple[str, str]] = []
+    notes: list[str] = []
     try:
         trailer = await resolve_trailer(int(item["id"]))
         if trailer and trailer.get("youtube_id"):
             sources.append(("YouTube", f"https://www.youtube.com/watch?v={trailer['youtube_id']}"))
         elif trailer and trailer.get("direct_url"):
             sources.append(("Прямая ссылка", str(trailer["direct_url"])))
-    except Exception:
+        else:
+            notes.append("YouTube: официальный трейлер не найден")
+    except Exception as exc:
         logging.exception("Trailer lookup failed")
+        notes.append(f"YouTube: ошибка поиска ({type(exc).__name__})")
+
+    title = kp.title(item)
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
                 RUTUBE_SEARCH_API,
-                params={"query": f"{kp.title(item)} трейлер", "format": "json"},
+                params={"query": f"{title} трейлер", "format": "json"},
                 headers={"accept": "application/json"},
             ) as resp:
+                status = resp.status
                 data = await resp.json(content_type=None)
-        for video in (data.get("results") or [])[:10]:
-            vid = _rutube_video_id(video) if isinstance(video, dict) else None
-            if vid and "трейлер" in str(video.get("title") or "").lower():
-                sources.append(("Rutube", f"https://rutube.ru/video/{vid}/"))
-                break
-    except Exception:
+        results = [v for v in (data.get("results") or []) if isinstance(v, dict)][:15]
+        # сначала ролики со словом «трейлер/тизер», потом любые с названием фильма
+        want = _rutube_norm(title)
+        picked = next((v for v in results if any(w in str(v.get("title") or "").lower() for w in TRAILER_WORDS)
+                       and _rutube_video_id(v)), None)
+        picked = picked or next((v for v in results if want and want in _rutube_norm(v.get("title"))
+                                 and _rutube_video_id(v)), None)
+        if picked:
+            sources.append(("Rutube", f"https://rutube.ru/video/{_rutube_video_id(picked)}/"))
+            notes.append(f"Rutube: нашёлся «{str(picked.get('title') or '')[:70]}»")
+        else:
+            top = "; ".join(str(v.get("title") or "")[:40] for v in results[:3]) or "пусто"
+            notes.append(f"Rutube: HTTP {status}, результатов {len(results)}, подходящих нет ({top})")
+    except Exception as exc:
         logging.exception("Rutube trailer search failed")
-    return sources
+        notes.append(f"Rutube: поиск не удался ({type(exc).__name__}: {str(exc)[:120]})")
+    return sources, notes
 
 
 @router.message(Command("trailer"))
@@ -6623,12 +6642,8 @@ async def trailer_test_command(
         await message.answer("Фильм не найден.")
         return
     item = found[0]
-    sources = await trailer_sources(item)
-    if not sources:
-        await message.answer(f"Трейлер для «{escape(kp.title(item))}» не нашёлся ни на YouTube, ни на Rutube.")
-        return
-
-    report = [f"🎬 <b>{escape(kp.title(item))}</b>"]
+    sources, notes = await trailer_sources(item)
+    report = [f"🎬 <b>{escape(kp.title(item))}</b>"] + [f"ℹ️ {escape(n)}" for n in notes]
     for name, url in sources:
         out = SHORTS_DIR / f"clip_test_{message.from_user.id}_{name}.mp4"
         out.parent.mkdir(parents=True, exist_ok=True)
