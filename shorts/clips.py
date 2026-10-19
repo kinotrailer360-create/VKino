@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 log = logging.getLogger("shorts")
@@ -11,41 +12,42 @@ log = logging.getLogger("shorts")
 CLIP_FORMAT = "bv*[height<=720][ext=mp4]/bv*[height<=720]/b[height<=720]/b"
 
 
+async def _yt_dlp(url: str, outtmpl: str, extra: list[str], timeout: float) -> Path:
+    """yt-dlp отдельным процессом: по таймауту его можно убить, а память освобождается сразу.
+
+    В потоке бота он оставался висеть после таймаута и держал память — Railway падал по нехватке.
+    """
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings", "--no-progress",
+           "-f", CLIP_FORMAT, "-o", outtmpl, "--socket-timeout", "20", "--retries", "1",
+           "--print", "after_move:filepath", *extra, url]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        await proc.wait()
+        raise
+    lines = [ln for ln in out.decode(errors="ignore").splitlines() if ln.strip()]
+    if proc.returncode or not lines:
+        raise RuntimeError(f"yt-dlp: {err.decode(errors='ignore').strip()[-300:] or 'нет файла'}")
+    return Path(lines[-1].strip())
+
+
 async def download_clip(url: str, out: Path, start: float = 20.0, length: float = 4.0,
                         timeout: float = 120) -> Path:
     """Скачать отрезок [start, start+length] видео в out (mp4, 720p, без звука)."""
-
-    def run(partial: bool) -> Path:
-        import yt_dlp
-
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "noplaylist": True,
-            "format": CLIP_FORMAT,
-            "outtmpl": str(out.with_name(out.stem + "_raw.%(ext)s")),
-            "socket_timeout": 20,
-            "retries": 1,
-        }
-        if partial:
-            opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start, start + length)])
-            opts["force_keyframes_at_cuts"] = True
-        else:
-            opts["max_filesize"] = 80 * 1024 * 1024  # трейлер целиком — только если не огромный
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return Path(ydl.prepare_filename(info))
-
+    tmpl = str(out.with_name(out.stem + "_raw.%(ext)s"))
     seek = 0.0
     try:
-        raw = await asyncio.wait_for(asyncio.to_thread(run, True), timeout=timeout)
-    except Exception as exc:
+        raw = await _yt_dlp(url, tmpl, ["--download-sections", f"*{start:.2f}-{start + length:.2f}",
+                                        "--force-keyframes-at-cuts"], timeout)
+    except RuntimeError as exc:
         if "partially downloaded" not in str(exc):
             raise
         # источник не умеет отдавать кусок — качаем целиком и режем сами
         log.info("shorts: partial download unsupported for %s, downloading whole", url)
-        raw = await asyncio.wait_for(asyncio.to_thread(run, False), timeout=timeout)
+        raw = await _yt_dlp(url, tmpl, ["--max-filesize", "80M"], timeout)
         seek = start
 
     # единый вид: mp4 h264, без звука, ровно length секунд
@@ -118,22 +120,7 @@ def clip_start(duration: float, length: float) -> float:
 
 async def download_full(url: str, out_dir: Path, timeout: float = 150) -> Path:
     """Скачать трейлер целиком (видео без звука, до 720p, до 80 МБ) в out_dir; путь к файлу."""
-
-    def run() -> Path:
-        import yt_dlp
-
-        opts = {
-            "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
-            "format": CLIP_FORMAT,
-            "outtmpl": str(out_dir / "trailer_full.%(ext)s"),
-            "max_filesize": 80 * 1024 * 1024,
-            "socket_timeout": 20, "retries": 1,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return Path(ydl.prepare_filename(info))
-
-    return await asyncio.wait_for(asyncio.to_thread(run), timeout=timeout)
+    return await _yt_dlp(url, str(out_dir / "trailer_full.%(ext)s"), ["--max-filesize", "80M"], timeout)
 
 
 async def sample_frames(src: Path, out_dir: Path, every: float = 4.0, duration: float = 0.0,

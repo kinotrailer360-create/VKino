@@ -6649,7 +6649,6 @@ async def voice_action(message: Message, text: str) -> None:
         spoken = shorts_pronounce.apply(text[:500])
         path.parent.mkdir(parents=True, exist_ok=True)
         await shorts_say_to_file(spoken, path)
-        shorts_daily.piper_unload()
         engine = shorts_daily.last_engine
         note = "" if engine == "edge" else f"\n\n⚠️ Основной голос не ответил — это запасной голос: {escape(engine[:300])}"
         await message.answer_audio(
