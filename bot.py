@@ -6253,6 +6253,7 @@ SHORT_THEMES = {
     "news": "новости кино",
     "birthday": "день рождения звезды",
 }
+SHORTS_TIMEOUT = 15 * 60  # сборка дольше — что-то зависло, прерываем и сообщаем
 shorts_lock = asyncio.Lock()
 shorts_jobs: set[asyncio.Task] = set()
 
@@ -6358,7 +6359,9 @@ async def run_short(
                     logging.exception("Shorts: custom music download failed")
                     music = None
 
-            result = await make_daily_short(
+            # если бот перезапустится посреди сборки (обновление на Railway), после старта скажем об этом
+            await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": theme_key or ""}))
+            result = await asyncio.wait_for(make_daily_short(
                 kp._get,
                 work,
                 theme_key,
@@ -6370,7 +6373,7 @@ async def run_short(
                 manual=theme_key is not None,
                 gemini_key=GEMINI_API_KEY,
                 trailer_clips=await shorts_setting("clips") != "off",
-            )
+            ), timeout=SHORTS_TIMEOUT)
             await db().executemany(
                 """
                 INSERT INTO shorts_history (movie_id) VALUES ($1)
@@ -6380,13 +6383,39 @@ async def run_short(
             )
             for chat_id in chat_ids:
                 await send_short(bot, chat_id, result)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"сборка шла дольше {SHORTS_TIMEOUT // 60} минут и была прервана — "
+                "похоже, завис внешний сервис. Попробуй ещё раз."
+            ) from None
         finally:
+            await set_shorts_setting("running", None)
             shutil.rmtree(work, ignore_errors=True)
+
+
+async def report_interrupted_short(bot: Bot) -> None:
+    """Сборка оборвалась перезапуском бота — сообщаем, чтобы не ждали вечно."""
+    try:
+        raw = await shorts_setting("running")
+        if not raw:
+            return
+        await set_shorts_setting("running", None)
+        info = json.loads(raw)
+        theme = SHORT_THEMES.get(info.get("theme") or "", info.get("theme") or "тема дня")
+        for chat_id in info.get("chats") or sorted(ADMIN_IDS):
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Сборка шортса ({escape(theme)}) прервалась: бот перезапустился "
+                "(обычно из-за обновления на Railway). Нажми тему ещё раз.",
+            )
+    except Exception:
+        logging.exception("Failed to report interrupted short")
 
 
 async def shorts_daily_loop(
     bot: Bot,
 ) -> None:
+    await report_interrupted_short(bot)
     while True:
         try:
             now = datetime.now(MSK)
