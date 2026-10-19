@@ -208,10 +208,12 @@ class CardSlide(Slide):
         y = self.card_y + card.height + 26
         self.karaoke = None
         if caption:
-            for size in (46, 42, 38):  # длинный текст (факт) — шрифт поменьше
+            # факт/новость (караоке) — крупно, чтобы читалось с телефона; длинный — шрифт поменьше
+            sizes, max_lines = ((60, 54, 48, 42), 4) if karaoke else ((46, 42, 38), 5)
+            for size in sizes:
                 cap_f = font(cfg, "sans", size)
-                lines = wrap(d, caption, cap_f, W - 120)
-                if len(lines) <= 5:
+                lines = wrap(d, caption, cap_f, W - 100)
+                if len(lines) <= max_lines:
                     break
             if karaoke:
                 # караоке: слова рисуются каждый кадр, сказанные — жёлтым

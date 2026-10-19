@@ -30,6 +30,9 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     FSInputFile,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -6778,7 +6781,10 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres")],
-        [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("💡 Факты о фильме…", "sh:ask:facts")],
+        [_btn("💡 Факты: случайный", "sh:go:facts")],
+        # поиск с подсказками прямо при наборе (inline-режим бота)
+        [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
+        [_btn("✍️ Факты: ввести название", "sh:ask:facts")],
         [_btn("⚙️ Настройки ▸", "sh:settings")],
         [_btn("⬅️ В админку", "admin:home")],
     ])
@@ -6930,6 +6936,55 @@ async def shorts_music_file(message: Message, state: FSMContext) -> None:
     await state.clear()
     await set_shorts_setting("music_file_id", media.file_id)
     await message.answer("✅ Музыка для шортсов обновлена — со следующего ролика.")
+
+
+KP_TYPES = {
+    "movie": "Фильм",
+    "tv-series": "Сериал",
+    "cartoon": "Мультфильм",
+    "animated-series": "Мультсериал",
+    "anime": "Аниме",
+}
+
+
+@router.inline_query()
+async def inline_title_search(query: InlineQuery) -> None:
+    """Подсказки при наборе «@бот название»: выбор → «/short facts id:…» — факты точно о нём."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer([], cache_time=300, is_personal=True)
+        return
+    text = query.query.strip()
+    if len(text) < 2:
+        await query.answer([], cache_time=5, is_personal=True)
+        return
+    try:
+        items = await kp.search(text, limit=15)
+    except Exception:
+        logging.exception("Inline search failed")
+        items = []
+    results = []
+    for item in items:
+        if not item.get("id"):
+            continue
+        title = kp.title(item)
+        year = item.get("year")
+        rating = (item.get("rating") or {}).get("kp") or 0
+        details = [KP_TYPES.get(str(item.get("type") or ""), "Фильм")]
+        if rating:
+            details.append(f"КП {float(rating):.1f}")
+        genres = [g.get("name") for g in item.get("genres") or [] if isinstance(g, dict) and g.get("name")]
+        if genres:
+            details.append(", ".join(genres[:2]))
+        poster = item.get("poster") or {}
+        thumb = poster.get("previewUrl") or poster.get("url") if isinstance(poster, dict) else None
+        results.append(InlineQueryResultArticle(
+            id=str(item["id"]),
+            title=f"{title} ({year})" if year else title,
+            description=" • ".join(details),
+            thumbnail_url=thumb or None,
+            input_message_content=InputTextMessageContent(message_text=f"/short facts id:{item['id']}"),
+        ))
+    await query.answer(results, cache_time=30, is_personal=True)
 
 
 async def set_admin_commands(bot: Bot) -> None:
