@@ -6351,7 +6351,7 @@ async def shorts_daily_loop(
                             await bot.send_message(
                                 admin_id,
                                 "❌ Ежедневный шортс не собрался:\n"
-                                f"<code>{escape(str(exc)[:500])}</code>\n\n"
+                                f"<code>{escape(str(exc)[-700:])}</code>\n\n"
                                 "Попробуй вручную: /short",
                             )
                         except Exception:
@@ -6399,7 +6399,7 @@ async def short_command(
             logging.exception("Manual short failed")
             await message.answer(
                 "❌ Шортс не собрался:\n"
-                f"<code>{escape(str(exc)[:500])}</code>"
+                f"<code>{escape(str(exc)[-700:])}</code>"
             )
 
     task = asyncio.create_task(job())
