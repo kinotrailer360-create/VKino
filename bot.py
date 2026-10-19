@@ -8,9 +8,11 @@ import logging
 import os
 import random
 import re
+import shutil
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from html import escape
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
 
@@ -25,6 +27,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    FSInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -34,6 +37,8 @@ from aiogram.types import (
     WebAppInfo,
 )
 from dotenv import load_dotenv
+
+from shorts.daily import make_daily_short
 
 load_dotenv()
 
@@ -556,6 +561,16 @@ async def init_db() -> None:
                     season_number,
                     episode_number
                 )
+            );
+
+            CREATE TABLE IF NOT EXISTS shorts_history (
+                movie_id BIGINT PRIMARY KEY,
+                used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS shorts_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             """
         )
@@ -6197,6 +6212,234 @@ async def broadcast(
     )
 
 
+# ---------------------------------------------------------------- шортсы KinoMir360
+
+MSK = timezone(timedelta(hours=3))
+SHORTS_HOUR = int(os.getenv("SHORTS_HOUR", "8"))
+SHORTS_DIR = Path(os.getenv("SHORTS_DIR", "/tmp/kinomir_shorts"))
+SHORT_THEMES = {
+    "online": "онлайн-премьеры",
+    "cinema": "сейчас в кино",
+    "series": "новые сериалы",
+    "upcoming": "скоро в кино",
+    "genre": "топ случайного жанра",
+}
+shorts_lock = asyncio.Lock()
+shorts_jobs: set[asyncio.Task] = set()
+
+
+async def shorts_setting(key: str) -> str | None:
+    return await db().fetchval(
+        "SELECT value FROM shorts_settings WHERE key = $1",
+        key,
+    )
+
+
+async def set_shorts_setting(key: str, value: str | None) -> None:
+    if value is None:
+        await db().execute(
+            "DELETE FROM shorts_settings WHERE key = $1",
+            key,
+        )
+        return
+    await db().execute(
+        """
+        INSERT INTO shorts_settings (key, value)
+        VALUES ($1, $2)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        key,
+        value,
+    )
+
+
+async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
+    seo = result.seo
+    await bot.send_video(
+        chat_id,
+        FSInputFile(result.video, filename="kinomir360_short.mp4"),
+        caption=f"🎬 <b>{escape(seo['title'])}</b>",
+        width=1080,
+        height=1920,
+        supports_streaming=True,
+    )
+    await bot.send_document(
+        chat_id,
+        FSInputFile(result.cover, filename="cover.jpg"),
+        caption="🖼 Обложка для ролика",
+    )
+    for label, key in (
+        ("Название", "title"),
+        ("Описание", "description"),
+        ("Теги", "tags"),
+        ("Закреплённый комментарий", "pinned"),
+    ):
+        await bot.send_message(
+            chat_id,
+            f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>",
+        )
+    if seo.get("warning"):
+        await bot.send_message(chat_id, escape(seo["warning"]))
+
+
+async def run_short(
+    bot: Bot,
+    chat_ids: list[int],
+    theme_key: str | None = None,
+) -> None:
+    async with shorts_lock:
+        rows = await db().fetch(
+            """
+            SELECT movie_id FROM shorts_history
+            WHERE used_at > NOW() - INTERVAL '30 days'
+            """
+        )
+        exclude = {int(r["movie_id"]) for r in rows}
+        now = datetime.now(MSK)
+        work = SHORTS_DIR / now.strftime("%Y%m%d_%H%M%S")
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            music = None
+            file_id = await shorts_setting("music_file_id")
+            if file_id:
+                music = work / "music_custom"
+                try:
+                    await bot.download(file_id, destination=music)
+                except Exception:
+                    logging.exception("Shorts: custom music download failed")
+                    music = None
+
+            result = await make_daily_short(
+                kp._get,
+                work,
+                theme_key,
+                exclude,
+                music,
+                now.date(),
+            )
+            await db().executemany(
+                """
+                INSERT INTO shorts_history (movie_id) VALUES ($1)
+                ON CONFLICT (movie_id) DO UPDATE SET used_at = NOW()
+                """,
+                [(int(f["id"]),) for f in result.films if f.get("id")],
+            )
+            for chat_id in chat_ids:
+                await send_short(bot, chat_id, result)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+async def shorts_daily_loop(
+    bot: Bot,
+) -> None:
+    while True:
+        try:
+            now = datetime.now(MSK)
+            today = now.date().isoformat()
+            if (
+                now.hour >= SHORTS_HOUR
+                and await shorts_setting("daily_last_run") != today
+            ):
+                await set_shorts_setting("daily_last_run", today)
+                try:
+                    await run_short(bot, sorted(ADMIN_IDS))
+                except Exception as exc:
+                    logging.exception("Daily short failed")
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                "❌ Ежедневный шортс не собрался:\n"
+                                f"<code>{escape(str(exc)[:500])}</code>\n\n"
+                                "Попробуй вручную: /short",
+                            )
+                        except Exception:
+                            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Shorts loop error")
+        await asyncio.sleep(60)
+
+
+@router.message(Command("short"))
+async def short_command(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    theme = (message.text or "").partition(" ")[2].strip().lower()
+    if theme and theme not in SHORT_THEMES and not theme.startswith("genre:"):
+        await message.answer(
+            "Использование: /short [тема]\n\n"
+            + "\n".join(
+                f"<code>{key}</code> — {name}"
+                for key, name in SHORT_THEMES.items()
+            )
+            + "\n<code>genre:ужасы</code> — топ жанра "
+            "(фантастика, ужасы, триллер, комедия, боевик, детектив)\n\n"
+            "Без темы — тема дня по расписанию."
+        )
+        return
+    if shorts_lock.locked():
+        await message.answer("⏳ Шортс уже собирается, подожди пару минут.")
+        return
+
+    await message.answer("⏳ Собираю шортс, это займёт 2–5 минут…")
+
+    async def job() -> None:
+        try:
+            await run_short(message.bot, [message.chat.id], theme or None)
+        except Exception as exc:
+            logging.exception("Manual short failed")
+            await message.answer(
+                "❌ Шортс не собрался:\n"
+                f"<code>{escape(str(exc)[:500])}</code>"
+            )
+
+    task = asyncio.create_task(job())
+    shorts_jobs.add(task)
+    task.add_done_callback(shorts_jobs.discard)
+
+
+@router.message(Command("music"))
+async def music_command(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    arg = (message.text or message.caption or "").partition(" ")[2].strip().lower()
+    if arg in ("default", "сброс"):
+        await set_shorts_setting("music_file_id", None)
+        await message.answer("✅ Вернул стандартную музыку для шортсов.")
+        return
+
+    source = message if (message.audio or message.document) else message.reply_to_message
+    media = None
+    if source:
+        media = source.audio or source.document or source.voice
+    if not media:
+        await message.answer(
+            "Пришли аудиофайл с подписью /music "
+            "или ответь /music на сообщение с музыкой.\n"
+            "Музыка должна быть без авторских прав.\n"
+            "<code>/music default</code> — вернуть стандартную."
+        )
+        return
+
+    await set_shorts_setting("music_file_id", media.file_id)
+    await message.answer("✅ Музыка для шортсов обновлена — со следующего ролика.")
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -6226,6 +6469,9 @@ async def main() -> None:
     reminder_task = asyncio.create_task(
         premiere_reminder_loop(bot)
     )
+    shorts_task = asyncio.create_task(
+        shorts_daily_loop(bot)
+    )
 
     dp = Dispatcher()
     dp.include_router(router)
@@ -6242,6 +6488,7 @@ async def main() -> None:
         provider_task.cancel()
         blender_task.cancel()
         reminder_task.cancel()
+        shorts_task.cancel()
 
         try:
             await provider_task
@@ -6255,6 +6502,11 @@ async def main() -> None:
 
         try:
             await reminder_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await shorts_task
         except asyncio.CancelledError:
             pass
 
