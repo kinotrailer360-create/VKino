@@ -353,11 +353,19 @@ def _facts_word(n: int) -> str:
 
 async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int]) -> tuple[dict[str, Any], list[str]]:
     if query:
+        # «Мастер и Маргарита 2024» — год в конце уточняет, какой из одноимённых фильмов
+        year_m = re.search(r"\s(19\d\d|20\d\d)$", query)
+        year = int(year_m.group(1)) if year_m else None
+        name = query[: year_m.start()].strip() if year_m else query
         try:
-            data = await fetch("/movie/search", query=query, page=1, limit=5)
+            data = await fetch("/movie/search", query=name, page=1, limit=10)
             cands = [x for x in data.get("docs") or [] if isinstance(x, dict)]
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Поиск «{query}» не удался: {exc}") from exc
+        if year:
+            cands = [c for c in cands if c.get("year") == year] or cands
+        # одноимённые (фильм 2024 и сериал 2005) — берём самый известный, по числу оценок
+        cands.sort(key=lambda c: -int((c.get("votes") or {}).get("kp") or 0))
         need = 3
     else:
         cands = await _query(fetch, page=random.randint(1, 5), sortField="votes.kp", sortType="-1",
@@ -418,8 +426,8 @@ async def _trailer_clip(item: dict[str, Any], out: Path) -> bool:
 
 
 async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]], work: Path,
-                     gemini_key: str) -> dict[int, str]:
-    """Для фактов — фрагменты трейлера, где видно то, о чём факт: {номер факта: файл клипа}.
+                     gemini_key: str) -> tuple[dict[int, str], str]:
+    """Для фактов — фрагменты трейлера, где видно то, о чём факт: ({номер факта: файл клипа}, пояснение).
 
     Трейлер с Rutube качается целиком, режется на кадры, Gemini выбирает кадр под каждый факт
     (или «ничего не подходит»), вокруг выбранного момента вырезается CLIP_SECONDS.
@@ -430,16 +438,16 @@ async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]],
         found = await clips.rutube_trailer([t for t in titles if t], item.get("year"))
         if not found:
             log.info("shorts: no Rutube trailer for facts about %s", _title(item))
-            return {}
+            return {}, "трейлер на Rutube не нашёлся"
         trailer_dir.mkdir(exist_ok=True)
         src = await clips.download_full(found["url"], trailer_dir)
         frames = await clips.sample_frames(src, trailer_dir, duration=found["duration"])
         if not frames:
-            return {}
+            return {}, "не удалось нарезать кадры из трейлера"
         thumbs = [Image.open(path).convert("RGB") for _, path in frames]
         choices = await ai.match_images(gemini_key, [text for _, text in facts_by_idx], thumbs)
         if not choices:
-            return {}
+            return {}, f"Gemini не ответил ({ai.last_error or 'без подробностей'})"
         out: dict[int, str] = {}
         used: set[int] = set()
         for (i, _), c in zip(facts_by_idx, choices):
@@ -450,10 +458,10 @@ async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]],
             # момент чуть раньше выбранного кадра — чтобы действие успело начаться в кадре
             await clips.cut_clip(src, clip, frames[c][0] - 1.5, CLIP_SECONDS)
             out[i] = clip.name
-        return out
+        return out, "" if out else f"в трейлере «{found['title'][:60]}» нет моментов под эти факты"
     except Exception as exc:  # noqa: BLE001 — без трейлера будут фото и кадры
         log.warning("shorts: trailer clips for facts about %s failed: %s", _title(item), exc)
-        return {}
+        return {}, f"ошибка: {type(exc).__name__}: {str(exc)[:150]}"
     finally:
         import shutil
         shutil.rmtree(trailer_dir, ignore_errors=True)
@@ -525,7 +533,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
             except Exception:  # noqa: BLE001
                 images.append(_placeholder())
     for i, ((item, _), img) in enumerate(zip(chosen, images), 1):
-        card = await asyncio.to_thread(make_card, img, "", i, n, None, "IMDb", None, f"НОВОСТЬ №{i}", 780)
+        card = await asyncio.to_thread(make_card, img, "", i, n, None, "IMDb", None, f"НОВОСТЬ №{i}", FACT_CARD_H)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
         cards.append({"image": path.name, "caption": item.title, "info": [[("Источник", item.source)]],
@@ -545,7 +553,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
     spoken = retold or [say(it) for it, _ in chosen]
     lines = ([f"Главные новости кино на {day}!"] + spoken
-             + [f"Какая новость удивила больше всего? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
+             + [f"Какая новость удивила? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
     voiced = await _render(work, cover_path, cards, lines, "НОВОСТИ", "НОВОСТИ КИНО",
                            "КАКАЯ НОВОСТЬ\nУДИВИЛА БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
 
@@ -580,7 +588,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
 # ---------------------------------------------------------------- голос
 
 NUMBERS = {1: "один", 2: "два", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь"}
-SAVE_AND_SUBSCRIBE = "Сохрани, чтобы не потерять, и подписывайся на КиноМир триста шестьдесят!"
+SAVE_AND_SUBSCRIBE = "Сохрани и подпишись на КиноМир триста шестьдесят!"
 
 
 def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
@@ -822,7 +830,10 @@ def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _portrait(img: Image.Image, w: int = 1080, h: int = 780) -> Image.Image:
+FACT_CARD_H = 1000  # высота картинки на слайдах фактов и новостей
+
+
+def _portrait(img: Image.Image, w: int = 1080, h: int = FACT_CARD_H) -> Image.Image:
     """Портрет целиком по центру на размытом фоне из него же (иначе обрезка срежет лицо)."""
     from PIL import ImageFilter
     s = max(w / img.width, h / img.height)
@@ -882,8 +893,12 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     rest = [i for i in range(n) if i not in portraits]
     # факты без фото — сначала момент из трейлера, который Gemini счёл подходящим
     videos: dict[int, str] = {}
-    if trailer_clips and gemini_key and rest:
-        videos = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
+    video_note = ""
+    if trailer_clips and rest:
+        if gemini_key:
+            videos, video_note = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
+        else:
+            video_note = "нет ключа GEMINI_API_KEY — без него моменты не подобрать"
     # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
     stills = [i for i in rest if i not in videos]
     choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
@@ -899,12 +914,12 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     for i, fact in enumerate(facts, 1):
         # название уже в заголовке слайда — на карточке не повторяем
         card = await asyncio.to_thread(make_card, picked[i - 1], "", i, n,
-                                       None, "IMDb", None, f"ФАКТ №{i}", 780)
+                                       None, "IMDb", None, f"ФАКТ №{i}", FACT_CARD_H)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
         video: dict[str, str] = {}
         if (i - 1) in videos:
-            card_overlay("", i, n, None, "IMDb", None, f"ФАКТ №{i}", 780).save(work / f"overlay{i}.png")
+            card_overlay("", i, n, None, "IMDb", None, f"ФАКТ №{i}", FACT_CARD_H).save(work / f"overlay{i}.png")
             video = {"clip": videos[i - 1], "overlay": f"overlay{i}.png"}
         cards.append({"image": path.name, "caption": fact, "karaoke": True, **video})
 
@@ -913,14 +928,19 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     cover.save(cover_path, quality=93)
 
     lines = ([f"{hook}, которые ты точно не знал!"] + facts
-             + [f"Какой факт удивил больше всего? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
+             + [f"Какой факт удивил? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
     voiced = await _render(work, cover_path, cards, lines, "ФАКТЫ", t.upper(),
                            "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_facts_seo(film, facts))
+    notes = []
+    if video_note:
+        notes.append(f"🎞 Видео из трейлера не вставлено: {video_note}.")
     if gemini_key and ai.last_error:
-        result.seo["warning"] = f"⚠️ Gemini не помог подобрать кадры: {ai.last_error}"
+        notes.append(f"⚠️ Gemini не помог подобрать кадры: {ai.last_error}")
     if not voiced:
-        result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
+        notes.append("⚠️ Голос не синтезировался — ролик собран только с музыкой.")
+    if notes:
+        result.seo["warning"] = "\n".join(notes)
     return result
 
 
