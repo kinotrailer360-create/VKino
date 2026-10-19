@@ -7,6 +7,7 @@ import html
 import io
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -26,6 +27,9 @@ ASSETS = ROOT / "assets"
 FILMS = 5
 VOICE = "ru-RU-DmitryNeural"
 VOICE_RATE = "+22%"
+# запасной голос — Piper, работает прямо на сервере без интернета (модель кладёт Dockerfile)
+PIPER_MODEL = Path(os.getenv("PIPER_MODEL", "/opt/piper/voice.onnx"))
+PIPER_SPEED = 0.8  # length_scale: меньше — быстрее, ~как +22% у основного голоса
 GAP = 0.2  # пауза между фразами, сек
 MIN_RATING = 6.0  # ниже — рейтинг не показываем, он только отпугнёт
 SKIP_RATING = 5.5  # ниже — фильм в подборку не берём
@@ -584,7 +588,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
     if ai.last_error:
         result.seo["warning"] = f"⚠️ ИИ не пересказал новости: {ai.last_error}"
-    if not voiced or tts_error:
+    if not voiced or tts_note:
         result.seo["warning"] = no_voice_note(voiced)
     return result
 
@@ -637,11 +641,11 @@ async def _duration(path: Path) -> float:
 def no_voice_note(voiced: bool = False) -> str:
     reason = f" Причина: {tts_error}." if tts_error else ""
     if voiced:
-        return f"⚠️ Часть фраз без голоса.{reason}"
+        return tts_note or ""
     return f"⚠️ Голос не синтезировался — ролик собран только с музыкой.{reason} Попробуй собрать ещё раз."
 
 
-TTS_TIMEOUT = 40  # сек на фразу: без лимита запрос к сервису голоса может висеть бесконечно
+TTS_TIMEOUT = 20  # сек на фразу (обычно отвечает за 1–3 с): без лимита запрос к сервису голоса может висеть бесконечно
 
 
 async def _tts(text: str, path: Path) -> list[float]:
@@ -660,6 +664,7 @@ async def _tts(text: str, path: Path) -> list[float]:
 
 TTS_RETRY_DELAYS = (3, 8)  # сервис голоса иногда сбоит на секунды — повторяем, а не сдаёмся
 tts_error: str | None = None  # причина, если голос так и не получился — показываем админу
+tts_note: str | None = None  # пометка, если ролик озвучен запасным голосом
 
 
 async def _say_once(text: str, path: Path) -> list[float]:
@@ -673,8 +678,8 @@ async def _say_once(text: str, path: Path) -> list[float]:
         return await asyncio.wait_for(_tts(text.replace(pronounce.STRESS, ""), path), timeout=TTS_TIMEOUT)
 
 
-async def say_to_file(text: str, path: Path) -> list[float]:
-    """Озвучить фразу в mp3 (время слов в ответе), с повторами при сбое сервиса."""
+async def _edge_to_file(text: str, path: Path) -> list[float]:
+    """Основной голос (Microsoft Edge) с повторами при сбое сервиса."""
     for delay in (*TTS_RETRY_DELAYS, None):
         try:
             return await _say_once(text, path)
@@ -686,6 +691,62 @@ async def say_to_file(text: str, path: Path) -> list[float]:
     raise AssertionError("unreachable")
 
 
+_piper_voice: Any = None
+
+
+def piper_ready() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("piper") is not None and PIPER_MODEL.exists()
+
+
+def _piper_sync(text: str, wav: Path) -> None:
+    import wave
+
+    from piper import PiperVoice, SynthesisConfig
+
+    global _piper_voice
+    if _piper_voice is None:
+        _piper_voice = PiperVoice.load(str(PIPER_MODEL))
+    with wave.open(str(wav), "wb") as out:
+        _piper_voice.synthesize_wav(text.replace(pronounce.STRESS, ""), out,
+                                    syn_config=SynthesisConfig(length_scale=PIPER_SPEED))
+
+
+def piper_unload() -> None:
+    """Модель занимает ~150 МБ — после озвучки освобождаем память."""
+    global _piper_voice
+    _piper_voice = None
+
+
+async def _piper_to_file(text: str, path: Path) -> list[float]:
+    """Запасной голос Piper в mp3; времени слов нет — субтитры идут равномерно по фразе."""
+    wav = path.with_suffix(".piper.wav")
+    await asyncio.to_thread(_piper_sync, text, wav)
+    await _run("ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-q:a", "3", str(path))
+    wav.unlink(missing_ok=True)
+    return []
+
+
+last_engine = "edge"  # каким голосом озвучена последняя фраза (для /voice)
+
+
+async def say_to_file(text: str, path: Path) -> list[float]:
+    """Озвучить фразу в mp3 (время слов в ответе): основной голос, при сбое — запасной Piper."""
+    global last_engine
+    try:
+        words = await _edge_to_file(text, path)
+        last_engine = "edge"
+        return words
+    except Exception as exc:  # noqa: BLE001
+        if not piper_ready():
+            raise
+        log.warning("shorts: Edge TTS failed (%r), using Piper", exc)
+        words = await _piper_to_file(text, path)
+        last_engine = f"piper ({str(exc).rstrip('.') or type(exc).__name__})"
+        return words
+
+
 def _speakable(text: str) -> str:
     """Убираем эмодзи и редкие символы — на них сервис голоса может ответить «No audio»."""
     text = re.sub(rf"[^\w\s.,!?:;«»\"'()%+\-–—{pronounce.STRESS}]", " ", text)
@@ -695,31 +756,37 @@ def _speakable(text: str) -> str:
 
 async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
-    parts: list[Path] = []
+    global tts_error, tts_note
+    tts_error, tts_note = None, None
+    speak = [_speakable(pronounce.apply(text)) for text in lines]
+    parts: list[Path] = [work / f"voice_{i}.mp3" for i in range(len(lines))]
     words: list[list[float]] = []
-    global tts_error
-    tts_error = None
     failed: list[int] = []
-    for i, text in enumerate(lines):
-        part = work / f"voice_{i}.mp3"
-        spoken = _speakable(pronounce.apply(text))
-        try:
-            if len(failed) == i >= 2:
-                raise RuntimeError("пропуск")  # первые фразы не озвучились — сервис недоступен, не ждём впустую
-            words.append(await say_to_file(spoken, part))
-        except Exception as exc:  # noqa: BLE001 — неудачная фраза идёт тишиной, остальные с голосом
-            log.warning("shorts: TTS failed for %r: %r", spoken[:60], exc)
-            failed.append(i)
-            if str(exc) != "пропуск":
-                tts_error = f"{str(exc).rstrip('.') or type(exc).__name__} (фраза: «{text[:40]}…»)"[:250]
-            sec = max(2.5, min(len(text) / 14, 8.0))  # примерно столько звучала бы фраза
-            await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-                       "-t", f"{sec:.2f}", str(part))
-            words.append([])
-        parts.append(part)
-    voiced = len(failed) < len(lines)
-    if failed and voiced:
-        tts_error = f"не озвучено фраз: {len(failed)} из {len(lines)} — {tts_error}"
+    try:
+        for i, text in enumerate(speak):
+            words.append(await _edge_to_file(text, parts[i]))
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc).rstrip(".") or type(exc).__name__
+        log.warning("shorts: Edge TTS failed (%s)", reason)
+        words = []
+        if piper_ready():
+            # весь ролик одним голосом: переозвучиваем все фразы запасным
+            tts_note = f"🗣 Основной голос не ответил ({reason[:120]}) — озвучено запасным голосом."
+            try:
+                for i, text in enumerate(speak):
+                    words.append(await _piper_to_file(text, parts[i]))
+            except Exception as exc2:  # noqa: BLE001
+                log.exception("shorts: Piper failed too")
+                reason, words = f"{reason}; запасной голос: {exc2}", []
+            finally:
+                piper_unload()
+        if len(words) < len(speak):
+            tts_error, failed, words = reason[:250], list(range(len(speak))), [[] for _ in speak]
+            for i, text in enumerate(lines):
+                sec = max(2.5, min(len(text) / 14, 8.0))  # примерно столько звучала бы фраза
+                await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                           "-t", f"{sec:.2f}", str(parts[i]))
+    voiced = not failed
 
     starts, spans, t = [], [], 0.0
     inputs, chains = [], []
@@ -979,7 +1046,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         notes.append(f"🎞 Видео из трейлера не вставлено: {video_note}.")
     if ai.last_error:
         notes.append(f"⚠️ ИИ не помог подобрать кадры: {ai.last_error}")
-    if not voiced or tts_error:
+    if not voiced or tts_note:
         notes.append(no_voice_note(voiced))
     if notes:
         result.seo["warning"] = "\n".join(notes)
@@ -1074,6 +1141,6 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                            "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
-    if not voiced or tts_error:
+    if not voiced or tts_note:
         result.seo["warning"] = no_voice_note(voiced)
     return result
