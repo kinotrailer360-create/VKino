@@ -63,6 +63,16 @@ def make_card(image: Image.Image, title: str, index: int, total: int,
               height: int = CARD_H, place: int | None = None) -> Image.Image:
     """Карточка 1080xheight: рейтинг (или badge) слева сверху, n/N справа, название и актёры снизу."""
     card = _cover(image.convert("RGB"), CARD_W, height, 0.35).convert("RGBA")
+    card.alpha_composite(card_overlay(title, index, total, rating, rating_source, cast, badge, height, place))
+    return card.convert("RGB")
+
+
+def card_overlay(title: str, index: int, total: int,
+                 rating: float | None = None, rating_source: str = "IMDb",
+                 cast: list[str] | None = None, badge: str | None = None,
+                 height: int = CARD_H, place: int | None = None) -> Image.Image:
+    """Всё оформление карточки на прозрачном фоне — кладётся поверх картинки или видео трейлера."""
+    card = Image.new("RGBA", (CARD_W, height), (0, 0, 0, 0))
     card.alpha_composite(_gradient(CARD_W, 260, 150, 0), (0, 0))
     card.alpha_composite(_gradient(CARD_W, 480, 0, 225), (0, height - 480))
     d = ImageDraw.Draw(card)
@@ -118,7 +128,7 @@ def _finish(card, d, title, cast, height):
     if cast_line:
         _center(d, bottom + 14, cast_line, cast_f)
         d.rounded_rectangle((110, bottom + 70, CARD_W - 110, bottom + 80), 5, fill=RED)
-    return card.convert("RGB")
+    return card
 
 
 def make_cover(image: Image.Image, tag: str, headline: str, brand: str = "KinoMir360") -> Image.Image:

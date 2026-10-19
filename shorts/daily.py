@@ -18,8 +18,8 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, news, pronounce, tmdb, wiki
-from .cards import make_card, make_cover
+from . import ai, clips, news, pronounce, tmdb, wiki
+from .cards import card_overlay, make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
@@ -394,6 +394,27 @@ async def _stills(fetch: Fetch, item: dict[str, Any]) -> list[str]:
         if fallback and fallback not in urls:
             urls.append(fallback)
     return urls
+
+
+# ---------------------------------------------------------------- фрагменты трейлеров
+
+CLIP_SECONDS = 5.0
+
+
+async def _trailer_clip(item: dict[str, Any], out: Path) -> bool:
+    """Скачать 5 секунд трейлера с Rutube в out; False — не нашлось или не скачалось."""
+    titles = [str(item.get(k) or "") for k in ("name", "alternativeName", "enName")]
+    try:
+        found = await clips.rutube_trailer([t for t in titles if t], item.get("year"))
+        if not found:
+            log.info("shorts: no Rutube trailer for %s", _title(item))
+            return False
+        await clips.download_clip(found["url"], out, clips.clip_start(found["duration"], CLIP_SECONDS),
+                                  CLIP_SECONDS, timeout=90)
+        return out.exists()
+    except Exception as exc:  # noqa: BLE001 — без трейлера останется кадр
+        log.warning("shorts: trailer clip for %s failed: %s", _title(item), exc)
+        return False
 
 
 # ---------------------------------------------------------------- новости кино
@@ -856,7 +877,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                            exclude: set[int] | None = None, music: Path | None = None,
                            today: date | None = None, tmdb_key: str = "",
                            news_feeds: list[str] | None = None, manual: bool = False,
-                           gemini_key: str = "") -> ShortResult:
+                           gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
@@ -915,13 +936,18 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                                            _actors(f), badge, place=n - i + 1)
             path = work / f"card{i}.jpg"
             card.save(path, quality=93)
+            video: dict[str, str] = {}
+            if trailer_clips and await _trailer_clip(f, work / f"clip{i}.mp4"):
+                overlay = card_overlay(_title(f), i, n, rating, src or "IMDb", _actors(f), badge, place=n - i + 1)
+                overlay.save(work / f"overlay{i}.png")
+                video = {"clip": f"clip{i}.mp4", "overlay": f"overlay{i}.png"}
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
             rows = info_rows(f)
             f["_awards"] = wiki.awards_line(await wiki.awards(f))
             if f["_awards"]:
                 rows.append([("Награды", f["_awards"])])
-            cards.append({"image": path.name, "caption": caption, "info": rows})
+            cards.append({"image": path.name, "caption": caption, "info": rows, **video})
         # обложка — фильм №1: русский постер Кинопоиска, запасной — постер TMDB
         cover_src = await _download_first(session, [_poster_url(films[-1])] + posters_tmdb)
 

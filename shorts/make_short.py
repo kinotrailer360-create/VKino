@@ -149,11 +149,43 @@ class IntroSlide(Slide):
         return zoom(self.base, 1.0 + 0.07 * t / max(dur, 1), W, H)
 
 
+class ClipReader:
+    """Кадры видео трейлера по одному (ffmpeg -> raw RGB), по кругу, подогнанные под карточку."""
+
+    def __init__(self, path: Path, w: int, h: int):
+        self.w, self.h = w, h
+        self.size = w * h * 3
+        self.proc = subprocess.Popen(
+            # один поток декодера и фильтров — иначе ffmpeg держит в памяти кадры на каждый поток
+            ["ffmpeg", "-v", "error", "-threads", "1", "-filter_threads", "1",
+             "-stream_loop", "-1", "-i", str(path), "-an",
+             "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS}",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.last: Image.Image | None = None
+
+    def next(self) -> Image.Image | None:
+        data = self.proc.stdout.read(self.size) if self.proc.stdout else b""
+        if len(data) == self.size:
+            self.last = Image.frombytes("RGB", (self.w, self.h), data)
+        return self.last  # видео кончилось/сломалось — держим последний кадр
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait()
+
+
 class CardSlide(Slide):
-    def __init__(self, cfg, path, idx, total, caption, info=None, karaoke=None):
+    def __init__(self, cfg, path, idx, total, caption, info=None, karaoke=None, clip=None, overlay=None):
         card = Image.open(path).convert("RGB")
         card = card.resize((W, round(card.height * W / card.width)), Image.LANCZOS)
         self.card = card
+        # фрагмент трейлера под оформлением карточки (рейтинг, №, название)
+        self.clip = self.card_overlay = None
+        if clip and overlay and Path(clip).exists() and Path(overlay).exists():
+            self.card_overlay = Image.open(overlay).convert("RGBA").resize(card.size)
+            self.clip = ClipReader(Path(clip), card.width, card.height)
         bg = cover(card, int(W * 1.1), int(H * 1.1)).filter(ImageFilter.GaussianBlur(40))
         self.bg = Image.blend(bg, Image.new("RGB", bg.size), 0.55)
         self.card_y = 380
@@ -226,13 +258,25 @@ class CardSlide(Slide):
         img = zoom(self.bg, 1.0 + 0.06 * t / max(dur, 1), W, H)
         s = 1.12 - 0.12 * ease_out(t / 0.45) + 0.03 * t / max(dur, 1)
         cw, ch = round(W * s), round(self.card.height * s)
-        card = self.card.resize((cw, ch), Image.BILINEAR)
+        source = self.card
+        if self.clip:
+            video = self.clip.next()
+            if video is not None:
+                source = video.convert("RGBA")
+                source.alpha_composite(self.card_overlay)
+                source = source.convert("RGB")
+        card = source.resize((cw, ch), Image.BILINEAR)
         cx, cy = (W - cw) // 2, self.card_y + (self.card.height - ch) // 2
         img.paste(card, (cx, cy))
         img.paste(self.overlay, (0, 0), self.overlay)
         if self.karaoke:
             self._draw_karaoke(img, t)
         return img
+
+    def close(self):
+        if self.clip:
+            self.clip.close()
+            self.clip = None
 
     def _draw_karaoke(self, img, t):
         words, fnt, spoken, speech = self.karaoke
@@ -350,7 +394,9 @@ def render(cfg: dict, base: Path) -> Path:
     # слайды создаются по мере надобности и выгружаются после показа — экономим память
     makers = [lambda: IntroSlide(cfg, p(cfg["intro"]))]
     makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"),
-                                          c.get("karaoke"))
+                                          c.get("karaoke"),
+                                          p(c["clip"]) if c.get("clip") else None,
+                                          p(c["overlay"]) if c.get("overlay") else None)
                for i, c in enumerate(cards)]
     makers.append(lambda: OutroSlide(cfg, p(cfg["intro"]), logo))
     loaded: dict[int, Slide] = {}
@@ -358,7 +404,7 @@ def render(cfg: dict, base: Path) -> Path:
     def slide(k: int) -> Slide:
         if k not in loaded:
             for old in [j for j in loaded if j < k - 1]:
-                del loaded[old]
+                getattr(loaded.pop(old), "close", lambda: None)()
             loaded[k] = makers[k]()
         return loaded[k]
 
@@ -413,6 +459,8 @@ def render(cfg: dict, base: Path) -> Path:
             raise encoder_failed() from None
         if f % (FPS * 5) == 0:
             print(f"  {t:5.1f}/{total:.1f} c", flush=True)
+    for sl in loaded.values():
+        getattr(sl, "close", lambda: None)()
     enc.stdin.close()
     if enc.wait():
         raise encoder_failed()

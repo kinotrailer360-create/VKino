@@ -6347,6 +6347,7 @@ async def run_short(
                 await news_feeds(),
                 manual=theme_key is not None,
                 gemini_key=GEMINI_API_KEY,
+                trailer_clips=await shorts_setting("clips") != "off",
             )
             await db().executemany(
                 """
@@ -6677,6 +6678,27 @@ async def trailer_test_command(
         finally:
             out.unlink(missing_ok=True)
     await message.answer("\n".join(report), disable_web_page_preview=True)
+
+
+@router.message(Command("clips"))
+async def clips_command(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    arg = (message.text or "").partition(" ")[2].strip().lower()
+    if arg in ("on", "off"):
+        await set_shorts_setting("clips", None if arg == "on" else "off")
+    state = "выключены" if await shorts_setting("clips") == "off" else "включены"
+    await message.answer(
+        f"🎞 Фрагменты трейлеров в подборках: <b>{state}</b>.\n"
+        "Трейлеры ищутся на Rutube (работает с сервера в Европе), 5 секунд без звука.\n\n"
+        "<code>/clips on</code> — включить, <code>/clips off</code> — выключить"
+    )
 
 
 @router.message(Command("music"))
