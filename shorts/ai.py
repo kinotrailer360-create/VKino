@@ -11,13 +11,15 @@ import io
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import aiohttp
 from PIL import Image
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+MODELS = "https://generativelanguage.googleapis.com/v1beta/models"
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 log = logging.getLogger("shorts")
 
@@ -38,18 +40,47 @@ def _thumb(img: Image.Image) -> dict[str, Any]:
     return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode()}}
 
 
+def _version(name: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", name))  # 3.10 новее 3.9
+
+
+async def _newest_flash(session: aiohttp.ClientSession, key: str) -> str | None:
+    """Самая свежая стабильная модель Flash, доступная этому ключу (если нашу модель отключили)."""
+    async with session.get(MODELS, params={"pageSize": 200}, headers={"x-goog-api-key": key}) as resp:
+        data = await resp.json(content_type=None)
+    names = [
+        str(m.get("name", "")).removeprefix("models/")
+        for m in (data.get("models") or [] if isinstance(data, dict) else [])
+        if "generateContent" in (m.get("supportedGenerationMethods") or [])
+    ]
+    skip = ("lite", "image", "tts", "live", "audio", "preview", "exp", "thinking", "latest")
+    flash = [n for n in names if n.startswith("gemini-") and "flash" in n and not any(w in n for w in skip)]
+    return max(flash, key=_version) if flash else None
+
+
 async def _ask(key: str, parts: list[dict[str, Any]]) -> Any:
+    global MODEL
     body = {
         "contents": [{"parts": parts}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(API.format(model=MODEL), json=body, headers={"x-goog-api-key": key}) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status != 200:
-                msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
-                raise AIError(f"Gemini HTTP {resp.status}: {str(msg)[:200]}")
+        for attempt in range(2):
+            async with session.post(API.format(model=MODEL), json=body, headers={"x-goog-api-key": key}) as resp:
+                data = await resp.json(content_type=None)
+                status = resp.status
+            if status == 404 and attempt == 0:
+                # модель сняли с поддержки — берём новейшую Flash из списка доступных и повторяем
+                newer = await _newest_flash(session, key)
+                if newer and newer != MODEL:
+                    log.warning("shorts: Gemini model %s unavailable, switching to %s", MODEL, newer)
+                    MODEL = newer
+                    continue
+            break
+        if status != 200:
+            msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
+            raise AIError(f"Gemini HTTP {status} ({MODEL}): {str(msg)[:200]}")
     try:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(text)
