@@ -1222,9 +1222,38 @@ def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]]
     return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
 
 
+def _latin(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+async def _kp_role(fetch: Fetch | None, film: dict[str, Any], who: dict[str, Any]) -> str:
+    """Роль по-русски с Кинопоиска (на TMDB роли по-английски, и голос читает их ужасно)."""
+    if fetch is None:
+        return ""
+    title = str(film.get("title") or film.get("original_title") or "")
+    year = int(str(film.get("release_date") or "0")[:4] or 0)
+    try:
+        data = await fetch("/movie/search", query=title, page=1, limit=5)
+        doc = next((d for d in data.get("docs") or []
+                    if d.get("id") and (not year or abs(int(d.get("year") or 0) - year) <= 1)), None)
+        if not doc:
+            return ""
+        full = await fetch(f"/movie/{doc['id']}")
+    except Exception as exc:  # noqa: BLE001 — без роли карточка всё равно собирается
+        log.info("shorts: KP role for %s failed: %s", title, exc)
+        return ""
+    names = {who["name"].lower(), who["en"].lower()} - {""}
+    for p in full.get("persons") or []:
+        if str(p.get("name") or "").lower() in names or str(p.get("enName") or "").lower() in names:
+            role = str(p.get("description") or "").strip()
+            if role and not _latin(role):
+                return role
+    return ""
+
+
 async def make_birthday_short(work: Path, today: date, exclude: set[int] | None = None,
                               music: Path | None = None, tmdb_key: str = "",
-                              trailer_clips: bool = True) -> ShortResult:
+                              trailer_clips: bool = True, fetch: Fetch | None = None) -> ShortResult:
     await _progress(5, "Ищу именинника")
     who, info, top = await pick_birthday(today, exclude or set(), tmdb_key)
     await _progress(12, f"{who['name']}: качаю кадры и трейлеры")
@@ -1256,7 +1285,12 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
             if trailer_clips and await _trailer_clip(item, work / f"clip{i}.mp4"):
                 card_overlay(title, i, n, rating_shown, "TMDB", None, None, place=n - i + 1).save(work / f"overlay{i}.png")
                 video = {"clip": f"clip{i}.mp4", "overlay": f"overlay{i}.png"}
-            role = str(f.get("character") or "").strip()
+            # роль по-русски с Кинопоиска; английскую с TMDB не показываем и не озвучиваем
+            role = await _kp_role(fetch, f, who) if f.get("job") != "Director" else ""
+            if not role:
+                tmdb_role = str(f.get("character") or "").strip()
+                role = "" if _latin(tmdb_role) else tmdb_role
+            f["_role"] = role
             rows = [[("Роль", role)]] if role else [[("Режиссёр", name)]] if f.get("job") == "Director" else []
             cards.append({"image": path.name, "caption": " • ".join(x for x in [name, year] if x),
                           "info": rows, **video})
@@ -1269,7 +1303,7 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
     def say(f: dict[str, Any], place: int) -> str:
         title = f"«{f.get('title') or f.get('original_title')}»"
         head = f"И номер один — {title}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}."
-        role = str(f.get("character") or "").strip()
+        role = f.get("_role") or ""
         return f"{head} Роль — {role}." if role and len(role) < 40 else head
 
     lines = ([f"Сегодня день рождения празднует {name}! {he.capitalize()} {age} {_years(age)}. Лучшие фильмы:"]
@@ -1300,7 +1334,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     theme_key = theme_key or SCHEDULE[today.weekday()]
     if theme_key == "birthday":
         try:
-            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips)
+            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips, fetch)
         except Exception:
             if manual:
                 raise
