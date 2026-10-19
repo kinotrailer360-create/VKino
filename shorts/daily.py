@@ -723,40 +723,33 @@ async def _edge_to_file(text: str, path: Path) -> list[float]:
     raise AssertionError("unreachable")
 
 
-_piper_voice: Any = None
-
-
 def piper_ready() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("piper") is not None and PIPER_MODEL.exists()
 
 
-def _piper_sync(text: str, wav: Path) -> None:
-    import wave
-
-    from piper import PiperVoice, SynthesisConfig
-
-    global _piper_voice
-    if _piper_voice is None:
-        _piper_voice = PiperVoice.load(str(PIPER_MODEL))
-    with wave.open(str(wav), "wb") as out:
-        _piper_voice.synthesize_wav(text.replace(pronounce.STRESS, ""), out,
-                                    syn_config=SynthesisConfig(length_scale=PIPER_SPEED))
-
-
-def piper_unload() -> None:
-    """Модель занимает ~150 МБ — после озвучки освобождаем память."""
-    global _piper_voice
-    _piper_voice = None
+async def _piper_batch(items: list[tuple[str, Path]]) -> None:
+    """Запасной голос Piper в mp3 для нескольких фраз — отдельным процессом (память освобождается сразу)."""
+    wavs = [(text.replace(pronounce.STRESS, ""), str(path.with_suffix(".piper.wav"))) for text, path in items]
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "shorts.piper_tts", str(PIPER_MODEL), str(PIPER_SPEED),
+        stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(json.dumps(wavs).encode()), timeout=180)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        raise
+    if proc.returncode:
+        raise RuntimeError(f"piper: {err.decode(errors='ignore')[-300:]}")
+    for (_, wav), (_, path) in zip(wavs, items):
+        await _run("ffmpeg", "-v", "error", "-y", "-i", wav, "-c:a", "libmp3lame", "-q:a", "3", str(path))
+        Path(wav).unlink(missing_ok=True)
 
 
 async def _piper_to_file(text: str, path: Path) -> list[float]:
-    """Запасной голос Piper в mp3; времени слов нет — субтитры идут равномерно по фразе."""
-    wav = path.with_suffix(".piper.wav")
-    await asyncio.to_thread(_piper_sync, text, wav)
-    await _run("ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-q:a", "3", str(path))
-    wav.unlink(missing_ok=True)
+    """Одна фраза запасным голосом; времени слов нет — субтитры идут равномерно по фразе."""
+    await _piper_batch([(text, path)])
     return []
 
 
@@ -859,13 +852,11 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
             # весь ролик одним голосом: переозвучиваем все фразы запасным
             tts_note = f"🗣 Основной голос не ответил ({reason[:220]}) — озвучено запасным голосом."
             try:
-                for i, text in enumerate(speak):
-                    words.append(await _piper_to_file(text, parts[i]))
+                await _piper_batch(list(zip(speak, parts)))
+                words = [[] for _ in speak]
             except Exception as exc2:  # noqa: BLE001
                 log.exception("shorts: Piper failed too")
                 reason, words = f"{reason}; запасной голос: {exc2}", []
-            finally:
-                piper_unload()
         if len(words) < len(speak):
             tts_error, failed, words = reason[:250], list(range(len(speak))), [[] for _ in speak]
             for i, text in enumerate(lines):
