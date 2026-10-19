@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, news, tmdb, wiki
+from . import ai, news, pronounce, tmdb, wiki
 from .cards import make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -555,7 +555,7 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
         import edge_tts
         for i, text in enumerate(lines):
             part = work / f"voice_{i}.mp3"
-            await edge_tts.Communicate(text, VOICE, rate=VOICE_RATE).save(str(part))
+            await edge_tts.Communicate(pronounce.apply(text), VOICE, rate=VOICE_RATE).save(str(part))
             parts.append(part)
     except Exception as exc:  # noqa: BLE001 — без голоса ролик всё равно собираем
         log.warning("shorts: TTS failed, using silence: %s", exc)

@@ -39,6 +39,8 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from shorts import news as shorts_news
+from shorts import pronounce as shorts_pronounce
+from shorts.daily import VOICE as SHORTS_VOICE, VOICE_RATE as SHORTS_VOICE_RATE
 from shorts.daily import make_daily_short
 
 load_dotenv()
@@ -6257,6 +6259,16 @@ async def set_shorts_setting(key: str, value: str | None) -> None:
     )
 
 
+async def load_pronunciations() -> dict[str, str]:
+    raw = await shorts_setting("pronounce")
+    try:
+        table = json.loads(raw) if raw else {}
+    except ValueError:
+        table = {}
+    shorts_pronounce.CUSTOM = table if isinstance(table, dict) else {}
+    return shorts_pronounce.CUSTOM
+
+
 async def news_feeds() -> list[str]:
     raw = await shorts_setting("news_feeds")
     try:
@@ -6308,6 +6320,7 @@ async def run_short(
             """
         )
         exclude = {int(r["movie_id"]) for r in rows}
+        await load_pronunciations()
         now = datetime.now(MSK)
         work = SHORTS_DIR / now.strftime("%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
@@ -6470,6 +6483,87 @@ async def feeds_command(
         "<code>/feeds default</code> — стандартный список"
     )
     await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+@router.message(Command("say"))
+async def say_command(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    arg = (message.text or "").partition(" ")[2].strip()
+    table = dict(await load_pronunciations())
+    if arg.lower().startswith("del "):
+        word = arg[4:].strip()
+        if table.pop(word, None) is None:
+            await message.answer("Такого слова в своём словаре нет.")
+            return
+        await set_shorts_setting("pronounce", json.dumps(table, ensure_ascii=False) if table else None)
+        await message.answer(f"✅ Удалено: {escape(word)}")
+        return
+    if "=" in arg:
+        word, _, spoken = (x.strip() for x in arg.partition("="))
+        if not word or not spoken:
+            await message.answer("Формат: <code>/say IMAX = Аймакс</code>")
+            return
+        table[word] = spoken
+        await set_shorts_setting("pronounce", json.dumps(table, ensure_ascii=False))
+        await message.answer(
+            f"✅ «{escape(word)}» теперь читается как «{escape(shorts_pronounce.mark_stress(spoken))}».\n"
+            f"Проверить: <code>/voice {escape(word)}</code>"
+        )
+        return
+
+    lines = ["🗣 <b>Произношение в озвучке</b>"]
+    if table:
+        lines.append("\nСвои замены:")
+        lines += [f"• {escape(w)} → {escape(shorts_pronounce.mark_stress(s))}" for w, s in table.items()]
+    lines.append(f"\nВстроенных замен: {len(shorts_pronounce.DEFAULT)} (IMAX, Netflix, HBO, Marvel…)")
+    lines.append(
+        "\n<code>/say IMAX = Аймакс</code> — как читать слово\n"
+        "<code>/say замок = замОк</code> — ударение: заглавная гласная\n"
+        "<code>/say del IMAX</code> — удалить свою замену\n"
+        "<code>/voice текст</code> — послушать, как прозвучит"
+    )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("voice"))
+async def voice_command(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    text = (message.text or "").partition(" ")[2].strip()
+    if not text:
+        await message.answer("Использование: <code>/voice Премьера в IMAX уже завтра</code>")
+        return
+    await load_pronunciations()
+    spoken = shorts_pronounce.apply(text[:500])
+    path = SHORTS_DIR / f"voice_test_{message.from_user.id}.mp3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import edge_tts
+
+        await edge_tts.Communicate(spoken, SHORTS_VOICE, rate=SHORTS_VOICE_RATE).save(str(path))
+        await message.answer_audio(
+            FSInputFile(path, filename="voice.mp3"),
+            caption=f"🗣 {escape(spoken[:900])}",
+        )
+    except Exception as exc:
+        await message.answer(
+            f"❌ Не получилось озвучить: <code>{escape(str(exc)[:300])}</code>"
+        )
+    finally:
+        path.unlink(missing_ok=True)
 
 
 @router.message(Command("music"))
