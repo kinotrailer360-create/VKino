@@ -60,7 +60,7 @@ def _center(draw, y, text, fnt, fill="white", w=CARD_W, shadow=True):
 def make_card(image: Image.Image, title: str, index: int, total: int,
               rating: float | None = None, rating_source: str = "IMDb",
               cast: list[str] | None = None, badge: str | None = None,
-              height: int = CARD_H) -> Image.Image:
+              height: int = CARD_H, place: int | None = None) -> Image.Image:
     """Карточка 1080xheight: рейтинг (или badge) слева сверху, n/N справа, название и актёры снизу."""
     card = _cover(image.convert("RGB"), CARD_W, height, 0.35).convert("RGBA")
     card.alpha_composite(_gradient(CARD_W, 260, 150, 0), (0, 0))
@@ -81,8 +81,17 @@ def make_card(image: Image.Image, title: str, index: int, total: int,
         d.rounded_rectangle((24, 40, 24 + bw + 50, 112), 10, fill=RED)
         d.text((49, 52), badge, font=bf, fill="white")
 
-    # n/N
     big = _font("PTSerif-Bold.ttf", 150)
+    if place is not None:
+        # обратный отсчёт: «№5» … «№1»
+        label = f"№{place}"
+        lw = d.textlength(label, font=big)
+        x = CARD_W - 30 - lw
+        d.text((x + 3, 13), label, font=big, fill=(0, 0, 0, 140))
+        d.text((x, 10), label, font=big, fill=(255, 214, 0) if place == 1 else "white")
+        return _finish(card, d, title, cast, height)
+
+    # n/N
     small = _font("PTSerif-Bold.ttf", 150)
     num, den = str(index), str(total)
     nw, dw = d.textlength(num, font=big), d.textlength(den, font=small)
@@ -93,6 +102,11 @@ def make_card(image: Image.Image, title: str, index: int, total: int,
     d.text((x + nw + 30 + 3, 13), den, font=small, fill=(0, 0, 0, 140))
     d.text((x + nw + 30, 10), den, font=small, fill="white")
 
+    return _finish(card, d, title, cast, height)
+
+
+def _finish(card, d, title, cast, height):
+    """Название и «В ролях» внизу карточки."""
     # название и актёры
     cast_line = ("В ролях: " + ", ".join(cast[:3])) if cast else ""
     cast_f = _fit(d, cast_line, "PTSerif-Regular.ttf", 38, CARD_W - 80, 26) if cast_line else None
