@@ -6331,10 +6331,35 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         await bot.send_message(chat_id, escape(seo["warning"]))
 
 
+def progress_bar(pct: int, stage: str) -> str:
+    filled = pct // 10
+    return f"⏳ Собираю шортс\n<code>{'▓' * filled}{'░' * (10 - filled)}</code> {pct}%\n{escape(stage)}"
+
+
+def progress_updater(status: Message | None):
+    """Двигает полоску в сообщении status; правит не чаще раза в 3 с, чтобы не упереться в лимиты Telegram."""
+    last = {"pct": -1, "at": 0.0}
+
+    async def update(pct: int, stage: str) -> None:
+        if status is None:
+            return
+        now = time.monotonic()
+        if pct < 100 and (pct == last["pct"] or now - last["at"] < 3):
+            return
+        last.update(pct=pct, at=now)
+        try:
+            await status.edit_text(progress_bar(pct, stage))
+        except Exception as exc:  # noqa: BLE001 — «message is not modified», сеть и т.п.
+            logging.debug("Progress edit failed: %s", exc)
+
+    return update
+
+
 async def run_short(
     bot: Bot,
     chat_ids: list[int],
     theme_key: str | None = None,
+    status: Message | None = None,
 ) -> None:
     async with shorts_lock:
         rows = await db().fetch(
@@ -6361,6 +6386,8 @@ async def run_short(
 
             # если бот перезапустится посреди сборки (обновление на Railway), после старта скажем об этом
             await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": theme_key or ""}))
+            progress = progress_updater(status)
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(make_daily_short(
                 kp._get,
                 work,
@@ -6381,14 +6408,16 @@ async def run_short(
                 """,
                 [(int(f["id"]),) for f in result.films if f.get("id")],
             )
+            await progress(100, "Готово — отправляю ролик")
             for chat_id in chat_ids:
                 await send_short(bot, chat_id, result)
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"сборка шла дольше {SHORTS_TIMEOUT // 60} минут и была прервана — "
-                "похоже, завис внешний сервис. Попробуй ещё раз."
+                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}. Попробуй ещё раз."
             ) from None
         finally:
+            shorts_daily.on_progress = None
             await set_shorts_setting("running", None)
             shutil.rmtree(work, ignore_errors=True)
 
@@ -6483,13 +6512,17 @@ async def start_short(message: Message, theme: str) -> None:
         await message.answer("⏳ Шортс уже собирается, подожди пару минут.")
         return
 
-    await message.answer("⏳ Собираю шортс, это займёт 2–5 минут…")
+    status = await message.answer(progress_bar(0, "Начинаю, обычно это 2–5 минут"))
 
     async def job() -> None:
         try:
-            await run_short(message.bot, [message.chat.id], theme or None)
+            await run_short(message.bot, [message.chat.id], theme or None, status)
         except Exception as exc:
             logging.exception("Manual short failed")
+            try:
+                await status.edit_text("❌ Сборка остановилась — причина ниже")
+            except TelegramBadRequest:
+                pass
             await message.answer(
                 "❌ Шортс не собрался:\n"
                 f"<code>{escape(str(exc)[-700:])}</code>"
