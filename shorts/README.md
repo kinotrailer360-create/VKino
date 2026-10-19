@@ -26,4 +26,4 @@ python shorts/make_short.py путь/к/config.json
 Если нужно задать вручную — укажите `"starts": [0, 5.5, 10.5, ...]` (секунды начала каждого слайда).
 
 Прочие настройки: `header`, `tag`, `music_db` (громкость музыки, дБ), `tail` (хвост после голоса, сек),
-`watermark_width`, `watermark_opacity`, `outro.question` (`\n` — перенос строки), `outro.channel`, `outro.note`.
+`watermark_width`, `watermark_opacity`, `outro.question` (`\n` — перенос строки), `outro.channel`, `outro.youtube`, `outro.telegram` (подписи на кнопках), `outro.note`.

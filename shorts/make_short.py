@@ -235,15 +235,16 @@ class OutroSlide(Slide):
         btn_f = font(cfg, "sans", 52)
         name = cfg["outro"].get("channel", "KinoMir360")
         self.buttons = []
-        for i, (label, icon, col) in enumerate((("YouTube", draw_yt_icon, YT_RED),
-                                                ("Telegram", draw_tg_icon, TG_BLUE))):
+        for i, (label, icon, col, key) in enumerate((("YouTube", draw_yt_icon, YT_RED, "youtube"),
+                                                     ("Telegram", draw_tg_icon, TG_BLUE, "telegram"))):
+            handle = cfg["outro"].get(key, name)
             btn = Image.new("RGBA", (860, 140), (0, 0, 0, 0))
             bd = ImageDraw.Draw(btn)
             bd.rounded_rectangle((0, 0, 859, 139), 70, fill=(255, 255, 255, 235))
             icon(bd, 40, 25, 90)
             bd.text((160, 36), f"{label}", font=btn_f, fill=(20, 20, 20))
             lx = 160 + bd.textlength(label + "  ", font=btn_f)
-            bd.text((lx, 36), name, font=btn_f, fill=col)
+            bd.text((lx, 36), handle, font=btn_f, fill=col)
             self.buttons.append(btn)
         sub_f = font(cfg, "sans", 40)
         text_center(d, W / 2, 1690, cfg["outro"].get("note", "ссылки в описании"), sub_f,
