@@ -459,8 +459,8 @@ def render(cfg: dict, base: Path) -> Path:
             enc.stdin.write(img.tobytes())
         except BrokenPipeError:
             raise encoder_failed() from None
-        if f % (FPS * 5) == 0:
-            print(f"  {t:5.1f}/{total:.1f} c", flush=True)
+        if f % (FPS * 2) == 0:  # бот читает эти строки и двигает полоску загрузки
+            print(f"PROGRESS {f / n_frames:.3f}  {t:5.1f}/{total:.1f} c", flush=True)
     for sl in loaded.values():
         getattr(sl, "close", lambda: None)()
     enc.stdin.close()

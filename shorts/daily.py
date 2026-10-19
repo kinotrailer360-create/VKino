@@ -52,6 +52,18 @@ GENRES = {
 Fetch = Callable[..., Awaitable[dict[str, Any]]]
 log = logging.getLogger("shorts")
 
+ProgressFn = Callable[[int, str], Awaitable[None]]
+on_progress: ProgressFn | None = None  # бот ставит перед сборкой — двигает полоску «▓▓░░ 35%»
+
+
+async def _progress(pct: int, stage: str) -> None:
+    if on_progress is None:
+        return
+    try:
+        await on_progress(max(0, min(pct, 100)), stage)
+    except Exception as exc:  # noqa: BLE001 — полоска не должна ломать сборку
+        log.debug("shorts: progress update failed: %s", exc)
+
 
 @dataclass
 class Theme:
@@ -510,7 +522,9 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
                           music: Path | None = None, tmdb_key: str = "",
                           today: date | None = None, gemini_key: str = "") -> ShortResult:
     today = today or date.today()
+    await _progress(5, "Читаю ленты новостей")
     items = await news.latest_news(feeds, exclude or set())
+    await _progress(12, "Качаю картинки к новостям")
     # сначала новости с картинкой (кадр фильма или фото из ленты), потом остальные
     with_img: list[tuple[news.NewsItem, list[str]]] = []
     without: list[tuple[news.NewsItem, list[str]]] = []
@@ -558,6 +572,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
 
     # Gemini пересказывает своими словами; без ИИ — заголовок и лид как есть
     ai.last_error = None
+    await _progress(30, "ИИ пересказывает новости")
     retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
     spoken = retold or [say(it) for it, _ in chosen]
     lines = ([f"Главные новости кино на {day}!"] + spoken
@@ -948,6 +963,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     Карточки с "karaoke": True получают время слов для подсветки текста.
     Звуки: «вжух» на каждом переходе, «бум» перед слайдом boom_slide (номер один в отсчёте).
     """
+    await _progress(40, "Озвучка")
     voice, starts, voiced, spans = await synthesize(lines, work)
     for i, card in enumerate(cards, 1):  # слайд 0 — обложка
         if card.pop("karaoke", False):
@@ -979,8 +995,25 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     }
     cfg_path = work / "short.json"
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # рендер — отдельным процессом, чтобы не блокировать бота
-    await _run(sys.executable, "-m", "shorts.make_short", str(cfg_path))
+    # рендер — отдельным процессом, чтобы не блокировать бота; его строки PROGRESS двигают полоску
+    await _progress(50, "Монтаж видео")
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "shorts.make_short", str(cfg_path),
+                                                stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent)
+    errors = asyncio.create_task(proc.stderr.read())  # читаем параллельно, иначе процесс может встать
+    try:
+        async for line in proc.stdout:
+            m = re.match(rb"PROGRESS ([\d.]+)", line)
+            if m:
+                await _progress(50 + round(48 * float(m.group(1))), "Монтаж видео")
+        await proc.wait()
+    except asyncio.CancelledError:
+        proc.kill()  # сборку прервали по таймауту — не оставляем рендер жрать память
+        raise
+    err = await errors
+    if proc.returncode:
+        raise RuntimeError(f"{sys.executable} failed: {err.decode(errors='ignore')[-800:]}")
+    await _progress(98, "Видео готово")
     return voiced
 
 
@@ -1019,7 +1052,9 @@ def _portrait(img: Image.Image, w: int = 1080, h: int = FACT_CARD_H) -> Image.Im
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
                            music: Path | None = None, tmdb_key: str = "",
                            gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
+    await _progress(5, "Ищу фильм и факты")
     film, facts = await pick_fact_film(fetch, query, exclude or set())
+    await _progress(10, f"«{_title(film)}»: качаю кадры")
     # награды из Викиданных — первым фактом
     award_fact = wiki.awards_fact(_title(film), await wiki.awards(film))
     if award_fact:
@@ -1065,12 +1100,14 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     videos: dict[int, str] = {}
     video_note = ""
     if trailer_clips and rest:
+        await _progress(18, "Ищу моменты в трейлере")
         if ai.available(gemini_key):
             videos, video_note = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
         else:
             video_note = "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY — без ИИ моменты не подобрать"
     # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
     stills = [i for i in rest if i not in videos]
+    await _progress(32, "ИИ подбирает кадры")
     choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
     used: set[int] = set()
     picked: dict[int, Image.Image] = dict(portraits)
@@ -1184,7 +1221,9 @@ def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]]
 async def make_birthday_short(work: Path, today: date, exclude: set[int] | None = None,
                               music: Path | None = None, tmdb_key: str = "",
                               trailer_clips: bool = True) -> ShortResult:
+    await _progress(5, "Ищу именинника")
     who, info, top = await pick_birthday(today, exclude or set(), tmdb_key)
+    await _progress(12, f"{who['name']}: качаю кадры и трейлеры")
     name, female = who["name"], who["female"]
     born = date.fromisoformat(who["born"])
     age = today.year - born.year
@@ -1199,6 +1238,7 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
         photo = await _download_first(session, tmdb.profile_urls(info))
         for i, f in enumerate(films, 1):
             title = str(f.get("title") or f.get("original_title") or "")
+            await _progress(12 + 25 * (i - 1) // n, f"Фильм {i} из {n}: {title}")
             year = str(f.get("release_date") or "")[:4]
             img = await _download_first(session, [tmdb.still_url(f)])
             rating = float(f.get("vote_average") or 0)
@@ -1284,6 +1324,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     theme = theme_for(theme_key, today)
     # в текстах зашито «5 ...», поэтому фильмов должно быть ровно FILMS;
     # если тема их не набрала — берём жанровую подборку
+    await _progress(5, "Подбираю фильмы")
     films = await pick_films(fetch, theme, today, exclude or set())
     for _ in range(3):
         if len(films) >= FILMS:
@@ -1303,6 +1344,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     async with aiohttp.ClientSession(timeout=timeout) as session:
         posters_tmdb: list[str] = []
         for i, f in enumerate(films, 1):
+            await _progress(10 + 28 * (i - 1) // n, f"Фильм {i} из {n}: {_title(f)}")
             # кадр без надписей с TMDB, если нет — фон/постер Кинопоиска
             backdrops, posters = await tmdb.images(tmdb_key, f, limit=1)
             if i == n:
