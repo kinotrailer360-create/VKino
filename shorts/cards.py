@@ -11,6 +11,7 @@ CARD_W, CARD_H = 1080, 1000
 COVER_W, COVER_H = 1080, 1920
 RED = (229, 9, 20)
 IMDB_YELLOW = (245, 197, 24)
+TMDB_GREEN = (1, 210, 119)
 KP_ORANGE = (255, 102, 0)
 
 
@@ -79,11 +80,12 @@ def card_overlay(title: str, index: int, total: int,
 
     # рейтинг или дата премьеры
     if rating:
-        col = IMDB_YELLOW if rating_source == "IMDb" else KP_ORANGE
+        col = {"IMDb": IMDB_YELLOW, "TMDB": TMDB_GREEN}.get(rating_source, KP_ORANGE)
         d.ellipse((20, 30, 120, 130), fill=col)
-        lab = _font("PTSerif-Bold.ttf", 30 if rating_source == "IMDb" else 38)
+        short = len(rating_source) <= 2  # «КП» крупнее, IMDb/TMDB — мельче, чтобы влезли в круг
+        lab = _font("PTSerif-Bold.ttf", 38 if short else 27)
         lw = d.textlength(rating_source, font=lab)
-        d.text((70 - lw / 2, 62 if rating_source == "IMDb" else 57), rating_source, font=lab, fill=(0, 0, 0))
+        d.text((70 - lw / 2, 57 if short else 64), rating_source, font=lab, fill=(0, 0, 0))
         d.text((140, 38), f"{rating:.1f}", font=_font("PTSerif-Bold.ttf", 72), fill="white")
     elif badge:
         bf = _font("Montserrat.ttf", 40, "Bold")

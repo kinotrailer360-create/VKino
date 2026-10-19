@@ -6251,6 +6251,7 @@ SHORT_THEMES = {
     "genre": "топ случайного жанра",
     "facts": "5 фактов о фильме",
     "news": "новости кино",
+    "birthday": "день рождения звезды",
 }
 shorts_lock = asyncio.Lock()
 shorts_jobs: set[asyncio.Task] = set()
@@ -6784,7 +6785,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
-        [_btn("🎭 Топ жанра ▸", "sh:genres")],
+        [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
         [_btn("💡 Факты: случайный", "sh:go:facts")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
