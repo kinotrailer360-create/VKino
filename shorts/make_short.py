@@ -166,14 +166,23 @@ class CardSlide(Slide):
         tw = d.textlength(tag, font=tag_f)
         d.rectangle((W / 2 - tw / 2 - 30, 165, W / 2 + tw / 2 + 30, 235), fill=RED)
         text_center(d, W / 2, 173, tag, tag_f)
-        text_center(d, W / 2, 250, cfg.get("header", ""), font(cfg, "head", 84), stroke=3)
+        header = cfg.get("header", "")
+        for size in (84, 72, 62, 54):  # длинное название фильма — шрифт поменьше
+            head_f = font(cfg, "head", size)
+            if d.textlength(header, font=head_f) <= W - 80:
+                break
+        text_center(d, W / 2, 250 + (84 - size) // 2, header, head_f, stroke=3)
 
         y = self.card_y + card.height + 26
         if caption:
-            cap_f = font(cfg, "sans", 46)
-            for line in wrap(d, caption, cap_f, W - 140):
+            for size in (46, 42, 38):  # длинный текст (факт) — шрифт поменьше
+                cap_f = font(cfg, "sans", size)
+                lines = wrap(d, caption, cap_f, W - 120)
+                if len(lines) <= 5:
+                    break
+            for line in lines:
                 text_center(d, W / 2, y, line, cap_f, stroke=3)
-                y += 60
+                y += round(size * 1.3)
         # строки «подпись: значение • подпись: значение» — даты выхода, бюджет, сборы
         for row in info or []:
             pieces = []

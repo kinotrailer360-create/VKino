@@ -59,11 +59,12 @@ def _center(draw, y, text, fnt, fill="white", w=CARD_W, shadow=True):
 
 def make_card(image: Image.Image, title: str, index: int, total: int,
               rating: float | None = None, rating_source: str = "IMDb",
-              cast: list[str] | None = None, badge: str | None = None) -> Image.Image:
-    """Карточка 1080x1000: рейтинг (или badge) слева сверху, n/N справа, название и актёры снизу."""
-    card = _cover(image.convert("RGB"), CARD_W, CARD_H, 0.35).convert("RGBA")
+              cast: list[str] | None = None, badge: str | None = None,
+              height: int = CARD_H) -> Image.Image:
+    """Карточка 1080xheight: рейтинг (или badge) слева сверху, n/N справа, название и актёры снизу."""
+    card = _cover(image.convert("RGB"), CARD_W, height, 0.35).convert("RGBA")
     card.alpha_composite(_gradient(CARD_W, 260, 150, 0), (0, 0))
-    card.alpha_composite(_gradient(CARD_W, 480, 0, 225), (0, CARD_H - 480))
+    card.alpha_composite(_gradient(CARD_W, 480, 0, 225), (0, height - 480))
     d = ImageDraw.Draw(card)
 
     # рейтинг или дата премьеры
@@ -97,8 +98,9 @@ def make_card(image: Image.Image, title: str, index: int, total: int,
     cast_f = _fit(d, cast_line, "PTSerif-Regular.ttf", 38, CARD_W - 80, 26) if cast_line else None
     title_f = _fit(d, title.upper(), "PTSerif-Bold.ttf", 120, CARD_W - 60, 54)
     tb = d.textbbox((0, 0), title.upper(), font=title_f)
-    bottom = CARD_H - (110 if cast_line else 60)
-    _center(d, bottom - tb[3], title.upper(), title_f)
+    bottom = height - (110 if cast_line else 60)
+    if title:
+        _center(d, bottom - tb[3], title.upper(), title_f)
     if cast_line:
         _center(d, bottom + 14, cast_line, cast_f)
         d.rounded_rectangle((110, bottom + 70, CARD_W - 110, bottom + 80), 5, fill=RED)
@@ -136,9 +138,10 @@ def make_cover(image: Image.Image, tag: str, headline: str, brand: str = "KinoMi
                 lines.append(cur)
         if len(lines) <= 3:
             break
+    max_lines = 3 if len(lines) <= 3 else 4  # очень длинное название — даём четвёртую строку
     step = round(size * 1.25)
     y = panel_y + 110 + (3 - min(len(lines), 3)) * step // 2
-    for line in lines[:3]:
+    for line in lines[:max_lines]:
         _center(d, y, line, hf, w=COVER_W)
         y += step
 
