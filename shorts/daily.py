@@ -417,6 +417,48 @@ async def _trailer_clip(item: dict[str, Any], out: Path) -> bool:
         return False
 
 
+async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]], work: Path,
+                     gemini_key: str) -> dict[int, str]:
+    """Для фактов — фрагменты трейлера, где видно то, о чём факт: {номер факта: файл клипа}.
+
+    Трейлер с Rutube качается целиком, режется на кадры, Gemini выбирает кадр под каждый факт
+    (или «ничего не подходит»), вокруг выбранного момента вырезается CLIP_SECONDS.
+    """
+    titles = [str(item.get(k) or "") for k in ("name", "alternativeName", "enName")]
+    trailer_dir = work / "trailer"
+    try:
+        found = await clips.rutube_trailer([t for t in titles if t], item.get("year"))
+        if not found:
+            log.info("shorts: no Rutube trailer for facts about %s", _title(item))
+            return {}
+        trailer_dir.mkdir(exist_ok=True)
+        src = await clips.download_full(found["url"], trailer_dir)
+        frames = await clips.sample_frames(src, trailer_dir, duration=found["duration"])
+        if not frames:
+            return {}
+        thumbs = [Image.open(path).convert("RGB") for _, path in frames]
+        choices = await ai.match_images(gemini_key, [text for _, text in facts_by_idx], thumbs)
+        if not choices:
+            return {}
+        out: dict[int, str] = {}
+        used: set[int] = set()
+        for (i, _), c in zip(facts_by_idx, choices):
+            if c < 0 or c in used:
+                continue
+            used.add(c)
+            clip = work / f"fclip{i}.mp4"
+            # момент чуть раньше выбранного кадра — чтобы действие успело начаться в кадре
+            await clips.cut_clip(src, clip, frames[c][0] - 1.5, CLIP_SECONDS)
+            out[i] = clip.name
+        return out
+    except Exception as exc:  # noqa: BLE001 — без трейлера будут фото и кадры
+        log.warning("shorts: trailer clips for facts about %s failed: %s", _title(item), exc)
+        return {}
+    finally:
+        import shutil
+        shutil.rmtree(trailer_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- новости кино
 
 NEWS = 5
@@ -795,7 +837,7 @@ def _portrait(img: Image.Image, w: int = 1080, h: int = 780) -> Image.Image:
 
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
                            music: Path | None = None, tmdb_key: str = "",
-                           gemini_key: str = "") -> ShortResult:
+                           gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
     film, facts = await pick_fact_film(fetch, query, exclude or set())
     # награды из Викиданных — первым фактом
     award_fact = wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -836,14 +878,19 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     if not images:
         raise RuntimeError(f"Не скачались картинки для «{t}»")
 
-    # остальные факты — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
-    rest = [i for i in range(n) if i not in portraits]
     ai.last_error = None
-    choices = await ai.match_images(gemini_key, [facts[i] for i in rest], images) if rest else None
+    rest = [i for i in range(n) if i not in portraits]
+    # факты без фото — сначала момент из трейлера, который Gemini счёл подходящим
+    videos: dict[int, str] = {}
+    if trailer_clips and gemini_key and rest:
+        videos = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
+    # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
+    stills = [i for i in rest if i not in videos]
+    choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
     used: set[int] = set()
     picked: dict[int, Image.Image] = dict(portraits)
-    for k, i in enumerate(rest):
-        c = choices[k] if choices else -1
+    for k, i in enumerate(stills + list(videos)):  # у фактов с видео кадр — запасной
+        c = choices[k] if choices and k < len(stills) else -1
         if c < 0 or c in used:
             c = next((j for j in range(len(images)) if j not in used), k % len(images))
         used.add(c)
@@ -855,7 +902,11 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                                        None, "IMDb", None, f"ФАКТ №{i}", 780)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
-        cards.append({"image": path.name, "caption": fact, "karaoke": True})
+        video: dict[str, str] = {}
+        if (i - 1) in videos:
+            card_overlay("", i, n, None, "IMDb", None, f"ФАКТ №{i}", 780).save(work / f"overlay{i}.png")
+            video = {"clip": videos[i - 1], "overlay": f"overlay{i}.png"}
+        cards.append({"image": path.name, "caption": fact, "karaoke": True, **video})
 
     cover = await asyncio.to_thread(make_cover, cover_src, "ФАКТЫ", f"{hook}, которые ты не знал")
     cover_path = work / "cover.jpg"
@@ -894,7 +945,8 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     if theme_key.startswith("facts"):
         query = theme_key.partition(":")[2].strip()
         try:
-            return await make_facts_short(fetch, work, query, exclude, music, tmdb_key, gemini_key)
+            return await make_facts_short(fetch, work, query, exclude, music, tmdb_key, gemini_key,
+                                          trailer_clips)
         except RuntimeError:
             if query:
                 raise
