@@ -22,8 +22,10 @@ ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 FILMS = 5
 VOICE = "ru-RU-DmitryNeural"
-VOICE_RATE = "+8%"
-GAP = 0.25  # пауза между фразами, сек
+VOICE_RATE = "+22%"
+GAP = 0.2  # пауза между фразами, сек
+MIN_RATING = 6.0  # ниже — рейтинг не показываем, он только отпугнёт
+SKIP_RATING = 5.5  # ниже — фильм в подборку не берём
 
 YOUTUBE_URL = "https://youtube.com/@kinomir360"
 TELEGRAM_URL = "https://t.me/KinoMir360"
@@ -89,16 +91,24 @@ def _poster_url(item: dict[str, Any]) -> str | None:
     return _image_url(item)
 
 
-def _rating(item: dict[str, Any]) -> tuple[float | None, str]:
+def _best_rating(item: dict[str, Any]) -> tuple[float, str]:
+    """Больший из рейтингов IMDb и Кинопоиска (0 — рейтинга нет)."""
     r = item.get("rating") or {}
-    for key, label in (("imdb", "IMDb"), ("kp", "КП")):
+    best, label = 0.0, ""
+    for key, name in (("imdb", "IMDb"), ("kp", "КП")):
         try:
             v = float(r.get(key) or 0)
         except (TypeError, ValueError):
-            v = 0
-        if v > 0:
-            return v, label
-    return None, ""
+            v = 0.0
+        if v > best:
+            best, label = v, name
+    return best, label
+
+
+def _rating(item: dict[str, Any]) -> tuple[float | None, str]:
+    """Рейтинг для карточки и описания: только если он достаточно высокий."""
+    v, label = _best_rating(item)
+    return (v, label) if v >= MIN_RATING else (None, "")
 
 
 def _actors(item: dict[str, Any], n: int = 3) -> list[str]:
@@ -137,6 +147,61 @@ def _premiere(item: dict[str, Any]) -> date | None:
 
 def _date_ru(d: date) -> str:
     return f"{d.day} {MONTHS[d.month - 1]}"
+
+
+def _pdate(item: dict[str, Any], key: str) -> date | None:
+    raw = str((item.get("premiere") or {}).get(key) or "")[:10]
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _date_full(d: date) -> str:
+    return f"{d.day} {MONTHS[d.month - 1]} {d.year}"
+
+
+def _money(obj: Any) -> str | None:
+    """{"value": 150000000, "currency": "$"} -> "$150 млн"."""
+    if not isinstance(obj, dict):
+        return None
+    try:
+        v = float(obj.get("value") or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    if v >= 1e9:
+        num = f"{v / 1e9:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " млрд"
+    elif v >= 1e6:
+        num = f"{v / 1e6:.0f} млн"
+    else:
+        num = f"{v / 1e3:.0f} тыс"
+    cur = str(obj.get("currency") or "$").strip()
+    if cur in ("$", "€"):
+        return f"{cur}{num}"
+    return f"{num} руб." if cur in ("₽", "руб", "руб.", "RUB") else f"{num} {cur}"
+
+
+def info_rows(item: dict[str, Any]) -> list[list[tuple[str, str]]]:
+    """Строки под карточкой: даты выхода, бюджет и сборы — что есть в данных."""
+    dates: list[tuple[str, str]] = []
+    if item.get("isSeries"):
+        if d := _pdate(item, "world"):
+            dates.append(("Премьера", _date_full(d)))
+    else:
+        if d := _pdate(item, "russia"):
+            dates.append(("В кино", _date_full(d)))
+        if d := _pdate(item, "digital"):
+            dates.append(("Онлайн", _date_full(d)))
+        if not dates and (d := _pdate(item, "world")):
+            dates.append(("Премьера", _date_full(d)))
+    money: list[tuple[str, str]] = []
+    if b := _money(item.get("budget")):
+        money.append(("Бюджет", b))
+    if f := _money((item.get("fees") or {}).get("world")):
+        money.append(("Сборы", f))
+    return [row for row in (dates, money) if row]
 
 
 async def _query(fetch: Fetch, **params: Any) -> list[dict[str, Any]]:
@@ -211,6 +276,8 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         mid = d.get("id")
         if not mid or mid in exclude or mid in seen or not _title(d) or not _image_url(d):
             continue
+        if 0 < _best_rating(d)[0] < SKIP_RATING:
+            continue
         seen.add(mid)
         picked.append(d)
         if len(picked) >= FILMS:
@@ -240,17 +307,14 @@ def _say_film(item: dict[str, Any], theme: Theme) -> str:
         parts.append(f"В кино с {_date_ru(_premiere(item))}.")
     elif genres:
         parts.append(f"{genres[0].capitalize()}.")
-    actors = _actors(item, 1)
-    if actors:
-        parts.append(f"В главной роли — {actors[0]}.")
     return " ".join(parts)
 
 
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
     return ([f"{theme.hook}. Сохрани, чтобы не потерять!"]
             + [_say_film(f, theme) for f in films]
-            + ["Какой посмотришь первым? Пиши в комментариях! "
-               "Подписывайся на КиноМир триста шестьдесят в Ютубе и Телеграме."])
+            + ["Какой посмотришь первым? Пиши в комментариях "
+               "и подписывайся на КиноМир триста шестьдесят!"])
 
 
 async def _run(*cmd: str) -> str:
@@ -377,7 +441,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
         for i, f in enumerate(films, 1):
             img = await _download(session, _image_url(f))
             rating, src = _rating(f)
-            badge = None
+            badge = None if rating else "НОВИНКА"
             if theme.upcoming:
                 prem = _premiere(f)
                 rating, badge = None, (f"С {_date_ru(prem).upper()}" if prem else "СКОРО")
@@ -387,7 +451,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
             card.save(path, quality=93)
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
-            cards.append({"image": path.name, "caption": caption})
+            cards.append({"image": path.name, "caption": caption, "info": info_rows(f)})
 
     headline = theme.hook.replace(", ", ",\n", 1)
     cover = await asyncio.to_thread(make_cover, cover_src, theme.tag, headline)
