@@ -22,7 +22,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -7043,11 +7043,18 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(router)
-    await set_admin_commands(bot)
+    commands_task = asyncio.create_task(set_admin_commands(bot))  # не задерживает запуск
 
-    await bot.delete_webhook(
-        drop_pending_updates=True
-    )
+    # Telegram иногда не отвечает вовремя — ждём и повторяем, а не падаем и не перезапускаемся
+    for attempt in range(1, 31):
+        try:
+            await bot.delete_webhook(
+                drop_pending_updates=True
+            )
+            break
+        except TelegramNetworkError as exc:
+            logging.warning("Telegram unreachable on start (attempt %s): %s", attempt, exc)
+            await asyncio.sleep(min(5 * attempt, 60))
 
     logging.info("VKino started")
 
@@ -7058,6 +7065,7 @@ async def main() -> None:
         blender_task.cancel()
         reminder_task.cancel()
         shorts_task.cancel()
+        commands_task.cancel()
 
         try:
             await provider_task
