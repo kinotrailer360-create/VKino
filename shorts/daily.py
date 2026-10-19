@@ -754,6 +754,49 @@ def _speakable(text: str) -> str:
     return text.strip() or "…"
 
 
+def _pieces(text: str) -> list[str]:
+    """Фраза по предложениям, длинные — ещё и по запятым."""
+    out: list[str] = []
+    for sent in re.split(r"(?<=[.!?…])\s+", text):
+        if len(sent) > 90 and "," in sent:
+            out += [p.strip() for p in re.split(r"(?<=,)\s+", sent) if p.strip()]
+        elif sent.strip():
+            out.append(sent.strip())
+    return out
+
+
+async def _edge_pieces(text: str, path: Path, stem: Path) -> tuple[list[float], list[str]]:
+    """Озвучить фразу кусками основным голосом и склеить; куски, которые не вышли, пропускаем.
+
+    Возвращает (время слов во всей фразе, тексты пропущенных кусков). Если не вышло ничего — тишина.
+    """
+    files: list[Path] = []
+    words: list[float] = []
+    lost: list[str] = []
+    t = 0.0
+    for k, piece in enumerate(_pieces(text)):
+        out = stem.with_name(f"{stem.name}_p{k}.mp3")
+        try:
+            got = await _say_once(piece, out)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: Edge TTS piece failed %r: %r", piece[:60], exc)
+            lost.append(piece)
+            continue
+        words += [t + w for w in got]
+        t += await _duration(out) + 0.1
+        files.append(out)
+    if not files:
+        await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                   "-t", f"{max(2.5, min(len(text) / 14, 8.0)):.2f}", str(path))
+        return [], lost
+    inputs = [arg for f in files for arg in ("-i", str(f))]
+    chain = "".join(f"[{i}:a]aresample=24000,apad=pad_dur=0.1[a{i}];" for i in range(len(files)))
+    chain += "".join(f"[a{i}]" for i in range(len(files))) + f"concat=n={len(files)}:v=0:a=1[out]"
+    await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", chain, "-map", "[out]",
+               "-c:a", "libmp3lame", "-q:a", "3", str(path))
+    return words, lost
+
+
 async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     global tts_error, tts_note
@@ -762,16 +805,27 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
     parts: list[Path] = [work / f"voice_{i}.mp3" for i in range(len(lines))]
     words: list[list[float]] = []
     failed: list[int] = []
+    dropped: list[str] = []
     try:
         for i, text in enumerate(speak):
-            words.append(await _edge_to_file(text, parts[i]))
+            try:
+                words.append(await _edge_to_file(text, parts[i]))
+            except Exception as exc:  # noqa: BLE001
+                if not words:
+                    raise  # первая же фраза не озвучилась — сервис недоступен целиком
+                # сервис работает, но эта фраза ему не нравится — озвучиваем её по кусочкам
+                log.warning("shorts: Edge TTS rejected phrase %d (%r), trying pieces", i + 1, exc)
+                got, lost = await _edge_pieces(text, parts[i], work / f"voice_{i}")
+                words.append(got)
+                dropped += lost
     except Exception as exc:  # noqa: BLE001
-        reason = str(exc).rstrip(".") or type(exc).__name__
+        bad = len(words)
+        reason = f"{str(exc).rstrip('.') or type(exc).__name__}; фраза №{bad + 1}: «{speak[bad][:60]}»"
         log.warning("shorts: Edge TTS failed (%s)", reason)
         words = []
         if piper_ready():
             # весь ролик одним голосом: переозвучиваем все фразы запасным
-            tts_note = f"🗣 Основной голос не ответил ({reason[:120]}) — озвучено запасным голосом."
+            tts_note = f"🗣 Основной голос не ответил ({reason[:220]}) — озвучено запасным голосом."
             try:
                 for i, text in enumerate(speak):
                     words.append(await _piper_to_file(text, parts[i]))
@@ -787,6 +841,9 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
                 await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
                            "-t", f"{sec:.2f}", str(parts[i]))
     voiced = not failed
+    if dropped and not tts_note:
+        tts_note = ("🗣 Основной голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
+                    + "; ".join(f"«{d[:60]}»" for d in dropped[:3]))
 
     starts, spans, t = [], [], 0.0
     inputs, chains = [], []
