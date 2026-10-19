@@ -56,7 +56,13 @@ ProgressFn = Callable[[int, str], Awaitable[None]]
 on_progress: ProgressFn | None = None  # бот ставит перед сборкой — двигает полоску «▓▓░░ 35%»
 
 
+last_stage = ""  # последний этап сборки — если она зависнет, бот скажет, на чём
+
+
 async def _progress(pct: int, stage: str) -> None:
+    global last_stage
+    last_stage = f"{pct}% — {stage}"
+    log.info("shorts: %s", last_stage)
     if on_progress is None:
         return
     try:
@@ -429,17 +435,24 @@ async def _stills(fetch: Fetch, item: dict[str, Any]) -> list[str]:
 CLIP_SECONDS = 5.0
 
 
+TRAILER_BUDGET = 75  # сек на трейлер одного фильма: не уложились — карточка с кадром
+
+
 async def _trailer_clip(item: dict[str, Any], out: Path) -> bool:
     """Скачать 5 секунд трейлера с Rutube в out; False — не нашлось или не скачалось."""
     titles = [str(item.get(k) or "") for k in ("name", "alternativeName", "enName")]
-    try:
+
+    async def fetch() -> bool:
         found = await clips.rutube_trailer([t for t in titles if t], item.get("year"))
         if not found:
             log.info("shorts: no Rutube trailer for %s", _title(item))
             return False
         await clips.download_clip(found["url"], out, clips.clip_start(found["duration"], CLIP_SECONDS),
-                                  CLIP_SECONDS, timeout=90)
+                                  CLIP_SECONDS, timeout=60)
         return out.exists()
+
+    try:
+        return await asyncio.wait_for(fetch(), timeout=TRAILER_BUDGET)
     except Exception as exc:  # noqa: BLE001 — без трейлера останется кадр
         log.warning("shorts: trailer clip for %s failed: %s", _title(item), exc)
         return False

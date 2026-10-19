@@ -6387,7 +6387,7 @@ async def run_short(
             # если бот перезапустится посреди сборки (обновление на Railway), после старта скажем об этом
             await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": theme_key or ""}))
             progress = progress_updater(status)
-            shorts_daily.on_progress = progress
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(make_daily_short(
                 kp._get,
                 work,
@@ -6414,7 +6414,7 @@ async def run_short(
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"сборка шла дольше {SHORTS_TIMEOUT // 60} минут и была прервана — "
-                "похоже, завис внешний сервис. Попробуй ещё раз."
+                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}. Попробуй ещё раз."
             ) from None
         finally:
             shorts_daily.on_progress = None
