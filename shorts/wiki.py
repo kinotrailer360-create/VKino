@@ -107,3 +107,55 @@ def awards_fact(title: str, aw: dict[str, dict[str, int]]) -> str | None:
         name, noms = _order(aw["noms"])[0]
         return f"«{title}» {noms} {_plural(noms, 'раз', 'раза', 'раз')} номинировался на «{name}»."
     return None
+
+
+# ---------------------------------------------------------------- дни рождения
+
+# актёр, киноактёр, телеактёр, кинорежиссёр; известность — по числу статей в Википедиях (sitelinks)
+BIRTHDAYS = """
+SELECT ?p ?ru ?en ?born ?gender ?imdb ?sl WHERE {
+  VALUES ?occ { wd:Q33999 wd:Q10800557 wd:Q10798782 wd:Q2526255 }
+  ?p wdt:P106 ?occ ; wikibase:sitelinks ?sl .
+  FILTER(?sl > 40)
+  ?p wdt:P569 ?born .
+  FILTER(MONTH(?born) = %d && DAY(?born) = %d)
+  FILTER NOT EXISTS { ?p wdt:P570 [] }
+  ?p wdt:P345 ?imdb .
+  FILTER(STRSTARTS(?imdb, "nm"))
+  ?p rdfs:label ?ru . FILTER(LANG(?ru) = "ru")
+  OPTIONAL { ?p rdfs:label ?en . FILTER(LANG(?en) = "en") }
+  OPTIONAL { ?p wdt:P21 ?gender }
+}
+ORDER BY DESC(?sl)
+LIMIT 40
+"""
+FEMALE = "http://www.wikidata.org/entity/Q6581072"
+
+
+async def birthdays(month: int, day: int, limit: int = 10) -> list[dict[str, Any]]:
+    """Живые звёзды кино, родившиеся в этот день, самые известные первыми.
+
+    [{"name", "en", "born": "YYYY-MM-DD", "female": bool, "imdb": "nm…"}]; ошибка — исключение.
+    """
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
+        async with session.get(SPARQL, params={"query": BIRTHDAYS % (month, day), "format": "json"}) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in data["results"]["bindings"]:
+        imdb = row["imdb"]["value"]
+        if imdb in seen:  # несколько профессий/дат — одна запись
+            continue
+        seen.add(imdb)
+        out.append({
+            "name": row["ru"]["value"],
+            "en": (row.get("en") or {}).get("value", ""),
+            "born": row["born"]["value"][:10],
+            "female": (row.get("gender") or {}).get("value") == FEMALE,
+            "imdb": imdb,
+        })
+        if len(out) >= limit:
+            break
+    return out

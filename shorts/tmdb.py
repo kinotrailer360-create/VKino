@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from typing import Any
 
 import aiohttp
@@ -102,3 +103,54 @@ async def people(key: str, item: dict[str, Any]) -> dict[str, str]:
         if person.get("profile_path") and person.get("name"):
             out.setdefault(str(person["name"]).lower(), f"{IMG}h632{person['profile_path']}")
     return out
+
+
+async def person(key: str, imdb: str) -> dict[str, Any] | None:
+    """Человек по IMDb ID: профиль (на русском) с фильмографией и фото, или None."""
+    if not key:
+        return None
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        found = await _get(session, key, f"/find/{imdb}", external_source="imdb_id")
+        people = found.get("person_results") or []
+        if not people:
+            return None
+        return await _get(session, key, f"/person/{people[0]['id']}", language="ru-RU",
+                          append_to_response="movie_credits,images")
+
+
+def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
+    """Самые известные фильмы человека: роли (или режиссура), без документалок и камео «в роли себя»."""
+    credits = info.get("movie_credits") or {}
+    directing = info.get("known_for_department") == "Directing"
+    pool = ([c for c in credits.get("crew") or [] if c.get("job") == "Director"] if directing
+            else [c for c in credits.get("cast") or []
+                  if not re.search(r"\b(self|himself|herself|себя)\b", str(c.get("character") or ""), re.I)])
+    films: dict[int, dict[str, Any]] = {}
+    for c in pool:
+        if 99 in (c.get("genre_ids") or []) or not c.get("release_date") or not c.get("id"):
+            continue  # документальные и ещё не вышедшие не берём
+        if (c.get("vote_count") or 0) < 50:
+            continue
+        films.setdefault(int(c["id"]), c)
+    top = sorted(films.values(), key=lambda c: c.get("vote_count") or 0, reverse=True)[:n]
+    return top
+
+
+def still_url(film: dict[str, Any]) -> str | None:
+    if film.get("backdrop_path"):
+        return f"{IMG}w1280{film['backdrop_path']}"
+    if film.get("poster_path"):
+        return f"{IMG}w780{film['poster_path']}"
+    return None
+
+
+def profile_urls(info: dict[str, Any]) -> list[str]:
+    """Портреты: основной и ещё несколько из галереи — для обложки и первого слайда."""
+    urls = [f"{IMG}h632{info['profile_path']}"] if info.get("profile_path") else []
+    for p in ((info.get("images") or {}).get("profiles") or [])[:4]:
+        if p.get("file_path"):
+            url = f"{IMG}h632{p['file_path']}"
+            if url not in urls:
+                urls.append(url)
+    return urls

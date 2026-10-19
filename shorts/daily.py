@@ -1053,6 +1053,137 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     return result
 
 
+# ---------------------------------------------------------------- день рождения
+
+BIRTHDAY_FILMS = 5
+
+
+def _years(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "год"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "года"
+    return "лет"
+
+
+def person_uid(imdb: str) -> int:
+    """Отрицательный id для истории роликов — не пересекается с фильмами Кинопоиска и новостями."""
+    return -(10**12 + int(re.sub(r"\D", "", imdb) or 0))
+
+
+async def pick_birthday(today: date, exclude: set[int], tmdb_key: str) -> tuple[dict[str, Any], dict[str, Any],
+                                                                             list[dict[str, Any]]]:
+    """(человек из Викиданных, профиль TMDB, лучшие фильмы) — самый известный именинник с фильмами."""
+    people = await wiki.birthdays(today.month, today.day)
+    if not people:
+        raise RuntimeError("Сегодня в Викиданных нет известных именинников из кино")
+    for who in people:
+        if person_uid(who["imdb"]) in exclude:
+            continue
+        try:
+            info = await tmdb.person(tmdb_key, who["imdb"])
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: TMDB person %s failed: %s", who["imdb"], exc)
+            continue
+        if not info:
+            continue
+        films = tmdb.best_movies(info, BIRTHDAY_FILMS)
+        if len(films) >= 3:
+            return who, info, films
+    raise RuntimeError("Не нашлось именинника с фильмами на TMDB (нужен TMDB_API_KEY)")
+
+
+def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]], female: bool) -> dict[str, str]:
+    title = f"{name} — {age} {_years(age)}! Лучшие фильмы 🎂 #shorts"
+    if len(title) > 100:
+        title = f"{name}: лучшие фильмы 🎂 #shorts"[:100]
+    names = [str(f.get("title") or f.get("original_title")) for f in films]
+    description = "\n".join([
+        f"🎂 Сегодня день рождения: {name}" + (f" ({en})" if en and en != name else "")
+        + f" — {age} {_years(age)}!", "",
+        "Лучшие фильмы:",
+        *[f"{len(films) - i}. {t}" + (f" ({str(f.get('release_date'))[:4]})" if f.get("release_date") else "")
+          for i, (t, f) in enumerate(zip(names, films))], "",
+        "А какой фильм твой любимый? Пиши в комментариях 👇", "",
+        f"📺 YouTube: {YOUTUBE_URL}",
+        f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
+        "#деньрождения #кино #KinoMir360",
+    ])
+    tags: list[str] = []
+    for tag in [name.lower(), en.lower(), f"{name.lower()} фильмы", f"лучшие фильмы {name.lower()}",
+                f"{name.lower()} день рождения", "день рождения звезды", "лучшие фильмы"] + \
+            [t.lower() for t in names] + ["KinoMir360", "киномир360", "шортс кино"]:
+        if tag and tag not in tags and len(", ".join(tags + [tag])) <= 480:
+            tags.append(tag)
+    pinned = (f"А какой фильм с {'ней' if female else 'ним'} твой любимый? 👇\n"
+              f"Ещё больше подборок — в нашем Telegram 👉 {TELEGRAM_URL}")
+    return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
+
+
+async def make_birthday_short(work: Path, today: date, exclude: set[int] | None = None,
+                              music: Path | None = None, tmdb_key: str = "",
+                              trailer_clips: bool = True) -> ShortResult:
+    who, info, top = await pick_birthday(today, exclude or set(), tmdb_key)
+    name, female = who["name"], who["female"]
+    born = date.fromisoformat(who["born"])
+    age = today.year - born.year
+    he = "ей" if female else "ему"
+    # обратный отсчёт: самый известный фильм — последним
+    films = top[::-1]
+    n = len(films)
+
+    cards = []
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        photo = await _download_first(session, tmdb.profile_urls(info))
+        for i, f in enumerate(films, 1):
+            title = str(f.get("title") or f.get("original_title") or "")
+            year = str(f.get("release_date") or "")[:4]
+            img = await _download_first(session, [tmdb.still_url(f)])
+            rating = float(f.get("vote_average") or 0)
+            rating_shown = rating if rating >= MIN_RATING else None
+            card = await asyncio.to_thread(make_card, img, title, i, n, rating_shown, "TMDB", None, None,
+                                           place=n - i + 1)
+            path = work / f"card{i}.jpg"
+            card.save(path, quality=93)
+            video: dict[str, str] = {}
+            item = {"name": title, "alternativeName": f.get("original_title"), "year": int(year) if year else None}
+            if trailer_clips and await _trailer_clip(item, work / f"clip{i}.mp4"):
+                card_overlay(title, i, n, rating_shown, "TMDB", None, None, place=n - i + 1).save(work / f"overlay{i}.png")
+                video = {"clip": f"clip{i}.mp4", "overlay": f"overlay{i}.png"}
+            role = str(f.get("character") or "").strip()
+            rows = [[("Роль", role)]] if role else [[("Режиссёр", name)]] if f.get("job") == "Director" else []
+            cards.append({"image": path.name, "caption": " • ".join(x for x in [name, year] if x),
+                          "info": rows, **video})
+
+    portrait = _portrait(photo, 1080, 1350)
+    cover = await asyncio.to_thread(make_cover, portrait, "ДЕНЬ РОЖДЕНИЯ", f"{name}\n{age} {_years(age)}!")
+    cover_path = work / "cover.jpg"
+    cover.save(cover_path, quality=93)
+
+    def say(f: dict[str, Any], place: int) -> str:
+        title = f"«{f.get('title') or f.get('original_title')}»"
+        head = f"И номер один — {title}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}."
+        role = str(f.get("character") or "").strip()
+        return f"{head} Роль — {role}." if role and len(role) < 40 else head
+
+    lines = ([f"Сегодня день рождения празднует {name}! {he.capitalize()} {age} {_years(age)}. Лучшие фильмы:"]
+             + [say(f, n - i) for i, f in enumerate(films)]
+             + [f"А какой фильм с {'ней' if female else 'ним'} твой любимый? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
+    header = name.upper()
+    voiced = await _render(work, cover_path, cards, lines, "ДЕНЬ РОЖДЕНИЯ", header,
+                           "КАКОЙ ФИЛЬМ\nТВОЙ ЛЮБИМЫЙ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
+
+    hook = f"{name} — {age} {_years(age)}"
+    theme = Theme("birthday", "ДЕНЬ РОЖДЕНИЯ", header, hook, hook, [])
+    seo = build_birthday_seo(name, who["en"], age, films, female)
+    result = ShortResult(work / "short.mp4", cover_path, theme,
+                         [{"id": person_uid(who["imdb"]), "name": name}], seo)
+    if not voiced or tts_note:
+        result.seo["warning"] = no_voice_note(voiced)
+    return result
+
+
 async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = None,
                            exclude: set[int] | None = None, music: Path | None = None,
                            today: date | None = None, tmdb_key: str = "",
@@ -1062,6 +1193,14 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
     theme_key = theme_key or SCHEDULE[today.weekday()]
+    if theme_key == "birthday":
+        try:
+            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips)
+        except Exception:
+            if manual:
+                raise
+            log.exception("shorts: birthday failed, falling back to genre")
+            theme_key = "genre"
     if theme_key == "news":
         try:
             return await make_news_short(fetch, work, news_feeds or news.DEFAULT_FEEDS, exclude, music,
