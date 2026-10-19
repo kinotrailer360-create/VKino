@@ -547,15 +547,33 @@ async def _duration(path: Path) -> float:
     return float(out.strip())
 
 
+TTS_TIMEOUT = 40  # сек на фразу: без лимита запрос к сервису голоса может висеть бесконечно
+
+
+async def say_to_file(text: str, path: Path) -> None:
+    """Озвучить фразу в mp3. Если сервис не принял знак ударения — повторяем без него."""
+    import edge_tts
+
+    try:
+        await asyncio.wait_for(edge_tts.Communicate(text, VOICE, rate=VOICE_RATE).save(str(path)),
+                               timeout=TTS_TIMEOUT)
+    except Exception:
+        if pronounce.STRESS not in text:
+            raise
+        log.warning("shorts: TTS failed with stress marks, retrying without them")
+        await asyncio.wait_for(
+            edge_tts.Communicate(text.replace(pronounce.STRESS, ""), VOICE, rate=VOICE_RATE).save(str(path)),
+            timeout=TTS_TIMEOUT)
+
+
 async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool]:
     """Озвучка по фразам; возвращает файл, начало каждой фразы и признак, что голос есть."""
     parts: list[Path] = []
     voiced = True
     try:
-        import edge_tts
         for i, text in enumerate(lines):
             part = work / f"voice_{i}.mp3"
-            await edge_tts.Communicate(pronounce.apply(text), VOICE, rate=VOICE_RATE).save(str(part))
+            await say_to_file(pronounce.apply(text), part)
             parts.append(part)
     except Exception as exc:  # noqa: BLE001 — без голоса ролик всё равно собираем
         log.warning("shorts: TTS failed, using silence: %s", exc)
