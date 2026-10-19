@@ -465,7 +465,8 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         card = await asyncio.to_thread(make_card, img, "", i, n, None, "IMDb", None, f"НОВОСТЬ №{i}", 780)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
-        cards.append({"image": path.name, "caption": item.title, "info": [[("Источник", item.source)]]})
+        cards.append({"image": path.name, "caption": item.title, "info": [[("Источник", item.source)]],
+                      "karaoke": True})
 
     day = _date_ru(today)
     cover = await asyncio.to_thread(make_cover, images[0], "НОВОСТИ", f"Главные новости кино\n{day}")
@@ -481,8 +482,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
     spoken = retold or [say(it) for it, _ in chosen]
     lines = ([f"Главные новости кино на {day}!"] + spoken
-             + ["Какая новость удивила больше всего? Пиши в комментариях "
-                "и подписывайся на КиноМир триста шестьдесят!"])
+             + [f"Какая новость удивила больше всего? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
     voiced = await _render(work, cover_path, cards, lines, "НОВОСТИ", "НОВОСТИ КИНО",
                            "КАКАЯ НОВОСТЬ\nУДИВИЛА БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
 
@@ -516,8 +516,14 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
 
 # ---------------------------------------------------------------- голос
 
-def _say_film(item: dict[str, Any], theme: Theme) -> str:
-    parts = [f"«{_title(item)}»."]
+NUMBERS = {1: "один", 2: "два", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь"}
+SAVE_AND_SUBSCRIBE = "Сохрани, чтобы не потерять, и подписывайся на КиноМир триста шестьдесят!"
+
+
+def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
+    """Обратный отсчёт: «Номер пять — «X». Комедия.» … «И номер один — «X»!»."""
+    title = f"«{_title(item)}»"
+    parts = [f"И номер один — {title}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}."]
     genres = _genres(item)
     if theme.upcoming and _premiere(item):
         parts.append(f"В кино с {_date_ru(_premiere(item))}.")
@@ -527,10 +533,16 @@ def _say_film(item: dict[str, Any], theme: Theme) -> str:
 
 
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
-    return ([f"{theme.hook}. Сохрани, чтобы не потерять!"]
-            + [_say_film(f, theme) for f in films]
-            + ["Какой посмотришь первым? Пиши в комментариях "
-               "и подписывайся на КиноМир триста шестьдесят!"])
+    # короткое начало — первые секунды решают, досмотрят ли ролик; «сохрани» — в конце
+    n = len(films)
+    return ([f"{theme.hook}!"]
+            + [_say_film(f, theme, n - i) for i, f in enumerate(films)]
+            + [f"Какой посмотришь первым? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
+
+
+def _rank_key(item: dict[str, Any]) -> tuple[float, int]:
+    """Чем выше, тем ближе к №1: лучший рейтинг, при равенстве — больше оценок."""
+    return _best_rating(item)[0], int((item.get("votes") or {}).get("kp") or 0)
 
 
 async def _run(*cmd: str) -> str:
@@ -550,35 +562,45 @@ async def _duration(path: Path) -> float:
 TTS_TIMEOUT = 40  # сек на фразу: без лимита запрос к сервису голоса может висеть бесконечно
 
 
-async def say_to_file(text: str, path: Path) -> None:
-    """Озвучить фразу в mp3. Если сервис не принял знак ударения — повторяем без него."""
+async def _tts(text: str, path: Path) -> list[float]:
+    """Синтез в mp3; возвращает время начала каждого слова (сек) — для субтитров-караоке."""
     import edge_tts
 
+    words: list[float] = []
+    with open(path, "wb") as out:
+        async for chunk in edge_tts.Communicate(text, VOICE, rate=VOICE_RATE, boundary="WordBoundary").stream():
+            if chunk["type"] == "audio":
+                out.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                words.append(chunk["offset"] / 10_000_000)  # единицы по 100 нс
+    return words
+
+
+async def say_to_file(text: str, path: Path) -> list[float]:
+    """Озвучить фразу в mp3 (время слов в ответе). Не принял знак ударения — повторяем без него."""
     try:
-        await asyncio.wait_for(edge_tts.Communicate(text, VOICE, rate=VOICE_RATE).save(str(path)),
-                               timeout=TTS_TIMEOUT)
+        return await asyncio.wait_for(_tts(text, path), timeout=TTS_TIMEOUT)
     except Exception:
         if pronounce.STRESS not in text:
             raise
         log.warning("shorts: TTS failed with stress marks, retrying without them")
-        await asyncio.wait_for(
-            edge_tts.Communicate(text.replace(pronounce.STRESS, ""), VOICE, rate=VOICE_RATE).save(str(path)),
-            timeout=TTS_TIMEOUT)
+        return await asyncio.wait_for(_tts(text.replace(pronounce.STRESS, ""), path), timeout=TTS_TIMEOUT)
 
 
-async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool]:
-    """Озвучка по фразам; возвращает файл, начало каждой фразы и признак, что голос есть."""
+async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
+    """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     parts: list[Path] = []
+    words: list[list[float]] = []
     voiced = True
     try:
         for i, text in enumerate(lines):
             part = work / f"voice_{i}.mp3"
-            await say_to_file(pronounce.apply(text), part)
+            words.append(await say_to_file(pronounce.apply(text), part))
             parts.append(part)
     except Exception as exc:  # noqa: BLE001 — без голоса ролик всё равно собираем
         log.warning("shorts: TTS failed, using silence: %s", exc)
         voiced = False
-        parts = []
+        parts, words = [], [[] for _ in lines]
         for i in range(len(lines)):
             part = work / f"voice_{i}.mp3"
             sec = 3.5 if 0 < i < len(lines) - 1 else 4.5
@@ -586,18 +608,20 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
                        "-t", str(sec), str(part))
             parts.append(part)
 
-    starts, t = [], 0.0
+    starts, spans, t = [], [], 0.0
     inputs, chains = [], []
     for i, part in enumerate(parts):
         starts.append(round(t, 3))
-        t += await _duration(part) + GAP
+        dur = await _duration(part)
+        spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]]})
+        t += dur + GAP
         inputs += ["-i", str(part)]
         chains.append(f"[{i}:a]aresample=48000,apad=pad_dur={GAP}[a{i}]")
     filt = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(parts))) + \
         f"concat=n={len(parts)}:v=0:a=1[out]"
     voice = work / "voice.wav"
     await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
-    return voice, starts, voiced
+    return voice, starts, voiced, spans
 
 
 # ---------------------------------------------------------------- SEO
@@ -609,9 +633,9 @@ def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
         title = title[:90].rstrip() + "… #shorts"
 
     rows = []
-    for i, f in enumerate(films, 1):
+    for i, f in enumerate(films):
         year = f.get("year")
-        line = f"{i}. {_title(f)}" + (f" ({year})" if year else "")
+        line = f"{len(films) - i}. {_title(f)}" + (f" ({year})" if year else "")
         rating, src = _rating(f)
         if theme.upcoming and _premiere(f):
             line += f" — в кино с {_date_ru(_premiere(f))}"
@@ -676,9 +700,20 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
 # ---------------------------------------------------------------- сборка
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
-                  tag: str, header: str, question: str, music: Path | None) -> bool:
-    """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить."""
-    voice, starts, voiced = await synthesize(lines, work)
+                  tag: str, header: str, question: str, music: Path | None,
+                  boom_slide: int | None = None) -> bool:
+    """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить.
+
+    Карточки с "karaoke": True получают время слов для подсветки текста.
+    Звуки: «вжух» на каждом переходе, «бум» перед слайдом boom_slide (номер один в отсчёте).
+    """
+    voice, starts, voiced, spans = await synthesize(lines, work)
+    for i, card in enumerate(cards, 1):  # слайд 0 — обложка
+        if card.pop("karaoke", False):
+            card["karaoke"] = spans[i]
+    sfx = [[max(st - 0.15, 0), str(ASSETS / "whoosh.wav"), -6] for st in starts[1:]]
+    if boom_slide is not None and boom_slide < len(starts):
+        sfx.append([max(starts[boom_slide] - 0.05, 0), str(ASSETS / "boom.wav"), -5])
     cfg = {
         "output": "short.mp4",
         "intro": cover_path.name,
@@ -692,6 +727,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         "header": header,
         "cards": cards,
         "starts": starts,
+        "sfx": sfx,
         "outro": {
             "question": question,
             "channel": "KinoMir360",
@@ -798,15 +834,14 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                                        None, "IMDb", None, f"ФАКТ №{i}", 780)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
-        cards.append({"image": path.name, "caption": fact})
+        cards.append({"image": path.name, "caption": fact, "karaoke": True})
 
     cover = await asyncio.to_thread(make_cover, cover_src, "ФАКТЫ", f"{hook}, которые ты не знал")
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
     lines = ([f"{hook}, которые ты точно не знал!"] + facts
-             + ["Какой факт удивил тебя больше всего? Пиши в комментариях "
-                "и подписывайся на КиноМир триста шестьдесят!"])
+             + [f"Какой факт удивил больше всего? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
     voiced = await _render(work, cover_path, cards, lines, "ФАКТЫ", t.upper(),
                            "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_facts_seo(film, facts))
@@ -857,6 +892,9 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     if len(films) < FILMS:
         raise RuntimeError(f"Не набралось {FILMS} фильмов для подборки (тема {theme.key})")
     n = len(films)
+    # обратный отсчёт: показываем с №5 до №1, лучший — последним (ожидаемые — по порядку ожидания)
+    ranked = films if theme.upcoming else sorted(films, key=_rank_key, reverse=True)
+    films = ranked[::-1]
 
     cards = []
     timeout = aiohttp.ClientTimeout(total=30)
@@ -865,7 +903,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
         for i, f in enumerate(films, 1):
             # кадр без надписей с TMDB, если нет — фон/постер Кинопоиска
             backdrops, posters = await tmdb.images(tmdb_key, f, limit=1)
-            if i == 1:
+            if i == n:
                 posters_tmdb = posters
             img = await _download_first(session, backdrops + [_image_url(f)])
             rating, src = _rating(f)
@@ -874,7 +912,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                 prem = _premiere(f)
                 rating, badge = None, (f"С {_date_ru(prem).upper()}" if prem else "СКОРО")
             card = await asyncio.to_thread(make_card, img, _title(f), i, n, rating, src or "IMDb",
-                                           _actors(f), badge)
+                                           _actors(f), badge, place=n - i + 1)
             path = work / f"card{i}.jpg"
             card.save(path, quality=93)
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
@@ -884,8 +922,8 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
             if f["_awards"]:
                 rows.append([("Награды", f["_awards"])])
             cards.append({"image": path.name, "caption": caption, "info": rows})
-        # обложка: русский постер Кинопоиска, запасной — постер TMDB
-        cover_src = await _download_first(session, [_poster_url(films[0])] + posters_tmdb)
+        # обложка — фильм №1: русский постер Кинопоиска, запасной — постер TMDB
+        cover_src = await _download_first(session, [_poster_url(films[-1])] + posters_tmdb)
 
     headline = theme.hook.replace(", ", ",\n", 1)
     cover = await asyncio.to_thread(make_cover, cover_src, theme.tag, headline)
@@ -893,7 +931,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     cover.save(cover_path, quality=93)
 
     voiced = await _render(work, cover_path, cards, voice_lines(theme, films), theme.tag, theme.header,
-                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music)
+                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
     if not voiced:

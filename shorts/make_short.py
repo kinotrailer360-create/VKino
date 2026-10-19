@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H = 1080, 1920
 FPS = 30
-XFADE = 0.3  # длительность перехода между слайдами, сек
+XFADE = 0.2  # длительность перехода между слайдами, сек
 RED = (229, 9, 20)
 TG_BLUE = (42, 171, 238)
 YT_RED = (255, 0, 0)
@@ -150,7 +150,7 @@ class IntroSlide(Slide):
 
 
 class CardSlide(Slide):
-    def __init__(self, cfg, path, idx, total, caption, info=None):
+    def __init__(self, cfg, path, idx, total, caption, info=None, karaoke=None):
         card = Image.open(path).convert("RGB")
         card = card.resize((W, round(card.height * W / card.width)), Image.LANCZOS)
         self.card = card
@@ -174,15 +174,27 @@ class CardSlide(Slide):
         text_center(d, W / 2, 250 + (84 - size) // 2, header, head_f, stroke=3)
 
         y = self.card_y + card.height + 26
+        self.karaoke = None
         if caption:
             for size in (46, 42, 38):  # длинный текст (факт) — шрифт поменьше
                 cap_f = font(cfg, "sans", size)
                 lines = wrap(d, caption, cap_f, W - 120)
                 if len(lines) <= 5:
                     break
-            for line in lines:
-                text_center(d, W / 2, y, line, cap_f, stroke=3)
-                y += round(size * 1.3)
+            if karaoke:
+                # караоке: слова рисуются каждый кадр, сказанные — жёлтым
+                words = []
+                for line in lines:
+                    x = (W - d.textlength(line, font=cap_f)) / 2
+                    for word in line.split(" "):
+                        words.append((x, y, word))
+                        x += d.textlength(word + " ", font=cap_f)
+                    y += round(size * 1.3)
+                self.karaoke = (words, cap_f, karaoke.get("words") or [], karaoke.get("speech") or 1.0)
+            else:
+                for line in lines:
+                    text_center(d, W / 2, y, line, cap_f, stroke=3)
+                    y += round(size * 1.3)
         # строки «подпись: значение • подпись: значение» — даты выхода, бюджет, сборы
         for row in info or []:
             pieces = []
@@ -218,7 +230,22 @@ class CardSlide(Slide):
         cx, cy = (W - cw) // 2, self.card_y + (self.card.height - ch) // 2
         img.paste(card, (cx, cy))
         img.paste(self.overlay, (0, 0), self.overlay)
+        if self.karaoke:
+            self._draw_karaoke(img, t)
         return img
+
+    def _draw_karaoke(self, img, t):
+        words, fnt, spoken, speech = self.karaoke
+        if spoken:
+            # время слов из синтеза; слов на экране может быть чуть больше/меньше (IMAX -> Аймакс)
+            said = sum(1 for w in spoken if w <= t)
+            done = round(said * len(words) / len(spoken))
+        else:
+            done = int(len(words) * min(max(t / speech, 0), 1) + 0.5)
+        d = ImageDraw.Draw(img)
+        for k, (x, y, word) in enumerate(words):
+            col = (255, 214, 0) if k < done else (255, 255, 255)
+            d.text((x, y), word, font=fnt, fill=col, stroke_width=3, stroke_fill=(0, 0, 0))
 
 
 def draw_yt_icon(d, x, y, s):
@@ -288,15 +315,24 @@ class OutroSlide(Slide):
 
 # ---------------------------------------------------------------- render
 
-def mix_audio(voice: Path, music: Path, total: float, out: Path, music_db: float):
+def mix_audio(voice: Path, music: Path, total: float, out: Path, music_db: float,
+              sfx: list[tuple[float, Path, float]] | None = None):
+    """Голос + музыка (приглушается под голос) + звуковые эффекты (время, файл, громкость дБ)."""
     fade = max(total - 2.0, 0)
+    sfx = [(t, f, db) for t, f, db in sfx or [] if 0 <= t < total and f.exists()]
+    inputs = ["-i", str(voice), "-i", str(music)]
     filt = (
         f"[1:a]volume={music_db}dB,atrim=0:{total},afade=t=in:d=0.5,afade=t=out:st={fade}:d=2[m];"
         f"[0:a]apad=whole_dur={total},asplit=2[v][sc];"
         f"[m][sc]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=400[md];"
-        f"[v][md]amix=inputs=2:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[a]"
     )
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(voice), "-i", str(music),
+    for k, (t, f, db) in enumerate(sfx):
+        inputs += ["-i", str(f)]
+        ms = round(t * 1000)
+        filt += f"[{k + 2}:a]aresample=48000,volume={db}dB,adelay={ms}|{ms}[s{k}];"
+    mix = "[v][md]" + "".join(f"[s{k}]" for k in range(len(sfx)))
+    filt += f"{mix}amix=inputs={2 + len(sfx)}:normalize=0:duration=first,loudnorm=I=-14:TP=-1.5:LRA=11[a]"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *inputs,
                     "-filter_complex", filt, "-map", "[a]", "-ar", "48000", "-c:a", "aac", "-b:a", "192k",
                     str(out)], check=True)
 
@@ -313,7 +349,8 @@ def render(cfg: dict, base: Path) -> Path:
     cards = cfg["cards"]
     # слайды создаются по мере надобности и выгружаются после показа — экономим память
     makers = [lambda: IntroSlide(cfg, p(cfg["intro"]))]
-    makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"))
+    makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"),
+                                          c.get("karaoke"))
                for i, c in enumerate(cards)]
     makers.append(lambda: OutroSlide(cfg, p(cfg["intro"]), logo))
     loaded: dict[int, Slide] = {}
@@ -338,7 +375,8 @@ def render(cfg: dict, base: Path) -> Path:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     audio = out.with_suffix(".m4a")
-    mix_audio(voice, music, total, audio, cfg.get("music_db", -14))
+    sfx = [(float(t), p(f), float(db)) for t, f, db in cfg.get("sfx") or []]
+    mix_audio(voice, music, total, audio, cfg.get("music_db", -14), sfx)
 
     # настройки x264 под маленький сервер: один поток и короткий lookahead — мало памяти
     log_path = out.with_suffix(".ffmpeg.log")
