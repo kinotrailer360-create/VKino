@@ -6312,11 +6312,6 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         height=1920,
         supports_streaming=True,
     )
-    await bot.send_document(
-        chat_id,
-        FSInputFile(result.cover, filename="cover.jpg"),
-        caption="🖼 Обложка для ролика",
-    )
     for label, key in (
         ("Название", "title"),
         ("Описание", "description"),
