@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 
 from shorts import news as shorts_news
 from shorts import pronounce as shorts_pronounce
+from shorts.clips import download_clip as shorts_download_clip
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
@@ -6565,6 +6566,82 @@ async def voice_command(
         )
     finally:
         path.unlink(missing_ok=True)
+
+
+async def trailer_sources(item: dict[str, Any]) -> list[tuple[str, str]]:
+    """Откуда можно взять фрагмент трейлера: [(название источника, url)]."""
+    sources: list[tuple[str, str]] = []
+    try:
+        trailer = await resolve_trailer(int(item["id"]))
+        if trailer and trailer.get("youtube_id"):
+            sources.append(("YouTube", f"https://www.youtube.com/watch?v={trailer['youtube_id']}"))
+        elif trailer and trailer.get("direct_url"):
+            sources.append(("Прямая ссылка", str(trailer["direct_url"])))
+    except Exception:
+        logging.exception("Trailer lookup failed")
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                RUTUBE_SEARCH_API,
+                params={"query": f"{kp.title(item)} трейлер", "format": "json"},
+                headers={"accept": "application/json"},
+            ) as resp:
+                data = await resp.json(content_type=None)
+        for video in (data.get("results") or [])[:10]:
+            vid = _rutube_video_id(video) if isinstance(video, dict) else None
+            if vid and "трейлер" in str(video.get("title") or "").lower():
+                sources.append(("Rutube", f"https://rutube.ru/video/{vid}/"))
+                break
+    except Exception:
+        logging.exception("Rutube trailer search failed")
+    return sources
+
+
+@router.message(Command("trailer"))
+async def trailer_test_command(
+    message: Message,
+) -> None:
+    """Проверка: качаются ли фрагменты трейлеров с этого сервера."""
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    query = (message.text or "").partition(" ")[2].strip()
+    if not query:
+        await message.answer("Использование: <code>/trailer Интерстеллар</code>")
+        return
+    await message.answer("⏳ Ищу трейлер и пробую скачать 4 секунды…")
+    try:
+        found = await kp.search(query, limit=1)
+    except Exception as exc:
+        await message.answer(f"❌ Поиск не удался: <code>{escape(str(exc)[:200])}</code>")
+        return
+    if not found:
+        await message.answer("Фильм не найден.")
+        return
+    item = found[0]
+    sources = await trailer_sources(item)
+    if not sources:
+        await message.answer(f"Трейлер для «{escape(kp.title(item))}» не нашёлся ни на YouTube, ни на Rutube.")
+        return
+
+    report = [f"🎬 <b>{escape(kp.title(item))}</b>"]
+    for name, url in sources:
+        out = SHORTS_DIR / f"clip_test_{message.from_user.id}_{name}.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await shorts_download_clip(url, out)
+            await message.answer_video(FSInputFile(out), caption=f"✅ {name}: фрагмент скачался")
+            report.append(f"✅ {name}")
+        except Exception as exc:
+            logging.exception("Clip test failed for %s", url)
+            report.append(f"❌ {name}: <code>{escape(type(exc).__name__)}: {escape(str(exc)[:250])}</code>")
+        finally:
+            out.unlink(missing_ok=True)
+    await message.answer("\n".join(report), disable_web_page_preview=True)
 
 
 @router.message(Command("music"))
