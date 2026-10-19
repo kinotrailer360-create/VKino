@@ -352,7 +352,11 @@ def _facts_word(n: int) -> str:
 
 
 async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int]) -> tuple[dict[str, Any], list[str]]:
-    if query:
+    if query.startswith("id:") and query[3:].isdigit():
+        # выбран из подсказок поиска — точный фильм по id Кинопоиска
+        cands = [{"id": int(query[3:])}]
+        need = 3
+    elif query:
         # «Мастер и Маргарита 2024» — год в конце уточняет, какой из одноимённых фильмов
         year_m = re.search(r"\s(19\d\d|20\d\d)$", query)
         year = int(year_m.group(1)) if year_m else None
