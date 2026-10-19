@@ -149,6 +149,61 @@ def _date_ru(d: date) -> str:
     return f"{d.day} {MONTHS[d.month - 1]}"
 
 
+def _pdate(item: dict[str, Any], key: str) -> date | None:
+    raw = str((item.get("premiere") or {}).get(key) or "")[:10]
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _date_full(d: date) -> str:
+    return f"{d.day} {MONTHS[d.month - 1]} {d.year}"
+
+
+def _money(obj: Any) -> str | None:
+    """{"value": 150000000, "currency": "$"} -> "$150 млн"."""
+    if not isinstance(obj, dict):
+        return None
+    try:
+        v = float(obj.get("value") or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    if v >= 1e9:
+        num = f"{v / 1e9:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " млрд"
+    elif v >= 1e6:
+        num = f"{v / 1e6:.0f} млн"
+    else:
+        num = f"{v / 1e3:.0f} тыс"
+    cur = str(obj.get("currency") or "$").strip()
+    if cur in ("$", "€"):
+        return f"{cur}{num}"
+    return f"{num} руб." if cur in ("₽", "руб", "руб.", "RUB") else f"{num} {cur}"
+
+
+def info_rows(item: dict[str, Any]) -> list[list[tuple[str, str]]]:
+    """Строки под карточкой: даты выхода, бюджет и сборы — что есть в данных."""
+    dates: list[tuple[str, str]] = []
+    if item.get("isSeries"):
+        if d := _pdate(item, "world"):
+            dates.append(("Премьера", _date_full(d)))
+    else:
+        if d := _pdate(item, "russia"):
+            dates.append(("В кино", _date_full(d)))
+        if d := _pdate(item, "digital"):
+            dates.append(("Онлайн", _date_full(d)))
+        if not dates and (d := _pdate(item, "world")):
+            dates.append(("Премьера", _date_full(d)))
+    money: list[tuple[str, str]] = []
+    if b := _money(item.get("budget")):
+        money.append(("Бюджет", b))
+    if f := _money((item.get("fees") or {}).get("world")):
+        money.append(("Сборы", f))
+    return [row for row in (dates, money) if row]
+
+
 async def _query(fetch: Fetch, **params: Any) -> list[dict[str, Any]]:
     params.setdefault("page", 1)
     params.setdefault("limit", 40)
@@ -396,7 +451,7 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
             card.save(path, quality=93)
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
-            cards.append({"image": path.name, "caption": caption})
+            cards.append({"image": path.name, "caption": caption, "info": info_rows(f)})
 
     headline = theme.hook.replace(", ", ",\n", 1)
     cover = await asyncio.to_thread(make_cover, cover_src, theme.tag, headline)

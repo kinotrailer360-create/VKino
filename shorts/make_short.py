@@ -150,13 +150,13 @@ class IntroSlide(Slide):
 
 
 class CardSlide(Slide):
-    def __init__(self, cfg, path, idx, total, caption):
+    def __init__(self, cfg, path, idx, total, caption, info=None):
         card = Image.open(path).convert("RGB")
         card = card.resize((W, round(card.height * W / card.width)), Image.LANCZOS)
         self.card = card
         bg = cover(card, int(W * 1.1), int(H * 1.1)).filter(ImageFilter.GaussianBlur(40))
         self.bg = Image.blend(bg, Image.new("RGB", bg.size), 0.55)
-        self.card_y = 470
+        self.card_y = 380
 
         # статичный слой с заголовком, подписью и прогрессом
         ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -164,19 +164,36 @@ class CardSlide(Slide):
         tag_f = font(cfg, "sans", 40)
         tag = cfg.get("tag", "НОВИНКИ")
         tw = d.textlength(tag, font=tag_f)
-        d.rectangle((W / 2 - tw / 2 - 30, 210, W / 2 + tw / 2 + 30, 280), fill=RED)
-        text_center(d, W / 2, 218, tag, tag_f)
-        text_center(d, W / 2, 300, cfg.get("header", ""), font(cfg, "head", 84), stroke=3)
+        d.rectangle((W / 2 - tw / 2 - 30, 165, W / 2 + tw / 2 + 30, 235), fill=RED)
+        text_center(d, W / 2, 173, tag, tag_f)
+        text_center(d, W / 2, 250, cfg.get("header", ""), font(cfg, "head", 84), stroke=3)
 
+        y = self.card_y + card.height + 26
         if caption:
-            cap_f = font(cfg, "sans", 50)
-            y = self.card_y + card.height + 50
+            cap_f = font(cfg, "sans", 46)
             for line in wrap(d, caption, cap_f, W - 140):
                 text_center(d, W / 2, y, line, cap_f, stroke=3)
-                y += 66
+                y += 60
+        # строки «подпись: значение • подпись: значение» — даты выхода, бюджет, сборы
+        for row in info or []:
+            pieces = []
+            for k, (label, value) in enumerate(row):
+                if k:
+                    pieces.append(("  •  ", (170, 170, 170)))
+                pieces += [(f"{label}: ", (255, 196, 0)), (value, (255, 255, 255))]
+            for size in (38, 34, 30, 27):  # длинная строка — шрифт поменьше
+                info_f = font(cfg, "sans", size)
+                width = sum(d.textlength(t, font=info_f) for t, _ in pieces)
+                if width <= W - 50:
+                    break
+            x = (W - width) / 2
+            for t, col in pieces:
+                d.text((x, y), t, font=info_f, fill=col, stroke_width=2, stroke_fill=(0, 0, 0))
+                x += d.textlength(t, font=info_f)
+            y += 54
 
         # прогресс: total сегментов, заполнены до idx
-        seg_w, gap, y = 70, 12, 140
+        seg_w, gap, y = 70, 12, 110
         x0 = (W - (total * seg_w + (total - 1) * gap)) / 2
         for k in range(total):
             x = x0 + k * (seg_w + gap)
@@ -287,7 +304,7 @@ def render(cfg: dict, base: Path) -> Path:
     cards = cfg["cards"]
     # слайды создаются по мере надобности и выгружаются после показа — экономим память
     makers = [lambda: IntroSlide(cfg, p(cfg["intro"]))]
-    makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""))
+    makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"))
                for i, c in enumerate(cards)]
     makers.append(lambda: OutroSlide(cfg, p(cfg["intro"]), logo))
     loaded: dict[int, Slide] = {}
