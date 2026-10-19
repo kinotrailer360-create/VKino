@@ -40,7 +40,7 @@ from dotenv import load_dotenv
 
 from shorts import news as shorts_news
 from shorts import pronounce as shorts_pronounce
-from shorts.daily import VOICE as SHORTS_VOICE, VOICE_RATE as SHORTS_VOICE_RATE
+from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
 load_dotenv()
@@ -6546,21 +6546,22 @@ async def voice_command(
     if not text:
         await message.answer("Использование: <code>/voice Премьера в IMAX уже завтра</code>")
         return
-    await load_pronunciations()
-    spoken = shorts_pronounce.apply(text[:500])
+    await message.answer("⏳ Озвучиваю…")
     path = SHORTS_DIR / f"voice_test_{message.from_user.id}.mp3"
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import edge_tts
-
-        await edge_tts.Communicate(spoken, SHORTS_VOICE, rate=SHORTS_VOICE_RATE).save(str(path))
+        await load_pronunciations()
+        spoken = shorts_pronounce.apply(text[:500])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await shorts_say_to_file(spoken, path)
         await message.answer_audio(
             FSInputFile(path, filename="voice.mp3"),
             caption=f"🗣 {escape(spoken[:900])}",
         )
     except Exception as exc:
+        logging.exception("Voice test failed")
+        reason = "сервис голоса не ответил за 40 секунд" if isinstance(exc, asyncio.TimeoutError) else str(exc)
         await message.answer(
-            f"❌ Не получилось озвучить: <code>{escape(str(exc)[:300])}</code>"
+            f"❌ Не получилось озвучить: <code>{escape(type(exc).__name__)}: {escape(reason[:300])}</code>"
         )
     finally:
         path.unlink(missing_ok=True)
