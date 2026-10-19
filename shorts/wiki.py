@@ -111,51 +111,84 @@ def awards_fact(title: str, aw: dict[str, dict[str, int]]) -> str | None:
 
 # ---------------------------------------------------------------- дни рождения
 
-# актёр, киноактёр, телеактёр, кинорежиссёр; известность — по числу статей в Википедиях (sitelinks)
-BIRTHDAYS = """
-SELECT ?p ?ru ?en ?born ?gender ?imdb ?sl WHERE {
-  VALUES ?occ { wd:Q33999 wd:Q10800557 wd:Q10798782 wd:Q2526255 }
-  ?p wdt:P106 ?occ ; wikibase:sitelinks ?sl .
-  FILTER(?sl > 40)
-  ?p wdt:P569 ?born .
-  FILTER(MONTH(?born) = %d && DAY(?born) = %d)
-  FILTER NOT EXISTS { ?p wdt:P570 [] }
-  ?p wdt:P345 ?imdb .
-  FILTER(STRSTARTS(?imdb, "nm"))
-  ?p rdfs:label ?ru . FILTER(LANG(?ru) = "ru")
-  OPTIONAL { ?p rdfs:label ?en . FILTER(LANG(?en) = "en") }
-  OPTIONAL { ?p wdt:P21 ?gender }
+# «Родились в этот день» из Википедии (лёгкий запрос), подробности — пачкой из Викиданных.
+# Тяжёлый SPARQL по всем актёрам Викиданные не тянут (502 по таймауту).
+ONTHISDAY = "https://{lang}.wikipedia.org/api/rest_v1/feed/onthisday/births/{month:02d}/{day:02d}"
+ENTITIES = "https://www.wikidata.org/w/api.php"
+FILM_JOBS = {
+    "en": r"\b(actor|actress|film director|filmmaker|director)\b",
+    "ru": r"(актёр|актер|актриса|режиссёр|режиссер)",
 }
-ORDER BY DESC(?sl)
-LIMIT 40
-"""
-FEMALE = "http://www.wikidata.org/entity/Q6581072"
+FEMALE = "Q6581072"
+
+
+def _claim(entity: dict[str, Any], prop: str) -> Any:
+    for claim in (entity.get("claims") or {}).get(prop) or []:
+        value = ((claim.get("mainsnak") or {}).get("datavalue") or {}).get("value")
+        if value is not None:
+            return value
+    return None
+
+
+async def _born_today(session: aiohttp.ClientSession, month: int, day: int) -> list[str]:
+    """Q-идентификаторы людей кино, родившихся в этот день (англ. Википедия, запасная — русская)."""
+    ids: list[str] = []
+    errors = []
+    for lang in ("en", "ru"):
+        try:
+            async with session.get(ONTHISDAY.format(lang=lang, month=month, day=day)) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{lang}: {exc}")
+            continue
+        for event in data.get("births") or []:
+            for page in event.get("pages") or []:
+                qid = page.get("wikibase_item")
+                if qid and qid not in ids and re.search(FILM_JOBS[lang], str(page.get("description") or ""), re.I):
+                    ids.append(qid)
+        if ids:
+            return ids
+    if errors:
+        raise RuntimeError("Википедия не ответила: " + "; ".join(errors))
+    return ids
 
 
 async def birthdays(month: int, day: int, limit: int = 10) -> list[dict[str, Any]]:
     """Живые звёзды кино, родившиеся в этот день, самые известные первыми.
 
     [{"name", "en", "born": "YYYY-MM-DD", "female": bool, "imdb": "nm…"}]; ошибка — исключение.
+    Известность — по числу статей о человеке в Википедиях на разных языках.
     """
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=40)
     async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
-        async with session.get(SPARQL, params={"query": BIRTHDAYS % (month, day), "format": "json"}) as resp:
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
+        ids = await _born_today(session, month, day)
+        entities: dict[str, Any] = {}
+        for i in range(0, len(ids), 50):  # API отдаёт до 50 записей за раз
+            params = {"action": "wbgetentities", "ids": "|".join(ids[i:i + 50]), "format": "json",
+                      "props": "labels|claims|sitelinks", "languages": "ru|en"}
+            async with session.get(ENTITIES, params=params) as resp:
+                resp.raise_for_status()
+                entities.update((await resp.json(content_type=None)).get("entities") or {})
     out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in data["results"]["bindings"]:
-        imdb = row["imdb"]["value"]
-        if imdb in seen:  # несколько профессий/дат — одна запись
-            continue
-        seen.add(imdb)
+    for qid in ids:
+        e = entities.get(qid) or {}
+        labels = e.get("labels") or {}
+        imdb = _claim(e, "P345")
+        birth = _claim(e, "P569")
+        born = str(birth.get("time") or "") if isinstance(birth, dict) else ""
+        if _claim(e, "P570") is not None or not str(imdb or "").startswith("nm") or "ru" not in labels:
+            continue  # умершие, без IMDb или без русского имени
+        if len(born) < 11 or born[6:11] != f"{month:02d}-{day:02d}":
+            continue  # дата в Викиданных не совпала (бывает старый/новый стиль)
+        gender = _claim(e, "P21")
         out.append({
-            "name": row["ru"]["value"],
-            "en": (row.get("en") or {}).get("value", ""),
-            "born": row["born"]["value"][:10],
-            "female": (row.get("gender") or {}).get("value") == FEMALE,
+            "name": labels["ru"]["value"],
+            "en": (labels.get("en") or {}).get("value", ""),
+            "born": born[1:11],
+            "female": isinstance(gender, dict) and gender.get("id") == FEMALE,
             "imdb": imdb,
+            "_fame": len(e.get("sitelinks") or {}),
         })
-        if len(out) >= limit:
-            break
-    return out
+    out.sort(key=lambda p: p["_fame"], reverse=True)
+    return out[:limit]
