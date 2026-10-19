@@ -6223,6 +6223,7 @@ SHORT_THEMES = {
     "series": "новые сериалы",
     "upcoming": "скоро в кино",
     "genre": "топ случайного жанра",
+    "facts": "5 фактов о фильме",
 }
 shorts_lock = asyncio.Lock()
 shorts_jobs: set[asyncio.Task] = set()
@@ -6373,8 +6374,14 @@ async def short_command(
     ):
         return
 
-    theme = (message.text or "").partition(" ")[2].strip().lower()
-    if theme and theme not in SHORT_THEMES and not theme.startswith("genre:"):
+    theme = (message.text or "").partition(" ")[2].strip()
+    if theme.lower().startswith("facts"):
+        # /short facts Матрица — название фильма оставляем как есть
+        query = theme[5:].strip(" :")
+        theme = f"facts:{query}" if query else "facts"
+    else:
+        theme = theme.lower()
+    if theme and theme not in SHORT_THEMES and not theme.startswith(("genre:", "facts:")):
         await message.answer(
             "Использование: /short [тема]\n\n"
             + "\n".join(
@@ -6382,7 +6389,8 @@ async def short_command(
                 for key, name in SHORT_THEMES.items()
             )
             + "\n<code>genre:ужасы</code> — топ жанра "
-            "(фантастика, ужасы, триллер, комедия, боевик, детектив)\n\n"
+            "(фантастика, ужасы, триллер, комедия, боевик, детектив)\n"
+            "<code>facts Матрица</code> — факты о конкретном фильме\n\n"
             "Без темы — тема дня по расписанию."
         )
         return

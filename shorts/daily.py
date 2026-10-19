@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import json
 import logging
 import random
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -31,7 +33,7 @@ YOUTUBE_URL = "https://youtube.com/@kinomir360"
 TELEGRAM_URL = "https://t.me/KinoMir360"
 
 # По дням недели (пн..вс)
-SCHEDULE = ["online", "cinema", "series", "genre", "online", "upcoming", "cinema"]
+SCHEDULE = ["online", "cinema", "facts", "genre", "online", "upcoming", "facts"]
 
 GENRES = {
     "фантастика": ("ТОП ФАНТАСТИКИ", "фантастических фильмов, которые взрывают мозг", "фантастика"),
@@ -298,6 +300,88 @@ async def _download(session: aiohttp.ClientSession, url: str) -> Image.Image:
         return Image.open(io.BytesIO(await resp.read())).convert("RGB")
 
 
+# ---------------------------------------------------------------- факты о фильме
+
+FACTS = 5
+FACT_MIN, FACT_MAX = 40, 170  # длиннее — не влезает на экран и затягивает ролик
+
+
+def _clean_fact(raw: Any) -> str:
+    text = html.unescape(re.sub(r"<[^>]+>", "", str(raw or "")))
+    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+
+
+def usable_facts(item: dict[str, Any]) -> list[str]:
+    """Факты без спойлеров и подходящей длины (сначала FACT, потом ляпы)."""
+    facts, bloopers = [], []
+    for f in item.get("facts") or []:
+        if not isinstance(f, dict) or f.get("spoiler"):
+            continue
+        text = _clean_fact(f.get("value"))
+        if not FACT_MIN <= len(text) <= FACT_MAX:
+            continue
+        (bloopers if str(f.get("type") or "").upper() == "BLOOPER" else facts).append(text)
+    return facts + bloopers
+
+
+def _kind(item: dict[str, Any]) -> str:
+    kind = str(item.get("type") or "")
+    if item.get("isSeries") or "series" in kind:
+        return "сериале"
+    if kind in ("cartoon", "anime"):
+        return "мультфильме"
+    return "фильме"
+
+
+def _facts_word(n: int) -> str:
+    return "факта" if 2 <= n <= 4 else "фактов"
+
+
+async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int]) -> tuple[dict[str, Any], list[str]]:
+    if query:
+        try:
+            data = await fetch("/movie/search", query=query, page=1, limit=5)
+            cands = [x for x in data.get("docs") or [] if isinstance(x, dict)]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Поиск «{query}» не удался: {exc}") from exc
+        need = 3
+    else:
+        cands = await _query(fetch, page=random.randint(1, 5), sortField="votes.kp", sortType="-1",
+                             notNullFields="name",
+                             **{"rating.kp": "7-10", "votes.kp": "150000-100000000"})
+        random.shuffle(cands)
+        need = FACTS
+    for d in cands[:8]:
+        if not d.get("id") or (not query and d["id"] in exclude):
+            continue
+        try:
+            full = await fetch(f"/movie/{d['id']}")
+        except Exception:  # noqa: BLE001
+            continue
+        facts = usable_facts(full)
+        if len(facts) >= need and _image_url(full):
+            return full, random.sample(facts[:12], min(FACTS, len(facts[:12])))
+    raise RuntimeError(f"Не нашёл фильм с {need}+ подходящими фактами" + (f" по запросу «{query}»" if query else ""))
+
+
+async def _stills(fetch: Fetch, item: dict[str, Any]) -> list[str]:
+    """Кадры из фильма; если API их не отдаёт — фон и постер."""
+    urls: list[str] = []
+    try:
+        data = await fetch("/image", movieId=item["id"], type="still", limit=20)
+        for img in data.get("docs") or []:
+            w, h = img.get("width") or 0, img.get("height") or 0
+            if img.get("url") and (not w or w >= 700) and (not h or w >= h):
+                urls.append(str(img["url"]))
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: no stills for %s: %s", item.get("id"), exc)
+    random.shuffle(urls)
+    for fallback in (_image_url(item), _poster_url(item)):
+        if fallback and fallback not in urls:
+            urls.append(fallback)
+    return urls
+
+
 # ---------------------------------------------------------------- голос
 
 def _say_film(item: dict[str, Any], theme: Theme) -> str:
@@ -412,7 +496,109 @@ def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
     return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
 
 
+def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
+    t, n, kind = _title(film), len(facts), _kind(film)
+    title = f"{n} {_facts_word(n)} о {kind} «{t}», которые ты не знал 🤯 #shorts"
+    if len(title) > 100:
+        title = f"{n} {_facts_word(n)} о «{t}» 🤯 #shorts"[:100]
+    year = film.get("year")
+    description = "\n".join([
+        f"{n} {_facts_word(n)} о {kind} «{t}»" + (f" ({year})" if year else "") + " — сохрани! 🍿", "",
+        *[f"{i}. {f}" for i, f in enumerate(facts, 1)], "",
+        "Какой факт удивил тебя больше всего? Пиши в комментариях 👇", "",
+        f"📺 YouTube: {YOUTUBE_URL}",
+        f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
+        "#фактыокино #кино #KinoMir360",
+    ])
+    tags: list[str] = []
+    for tag in ["факты о фильме", "интересные факты о кино", t.lower(), f"{t.lower()} факты",
+                f"{t.lower()} интересные факты", "как снимали", "съемки фильма"] + \
+            [a.lower() for a in _actors(film, 3)] + ["KinoMir360", "киномир360", "шортс кино"]:
+        if tag and tag not in tags and len(", ".join(tags + [tag])) <= 480:
+            tags.append(tag)
+    pinned = (f"Какой факт удивил больше? 👇\n"
+              f"Ещё больше фактов и подборок — в нашем Telegram 👉 {TELEGRAM_URL}")
+    return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
+
+
 # ---------------------------------------------------------------- сборка
+
+async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
+                  tag: str, header: str, question: str, music: Path | None) -> bool:
+    """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить."""
+    voice, starts, voiced = await synthesize(lines, work)
+    cfg = {
+        "output": "short.mp4",
+        "intro": cover_path.name,
+        "logo": str(ASSETS / "logo.png"),
+        "voice": voice.name,
+        "music": str(music or ASSETS / "music.mp3"),
+        "music_db": -14 if voiced else -6,
+        "tail": 1.2,
+        "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
+        "tag": tag,
+        "header": header,
+        "cards": cards,
+        "starts": starts,
+        "outro": {
+            "question": question,
+            "channel": "KinoMir360",
+            "youtube": "@kinomir360",
+            "telegram": "@KinoMir360",
+            "note": "ссылки в описании",
+        },
+    }
+    cfg_path = work / "short.json"
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    # рендер — отдельным процессом, чтобы не блокировать бота
+    await _run(sys.executable, "-m", "shorts.make_short", str(cfg_path))
+    return voiced
+
+
+async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
+                           music: Path | None = None) -> ShortResult:
+    film, facts = await pick_fact_film(fetch, query, exclude or set())
+    t, n, kind = _title(film), len(facts), _kind(film)
+    hook = f"{n} {_facts_word(n)} о {kind} «{t}»"
+    theme = Theme("facts", "ФАКТЫ", t.upper(), hook, hook, [])
+
+    cards = []
+    urls = await _stills(fetch, film)
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        cover_src = await _download(session, _poster_url(film))
+        images: list[Image.Image] = []
+        for url in urls:
+            if len(images) >= n:
+                break
+            try:
+                images.append(await _download(session, url))
+            except Exception:  # noqa: BLE001
+                continue
+    if not images:
+        raise RuntimeError(f"Не скачались картинки для «{t}»")
+    for i, fact in enumerate(facts, 1):
+        # название уже в заголовке слайда — на карточке не повторяем
+        card = await asyncio.to_thread(make_card, images[(i - 1) % len(images)], "", i, n,
+                                       None, "IMDb", None, f"ФАКТ №{i}", 780)
+        path = work / f"card{i}.jpg"
+        card.save(path, quality=93)
+        cards.append({"image": path.name, "caption": fact})
+
+    cover = await asyncio.to_thread(make_cover, cover_src, "ФАКТЫ", f"{hook}, которые ты не знал")
+    cover_path = work / "cover.jpg"
+    cover.save(cover_path, quality=93)
+
+    lines = ([f"{hook}, которые ты точно не знал!"] + facts
+             + ["Какой факт удивил тебя больше всего? Пиши в комментариях "
+                "и подписывайся на КиноМир триста шестьдесят!"])
+    voiced = await _render(work, cover_path, cards, lines, "ФАКТЫ", t.upper(),
+                           "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
+    result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_facts_seo(film, facts))
+    if not voiced:
+        result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
+    return result
+
 
 async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = None,
                            exclude: set[int] | None = None, music: Path | None = None,
@@ -420,6 +606,16 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
+    theme_key = theme_key or SCHEDULE[today.weekday()]
+    if theme_key.startswith("facts"):
+        query = theme_key.partition(":")[2].strip()
+        try:
+            return await make_facts_short(fetch, work, query, exclude, music)
+        except RuntimeError:
+            if query:
+                raise
+            log.exception("shorts: facts failed, falling back to genre")
+            theme_key = "genre"
     theme = theme_for(theme_key, today)
     # в текстах зашито «5 ...», поэтому фильмов должно быть ровно FILMS;
     # если тема их не набрала — берём жанровую подборку
@@ -458,33 +654,8 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
-    voice, starts, voiced = await synthesize(voice_lines(theme, films), work)
-
-    cfg = {
-        "output": "short.mp4",
-        "intro": cover_path.name,
-        "logo": str(ASSETS / "logo.png"),
-        "voice": voice.name,
-        "music": str(music or ASSETS / "music.mp3"),
-        "music_db": -14 if voiced else -6,
-        "tail": 1.2,
-        "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
-        "tag": theme.tag,
-        "header": theme.header,
-        "cards": cards,
-        "starts": starts,
-        "outro": {
-            "question": "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ",
-            "channel": "KinoMir360",
-            "youtube": "@kinomir360",
-            "telegram": "@KinoMir360",
-            "note": "ссылки в описании",
-        },
-    }
-    cfg_path = work / "short.json"
-    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # рендер — отдельным процессом, чтобы не блокировать бота
-    await _run(sys.executable, "-m", "shorts.make_short", str(cfg_path))
+    voiced = await _render(work, cover_path, cards, voice_lines(theme, films), theme.tag, theme.header,
+                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music)
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
     if not voiced:
