@@ -957,6 +957,95 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
     return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
 
 
+# ---------------------------------------------------------------- TikTok
+
+# в TikTok нет названия и кликабельных ссылок: короткая подпись с ключевыми словами + хэштеги
+# на русском (для русскоязычной ленты) и на английском (их TikTok часто продвигает шире)
+TIKTOK_BASE = ["#кино", "#фильмы", "#чтопосмотреть", "#киноманы", "#KinoMir360"]
+TIKTOK_BASE_EN = ["#movie", "#movies", "#film", "#cinema", "#fyp"]
+TIKTOK_THEME = {
+    "online": ["#новинкикино", "#онлайнкинотеатр", "#newmovies", "#streaming"],
+    "cinema": ["#кинопрокат", "#вкино", "#boxoffice", "#nowshowing"],
+    "upcoming": ["#скоровкино", "#премьеры", "#comingsoon", "#trailer"],
+    "series": ["#сериалы", "#новыесериалы", "#tvseries", "#series"],
+    "genre": ["#топфильмов", "#подборкафильмов", "#movierecommendations", "#top5"],
+    "facts": ["#фактыокино", "#интересныефакты", "#moviefacts", "#didyouknow"],
+    "news": ["#новостикино", "#киноновости", "#movienews", "#filmnews"],
+    "birthday": ["#деньрождения", "#актеры", "#happybirthday", "#actor"],
+}
+TIKTOK_MAX_TAGS = 15
+
+
+def _hashtag(text: str) -> str | None:
+    """«Мастер и Маргарита» -> #МастерИМаргарита; слишком длинное — не берём."""
+    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text)
+    tag = "".join(w[:1].upper() + w[1:] for w in words)
+    return f"#{tag}" if 2 < len(tag) <= 24 else None
+
+
+def _names(result: ShortResult) -> tuple[list[str], list[str]]:
+    """Названия (или имя именинника) по-русски и по-английски — для хэштегов; №1 первым."""
+    key, films = result.theme.key, result.films
+    if key == "news":  # здесь «фильмы» — заголовки новостей
+        return [], []
+    if key == "birthday":
+        return [str(f.get("name") or "") for f in films], [str(f.get("en") or "") for f in films]
+    films = films[::-1]  # в подборке №1 — последний
+    ru = [_title(f) for f in films]
+    en = [str(f.get("enName") or f.get("alternativeName") or "") for f in films]
+    return ru, [t for t in en if t and re.search(r"[A-Za-z]", t)]
+
+
+def _hashtags(result: ShortResult) -> list[str]:
+    """Хэштеги ролика, самые точные первыми: тема, названия/имя (рус и англ), затем общие."""
+    ru, en = _names(result)
+    theme = TIKTOK_THEME.get(result.theme.key, [])
+    tags = theme[:2] + [t for t in map(_hashtag, ru) if t][:2] + [t for t in map(_hashtag, en) if t][:2] \
+        + theme[2:] + TIKTOK_BASE + TIKTOK_BASE_EN
+    return list(dict.fromkeys(tags))
+
+
+def tiktok_caption(result: ShortResult) -> str:
+    """Подпись для TikTok: заголовок, вопрос для комментариев, призыв подписаться и хэштеги."""
+    seo = result.seo
+    title = re.sub(r"\s*#shorts\s*", " ", seo.get("title", "")).strip()
+    question = next((ln.strip() for ln in seo.get("pinned", "").splitlines() if ln.strip().endswith("👇")),
+                    "Пиши в комментариях 👇")
+    tags = _hashtags(result)[:TIKTOK_MAX_TAGS]
+    return "\n".join([title, "", question, "Подпишись, чтобы не пропустить новые ролики 🔔",
+                      "Ещё больше — в нашем Telegram KinoMir360 (ссылка в профиле)", "", " ".join(tags)])
+
+
+# YouTube: больше 15 хэштегов в описании — он игнорирует все, поэтому берём 14 + #shorts
+YOUTUBE_MAX_TAGS = 14
+EN_KEYWORDS = {
+    "online": ["new movies", "streaming premieres"],
+    "cinema": ["box office", "movies in theaters"],
+    "upcoming": ["coming soon movies", "movie trailers"],
+    "series": ["new tv series", "tv shows"],
+    "genre": ["movie recommendations", "best movies"],
+    "facts": ["movie facts", "behind the scenes"],
+    "news": ["movie news", "film news"],
+    "birthday": ["happy birthday", "best movies"],
+}
+
+
+def add_english_seo(result: ShortResult) -> None:
+    """YouTube: хэштеги на русском и английском в конце описания и английские ключевые слова в тегах."""
+    seo = result.seo
+    hashtags = ["#shorts"] + [t for t in _hashtags(result) if t != "#fyp"][:YOUTUBE_MAX_TAGS]
+    lines = seo.get("description", "").rstrip().splitlines()
+    if lines and lines[-1].startswith("#"):
+        lines = lines[:-1]  # прежняя строка хэштегов (только русские) — заменяем
+    seo["description"] = "\n".join(lines + [" ".join(hashtags)])
+    _, en = _names(result)
+    words = [w.strip() for w in seo.get("tags", "").split(",") if w.strip()]
+    for w in [e.lower() for e in en[:3]] + EN_KEYWORDS.get(result.theme.key, []) + ["movies", "film", "shorts"]:
+        if w and w not in words and len(", ".join(words + [w])) <= 480:
+            words.append(w)
+    seo["tags"] = ", ".join(words)
+
+
 # ---------------------------------------------------------------- сборка
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
@@ -1317,7 +1406,7 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
     theme = Theme("birthday", "ДЕНЬ РОЖДЕНИЯ", header, hook, hook, [])
     seo = build_birthday_seo(name, who["en"], age, films, female)
     result = ShortResult(work / "short.mp4", cover_path, theme,
-                         [{"id": person_uid(who["imdb"]), "name": name}], seo)
+                         [{"id": person_uid(who["imdb"]), "name": name, "en": who["en"]}], seo)
     if not voiced or tts_note:
         result.seo["warning"] = no_voice_note(voiced)
     return result
@@ -1329,6 +1418,17 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                            news_feeds: list[str] | None = None, manual: bool = False,
                            gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
+    result = await _make_short(fetch, work, theme_key, exclude, music, today, tmdb_key, news_feeds, manual,
+                               gemini_key, trailer_clips)
+    add_english_seo(result)
+    return result
+
+
+async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
+                      exclude: set[int] | None = None, music: Path | None = None,
+                      today: date | None = None, tmdb_key: str = "",
+                      news_feeds: list[str] | None = None, manual: bool = False,
+                      gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
     theme_key = theme_key or SCHEDULE[today.weekday()]

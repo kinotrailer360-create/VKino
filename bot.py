@@ -6312,11 +6312,6 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         height=1920,
         supports_streaming=True,
     )
-    await bot.send_document(
-        chat_id,
-        FSInputFile(result.cover, filename="cover.jpg"),
-        caption="🖼 Обложка для ролика",
-    )
     for label, key in (
         ("Название", "title"),
         ("Описание", "description"),
@@ -6327,6 +6322,10 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
             chat_id,
             f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>",
         )
+    await bot.send_message(
+        chat_id,
+        f"<b>TikTok — подпись с хэштегами:</b>\n<pre>{escape(shorts_daily.tiktok_caption(result))}</pre>",
+    )
     if seo.get("warning"):
         await bot.send_message(chat_id, escape(seo["warning"]))
 
@@ -6879,7 +6878,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
 
 SHORTS_MENU_TEXT = (
     "🎬 <b>Шортсы KinoMir360</b>\n\n"
-    "Нажми тему — ролик соберётся за 2–5 минут и придёт сюда вместе с обложкой и SEO.\n"
+    "Нажми тему — ролик соберётся за 2–5 минут и придёт сюда вместе с SEO для YouTube и TikTok.\n"
     "Каждый день в 8:00 по Москве ролик приходит сам."
 )
 
