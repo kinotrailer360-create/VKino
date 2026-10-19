@@ -1,7 +1,7 @@
 """Сборка вертикального шортса KinoMir360 из обложки, карточек, голоса и музыки.
 
-Запуск:  python shorts/make_short.py shorts/examples/premieres.json
-Зависимости: Pillow, numpy, ffmpeg/ffprobe в PATH.
+Запуск:  python -m shorts.make_short shorts/examples/premieres.json
+Зависимости: Pillow, ffmpeg/ffprobe в PATH.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H = 1080, 1920
@@ -83,24 +82,19 @@ def wrap(draw, text, fnt, max_w):
 
 
 def load_logo(path: Path) -> Image.Image:
-    """Логотип на чёрном фоне -> RGBA с прозрачным фоном (заливка от краёв)."""
-    img = Image.open(path).convert("RGB")
-    mask = Image.new("L", img.size, 0)
-    dark = np.asarray(img.convert("L")) < 28
-    # заливаем тёмный фон, связанный с краями картинки
-    from collections import deque
-    h, w = dark.shape
-    seen = np.zeros_like(dark)
-    q = deque((y, x) for y in (0, h - 1) for x in range(w)) + deque((y, x) for x in (0, w - 1) for y in range(h))
-    while q:
-        y, x = q.popleft()
-        if 0 <= y < h and 0 <= x < w and dark[y, x] and not seen[y, x]:
-            seen[y, x] = True
-            q.extend(((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)))
-    alpha = np.where(seen, 0, 255).astype(np.uint8)
-    mask = Image.fromarray(alpha).filter(ImageFilter.GaussianBlur(1.2))
+    """Логотип с прозрачностью. Если фон чёрный (JPG) — убираем его заливкой от краёв."""
+    img = Image.open(path)
+    if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+        img = img.convert("RGBA")
+        return img.crop(img.getbbox())
+    img = img.convert("RGB")
+    mask = img.convert("L").point(lambda v: 255 if v < 28 else 0)
+    for xy in ((0, 0), (img.width - 1, 0), (0, img.height - 1), (img.width - 1, img.height - 1)):
+        if mask.getpixel(xy) == 255:
+            ImageDraw.floodfill(mask, xy, 128)
+    alpha = mask.point(lambda v: 0 if v == 128 else 255).filter(ImageFilter.GaussianBlur(1.2))
     img = img.convert("RGBA")
-    img.putalpha(mask)
+    img.putalpha(alpha)
     return img.crop(img.getbbox())
 
 
@@ -281,11 +275,8 @@ def mix_audio(voice: Path, music: Path, total: float, out: Path, music_db: float
                     str(out)], check=True)
 
 
-def main(cfg_path: str):
-    cfg_path = Path(cfg_path).resolve()
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    base = cfg_path.parent
-
+def render(cfg: dict, base: Path) -> Path:
+    """Собрать видео по конфигу; относительные пути считаются от base."""
     def p(x):
         return (base / x).resolve()
 
@@ -338,6 +329,12 @@ def main(cfg_path: str):
     enc.wait()
     audio.unlink(missing_ok=True)
     print("Готово:", out)
+    return out
+
+
+def main(cfg_path: str):
+    cfg_path = Path(cfg_path).resolve()
+    render(json.loads(cfg_path.read_text(encoding="utf-8")), cfg_path.parent)
 
 
 if __name__ == "__main__":
