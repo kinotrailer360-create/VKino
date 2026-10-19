@@ -451,7 +451,7 @@ async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]],
         thumbs = [Image.open(path).convert("RGB") for _, path in frames]
         choices = await ai.match_images(gemini_key, [text for _, text in facts_by_idx], thumbs)
         if not choices:
-            return {}, f"Gemini не ответил ({ai.last_error or 'без подробностей'})"
+            return {}, f"ИИ не ответил ({ai.last_error or 'без подробностей'})"
         out: dict[int, str] = {}
         used: set[int] = set()
         for (i, _), c in zip(facts_by_idx, choices):
@@ -582,8 +582,8 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     theme = Theme("news", "НОВОСТИ", "НОВОСТИ КИНО", f"Главные новости кино на {day}", title, [])
     result = ShortResult(work / "short.mp4", cover_path, theme,
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
-    if gemini_key and ai.last_error:
-        result.seo["warning"] = f"⚠️ Gemini не пересказал новости: {ai.last_error}"
+    if ai.last_error:
+        result.seo["warning"] = f"⚠️ ИИ не пересказал новости: {ai.last_error}"
     if not voiced:
         result.seo["warning"] = no_voice_note()
     return result
@@ -890,7 +890,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     backdrops, _ = await tmdb.images(tmdb_key, film, limit=12)
     urls = tmdb.pick_varied(backdrops, 12) + await _stills(fetch, film)
     photos = await tmdb.people(tmdb_key, film)
-    pool_size = 12 if gemini_key else n
+    pool_size = 12 if ai.available(gemini_key) else n
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         cover_src = await _download(session, _poster_url(film))
@@ -922,10 +922,10 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     videos: dict[int, str] = {}
     video_note = ""
     if trailer_clips and rest:
-        if gemini_key:
+        if ai.available(gemini_key):
             videos, video_note = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
         else:
-            video_note = "нет ключа GEMINI_API_KEY — без него моменты не подобрать"
+            video_note = "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY — без ИИ моменты не подобрать"
     # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
     stills = [i for i in rest if i not in videos]
     choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
@@ -962,8 +962,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     notes = []
     if video_note:
         notes.append(f"🎞 Видео из трейлера не вставлено: {video_note}.")
-    if gemini_key and ai.last_error:
-        notes.append(f"⚠️ Gemini не помог подобрать кадры: {ai.last_error}")
+    if ai.last_error:
+        notes.append(f"⚠️ ИИ не помог подобрать кадры: {ai.last_error}")
     if not voiced:
         notes.append(no_voice_note())
     if notes:
