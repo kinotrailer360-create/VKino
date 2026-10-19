@@ -285,11 +285,21 @@ def render(cfg: dict, base: Path) -> Path:
     logo = load_logo(p(cfg["logo"]))
 
     cards = cfg["cards"]
-    slides: list[Slide] = [IntroSlide(cfg, p(cfg["intro"]))]
-    slides += [CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", "")) for i, c in enumerate(cards)]
-    slides.append(OutroSlide(cfg, p(cfg["intro"]), logo))
+    # слайды создаются по мере надобности и выгружаются после показа — экономим память
+    makers = [lambda: IntroSlide(cfg, p(cfg["intro"]))]
+    makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""))
+               for i, c in enumerate(cards)]
+    makers.append(lambda: OutroSlide(cfg, p(cfg["intro"]), logo))
+    loaded: dict[int, Slide] = {}
 
-    starts = slide_starts(cfg, voice, len(slides))
+    def slide(k: int) -> Slide:
+        if k not in loaded:
+            for old in [j for j in loaded if j < k - 1]:
+                del loaded[old]
+            loaded[k] = makers[k]()
+        return loaded[k]
+
+    starts = slide_starts(cfg, voice, len(makers))
     total = duration(voice) + cfg.get("tail", 1.5)
     ends = starts[1:] + [total]
     print("Слайды (сек):", ", ".join(f"{s:.2f}" for s in starts), f"| всего {total:.2f}")
@@ -304,29 +314,46 @@ def render(cfg: dict, base: Path) -> Path:
     audio = out.with_suffix(".m4a")
     mix_audio(voice, music, total, audio, cfg.get("music_db", -14))
 
+    # настройки x264 под маленький сервер: один поток и короткий lookahead — мало памяти
+    log_path = out.with_suffix(".ffmpeg.log")
+    log = open(log_path, "wb")
     enc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS),
-         "-i", "-", "-i", str(audio), "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "medium",
-         "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", "-movflags", "+faststart", str(out)],
-        stdin=subprocess.PIPE)
+         "-i", "-", "-i", str(audio), "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+         "-threads", "1", "-x264-params", "rc-lookahead=0:sync-lookahead=0:bframes=0:ref=2",
+         "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", "-movflags", "+faststart", str(out)],
+        stdin=subprocess.PIPE, stderr=log)
+
+    def encoder_failed() -> RuntimeError:
+        enc.wait()
+        log.close()
+        tail = log_path.read_text(errors="ignore")[-600:].strip()
+        return RuntimeError(f"ffmpeg завершился с кодом {enc.returncode} "
+                            f"(-9 — не хватило памяти): {tail or 'нет вывода'}")
 
     n_frames = round(total * FPS)
     for f in range(n_frames):
         t = f / FPS
         i = max(k for k, s in enumerate(starts) if s <= t)
         dur = ends[i] - starts[i]
-        img = slides[i].frame(t - starts[i], dur)
+        img = slide(i).frame(t - starts[i], dur)
         # переход: предыдущий слайд гаснет поверх нового
         if i > 0 and t - starts[i] < XFADE:
-            prev = slides[i - 1].frame(t - starts[i - 1], ends[i - 1] - starts[i - 1])
+            prev = slide(i - 1).frame(t - starts[i - 1], ends[i - 1] - starts[i - 1])
             img = Image.blend(prev, img, ease_out((t - starts[i]) / XFADE))
-        if not isinstance(slides[i], OutroSlide):
+        if i < len(makers) - 1:
             img.paste(wm, wm_pos, wm)
-        enc.stdin.write(img.tobytes())
+        try:
+            enc.stdin.write(img.tobytes())
+        except BrokenPipeError:
+            raise encoder_failed() from None
         if f % (FPS * 5) == 0:
             print(f"  {t:5.1f}/{total:.1f} c", flush=True)
     enc.stdin.close()
-    enc.wait()
+    if enc.wait():
+        raise encoder_failed()
+    log.close()
+    log_path.unlink(missing_ok=True)
     audio.unlink(missing_ok=True)
     print("Готово:", out)
     return out
