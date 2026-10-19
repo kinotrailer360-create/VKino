@@ -766,12 +766,13 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
         for i, text in enumerate(speak):
             words.append(await _edge_to_file(text, parts[i]))
     except Exception as exc:  # noqa: BLE001
-        reason = str(exc).rstrip(".") or type(exc).__name__
+        bad = len(words)  # на какой фразе споткнулся — чтобы было видно, что ему не понравилось
+        reason = f"{str(exc).rstrip('.') or type(exc).__name__}; фраза №{bad + 1}: «{speak[bad][:60]}»"
         log.warning("shorts: Edge TTS failed (%s)", reason)
         words = []
         if piper_ready():
             # весь ролик одним голосом: переозвучиваем все фразы запасным
-            tts_note = f"🗣 Основной голос не ответил ({reason[:120]}) — озвучено запасным голосом."
+            tts_note = f"🗣 Основной голос не ответил ({reason[:220]}) — озвучено запасным голосом."
             try:
                 for i, text in enumerate(speak):
                     words.append(await _piper_to_file(text, parts[i]))

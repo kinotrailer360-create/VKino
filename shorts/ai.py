@@ -26,10 +26,26 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 RESERVE_URL = os.getenv("RESERVE_AI_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
 RESERVE_MODEL = os.getenv("RESERVE_AI_MODEL", "qwen/qwen3.8-27b").strip()
-RESERVE_KEY = os.getenv("RESERVE_AI_KEY", "").strip()
-FONT = os.path.join(os.path.dirname(__file__), "assets", "Oswald.ttf")
-
 log = logging.getLogger("shorts")
+
+# русские буквы, похожие на латинские, — если имя переменной набрано на русской раскладке
+_LOOKALIKE = str.maketrans("АВЕКМНОРСТУХ", "ABEKMHOPCTYX")
+
+
+def _env_key(*names: str) -> str:
+    """Ключ из переменной окружения; находит имя и с русскими «двойниками» букв или пробелами."""
+    for name in names:
+        if os.getenv(name, "").strip():
+            return os.getenv(name, "").strip().strip("\"'")
+    for env, value in os.environ.items():
+        if env.strip().upper().translate(_LOOKALIKE) in names and value.strip():
+            log.warning("shorts: env %r looks like %s — using it", env, names[0])
+            return value.strip().strip("\"'")
+    return ""
+
+
+RESERVE_KEY = _env_key("RESERVE_AI_KEY", "GROQ_API_KEY")
+FONT = os.path.join(os.path.dirname(__file__), "assets", "Oswald.ttf")
 
 
 def available(key: str) -> bool:
@@ -197,7 +213,9 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
             log.warning("shorts: reserve AI failed: %s", exc)
-    raise AIError("; ".join(errors) or "нет ключа ИИ")
+    if not RESERVE_KEY:
+        errors.append("резервный ИИ не подключён: бот не видит переменную RESERVE_AI_KEY")
+    raise AIError("; ".join(errors))
 
 
 async def match_images(key: str, texts: list[str], images: list[Image.Image]) -> list[int] | None:
