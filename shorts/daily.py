@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import tmdb, wiki
+from . import news, tmdb, wiki
 from .cards import make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -34,7 +34,7 @@ YOUTUBE_URL = "https://youtube.com/@kinomir360"
 TELEGRAM_URL = "https://t.me/KinoMir360"
 
 # По дням недели (пн..вс)
-SCHEDULE = ["online", "cinema", "facts", "genre", "online", "upcoming", "facts"]
+SCHEDULE = ["online", "cinema", "facts", "genre", "news", "upcoming", "facts"]
 
 GENRES = {
     "фантастика": ("ТОП ФАНТАСТИКИ", "фантастических фильмов, которые взрывают мозг", "фантастика"),
@@ -396,6 +396,118 @@ async def _stills(fetch: Fetch, item: dict[str, Any]) -> list[str]:
     return urls
 
 
+# ---------------------------------------------------------------- новости кино
+
+NEWS = 5
+
+
+async def _news_film(fetch: Fetch, item: news.NewsItem) -> dict[str, Any] | None:
+    """Фильм из «кавычек» заголовка — через поиск Кинопоиска (poiskkino)."""
+    if not item.film_query:
+        return None
+    try:
+        data = await fetch("/movie/search", query=item.film_query, page=1, limit=3)
+    except Exception:  # noqa: BLE001
+        return None
+    want = item.film_query.lower()
+    for d in data.get("docs") or []:
+        names = {str(d.get(k) or "").lower() for k in ("name", "alternativeName", "enName")}
+        if want in names and _image_url(d):
+            return d
+    return None
+
+
+def _placeholder() -> Image.Image:
+    """Фон для новости без картинки: тёмный градиент с логотипом."""
+    bg = Image.linear_gradient("L").resize((1280, 720)).point(lambda v: 20 + v // 6)
+    img = Image.merge("RGB", (bg, bg.point(lambda v: v * 3 // 4), bg.point(lambda v: v // 2)))
+    logo = Image.open(ASSETS / "logo.png").convert("RGBA")
+    logo.thumbnail((520, 520))
+    img.paste(logo, ((1280 - logo.width) // 2, (720 - logo.height) // 2), logo)
+    return img
+
+
+async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: set[int] | None = None,
+                          music: Path | None = None, tmdb_key: str = "",
+                          today: date | None = None) -> ShortResult:
+    today = today or date.today()
+    items = await news.latest_news(feeds, exclude or set())
+    # сначала новости с картинкой (кадр фильма или фото из ленты), потом остальные
+    with_img: list[tuple[news.NewsItem, list[str]]] = []
+    without: list[tuple[news.NewsItem, list[str]]] = []
+    for item in items[:25]:
+        urls: list[str] = []
+        film = await _news_film(fetch, item)
+        if film:
+            item.film_name = _title(film)
+            backdrops, _ = await tmdb.images(tmdb_key, film, limit=1)
+            urls = backdrops + [u for u in [_image_url(film)] if u]
+        if item.image:
+            urls.append(item.image)
+        (with_img if urls else without).append((item, urls))
+        if len(with_img) >= NEWS:
+            break
+    chosen = sorted((with_img + without)[:NEWS], key=lambda x: -x[0].published)
+    if len(chosen) < 3:
+        raise RuntimeError(f"Мало свежих новостей ({len(chosen)}). Проверь ленты: /feeds")
+    n = len(chosen)
+
+    cards = []
+    images: list[Image.Image] = []
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for item, urls in chosen:
+            try:
+                images.append(await _download_first(session, urls))
+            except Exception:  # noqa: BLE001
+                images.append(_placeholder())
+    for i, ((item, _), img) in enumerate(zip(chosen, images), 1):
+        card = await asyncio.to_thread(make_card, img, "", i, n, None, "IMDb", None, f"НОВОСТЬ №{i}", 780)
+        path = work / f"card{i}.jpg"
+        card.save(path, quality=93)
+        cards.append({"image": path.name, "caption": item.title, "info": [[("Источник", item.source)]]})
+
+    day = _date_ru(today)
+    cover = await asyncio.to_thread(make_cover, images[0], "НОВОСТИ", f"Главные новости кино\n{day}")
+    cover_path = work / "cover.jpg"
+    cover.save(cover_path, quality=93)
+
+    def say(item: news.NewsItem) -> str:
+        title = item.title if item.title[-1] in ".!?…" else item.title + "."
+        return f"{title} {item.lead}".strip()
+
+    lines = ([f"Главные новости кино на {day}!"] + [say(it) for it, _ in chosen]
+             + ["Какая новость удивила больше всего? Пиши в комментариях "
+                "и подписывайся на КиноМир триста шестьдесят!"])
+    voiced = await _render(work, cover_path, cards, lines, "НОВОСТИ", "НОВОСТИ КИНО",
+                           "КАКАЯ НОВОСТЬ\nУДИВИЛА БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
+
+    first = chosen[0][0].title
+    title = f"Новости кино {day}: {first}"
+    title = (title if len(title) <= 88 else title[:85].rstrip() + "…") + " #shorts"
+    description = "\n".join([
+        f"Главные новости кино на {day} 🎬", "",
+        *[f"{i}. {it.title} ({it.source})" for i, (it, _) in enumerate(chosen, 1)], "",
+        "Какая новость удивила больше всего? Пиши в комментариях 👇", "",
+        f"📺 YouTube: {YOUTUBE_URL}",
+        f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
+        "#новостикино #кино #KinoMir360",
+    ])
+    tags: list[str] = []
+    for tag in ["новости кино", "новости кино сегодня", "новости сериалов", "кино новости", "что нового в кино"] + \
+            [it.film_name.lower() for it, _ in chosen if it.film_name] + ["KinoMir360", "киномир360", "шортс кино"]:
+        if tag not in tags and len(", ".join(tags + [tag])) <= 480:
+            tags.append(tag)
+    seo = {"title": title, "description": description, "tags": ", ".join(tags),
+           "pinned": f"Новости кино каждый день — в нашем Telegram 👉 {TELEGRAM_URL}\nКакая новость главная? 👇"}
+    theme = Theme("news", "НОВОСТИ", "НОВОСТИ КИНО", f"Главные новости кино на {day}", title, [])
+    result = ShortResult(work / "short.mp4", cover_path, theme,
+                         [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
+    if not voiced:
+        result.seo["warning"] = "⚠️ Голос не синтезировался — ролик собран только с музыкой."
+    return result
+
+
 # ---------------------------------------------------------------- голос
 
 def _say_film(item: dict[str, Any], theme: Theme) -> str:
@@ -624,11 +736,21 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 
 async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = None,
                            exclude: set[int] | None = None, music: Path | None = None,
-                           today: date | None = None, tmdb_key: str = "") -> ShortResult:
+                           today: date | None = None, tmdb_key: str = "",
+                           news_feeds: list[str] | None = None, manual: bool = False) -> ShortResult:
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
     theme_key = theme_key or SCHEDULE[today.weekday()]
+    if theme_key == "news":
+        try:
+            return await make_news_short(fetch, work, news_feeds or news.DEFAULT_FEEDS, exclude, music,
+                                         tmdb_key, today)
+        except RuntimeError:
+            if manual:
+                raise
+            log.exception("shorts: news failed, falling back to genre")
+            theme_key = "genre"
     if theme_key.startswith("facts"):
         query = theme_key.partition(":")[2].strip()
         try:

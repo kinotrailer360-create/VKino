@@ -38,6 +38,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from shorts import news as shorts_news
 from shorts.daily import make_daily_short
 
 load_dotenv()
@@ -6224,6 +6225,7 @@ SHORT_THEMES = {
     "upcoming": "скоро в кино",
     "genre": "топ случайного жанра",
     "facts": "5 фактов о фильме",
+    "news": "новости кино",
 }
 shorts_lock = asyncio.Lock()
 shorts_jobs: set[asyncio.Task] = set()
@@ -6252,6 +6254,15 @@ async def set_shorts_setting(key: str, value: str | None) -> None:
         key,
         value,
     )
+
+
+async def news_feeds() -> list[str]:
+    raw = await shorts_setting("news_feeds")
+    try:
+        feeds = json.loads(raw) if raw else None
+    except ValueError:
+        feeds = None
+    return feeds if isinstance(feeds, list) and feeds else list(shorts_news.DEFAULT_FEEDS)
 
 
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
@@ -6318,6 +6329,8 @@ async def run_short(
                 music,
                 now.date(),
                 TMDB_API_KEY,
+                await news_feeds(),
+                manual=theme_key is not None,
             )
             await db().executemany(
                 """
@@ -6414,6 +6427,47 @@ async def short_command(
     task = asyncio.create_task(job())
     shorts_jobs.add(task)
     task.add_done_callback(shorts_jobs.discard)
+
+
+@router.message(Command("feeds"))
+async def feeds_command(
+    message: Message,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in ADMIN_IDS
+    ):
+        return
+
+    action, _, arg = (message.text or "").partition(" ")[2].strip().partition(" ")
+    feeds = await news_feeds()
+    if action == "add" and arg.startswith(("http://", "https://")):
+        if arg not in feeds:
+            feeds.append(arg.strip())
+        await set_shorts_setting("news_feeds", json.dumps(feeds))
+        await message.answer("✅ Лента добавлена.")
+        return
+    if action == "del" and arg.isdigit() and 1 <= int(arg) <= len(feeds):
+        removed = feeds.pop(int(arg) - 1)
+        await set_shorts_setting("news_feeds", json.dumps(feeds) if feeds else None)
+        await message.answer(f"✅ Удалена: <code>{escape(removed[:80])}</code>")
+        return
+    if action == "default":
+        await set_shorts_setting("news_feeds", None)
+        await message.answer("✅ Вернул стандартный список лент.")
+        return
+
+    await message.answer("⏳ Проверяю ленты новостей…")
+    lines = ["📰 <b>Ленты новостей</b> (свежих за 48 ч):"]
+    for i, (url, res) in enumerate(await shorts_news.check_feeds(feeds), 1):
+        mark = f"✅ {res}" if isinstance(res, int) and res else f"❌ {escape(str(res))}"
+        lines.append(f"{i}. {mark}\n<code>{escape(url[:90])}</code>")
+    lines.append(
+        "\n<code>/feeds add URL</code> — добавить RSS\n"
+        "<code>/feeds del N</code> — удалить\n"
+        "<code>/feeds default</code> — стандартный список"
+    )
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
 @router.message(Command("music"))
