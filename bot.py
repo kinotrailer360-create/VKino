@@ -6317,6 +6317,7 @@ async def run_short(
                 exclude,
                 music,
                 now.date(),
+                TMDB_API_KEY,
             )
             await db().executemany(
                 """
