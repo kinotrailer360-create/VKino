@@ -959,18 +959,21 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
 
 # ---------------------------------------------------------------- TikTok
 
-# в TikTok нет названия и кликабельных ссылок: короткая подпись с ключевыми словами + 6–10 хэштегов
+# в TikTok нет названия и кликабельных ссылок: короткая подпись с ключевыми словами + хэштеги
+# на русском (для русскоязычной ленты) и на английском (их TikTok часто продвигает шире)
 TIKTOK_BASE = ["#кино", "#фильмы", "#чтопосмотреть", "#киноманы", "#KinoMir360"]
+TIKTOK_BASE_EN = ["#movie", "#movies", "#film", "#cinema", "#fyp"]
 TIKTOK_THEME = {
-    "online": ["#новинкикино", "#онлайнкинотеатр"],
-    "cinema": ["#кинопрокат", "#вкино"],
-    "upcoming": ["#скоровкино", "#премьеры"],
-    "series": ["#сериалы", "#новыесериалы"],
-    "genre": ["#топфильмов", "#подборкафильмов"],
-    "facts": ["#фактыокино", "#интересныефакты"],
-    "news": ["#новостикино", "#киноновости"],
-    "birthday": ["#деньрождения", "#актеры"],
+    "online": ["#новинкикино", "#онлайнкинотеатр", "#newmovies", "#streaming"],
+    "cinema": ["#кинопрокат", "#вкино", "#boxoffice", "#nowshowing"],
+    "upcoming": ["#скоровкино", "#премьеры", "#comingsoon", "#trailer"],
+    "series": ["#сериалы", "#новыесериалы", "#tvseries", "#series"],
+    "genre": ["#топфильмов", "#подборкафильмов", "#movierecommendations", "#top5"],
+    "facts": ["#фактыокино", "#интересныефакты", "#moviefacts", "#didyouknow"],
+    "news": ["#новостикино", "#киноновости", "#movienews", "#filmnews"],
+    "birthday": ["#деньрождения", "#актеры", "#happybirthday", "#actor"],
 }
+TIKTOK_MAX_TAGS = 15
 
 
 def _hashtag(text: str) -> str | None:
@@ -980,19 +983,31 @@ def _hashtag(text: str) -> str | None:
     return f"#{tag}" if 2 < len(tag) <= 24 else None
 
 
+def _names(result: ShortResult) -> tuple[list[str], list[str]]:
+    """Названия (или имя именинника) по-русски и по-английски — для хэштегов; №1 первым."""
+    key, films = result.theme.key, result.films
+    if key == "news":  # здесь «фильмы» — заголовки новостей
+        return [], []
+    if key == "birthday":
+        return [str(f.get("name") or "") for f in films], [str(f.get("en") or "") for f in films]
+    films = films[::-1]  # в подборке №1 — последний
+    ru = [_title(f) for f in films]
+    en = [str(f.get("enName") or f.get("alternativeName") or "") for f in films]
+    return ru, [t for t in en if t and re.search(r"[A-Za-z]", t)]
+
+
 def tiktok_caption(result: ShortResult) -> str:
     """Подпись для TikTok: заголовок, вопрос для комментариев, призыв подписаться и хэштеги."""
     seo, key = result.seo, result.theme.key
     title = re.sub(r"\s*#shorts\s*", " ", seo.get("title", "")).strip()
     question = next((ln.strip() for ln in seo.get("pinned", "").splitlines() if ln.strip().endswith("👇")),
                     "Пиши в комментариях 👇")
-    tags = list(TIKTOK_THEME.get(key, []))
-    if key != "news":  # в новостях «фильмы» — это заголовки новостей
-        names = [str(f.get("name") or "") for f in result.films] if key == "birthday" else \
-            [_title(f) for f in result.films][::-1]  # в подборке №1 — последний
-        tags += [t for t in (_hashtag(n) for n in names) if t][:3]
-    tags += TIKTOK_BASE
-    unique = list(dict.fromkeys(tags))[:10]
+    ru, en = _names(result)
+    theme = TIKTOK_THEME.get(key, [])
+    # самые точные — первыми: тема, названия/имя (рус и англ), затем общие
+    tags = theme[:2] + [t for t in map(_hashtag, ru) if t][:2] + [t for t in map(_hashtag, en) if t][:2] \
+        + theme[2:] + TIKTOK_BASE + TIKTOK_BASE_EN
+    unique = list(dict.fromkeys(tags))[:TIKTOK_MAX_TAGS]
     return "\n".join([title, "", question, "Подпишись, чтобы не пропустить новые ролики 🔔",
                       "Ещё больше — в нашем Telegram KinoMir360 (ссылка в профиле)", "", " ".join(unique)])
 
@@ -1357,7 +1372,7 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
     theme = Theme("birthday", "ДЕНЬ РОЖДЕНИЯ", header, hook, hook, [])
     seo = build_birthday_seo(name, who["en"], age, films, female)
     result = ShortResult(work / "short.mp4", cover_path, theme,
-                         [{"id": person_uid(who["imdb"]), "name": name}], seo)
+                         [{"id": person_uid(who["imdb"]), "name": name, "en": who["en"]}], seo)
     if not voiced or tts_note:
         result.seo["warning"] = no_voice_note(voiced)
     return result
