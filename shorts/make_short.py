@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
 
 W, H = 1080, 1920
 FPS = 30
@@ -149,6 +149,9 @@ class IntroSlide(Slide):
         return zoom(self.base, 1.0 + 0.07 * t / max(dur, 1), W, H)
 
 
+DARK = 22  # средняя яркость кадра (0–255), ниже — считаем чёрным/затемнением
+
+
 def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
     """Кадры трейлера в JPEG на диск заранее, до запуска кодировщика.
 
@@ -161,6 +164,15 @@ def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
          "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS}",
          "-q:v", "3", str(out_dir / "f%04d.jpg")],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # чёрные кадры и затемнения между сценами трейлера выкидываем; почти всё тёмное — без видео
+    frames = sorted(out_dir.glob("f*.jpg"))
+    dark = []
+    for f in frames:
+        with Image.open(f) as im:
+            if ImageStat.Stat(im.convert("L").resize((64, 36))).mean[0] < DARK:
+                dark.append(f)
+    for f in (frames if len(frames) - len(dark) < FPS else dark):
+        f.unlink(missing_ok=True)
     return out_dir
 
 
