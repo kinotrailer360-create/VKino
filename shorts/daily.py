@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import tmdb
+from . import tmdb, wiki
 from .cards import make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -481,6 +481,8 @@ def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
             line += f" — в кино с {_date_ru(_premiere(f))}"
         elif rating:
             line += f" — {src} {rating:.1f}"
+        if f.get("_awards"):
+            line += f" 🏆 {f['_awards']}"
         rows.append(line)
 
     hashtags = ["#чтопосмотреть", "#новинкикино", "#KinoMir360"]
@@ -572,6 +574,10 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
                            music: Path | None = None, tmdb_key: str = "") -> ShortResult:
     film, facts = await pick_fact_film(fetch, query, exclude or set())
+    # награды из Викиданных — первым фактом
+    award_fact = wiki.awards_fact(_title(film), await wiki.awards(film))
+    if award_fact:
+        facts = [award_fact] + facts[: FACTS - 1]
     t, n, kind = _title(film), len(facts), _kind(film)
     hook = f"{n} {_facts_word(n)} о {kind} «{t}»"
     theme = Theme("facts", "ФАКТЫ", t.upper(), hook, hook, [])
@@ -667,7 +673,11 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
             card.save(path, quality=93)
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
-            cards.append({"image": path.name, "caption": caption, "info": info_rows(f)})
+            rows = info_rows(f)
+            f["_awards"] = wiki.awards_line(await wiki.awards(f))
+            if f["_awards"]:
+                rows.append([("Награды", f["_awards"])])
+            cards.append({"image": path.name, "caption": caption, "info": rows})
         # обложка: русский постер Кинопоиска, запасной — постер TMDB
         cover_src = await _download_first(session, [_poster_url(films[0])] + posters_tmdb)
 
