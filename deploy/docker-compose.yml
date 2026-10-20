@@ -1,0 +1,46 @@
+# Бот + база + HTTPS для мини-приложения на своём сервере (Timeweb и т.п.).
+# Запуск и обновление — deploy/install.sh; настройки — deploy/.env (не в git).
+services:
+  db:
+    image: postgres:17-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: vkino
+      POSTGRES_DB: vkino
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?нужен POSTGRES_PASSWORD в .env}
+    volumes:
+      - db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vkino"]
+      interval: 5s
+      retries: 20
+
+  bot:
+    build: ..
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://vkino:${POSTGRES_PASSWORD}@db:5432/vkino
+      WEBAPP_URL: https://${DOMAIN}
+      PORT: "8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    logging:
+      options: {max-size: "10m", max-file: "3"}
+
+  caddy:
+    # сам получает и продлевает HTTPS-сертификат — мини-приложение Telegram работает только по https
+    image: caddy:2-alpine
+    restart: always
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+    depends_on: [bot]
+
+volumes:
+  db:
+  caddy:
