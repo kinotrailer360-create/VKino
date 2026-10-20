@@ -74,7 +74,9 @@ def card_overlay(title: str, index: int, total: int,
                  height: int = CARD_H, place: int | None = None) -> Image.Image:
     """Всё оформление карточки на прозрачном фоне — кладётся поверх картинки или видео трейлера."""
     card = Image.new("RGBA", (CARD_W, height), (0, 0, 0, 0))
-    card.alpha_composite(_gradient(CARD_W, 260, 150, 0), (0, 0))
+    # верхняя полоса почти непрозрачная: рейтинг, «НОВИНКА» и № читаются и поверх надписей трейлера
+    card.alpha_composite(_gradient(CARD_W, 150, 225, 205), (0, 0))
+    card.alpha_composite(_gradient(CARD_W, 150, 205, 0), (0, 150))
     card.alpha_composite(_gradient(CARD_W, 480, 0, 225), (0, height - 480))
     d = ImageDraw.Draw(card)
 
@@ -117,16 +119,34 @@ def card_overlay(title: str, index: int, total: int,
     return _finish(card, d, title, cast, height)
 
 
+def _title_lines(d, title: str) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+    """Название в одну строку, а длинное («Романовы: преданность и предательство») — в две, без обрезки."""
+    max_w = CARD_W - 60
+    one = _fit(d, title, "PTSerif-Bold.ttf", 120, max_w, 54)
+    if d.textlength(title, font=one) <= max_w or " " not in title:
+        return [(title, _fit(d, title, "PTSerif-Bold.ttf", 120, max_w, 30))]
+    words = title.split()
+    # разрыв после двоеточия/тире, иначе — ближе к середине по длине
+    cut = next((i + 1 for i, w in enumerate(words[:-1]) if w.endswith((":", "—", "-"))), None)
+    if cut is None:
+        cut = min(range(1, len(words)), key=lambda i: abs(len(" ".join(words[:i])) - len(" ".join(words[i:]))))
+    lines = [" ".join(words[:cut]), " ".join(words[cut:])]
+    size = min(_fit(d, ln, "PTSerif-Bold.ttf", 96, max_w, 30).size for ln in lines)
+    return [(ln, _font("PTSerif-Bold.ttf", size)) for ln in lines]
+
+
 def _finish(card, d, title, cast, height):
     """Название и «В ролях» внизу карточки."""
     # название и актёры
     cast_line = ("В ролях: " + ", ".join(cast[:3])) if cast else ""
     cast_f = _fit(d, cast_line, "PTSerif-Regular.ttf", 38, CARD_W - 80, 26) if cast_line else None
-    title_f = _fit(d, title.upper(), "PTSerif-Bold.ttf", 120, CARD_W - 60, 54)
-    tb = d.textbbox((0, 0), title.upper(), font=title_f)
     bottom = height - (110 if cast_line else 60)
     if title:
-        _center(d, bottom - tb[3], title.upper(), title_f)
+        y = bottom
+        for line, fnt in reversed(_title_lines(d, title.upper())):
+            y -= d.textbbox((0, 0), line, font=fnt)[3]
+            _center(d, y, line, fnt)
+            y -= 6
     if cast_line:
         _center(d, bottom + 14, cast_line, cast_f)
         d.rounded_rectangle((110, bottom + 70, CARD_W - 110, bottom + 80), 5, fill=RED)
