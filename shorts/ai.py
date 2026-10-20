@@ -45,12 +45,17 @@ def _env_key(*names: str) -> str:
 
 
 RESERVE_KEY = _env_key("RESERVE_AI_KEY", "GROQ_API_KEY")
+# третий ИИ — BeatAPI (beatapi.io): OpenAI-совместимый, есть бесплатные модели (id на «-free»)
+BEAT_KEY = _env_key("BEAT_API_KEY", "BEATAPI_API_KEY")
+BEAT_URL = os.getenv("BEAT_API_URL", "https://api.beatapi.io/v1").rstrip("/")
+BEAT_MODEL = os.getenv("BEAT_API_MODEL", "").strip()  # пусто — бесплатная модель, предпочтительно DeepSeek
+BEAT_HEADERS = {"User-Agent": "KinoMir360-bot/1.0"}  # без своего User-Agent их защита отвечает 403
 FONT = os.path.join(os.path.dirname(__file__), "assets", "Oswald.ttf")
 
 
 def available(key: str) -> bool:
     """Есть ли хоть один ИИ: ключ Gemini или резервный."""
-    return bool(key or RESERVE_KEY)
+    return bool(key or RESERVE_KEY or BEAT_KEY)
 
 
 class AIError(RuntimeError):
@@ -213,9 +218,87 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
             log.warning("shorts: reserve AI failed: %s", exc)
-    if not RESERVE_KEY:
+    if BEAT_KEY:
+        try:
+            result = await _ask_beat(prompt, image)
+            log.info("shorts: BeatAPI (%s) answered", _beat_model or BEAT_MODEL)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+            log.warning("shorts: BeatAPI failed: %s", exc)
+    if not RESERVE_KEY and not BEAT_KEY:
         errors.append("резервный ИИ не подключён: бот не видит переменную RESERVE_AI_KEY")
     raise AIError("; ".join(errors))
+
+
+_beat_model = ""
+
+
+async def _beat_get(session: aiohttp.ClientSession, path: str) -> Any:
+    async with session.get(f"{BEAT_URL}{path}",
+                           headers={**BEAT_HEADERS, "Authorization": f"Bearer {BEAT_KEY}"}) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            err = (data.get("error") or {}) if isinstance(data, dict) else {}
+            raise AIError(f"BeatAPI HTTP {resp.status} {err.get('code') or ''}: {str(err.get('message') or data)[:200]}")
+        return data
+
+
+async def beat_free_models() -> list[str]:
+    """Бесплатные модели BeatAPI прямо сейчас (список меняется, id заканчиваются на «-free»)."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _beat_get(session, "/models")
+    ids = [str(m.get("id")) for m in (data.get("data") if isinstance(data, dict) else None) or []
+           if isinstance(m, dict) and m.get("id")]
+    return [i for i in ids if i.endswith("-free") and not i.startswith("jev")]
+
+
+async def beat_status() -> dict[str, Any]:
+    """Для проверки в боте: баланс и бесплатные модели (без платных запросов)."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        usage = await _beat_get(session, "/usage")
+    return {"balance": usage.get("credit_balance") if isinstance(usage, dict) else None,
+            "free": await beat_free_models(), "model": BEAT_MODEL or await _pick_beat_model()}
+
+
+async def _pick_beat_model() -> str:
+    global _beat_model
+    if not _beat_model:
+        free = await beat_free_models()
+        if not free:
+            raise AIError("BeatAPI: бесплатных моделей сейчас нет — задайте BEAT_API_MODEL")
+        _beat_model = next((m for m in free if "deepseek" in m.lower()), free[0])
+    return _beat_model
+
+
+async def _ask_beat(prompt: str, image: Image.Image | None = None) -> Any:
+    """Запрос к BeatAPI (/v1/chat/completions). Бесплатные модели — 1 запрос в минуту до пополнения."""
+    model = BEAT_MODEL or await _pick_beat_model()
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image is not None:
+        small = image.copy()
+        small.thumbnail((1920, 1920))
+        buf = io.BytesIO()
+        small.save(buf, "JPEG", quality=80)
+        content.append({"type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}})
+    body = {"model": model, "temperature": 0.3, "messages": [{"role": "user", "content": content}]}
+    headers = {**BEAT_HEADERS, "Authorization": f"Bearer {BEAT_KEY}"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+        for attempt in range(2):
+            async with session.post(f"{BEAT_URL}/chat/completions", json=body, headers=headers) as resp:
+                status, data = resp.status, await resp.json(content_type=None)
+            err = (data.get("error") or {}) if isinstance(data, dict) else {}
+            if status == 429 and attempt == 0:  # лимит бесплатной модели — подождать и повторить один раз
+                await asyncio.sleep(min(float(err.get("retry_after_seconds") or 30), 65))
+                continue
+            break
+    if status != 200:
+        raise AIError(f"BeatAPI HTTP {status} {err.get('code') or ''} ({model}): {str(err.get('message') or data)[:200]}")
+    try:
+        return _json_from(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise AIError(f"BeatAPI: неожиданный ответ ({exc})") from exc
 
 
 async def match_images(key: str, texts: list[str], images: list[Image.Image]) -> list[int] | None:

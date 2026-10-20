@@ -45,6 +45,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from shorts import ai as shorts_ai
 from shorts import news as shorts_news
 from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
@@ -6835,6 +6836,37 @@ async def clips_command(
     )
 
 
+async def ai_status_action(message: Message) -> None:
+    """Какие ИИ подключены; BeatAPI — проверка ключа, баланс и бесплатные модели (без платных запросов)."""
+    rows = [
+        "🤖 <b>ИИ бота</b> (порядок: основной → запасные)",
+        f"1. Gemini: {'ключ есть ✅' if GEMINI_API_KEY else 'нет GEMINI_API_KEY ❌'} ({escape(shorts_ai.MODEL)})",
+        f"2. Groq: {'ключ есть ✅' if shorts_ai.RESERVE_KEY else 'нет RESERVE_AI_KEY ❌'} ({escape(shorts_ai.RESERVE_MODEL)})",
+    ]
+    if not shorts_ai.BEAT_KEY:
+        rows.append("3. BeatAPI: нет переменной BEAT_API_KEY ❌")
+    else:
+        wait = await message.answer("⏳ Проверяю BeatAPI…")
+        try:
+            st = await shorts_ai.beat_status()
+            free = st["free"]
+            listing = f" — {escape(', '.join(free[:8]))}" + ("…" if len(free) > 8 else "") if free else ""
+            rows.append(f"3. BeatAPI: ключ работает ✅, баланс ${float(st['balance'] or 0):.2f}\n"
+                        f"   модель: <code>{escape(st['model'])}</code>\n"
+                        f"   бесплатных моделей: {len(free)}{listing}")
+        except Exception as exc:
+            rows.append(f"3. BeatAPI: ❌ {escape(str(exc)[:300])}")
+        await wait.delete()
+    await message.answer("\n".join(rows))
+
+
+@router.message(Command("ai"))
+async def ai_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await ai_status_action(message)
+
+
 CLONE_POLL_SECONDS = 20
 CLONE_WAIT_SECONDS = 40 * 60
 
@@ -7000,7 +7032,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
         [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
-        [_btn("🎬 Проверить трейлер", "sh:ask:trailer")],
+        [_btn("🎬 Проверить трейлер", "sh:ask:trailer"), _btn("🤖 Проверить ИИ", "sh:ai")],
         [_btn("⬅️ Назад", "sh:menu")],
     ])
 
@@ -7164,6 +7196,8 @@ async def shorts_panel(
         await say_action(message, "")
     elif data == "sh:feeds":
         await feeds_action(message, "")
+    elif data == "sh:ai":
+        await ai_status_action(message)
     elif data == "sh:clone":
         await show(*await shorts_clone_menu())
     elif data == "sh:clone_off":
@@ -7814,6 +7848,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
+        BotCommand(command="ai", description="Проверить ИИ: Gemini, Groq, BeatAPI"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
