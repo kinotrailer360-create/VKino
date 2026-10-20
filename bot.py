@@ -52,6 +52,7 @@ from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
 from shorts import dub as shorts_dub
+from shorts import lore as shorts_lore
 from shorts import review as shorts_review
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
@@ -188,6 +189,13 @@ class ReviewState(StatesGroup):
     title = State()
     notes = State()
     own = State()
+    edit = State()
+    media = State()
+
+
+class LoreState(StatesGroup):
+    name = State()
+    hook = State()
     edit = State()
     media = State()
 
@@ -7006,7 +7014,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
-        [_btn("💡 Факты: случайный", "sh:go:facts")],
+        [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
@@ -7609,6 +7617,220 @@ async def review_own_text(message: Message, state: FSMContext) -> None:
     await show_script(message, state, script, can_redo=editing and bool(old.get("title")))
 
 
+# ---------------------------------------------------------------- история персонажа (лор)
+
+LORE_TIMEOUT = 20 * 60
+LORE_MEDIA_MAX = 24
+
+
+async def lore_ask_name(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(LoreState.name)
+    await message.answer(
+        "📖 <b>История персонажа</b>\n\nНапиши, про кого ролик: <code>Доктор Дум</code>, "
+        "<code>Дэдпул</code>, <code>Джокер</code>…\n\n<i>Передумал — /cancel</i>")
+
+
+async def lore_ask_hook(message: Message, state: FSMContext, name: str) -> None:
+    await state.update_data(lore_name=name, lore_hook="", lore_script=None, lore_media=[])
+    await state.set_state(LoreState.hook)
+    await message.answer(
+        f"📖 <b>{escape(name)}</b>\n\nЕсть новость-зацепка для начала ролика? Например: "
+        "<code>Роберт Дауни-младший сыграет Доктора Дума</code>. Напиши её — или жми «Без новости».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("➡️ Без новости", "lo:nohook")],
+                                                           [_btn("❌ Отмена", "lo:cancel")]]))
+
+
+async def lore_generate(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    wait = await message.answer("✍️ Читаю Википедию и пишу сценарий, обычно до минуты…")
+    try:
+        script = await shorts_lore.write_script(data["lore_name"], data.get("lore_hook") or "", GEMINI_API_KEY)
+    except Exception as exc:
+        logging.exception("Lore script failed")
+        await wait.edit_text(f"❌ Сценарий не написался: <code>{escape(str(exc)[:400])}</code>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("🔄 Ещё раз", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]]))
+        return
+    await wait.delete()
+    await state.update_data(lore_script=script)
+    await show_lore(message, state)
+
+
+async def show_lore(message: Message, state: FSMContext, brief: bool = False) -> None:
+    data = await state.get_data()
+    script = data["lore_script"]
+    media = data.get("lore_media") or []
+    chars = sum(len(x) for x in script["lines"])
+    head = (f"📝 <b>{escape(script.get('title') or data['lore_name'])}</b>\n"
+            f"{chars} символов ≈ {round(chars / 15)} с • источник: "
+            f"<a href=\"{escape(script.get('url') or '')}\">{escape(script.get('article') or 'Википедия')}</a>\n"
+            "Каждая строка — отдельная картинка в ролике.")
+    body = "" if brief else "\n\n" + escape(shorts_lore.script_text(script))
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Собрать шортс", "lo:go")], [_btn("✏️ Поправить текст", "lo:edit")],
+        [_btn(f"📎 Свои картинки ({len(media)})" if media else "📎 Добавить свои картинки", "lo:media")],
+        [_btn("🔄 Написать заново", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]])
+    await message.answer((head + body)[:4000], reply_markup=markup, disable_web_page_preview=True)
+
+
+async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message) -> None:
+    async with shorts_lock:
+        await load_pronunciations()
+        await load_voice()
+        work = SHORTS_DIR / datetime.now(MSK).strftime("lore_%Y%m%d_%H%M%S")
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            music = await custom_music(bot, work)
+            await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "история персонажа"}))
+            files: list[Path] = []
+            for k, item in enumerate(data.get("lore_media") or []):
+                path = work / f"user{k}{item['ext']}"
+                try:
+                    await bot.download(item["file_id"], destination=path)
+                    files.append(path)
+                except Exception:
+                    logging.exception("Lore: user file download failed")
+            progress = progress_updater(status)
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            result = await asyncio.wait_for(shorts_lore.make_lore(
+                work, data["lore_script"], music, files, GEMINI_API_KEY), timeout=LORE_TIMEOUT)
+            shorts_daily.add_english_seo(result)
+            await progress(100, "Готово — отправляю ролик")
+            await send_short(bot, chat_id, result)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"сборка шла дольше {LORE_TIMEOUT // 60} минут — "
+                               f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
+        finally:
+            shorts_daily.on_progress = None
+            await set_shorts_setting("running", None)
+            shutil.rmtree(work, ignore_errors=True)
+
+
+@router.message(Command("lore"))
+async def lore_command(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    name = (message.text or "").partition(" ")[2].strip()
+    if name:
+        await state.clear()
+        await lore_ask_hook(message, state, name)
+    else:
+        await lore_ask_name(message, state)
+
+
+@router.message(LoreState.name, F.text, ~F.text.startswith("/"))
+async def lore_name(message: Message, state: FSMContext) -> None:
+    await lore_ask_hook(message, state, _typed(message))
+
+
+@router.message(LoreState.hook, F.text, ~F.text.startswith("/"))
+async def lore_hook(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    await state.update_data(lore_hook=_typed(message))
+    await lore_generate(message, state)
+
+
+@router.message(LoreState.edit, F.text, ~F.text.startswith("/"))
+async def lore_edit(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    lines = shorts_lore.parse_lines(_typed(message))
+    if len(lines) < 2 or not data.get("lore_script"):
+        await message.answer("Пришли текст: каждая фраза — с новой строки (хотя бы 2 строки).")
+        return
+    script = dict(data["lore_script"], lines=lines[:20])
+    await state.set_state(None)
+    await state.update_data(lore_script=script)
+    await show_lore(message, state)
+
+
+@router.message(LoreState.media, F.photo | F.document)
+async def lore_media(message: Message, state: FSMContext) -> None:
+    if message.photo:
+        file, ext = message.photo[-1], ".jpg"
+    else:
+        doc = message.document
+        if not str(doc.mime_type or "").startswith("image/"):
+            await message.answer("Нужны картинки (страницы комиксов, кадры, арты) — это не картинка.")
+            return
+        file, ext = doc, Path(doc.file_name or "").suffix.lower() or ".jpg"
+    if (file.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать.")
+        return
+    async with review_media_lock:
+        media = (await state.get_data()).get("lore_media") or []
+        if len(media) >= LORE_MEDIA_MAX:
+            await message.answer(f"Хватит: уже {LORE_MEDIA_MAX} картинок. Нажми «✅ Готово».")
+            return
+        media.append({"file_id": file.file_id, "ext": ext})
+        await state.update_data(lore_media=media)
+    await message.answer(f"📎 Принято: {len(media)}", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[_btn("✅ Готово", "lo:media_done")]]))
+
+
+@router.callback_query(F.data.startswith("lo:"))
+async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message, action = callback.message, (callback.data or "")[3:]
+    data = await state.get_data()
+    if action == "start":
+        await lore_ask_name(message, state)
+        return
+    if action == "cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    if not data.get("lore_name"):
+        await message.answer("Начни заново: кнопка «📖 История персонажа» или /lore")
+        return
+    if action in ("nohook", "redo"):
+        await state.set_state(None)
+        await lore_generate(message, state)
+    elif not data.get("lore_script"):
+        await message.answer("Сначала нужен сценарий.")
+    elif action == "edit":
+        await state.set_state(LoreState.edit)
+        await message.answer("✏️ Скопируй текст выше, поправь и пришли одним сообщением — "
+                             "каждая фраза с новой строки (номера можно оставить).\n\n<i>Передумал — /cancel</i>")
+    elif action == "media":
+        await state.set_state(LoreState.media)
+        await message.answer(
+            "📎 Присылай картинки — страницы комиксов, кадры, арты, по одной или альбомом (до 24). "
+            "ИИ поставит каждую к подходящей фразе, камера проедет по странице сверху вниз. "
+            "Файлы до 20 МБ.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("✅ Готово", "lo:media_done")], [_btn("🗑 Убрать все мои картинки", "lo:media_clear")]]))
+    elif action in ("media_done", "media_clear"):
+        if action == "media_clear":
+            await state.update_data(lore_media=[])
+        await state.set_state(None)
+        await show_lore(message, state, brief=True)
+    elif action == "go":
+        if shorts_lock.locked():
+            await message.answer("⏳ Сейчас собирается другой ролик — нажми «Собрать» ещё раз через пару минут.")
+            return
+        await state.clear()
+        status = await message.answer(progress_bar(0, "Начинаю, обычно это 3–6 минут"))
+
+        async def job() -> None:
+            try:
+                await run_lore(message.bot, message.chat.id, data, status)
+            except Exception as exc:
+                logging.exception("Lore failed")
+                try:
+                    await status.edit_text("❌ Сборка остановилась — причина ниже")
+                except TelegramBadRequest:
+                    pass
+                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+
+        task = asyncio.create_task(job())
+        shorts_jobs.add(task)
+        task.add_done_callback(shorts_jobs.discard)
+
+
 # ---------------------------------------------------------------- закадровый перевод трейлера
 
 DUB_TIMEOUT = 20 * 60
@@ -7848,6 +8070,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
+        BotCommand(command="lore", description="Шортс «история персонажа»: /lore Доктор Дум"),
         BotCommand(command="ai", description="Проверить ИИ: Gemini, Groq, BeatAPI"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),

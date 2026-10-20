@@ -924,7 +924,8 @@ async def synthesize(lines: list[str], work: Path,
     for i, part in enumerate(parts):
         starts.append(round(t, 3))
         dur = await _duration(part)
-        spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]]})
+        spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]],
+                      "text": speak[i].replace(pronounce.STRESS, "")})
         t += dur + GAP
         inputs += ["-i", str(part)]
         chains.append(f"[{i}:a]aresample=48000,apad=pad_dur={GAP}[a{i}]")
@@ -933,6 +934,44 @@ async def synthesize(lines: list[str], work: Path,
     voice = work / "voice.wav"
     await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
     return voice, starts, voiced, spans
+
+
+async def word_timeline(voice: Path, starts: list[float], spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Субтитры по одному слову: [{"w", "s", "e"}] на всю озвучку.
+
+    Точно — распознаванием готовой дорожки (Whisper на Groq); нет ключа или сбой — по тексту фраз:
+    время слова из синтеза (голос Microsoft его даёт) или пропорционально длине слова.
+    """
+    if ai.RESERVE_KEY and "groq.com" in ai.RESERVE_URL:
+        mp3 = voice.with_suffix(".words.mp3")
+        try:
+            await _run("ffmpeg", "-v", "error", "-y", "-i", str(voice), "-ac", "1", "-ar", "16000",
+                       "-c:a", "libmp3lame", "-b:a", "48k", str(mp3))
+            words = await ai.transcribe_words(mp3.read_bytes())
+            if words:
+                return words
+        except Exception as exc:  # noqa: BLE001 — тогда по тексту
+            log.warning("shorts: word timestamps failed: %s", exc)
+        finally:
+            mp3.unlink(missing_ok=True)
+    out: list[dict[str, Any]] = []
+    for start, span in zip(starts, spans):
+        tokens = [w for w in str(span.get("text") or "").split() if re.search(r"\w", w)]
+        if not tokens:
+            continue
+        times = span.get("words") or []
+        if len(times) >= len(tokens):
+            marks = [start + t for t in times[:len(tokens)]]
+        else:
+            total = sum(len(w) + 1 for w in tokens)
+            acc, marks = 0, []
+            for w in tokens:
+                marks.append(start + span["speech"] * acc / total)
+                acc += len(w) + 1
+        for k, (w, m) in enumerate(zip(tokens, marks)):
+            end = marks[k + 1] if k + 1 < len(marks) else start + span["speech"]
+            out.append({"w": w, "s": round(m, 2), "e": round(end, 2)})
+    return out
 
 
 # ---------------------------------------------------------------- SEO
@@ -1023,6 +1062,7 @@ TIKTOK_THEME = {
     "facts": ["#фактыокино", "#интересныефакты", "#moviefacts", "#didyouknow"],
     "news": ["#новостикино", "#киноновости", "#movienews", "#filmnews"],
     "birthday": ["#деньрождения", "#актеры", "#happybirthday", "#actor"],
+    "lore": ["#историяперсонажа", "#комиксы", "#lore", "#comics"],
 }
 TIKTOK_MAX_TAGS = 15
 
@@ -1039,7 +1079,7 @@ def _names(result: ShortResult) -> tuple[list[str], list[str]]:
     key, films = result.theme.key, result.films
     if key == "news":  # здесь «фильмы» — заголовки новостей
         return [], []
-    if key == "birthday":
+    if key in ("birthday", "lore"):
         return [str(f.get("name") or "") for f in films], [str(f.get("en") or "") for f in films]
     films = films[::-1]  # в подборке №1 — последний
     ru = [_title(f) for f in films]
@@ -1078,6 +1118,7 @@ EN_KEYWORDS = {
     "facts": ["movie facts", "behind the scenes"],
     "news": ["movie news", "film news"],
     "birthday": ["happy birthday", "best movies"],
+    "lore": ["character origin", "comics lore"],
 }
 
 
@@ -1109,9 +1150,14 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     """
     await _progress(40, "Озвучка")
     voice, starts, voiced, spans = await synthesize(lines, work)
+    # субтитры по слову; текст, который и так звучит (караоке), на карточке тогда не дублируем
+    words = await word_timeline(voice, starts, spans) if voiced else []
     for i, card in enumerate(cards, 1):  # слайд 0 — обложка
         if card.pop("karaoke", False):
-            card["karaoke"] = spans[i]
+            if words:
+                card["caption"] = ""
+            else:
+                card["karaoke"] = spans[i]
     sfx = [[max(st - 0.15, 0), str(ASSETS / "whoosh.wav"), -6] for st in starts[1:]]
     if boom_slide is not None and boom_slide < len(starts):
         sfx.append([max(starts[boom_slide] - 0.05, 0), str(ASSETS / "boom.wav"), -5])
@@ -1129,6 +1175,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         "cards": cards,
         "starts": starts,
         "sfx": sfx,
+        "words": words,
         "outro": {
             "question": question,
             "channel": "KinoMir360",
