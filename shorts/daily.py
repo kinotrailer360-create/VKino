@@ -756,11 +756,13 @@ async def _piper_to_file(text: str, path: Path) -> list[float]:
 
 
 last_engine = "edge"  # каким голосом озвучена последняя фраза (для /voice)
+lumean_error = ""  # почему не сработал голос ElevenLabs (Lumean) — для /voice
 
 
 async def say_to_file(text: str, path: Path) -> list[float]:
     """Озвучить фразу в mp3 (время слов в ответе): основной голос, при сбое — запасной Piper."""
-    global last_engine
+    global last_engine, lumean_error
+    lumean_error = "" if lumean.enabled() else "нет переменной LUMEAN_API_KEY"
     if lumean.enabled():
         try:
             await lumean.synthesize([text.replace(pronounce.STRESS, "")], [path], path.parent)
@@ -768,6 +770,7 @@ async def say_to_file(text: str, path: Path) -> list[float]:
             return []
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Lumean TTS failed (%s), using Edge", exc)
+            lumean_error = str(exc)[:300]
     try:
         words = await _edge_to_file(text, path)
         last_engine = "edge"
