@@ -623,7 +623,8 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
 
 # ---------------------------------------------------------------- голос
 
-NUMBERS = {1: "один", 2: "два", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь"}
+NUMBERS = {1: "один", 2: "два", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь", 8: "восемь",
+           9: "девять", 10: "десять"}
 SAVE_AND_SUBSCRIBE = "Сохрани и подпишись на КиноМир триста шестьдесят!"
 
 
@@ -1000,7 +1001,7 @@ def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
         hashtags[1] = "#сериалы"
     elif theme.key == "upcoming":
         hashtags[1] = "#скоровкино"
-    elif theme.key.startswith("genre:"):
+    elif theme.key.startswith("genre:") or theme.key == "custom":
         hashtags[1] = "#подборкафильмов"
 
     description = "\n".join([
@@ -1063,6 +1064,7 @@ TIKTOK_THEME = {
     "news": ["#новостикино", "#киноновости", "#movienews", "#filmnews"],
     "birthday": ["#деньрождения", "#актеры", "#happybirthday", "#actor"],
     "lore": ["#историяперсонажа", "#комиксы", "#lore", "#comics"],
+    "custom": ["#подборкафильмов", "#чтопосмотреть", "#movierecommendations", "#top"],
 }
 TIKTOK_MAX_TAGS = 15
 
@@ -1119,6 +1121,7 @@ EN_KEYWORDS = {
     "news": ["movie news", "film news"],
     "birthday": ["happy birthday", "best movies"],
     "lore": ["character origin", "comics lore"],
+    "custom": ["movie recommendations", "best movies"],
 }
 
 
@@ -1339,6 +1342,49 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         notes.append(no_voice_note(voiced))
     if notes:
         result.seo["warning"] = "\n".join(notes)
+    return result
+
+
+# ---------------------------------------------------------------- своя подборка (тема и список от автора)
+
+CUSTOM_MIN, CUSTOM_MAX = 3, 10
+
+
+async def find_film(fetch: Fetch, query: str) -> dict[str, Any] | None:
+    """Фильм по «Название» или «Название 2018»: самый известный из найденных (полная карточка)."""
+    query = query.strip()
+    if query.startswith("id:") and query[3:].isdigit():
+        return await fetch(f"/movie/{int(query[3:])}")
+    year_m = re.search(r"[\s(]+(19\d\d|20\d\d)\)?$", query)
+    year = int(year_m.group(1)) if year_m else None
+    name = query[: year_m.start()].strip() if year_m else query
+    data = await fetch("/movie/search", query=name, page=1, limit=10)
+    cands = [x for x in data.get("docs") or [] if isinstance(x, dict) and x.get("id")]
+    if year:
+        cands = [c for c in cands if c.get("year") in (year - 1, year, year + 1)] or cands
+    if not cands:
+        return None
+    cands.sort(key=lambda c: (c.get("year") != year if year else False, -int((c.get("votes") or {}).get("kp") or 0)))
+    return await fetch(f"/movie/{cands[0]['id']}")
+
+
+def custom_theme(title: str, n: int) -> Theme:
+    title = re.sub(r"\s+", " ", title).strip(" .!") or "Подборка фильмов"
+    header = title.upper() if len(title) <= 34 else title.upper()[:33].rsplit(" ", 1)[0] + "…"
+    return Theme("custom", "ПОДБОРКА", header, title, f"{title} 🎬",
+                 [title.lower(), "подборка фильмов", "что посмотреть", "топ фильмов", "фильмы на вечер"])
+
+
+async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list[int], music: Path | None = None,
+                            tmdb_key: str = "", trailer_clips: bool = True) -> ShortResult:
+    """Своя подборка: тема и фильмы — от автора (или из чужого ролика), порядок — как в списке."""
+    work.mkdir(parents=True, exist_ok=True)
+    if not CUSTOM_MIN <= len(film_ids) <= CUSTOM_MAX:
+        raise RuntimeError(f"в подборке должно быть от {CUSTOM_MIN} до {CUSTOM_MAX} фильмов")
+    await _progress(5, "Загружаю фильмы")
+    films = [await fetch(f"/movie/{i}") for i in film_ids]
+    result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips)
+    add_english_seo(result)
     return result
 
 
@@ -1570,11 +1616,15 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
         films = await pick_films(fetch, theme, today, exclude or set())
     if len(films) < FILMS:
         raise RuntimeError(f"Не набралось {FILMS} фильмов для подборки (тема {theme.key})")
-    n = len(films)
     # обратный отсчёт: показываем с №5 до №1, лучший — последним (ожидаемые — по порядку ожидания)
     ranked = films if theme.upcoming else sorted(films, key=_rank_key, reverse=True)
-    films = ranked[::-1]
+    return await _list_short(work, theme, ranked[::-1], music, tmdb_key, trailer_clips)
 
+
+async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], music: Path | None,
+                      tmdb_key: str, trailer_clips: bool) -> ShortResult:
+    """Подборка-отсчёт по готовому списку: films в порядке показа (последний — №1)."""
+    n = len(films)
     cards = []
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:

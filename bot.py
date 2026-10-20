@@ -51,6 +51,7 @@ from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
+from shorts import copycat as shorts_copycat
 from shorts import dub as shorts_dub
 from shorts import lore as shorts_lore
 from shorts import review as shorts_review
@@ -191,6 +192,11 @@ class ReviewState(StatesGroup):
     own = State()
     edit = State()
     media = State()
+
+
+class CustomState(StatesGroup):
+    text = State()
+    video = State()
 
 
 class LoreState(StatesGroup):
@@ -7014,6 +7020,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
+        [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
@@ -7617,6 +7624,178 @@ async def review_own_text(message: Message, state: FSMContext) -> None:
     await show_script(message, state, script, can_redo=editing and bool(old.get("title")))
 
 
+# ---------------------------------------------------------------- своя подборка и «по образцу»
+
+CUSTOM_TIMEOUT = 15 * 60
+CUSTOM_HELP = (
+    "Первой строкой — тема, дальше фильмы, по одному на строку (год — по желанию):\n"
+    "<code>Фильмы, после которых не уснёшь\nСияние 1980\nРеинкарнация\nОно 2017</code>\n"
+    "Порядок — как в ролике: последний станет №1.")
+
+
+async def custom_ask(message: Message, state: FSMContext, video: bool) -> None:
+    await state.clear()
+    if video:
+        shutil.rmtree(SHORTS_DIR / f"copy_{message.chat.id}", ignore_errors=True)
+        await state.set_state(CustomState.video)
+        await message.answer(
+            "🔁 <b>Сделать по образцу</b>\n\nПришли чужой ролик-подборку: видеофайл до 20 МБ "
+            "(с YouTube/TikTok — сохрани на телефон и отправь) или ссылку на Rutube/VK. "
+            "ИИ вытащит тему и список фильмов, ты проверишь — и соберём нашу версию: "
+            "свои картинки, текст и голос.\n\n<i>Передумал — /cancel</i>")
+    else:
+        await state.set_state(CustomState.text)
+        await message.answer("🎯 <b>Своя подборка</b>\n\n" + CUSTOM_HELP + "\n\n<i>Передумал — /cancel</i>")
+
+
+async def show_plan(message: Message, state: FSMContext, title: str, films: list[dict[str, Any]]) -> None:
+    wait = await message.answer("🔎 Ищу фильмы на Кинопоиске…")
+    items = await shorts_copycat.resolve(kp._get, films)
+    await wait.delete()
+    found = [it for it in items if it["id"]]
+    await state.update_data(cs_title=title, cs_items=items)
+    rows = [f"🎯 <b>Тема:</b> {escape(title)}", ""]
+    for i, it in enumerate(items, 1):
+        mark = f"✅ {escape(it['label'])}" if it["id"] else "❌ не нашёл на Кинопоиске"
+        rows.append(f"{i}. {escape(it['query'])} — {mark}")
+    ok = shorts_daily.CUSTOM_MIN <= len(found) <= shorts_daily.CUSTOM_MAX
+    rows += ["", f"В ролик пойдут найденные ({len(found)}), последний — №1." if ok else
+             f"⚠️ Нужно от {shorts_daily.CUSTOM_MIN} до {shorts_daily.CUSTOM_MAX} найденных фильмов, сейчас "
+             f"{len(found)}. Поправь список."]
+    buttons = ([[_btn("✅ Собрать шортс", "cs:go")]] if ok else []) + [
+        [_btn("✏️ Изменить тему или список", "cs:edit")], [_btn("❌ Отмена", "cs:cancel")]]
+    await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status: Message) -> None:
+    async with shorts_lock:
+        await load_pronunciations()
+        await load_voice()
+        work = SHORTS_DIR / datetime.now(MSK).strftime("custom_%Y%m%d_%H%M%S")
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            music = await custom_music(bot, work)
+            await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "своя подборка"}))
+            progress = progress_updater(status)
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            result = await asyncio.wait_for(shorts_daily.make_custom_short(
+                kp._get, work, title, ids, music, TMDB_API_KEY,
+                trailer_clips=await shorts_setting("clips") != "off"), timeout=CUSTOM_TIMEOUT)
+            await progress(100, "Готово — отправляю ролик")
+            await send_short(bot, chat_id, result)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"сборка шла дольше {CUSTOM_TIMEOUT // 60} минут — "
+                               f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
+        finally:
+            shorts_daily.on_progress = None
+            await set_shorts_setting("running", None)
+            shutil.rmtree(work, ignore_errors=True)
+
+
+@router.message(Command("mylist"))
+async def custom_command(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await custom_ask(message, state, video=False)
+
+
+@router.message(CustomState.text, F.text, ~F.text.startswith("/"))
+async def custom_text(message: Message, state: FSMContext) -> None:
+    try:
+        title, films = shorts_copycat.parse_plan(_typed(message))
+    except ValueError:
+        await message.answer("Не понял список.\n\n" + CUSTOM_HELP)
+        return
+    await state.set_state(None)
+    await show_plan(message, state, title, films)
+
+
+@router.message(CustomState.video, F.video | F.document | F.text)
+async def custom_video(message: Message, state: FSMContext) -> None:
+    if (message.text or "").startswith("/"):
+        return
+    work = SHORTS_DIR / f"copy_{message.chat.id}"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    wait = await message.answer("⏳ Скачиваю ролик…")
+    try:
+        media = message.video or message.document
+        if media:
+            if media is message.document and not str(media.mime_type or "").startswith("video/"):
+                await wait.edit_text("Это не видео. Пришли видеофайл или ссылку.")
+                return
+            if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+                await wait.edit_text("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать. "
+                                     "Пришли ссылку на Rutube/VK или сжатую версию.")
+                return
+            src = work / "source.mp4"
+            await message.bot.download(media.file_id, destination=src)
+        else:
+            m = re.search(r"https?://\S+", message.text or "")
+            if not m:
+                await wait.edit_text("Нужен видеофайл или ссылка (https://…).")
+                return
+            src = await shorts_dub.fetch_source(m.group(0), work)
+        await wait.edit_text("👀 ИИ смотрит ролик и выписывает тему и фильмы, обычно до минуты…")
+        found = await shorts_copycat.extract(src, work, GEMINI_API_KEY)
+    except Exception as exc:
+        logging.exception("Copycat extraction failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>")
+        return
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await wait.delete()
+    await state.set_state(None)
+    await show_plan(message, state, found["title"] or "Подборка фильмов", found["films"])
+
+
+@router.callback_query(F.data.startswith("cs:"))
+async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message, action = callback.message, (callback.data or "")[3:]
+    if action in ("text", "video"):
+        await custom_ask(message, state, video=action == "video")
+        return
+    if action == "cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    data = await state.get_data()
+    if not data.get("cs_items"):
+        await message.answer("Начни заново: «🎯 Своя подборка» или «🔁 По образцу».")
+        return
+    if action == "edit":
+        await state.set_state(CustomState.text)
+        lines = [data["cs_title"]] + [it["label"] or it["query"] for it in data["cs_items"]]
+        await message.answer("✏️ Скопируй, поправь и пришли обратно (можно убрать, добавить, поменять порядок):\n\n"
+                             f"<code>{escape(chr(10).join(lines))}</code>")
+    elif action == "go":
+        if shorts_lock.locked():
+            await message.answer("⏳ Сейчас собирается другой ролик — нажми «Собрать» ещё раз через пару минут.")
+            return
+        ids = [it["id"] for it in data["cs_items"] if it["id"]]
+        await state.clear()
+        status = await message.answer(progress_bar(0, "Начинаю, обычно это 3–6 минут"))
+
+        async def job() -> None:
+            try:
+                await run_custom(message.bot, message.chat.id, data["cs_title"], ids, status)
+            except Exception as exc:
+                logging.exception("Custom short failed")
+                try:
+                    await status.edit_text("❌ Сборка остановилась — причина ниже")
+                except TelegramBadRequest:
+                    pass
+                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+
+        task = asyncio.create_task(job())
+        shorts_jobs.add(task)
+        task.add_done_callback(shorts_jobs.discard)
+
+
 # ---------------------------------------------------------------- история персонажа (лор)
 
 LORE_TIMEOUT = 20 * 60
@@ -8071,6 +8250,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
         BotCommand(command="lore", description="Шортс «история персонажа»: /lore Доктор Дум"),
+        BotCommand(command="mylist", description="Своя подборка: тема и список фильмов"),
         BotCommand(command="ai", description="Проверить ИИ: Gemini, Groq, BeatAPI"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
