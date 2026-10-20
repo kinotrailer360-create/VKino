@@ -20,8 +20,10 @@ from typing import Any
 
 import aiohttp
 
+from .ai import _env_key
+
 API = os.getenv("LUMEAN_API_URL", "https://api.lumean.app/api/public").rstrip("/")
-KEY = os.getenv("LUMEAN_API_KEY", "").strip().strip("\"'")
+KEY = _env_key("LUMEAN_API_KEY")  # находит и имя, набранное с русскими буквами-двойниками
 VOICE_ID = os.getenv("LUMEAN_VOICE_ID", "").strip()
 TEMPLATE_ID = os.getenv("LUMEAN_TEMPLATE_ID", "").strip()
 MODEL = os.getenv("LUMEAN_MODEL", "eleven_multilingual_v2").strip()

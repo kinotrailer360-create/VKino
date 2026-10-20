@@ -6651,6 +6651,8 @@ async def voice_action(message: Message, text: str) -> None:
         engine = shorts_daily.last_engine
         note = ("\n\n🎙 Голос ElevenLabs (Lumean)" if engine == "lumean" else "" if engine == "edge"
                 else f"\n\n⚠️ Основной голос не ответил — это запасной голос: {escape(engine[:300])}")
+        if engine != "lumean" and shorts_daily.lumean_error:
+            note += f"\n\n⚠️ ElevenLabs (Lumean) не сработал: {escape(shorts_daily.lumean_error)}"
         await message.answer_audio(
             FSInputFile(path, filename="voice.mp3"),
             caption=f"🗣 {escape(spoken[:800])}{note}",
