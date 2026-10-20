@@ -7,7 +7,7 @@
 #   python3 tg.py me                   — проверка токена
 import os, sys, json, time, urllib.request, urllib.parse, mimetypes, uuid, datetime
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-if not TOKEN: sys.exit('Нет переменной TELEGRAM_BOT_TOKEN')
+if not TOKEN and 'seo-preview' not in sys.argv: sys.exit('Нет переменной TELEGRAM_BOT_TOKEN')
 API = f'https://api.telegram.org/bot{TOKEN}/'; FILE = f'https://api.telegram.org/file/bot{TOKEN}/'
 HERE = os.path.dirname(os.path.abspath(__file__)); STATE = os.path.join(HERE, 'state.json')
 
@@ -57,12 +57,48 @@ def pull(out_root):
     json.dump(st, open(STATE, 'w'))
     print(json.dumps({'folder': out, 'new_updates': len(ups), 'files': sum(1 for i in man if 'file' in i)}, ensure_ascii=False))
 
+import html, re
+def seo_messages(md_path):
+    """Разбирает наш SEO-.md и собирает аккуратные сообщения для Telegram (HTML, копирование по нажатию)."""
+    t = open(md_path, encoding='utf-8').read(); E = html.escape
+    head = re.search(r'^#\s*SEO\s*[—-]\s*«?(.+?)»?\s*\(', t, re.M)
+    name = head.group(1) if head else os.path.basename(md_path)
+    def sec(title):
+        m = re.search(r'^##\s*' + title + r'.*?$(.*?)(?=^##\s|\Z)', t, re.M | re.S); return m.group(1) if m else ''
+    def ticks(block): return re.findall(r'`([^`\n]+)`', block)
+    def fence(block):
+        m = re.search(r'```\w*\n(.*?)```', block, re.S); return m.group(1).strip() if m else ''
+    nm = sec('Название'); titles = ticks(nm)
+    en = next((x for line in nm.splitlines() if 'англ' in line.lower() or 'english' in line.lower() for x in ticks(line)), None)
+    ru = [x for x in titles if x != en]
+    warn = [re.sub(r'[*`]', '', l).strip() for l in t.splitlines() if l.strip().startswith('⚠️')]
+    pub = sec('Публикация'); zak = next((x for l in pub.splitlines() if 'Закреп' in l for x in ticks(l)), None)
+    msgs = [f'🎬 <b>Ролик готов: {E(name)}</b>' + ('\n\n' + '\n'.join(E(w) for w in warn) if warn else '')]
+    if ru:
+        m = '📌 <b>Название</b> (нажми — скопируется):\n<code>' + E(ru[0]) + '</code>'
+        if len(ru) > 1: m += '\n\nЗапасные:\n' + '\n'.join('<code>' + E(x) + '</code>' for x in ru[1:3])
+        if en: m += '\n\n🇬🇧 <b>Перевод названия</b> (Studio → Переводы → English):\n<code>' + E(en) + '</code>'
+        msgs.append(m)
+    d = fence(sec('Описание'))
+    if d: msgs.append('📝 <b>Описание</b> (нажми — скопируется):\n<pre>' + E(d) + '</pre>')
+    tg_ = fence(sec('Теги'))
+    if tg_: msgs.append('🏷 <b>Теги</b>:\n<code>' + E(tg_) + '</code>')
+    tail = ['🖼 Обложка — первый кадр ролика (ползунок обложки в начало).']
+    if zak: tail.insert(0, '📍 <b>Закреплённый комментарий</b>:\n<code>' + E(zak) + '</code>')
+    msgs.append('\n\n'.join(tail))
+    return msgs
+
 cmd = sys.argv[1] if len(sys.argv) > 1 else 'me'
+if cmd == 'seo-preview':
+    [print(m, '\n-----') for m in seo_messages(sys.argv[2])]; sys.exit()
 if cmd == 'me': print(call('getMe'))
 elif cmd == 'pull': pull(sys.argv[2])
 elif cmd == 'send-video':
     print(call('sendVideo', {'chat_id': sys.argv[2], 'caption': (sys.argv[4] if len(sys.argv) > 4 else '')[:1024],
                              'supports_streaming': 'true'}, files={'video': sys.argv[3]}, timeout=600)['message_id'])
+elif cmd == 'send-seo':
+    for m in seo_messages(sys.argv[3]): call('sendMessage', {'chat_id': sys.argv[2], 'text': m, 'parse_mode': 'HTML'})
+    print('seo sent')
 elif cmd == 'send-text':
     t = sys.argv[3]; t = open(t[1:]).read() if t.startswith('@') else t
     for i in range(0, len(t), 4000): call('sendMessage', {'chat_id': sys.argv[2], 'text': t[i:i + 4000]})
