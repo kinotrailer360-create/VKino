@@ -6664,7 +6664,7 @@ async def voice_action(message: Message, text: str) -> None:
     try:
         await load_pronunciations()
         await load_voice()
-        spoken = shorts_pronounce.apply(text[:500])
+        spoken = (await shorts_daily.spoken_lines([text[:500]]))[0]
         path.parent.mkdir(parents=True, exist_ok=True)
         await shorts_say_to_file(spoken, path)
         engine = shorts_daily.last_engine
