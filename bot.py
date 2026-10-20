@@ -177,6 +177,7 @@ class ShortsState(StatesGroup):
     trailer_query = State()
     feed_url = State()
     music_file = State()
+    clone_audio = State()
 
 
 class AdminSourceState(StatesGroup):
@@ -3068,9 +3069,12 @@ def premiere_label(item: dict[str, Any]) -> str:
     return value.strftime("%d.%m.%Y") if value else ""
 
 
-def main_menu() -> ReplyKeyboardMarkup:
+SHORTS_BUTTON = "🎬 Шортсы (админ)"
+
+
+def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
+        keyboard=[*([[KeyboardButton(text=SHORTS_BUTTON)]] if admin else []),
             [KeyboardButton(text="🔎 Найти фильм или сериал")],
             [
                 KeyboardButton(text="🆕 Новинки"),
@@ -3624,8 +3628,13 @@ async def cmd_start(
         "⭐ Рейтинги Кинопоиска и IMDb\n"
         "🎞 Трейлеры и описания\n"
         "🍿 Подборки и рекомендации",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)),
     )
+
+
+@router.message(F.text == SHORTS_BUTTON)
+async def shorts_button(message: Message, state: FSMContext) -> None:
+    await shorts_panel_command(message, state)
 
 
 @router.message(F.text == "🔎 Найти фильм или сериал")
@@ -6814,6 +6823,12 @@ CLONE_POLL_SECONDS = 20
 CLONE_WAIT_SECONDS = 40 * 60
 
 
+async def clone_off(message: Message) -> None:
+    await set_shorts_setting("lumean_service", None)
+    await set_shorts_setting("lumean_voice", None)
+    await message.answer("✅ Вернул стандартный голос ElevenLabs.")
+
+
 @router.message(Command("clone"))
 async def clone_command(message: Message) -> None:
     """Клон своего голоса для озвучки (Lumean, Fish Audio): ответить /clone на голосовое сообщение."""
@@ -6821,15 +6836,16 @@ async def clone_command(message: Message) -> None:
         return
     arg = (message.text or "").partition(" ")[2].strip().lower()
     if arg in ("off", "выкл", "default"):
-        await set_shorts_setting("lumean_service", None)
-        await set_shorts_setting("lumean_voice", None)
-        await message.answer("✅ Вернул стандартный голос ElevenLabs.")
+        await clone_off(message)
         return
+    reply = message.reply_to_message
+    await clone_action(message, (reply.voice or reply.audio) if reply else None)
+
+
+async def clone_action(message: Message, media: Any) -> None:
     if not shorts_lumean.enabled():
         await message.answer("Нет ключа Lumean: добавьте переменную LUMEAN_API_KEY на Railway.")
         return
-    reply = message.reply_to_message
-    media = (reply.voice or reply.audio) if reply else None
     if media is None:
         current = await shorts_setting("lumean_voice")
         await message.answer(
@@ -6837,6 +6853,7 @@ async def clone_command(message: Message) -> None:
             "1. Запишите голосовое сообщение 30–60 секунд: обычная речь, как в роликах, "
             "в тишине, без музыки и чужих голосов.\n"
             "2. Ответьте на него командой <code>/clone</code> (свайп по сообщению влево → написать /clone).\n\n"
+            "Проще — кнопками: /shorts → ⚙️ Настройки → 🎙 Свой голос.\n"
             "Клонирование занимает несколько минут, бот напишет, когда голос будет готов.\n"
             "Вернуть стандартный голос: <code>/clone off</code>\n\n"
             + ("Сейчас: <b>ваш голос</b> (клон)." if current else "Сейчас: стандартный голос ElevenLabs.")
@@ -6871,7 +6888,10 @@ async def clone_command(message: Message) -> None:
             await set_shorts_setting("lumean_voice", str(info["voice_id"]))
             await message.answer(
                 "✅ Ваш голос готов! Теперь ролики озвучиваются им.\n"
-                "Проверить: <code>/voice Привет, это мой голос</code>\nВернуть стандартный: <code>/clone off</code>"
+                "Проверить и вернуть стандартный — кнопками ниже.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [_btn("🔊 Проверить голос", "sh:ask:voice")],
+                    [_btn("↩️ Стандартный голос", "sh:clone_off")]]),
             )
         else:
             reason = (info.get("error") or {}).get("reason") if isinstance(info.get("error"), dict) else info.get("error")
@@ -6956,10 +6976,26 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
-        [_btn("🔊 Проверить голос", "sh:ask:voice")],
+        [_btn("🔊 Проверить голос", "sh:ask:voice"), _btn("🎙 Свой голос ▸", "sh:clone")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
         [_btn("🎬 Проверить трейлер", "sh:ask:trailer")],
         [_btn("⬅️ Назад", "sh:menu")],
+    ])
+
+
+async def shorts_clone_menu() -> tuple[str, InlineKeyboardMarkup]:
+    own = bool(await shorts_setting("lumean_voice"))
+    text = (
+        "🎙 <b>Свой голос для роликов</b>\n\n"
+        f"Сейчас: <b>{'ваш голос (клон)' if own else 'стандартный голос ElevenLabs'}</b>.\n\n"
+        "Нажмите «Записать свой голос» и пришлите голосовое 30–60 секунд: обычная речь, "
+        "как в роликах, в тишине, без музыки и чужих голосов."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🎤 Записать свой голос", "sh:ask:clone")],
+        [_btn("🔊 Проверить голос", "sh:ask:voice")],
+        [_btn("↩️ Стандартный голос", "sh:clone_off")],
+        [_btn("⬅️ Назад", "sh:settings")],
     ])
 
 
@@ -6979,6 +7015,8 @@ SHORTS_ASKS = {
     "trailer": (ShortsState.trailer_query,
                 "🎬 Напиши название фильма или пришли ссылку на видео (VK, Rutube) — проверю, качается ли трейлер."),
     "feed": (ShortsState.feed_url, "📡 Пришли ссылку на RSS-ленту новостей кино."),
+    "clone": (ShortsState.clone_audio,
+              "🎤 Запишите и пришлите сюда голосовое сообщение на 30–60 секунд — сделаю из него ваш голос."),
     "music": (ShortsState.music_file, "🎵 Пришли аудиофайл (mp3) — он станет фоновой музыкой. Только музыка без АП!"),
 }
 
@@ -7039,6 +7077,10 @@ async def shorts_panel(
         await say_action(message, "")
     elif data == "sh:feeds":
         await feeds_action(message, "")
+    elif data == "sh:clone":
+        await show(*await shorts_clone_menu())
+    elif data == "sh:clone_off":
+        await clone_off(message)
 
 
 def _typed(message: Message) -> str:
@@ -7088,6 +7130,12 @@ async def shorts_music_file(message: Message, state: FSMContext) -> None:
     await state.clear()
     await set_shorts_setting("music_file_id", media.file_id)
     await message.answer("✅ Музыка для шортсов обновлена — со следующего ролика.")
+
+
+@router.message(ShortsState.clone_audio, F.voice | F.audio)
+async def shorts_clone_audio(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await clone_action(message, message.voice or message.audio)
 
 
 KP_TYPES = {
@@ -7146,7 +7194,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
-        BotCommand(command="clone", description="Свой голос: ответить /clone на голосовое"),
+        BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="trailer", description="Проверить скачивание трейлера"),
