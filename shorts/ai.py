@@ -527,3 +527,112 @@ async def transcribe_dub(key: str, audio: bytes, duration: float) -> list[dict[s
             errors.append(f"резерв: {exc}")
             log.warning("shorts: reserve dub transcription failed: %s", exc)
     raise AIError("; ".join(errors) or "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY (Groq)")
+
+
+async def transcribe_words(audio: bytes, language: str = "ru") -> list[dict[str, Any]]:
+    """Время каждого слова в готовой озвучке (Whisper на Groq): [{"w": слово, "s": начало, "e": конец}]."""
+    if not RESERVE_KEY or "groq.com" not in RESERVE_URL:
+        raise AIError("для субтитров по слову нужен ключ Groq (RESERVE_AI_KEY)")
+    url = RESERVE_URL.split("/chat/completions")[0] + "/audio/transcriptions"
+    form = aiohttp.FormData()
+    form.add_field("file", audio, filename="voice.mp3", content_type="audio/mpeg")
+    form.add_field("model", os.getenv("RESERVE_STT_MODEL", "whisper-large-v3"))
+    form.add_field("response_format", "verbose_json")
+    form.add_field("language", language)
+    form.add_field("timestamp_granularities[]", "word")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session, \
+            session.post(url, data=form, headers={"Authorization": f"Bearer {RESERVE_KEY}"}) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise AIError(f"распознавание слов HTTP {resp.status}: {str(data)[:200]}")
+    words = []
+    for w in data.get("words") or []:
+        text = str(w.get("word") or "").strip()
+        if text:
+            words.append({"w": text, "s": round(float(w["start"]), 2), "e": round(float(w["end"]), 2)})
+    return words
+
+
+async def write_lore(key: str, name: str, article: str, hook: str = "") -> dict[str, Any]:
+    """Сценарий шортса «история персонажа» на ~60 секунд: {"title", "en", "lines": [фраза, ...]}.
+
+    Факты — только из статьи (Википедия); hook — новость-зацепка автора («Дауни сыграет Дума»).
+    """
+    if not available(key):
+        raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY — ИИ не может написать сценарий")
+    zacep = (f"Начни с зацепки-новости автора: «{hook.strip()[:300]}» — и сразу вопрос, кто это такой. "
+             if hook.strip() else "Начни с цепляющего вопроса или факта, чтобы зритель не пролистнул. ")
+    prompt = (
+        f"Ты автор вертикальных роликов о кино и комиксах KinoMir360. Напиши закадровый текст шортса "
+        f"«история персонажа» про «{name}» на 55–65 секунд: 850–1050 символов. " + zacep +
+        "Дальше — история происхождения по порядку: детство и семья, что сделало его таким, ключевые "
+        "повороты, кем стал. Быстро, плотно, короткими фразами, разговорно, на «ты» не надо — "
+        "рассказ от третьего лица. В конце — короткий вывод и вопрос зрителю для комментариев. "
+        "Используй ТОЛЬКО факты из статьи ниже, ничего не выдумывай. Без эмодзи, ссылок и ремарок.\n"
+        "Раздели текст на 8–12 фраз — каждая фраза станет отдельной картинкой в ролике.\n"
+        "Ответь JSON: {\"title\": \"название шортса до 70 символов\", \"en\": \"имя персонажа по-английски\", "
+        "\"lines\": [\"фраза\", ...]}.\n\nСТАТЬЯ:\n" + article[:12000]
+    )
+    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    lines = [str(x).strip() for x in (data.get("lines") if isinstance(data, dict) else None) or [] if str(x).strip()]
+    if len(lines) < 4:
+        raise AIError("ИИ вернул слишком короткий сценарий — попробуй ещё раз")
+    return {"title": str(data.get("title") or "").strip()[:90], "en": str(data.get("en") or "").strip()[:60],
+            "lines": lines[:14]}
+
+
+LIST_TASK = (
+    "Это короткий ролик-подборка фильмов или сериалов. Определи тему подборки (её название — как в ролике, "
+    "по-русски, до 60 символов) и все фильмы/сериалы по порядку появления. Для каждого: название "
+    "по-русски, как в российском прокате, оригинальное название и год, если можно понять. Не выдумывай "
+    "фильмы, которых в ролике нет. Ответь JSON: {\"title\": \"тема\", \"films\": [{\"ru\": \"...\", "
+    "\"en\": \"...\", \"year\": 2018}, ...]}."
+)
+
+
+def _list_from(data: Any) -> dict[str, Any]:
+    films = []
+    for f in (data.get("films") if isinstance(data, dict) else None) or []:
+        if not isinstance(f, dict):
+            continue
+        ru, en = str(f.get("ru") or "").strip(), str(f.get("en") or "").strip()
+        try:
+            year = int(f.get("year") or 0) or None
+        except (TypeError, ValueError):
+            year = None
+        if ru or en:
+            films.append({"ru": ru, "en": en, "year": year})
+    if not films:
+        raise AIError("в ролике не нашлось списка фильмов")
+    return {"title": str(data.get("title") or "").strip()[:80], "films": films[:12]}
+
+
+async def extract_list(key: str, video: bytes, frames: list[Image.Image], audio: bytes) -> dict[str, Any]:
+    """Тема и список фильмов из чужого ролика-подборки: Gemini смотрит видео со звуком; не вышло —
+    кадры + распознанная речь (Whisper на Groq) резервному ИИ."""
+    errors = []
+    if key:
+        try:
+            parts = [{"text": LIST_TASK},
+                     {"inline_data": {"mime_type": "video/mp4", "data": base64.b64encode(video).decode()}}]
+            return _list_from(await _ask(key, parts))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Gemini: {exc}")
+            log.warning("shorts: Gemini list extraction failed: %s", exc)
+    if RESERVE_KEY or BEAT_KEY:
+        speech = ""
+        if RESERVE_KEY and "groq.com" in RESERVE_URL:
+            try:
+                speech = " ".join(s["text"] for s in await _groq_whisper(audio))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("shorts: whisper for list extraction failed: %s", exc)
+        prompt = (LIST_TASK + " На картинке — кадры ролика по порядку (номер в углу), надписи на них "
+                  "обычно и есть названия." + (f"\n\nРечь в ролике: {speech[:4000]}" if speech else ""))
+        try:
+            sheet = _sheet(frames) if frames else None
+            if RESERVE_KEY:
+                return _list_from(await _ask_reserve(prompt, sheet))
+            return _list_from(await _ask_beat(prompt, sheet))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"резерв: {exc}")
+    raise AIError("; ".join(errors) or "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
