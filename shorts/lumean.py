@@ -128,6 +128,24 @@ def _config(service: str, voice: str) -> dict[str, Any]:
     }}
 
 
+def _option_value(option: Any) -> str:
+    return str(option.get("value") or option.get("id") or "") if isinstance(option, dict) else str(option or "")
+
+
+async def _default_model(session: aiohttp.ClientSession, service: str) -> str:
+    """Модель сервиса из GET /templates/config-options: значение по умолчанию, иначе первая из списка."""
+    data = await _call(session, "GET", "/templates/config-options", params={"service": service})
+    field = ((data or {}).get("tts_settings") or {}).get("model_id") if isinstance(data, dict) else None
+    options = (field.get("options") or []) if isinstance(field, dict) else []
+    if isinstance(options, dict):  # {"значение": "название"}
+        options = list(options)
+    model = (_option_value(field.get("default")) if isinstance(field, dict) else "") or \
+        next((v for v in map(_option_value, options) if v), "")
+    if not model:
+        raise LumeanError(f"не нашёл модель {service} в config-options: {str(data)[:200]}")
+    return model
+
+
 async def _template_id(session: aiohttp.ClientSession) -> str:
     """Шаблон под текущий сервис и голос: найти по имени или создать один раз."""
     service = SERVICE
@@ -142,8 +160,11 @@ async def _template_id(session: aiohttp.ClientSession) -> str:
         if t.get("name") == name and t.get("id"):
             _templates[(service, voice)] = str(t["id"])
             return _templates[(service, voice)]
+    config = _config(service, voice)
+    if service == "fishaudio":  # модели Fish в Lumean меняются — берём ту, что предлагает сам сервис
+        config["tts_settings"]["model_id"] = await _default_model(session, service)
     created = await _call(session, "POST", "/templates",
-                          json={"service_key": service, "name": name, "config": _config(service, voice)})
+                          json={"service_key": service, "name": name, "config": config})
     _templates[(service, voice)] = str(created["id"])
     log.info("shorts: Lumean template %s (%s) created", created["id"], name)
     return _templates[(service, voice)]
