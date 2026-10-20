@@ -187,6 +187,7 @@ class ReviewState(StatesGroup):
     notes = State()
     own = State()
     edit = State()
+    media = State()
 
 
 class AdminSourceState(StatesGroup):
@@ -7286,7 +7287,8 @@ async def review_pick(message: Message, state: FSMContext, query: str) -> None:
     title = shorts_daily._title(film)
     year = f" ({film['year']})" if film.get("year") else ""
     await state.set_state(None)
-    await state.update_data(review_film=int(film["id"]), review_title=title, review_notes="", review_script=None)
+    await state.update_data(review_film=int(film["id"]), review_title=title, review_notes="", review_script=None,
+                            review_media=[])
     await wait.edit_text(
         f"🎞 Обзор: <b>«{escape(title)}»{year}</b>\n\n"
         "Как напишем текст?\n"
@@ -7298,7 +7300,8 @@ async def review_pick(message: Message, state: FSMContext, query: str) -> None:
     )
 
 
-async def show_script(message: Message, state: FSMContext, script: dict[str, Any], can_redo: bool) -> None:
+async def show_script(message: Message, state: FSMContext, script: dict[str, Any], can_redo: bool,
+                      brief: bool = False) -> None:
     await state.update_data(review_script=script)
     data = await state.get_data()
     chars = shorts_review.script_chars(script)
@@ -7312,7 +7315,7 @@ async def show_script(message: Message, state: FSMContext, script: dict[str, Any
             f"{chars} символов ≈ {max(1, round(chars / 14 / 60 * 10) / 10)} мин{cost}"
             + (f"\nНазвание для YouTube: <i>{escape(script['title'])}</i>" if script.get("title") else ""))
     chunks, cur = [], head
-    for block in shorts_review.script_text(script).split("\n\n"):
+    for block in [] if brief else shorts_review.script_text(script).split("\n\n"):
         piece = escape(block)
         if len(cur) + len(piece) + 2 > 3800:
             chunks.append(cur)
@@ -7320,7 +7323,9 @@ async def show_script(message: Message, state: FSMContext, script: dict[str, Any
         else:
             cur = f"{cur}\n\n{piece}"
     chunks.append(cur)
-    rows = [[_btn("✅ Озвучить и собрать видео", "rv:go")], [_btn("✏️ Поправить текст", "rv:edit")]]
+    media = data.get("review_media") or []
+    rows = [[_btn("✅ Озвучить и собрать видео", "rv:go")], [_btn("✏️ Поправить текст", "rv:edit")],
+            [_btn(f"📎 Свои фото/видео ({len(media)})" if media else "📎 Добавить свои фото/видео", "rv:media")]]
     if can_redo:
         rows.append([_btn("🔄 Написать заново", "rv:redo")])
     rows.append([_btn("❌ Отмена", "rv:cancel")])
@@ -7366,7 +7371,8 @@ async def send_review(bot: Bot, chat_id: int, result: Any) -> None:
         await bot.send_message(chat_id, escape(seo["warning"]))
 
 
-async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Message) -> None:
+async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Message,
+                     media: list[dict[str, str]] | None = None) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -7375,11 +7381,20 @@ async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Mes
         try:
             music = await custom_music(bot, work)
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "обзор фильма"}))
+            user_files: list[Path] = []
+            for k, item in enumerate(media or []):
+                path = work / f"user{k}{item['ext']}"
+                try:
+                    await bot.download(item["file_id"], destination=path)
+                    user_files.append(path)
+                except Exception:
+                    logging.exception("Review: user file download failed")
             progress = progress_updater(status, "обзор")
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(shorts_review.make_review(
                 kp._get, work, script, music, TMDB_API_KEY,
                 trailer_clips=await shorts_setting("clips") != "off",
+                user_media=user_files, gemini_key=GEMINI_API_KEY,
             ), timeout=REVIEW_TIMEOUT)
             await progress(100, "Готово — отправляю видео")
             await send_review(bot, chat_id, result)
@@ -7394,7 +7409,7 @@ async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Mes
             shutil.rmtree(work, ignore_errors=True)
 
 
-async def start_review(message: Message, script: dict[str, Any]) -> None:
+async def start_review(message: Message, script: dict[str, Any], media: list[dict[str, str]]) -> None:
     if shorts_lock.locked():
         await message.answer("⏳ Сейчас собирается другой ролик — нажми «Озвучить» ещё раз через пару минут.")
         return
@@ -7402,7 +7417,7 @@ async def start_review(message: Message, script: dict[str, Any]) -> None:
 
     async def job() -> None:
         try:
-            await run_review(message.bot, message.chat.id, script, status)
+            await run_review(message.bot, message.chat.id, script, status, media)
         except Exception as exc:
             logging.exception("Review failed")
             try:
@@ -7475,7 +7490,56 @@ async def review_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             await message.answer("Сначала нужен сценарий — выбери, как его написать.", reply_markup=review_menu())
             return
         await state.clear()
-        await start_review(message, script)
+        await start_review(message, script, data.get("review_media") or [])
+    elif action == "media":
+        await state.set_state(ReviewState.media)
+        await message.answer(
+            "📎 Присылай свои фото и видео — можно по одному или альбомом. ИИ поставит каждый файл "
+            "туда, где о нём речь в тексте, остальные — равномерно по ролику. Из видео возьму 1–3 "
+            "фрагмента по 5 секунд, звук не нужен.\n"
+            "Бот Telegram скачивает файлы <b>до 20 МБ</b>, больше — пришли сжатую версию.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("✅ Готово", "rv:media_done")], [_btn("🗑 Убрать все мои файлы", "rv:media_clear")]]))
+    elif action in ("media_done", "media_clear"):
+        if action == "media_clear":
+            await state.update_data(review_media=[])
+        await state.set_state(None)
+        script = data.get("review_script")
+        if script:
+            await show_script(message, state, script, can_redo=bool(script.get("title")), brief=True)
+
+
+REVIEW_MEDIA_MAX = 20
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # бот Telegram скачивает файлы до 20 МБ
+review_media_lock = asyncio.Lock()
+
+
+@router.message(ReviewState.media, F.photo | F.video | F.animation | F.document)
+async def review_media(message: Message, state: FSMContext) -> None:
+    if message.photo:
+        file, ext = message.photo[-1], ".jpg"
+    elif message.video or message.animation:
+        file, ext = message.video or message.animation, ".mp4"
+    else:
+        doc = message.document
+        mime = str(doc.mime_type or "")
+        if not mime.startswith(("image/", "video/")):
+            await message.answer("Это не фото и не видео — пропускаю.")
+            return
+        file = doc
+        ext = Path(doc.file_name or "").suffix.lower() or (".jpg" if mime.startswith("image/") else ".mp4")
+    if (file.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать. Пришли сжатую версию.")
+        return
+    async with review_media_lock:  # альбом приходит пачкой сообщений одновременно — не теряем файлы
+        media = (await state.get_data()).get("review_media") or []
+        if len(media) >= REVIEW_MEDIA_MAX:
+            await message.answer(f"Хватит: уже {REVIEW_MEDIA_MAX} файлов. Нажми «✅ Готово».")
+            return
+        media.append({"file_id": file.file_id, "ext": ext})
+        await state.update_data(review_media=media)
+    await message.answer(f"📎 Принято: {len(media)}", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[_btn("✅ Готово", "rv:media_done")]]))
 
 
 @router.message(ReviewState.title, F.text, ~F.text.startswith("/"))

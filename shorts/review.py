@@ -325,8 +325,78 @@ async def _trailer_clips(film: dict[str, Any], work: Path, n: int) -> tuple[list
         shutil.rmtree(tdir, ignore_errors=True)
 
 
+MAX_USER_ITEMS = 24
+skipped: list[str] = []  # свои файлы, которые не открылись — для пометки в отчёте
+
+
+async def _user_material(files: list[Path], work: Path) -> list[dict[str, Any]]:
+    """Свои фото и видео автора: [{"image": кадр 16:9, "clip": фрагмент или None, "thumb": для ИИ}].
+
+    Из видео — 1–3 фрагмента по CLIP_SECONDS (по длине ролика), каждый — отдельный материал.
+    """
+    items: list[dict[str, Any]] = []
+    skipped.clear()
+    for n, path in enumerate(files):
+        try:
+            if path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                img = Image.open(path).convert("RGB")
+                out = work / f"ruser{n}.jpg"
+                await asyncio.to_thread(lambda im=img, pt=out: _frame_image(im).save(pt, quality=90))
+                img.thumbnail((480, 480))
+                items.append({"image": out.name, "clip": None, "thumb": img})
+                continue
+            dur = await daily._duration(path)
+            count = 1 if dur < 12 else 2 if dur < 30 else 3
+            for k in range(count):
+                start = 0.0 if count == 1 else max(0.0, (dur - CLIP_SECONDS) * (k + 0.5) / count)
+                clip = work / f"ruser{n}_{k}.mp4"
+                # вертикальное видео с телефона — целиком по центру на размытом фоне из него же
+                await daily._run(
+                    "ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}", "-i", str(path),
+                    "-t", f"{min(CLIP_SECONDS, dur):.2f}", "-an", "-filter_complex",
+                    "[0:v]split[a][b];[a]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,"
+                    "boxblur=20:2,eq=brightness=-0.15[bg];[b]scale=1280:720:force_original_aspect_ratio=decrease[fg];"
+                    "[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30",
+                    "-c:v", "libx264", "-preset", "veryfast", "-threads", "1", "-pix_fmt", "yuv420p", str(clip))
+                still = work / f"ruser{n}_{k}.jpg"
+                await daily._run("ffmpeg", "-v", "error", "-y", "-ss", f"{min(1.0, dur / 2):.2f}", "-i", str(clip),
+                                 "-frames:v", "1", str(still))
+                img = Image.open(still).convert("RGB")
+                await asyncio.to_thread(lambda im=img, pt=still: _frame_image(im).save(pt, quality=90))
+                img.thumbnail((480, 480))
+                items.append({"image": still.name, "clip": clip.name, "thumb": img})
+        except Exception as exc:  # noqa: BLE001 — битый файл пропускаем, остальное в дело
+            log.warning("shorts: user material %s skipped: %s", path.name, exc)
+            skipped.append(path.name)
+        if len(items) >= MAX_USER_ITEMS:
+            break
+    return items[:MAX_USER_ITEMS]
+
+
+async def _place_user(items: list[dict[str, Any]], texts: list[str], gemini_key: str) -> dict[int, int]:
+    """Какой свой материал на какой кадр: ИИ ищет кадр по смыслу текста; что не нашло места —
+    равномерно по ролику. Каждый материал — ровно один раз."""
+    placed: dict[int, int] = {}
+    used: set[int] = set()
+    choices = await ai.match_images(gemini_key, texts, [it["thumb"] for it in items]) if gemini_key else None
+    for shot, c in enumerate(choices or []):
+        if c >= 0 and c not in used:
+            placed[shot] = c
+            used.add(c)
+    rest = [i for i in range(len(items)) if i not in used]
+    free = [k for k in range(len(texts)) if k not in placed]
+    for j, i in enumerate(rest):
+        if not free:
+            break
+        k = free[min(len(free) - 1, j * len(free) // len(rest))]
+        placed[k] = i
+        free.remove(k)
+    return placed
+
+
 async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: Path | None = None,
-                      tmdb_key: str = "", trailer_clips: bool = True) -> ShortResult:
+                      tmdb_key: str = "", trailer_clips: bool = True, user_media: list[Path] | None = None,
+                      gemini_key: str = "") -> ShortResult:
     await _progress(3, "Загружаю фильм")
     film = await fetch(f"/movie/{script['film_id']}")
     t = _title(film)
@@ -397,17 +467,33 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
         await _progress(40, "Режу фрагменты трейлера")
         clip_files, video_note = await _trailer_clips(film, work, min(MAX_CLIPS, len(plan) // 2))
 
-    # раскладка: портрет, если в эту секунду говорят о человеке; иначе через раз трейлер и кадр
+    shot_texts = []
+    for sh in plan:
+        mid = sh["start"] + SHOT / 2
+        sub = next((s for s in subs if s["start"] <= mid < s["end"]), None)
+        shot_texts.append(sub["text"] if sub else sections[sh["section"]]["text"][:200])
+    # свои фото и видео автора — в первую очередь, на кадры, где о них речь
+    user_items, user_at = [], {}
+    if user_media:
+        await _progress(42, "Разбираю ваши фото и видео")
+        user_items = await _user_material(user_media, work)
+        if user_items:
+            user_at = await _place_user(user_items, shot_texts, gemini_key)
+
+    # раскладка: свой материал; портрет, если в эту секунду говорят о человеке; иначе через раз трейлер и кадр
     shots: list[dict[str, Any]] = []
     img_k = clip_k = 0
     recent: list[str] = []
     for k, sh in enumerate(plan):
-        mid = sh["start"] + SHOT / 2
-        sub = next((s for s in subs if s["start"] <= mid < s["end"]), None)
-        person = _mentioned_person(sub["text"], film) if sub else None
+        person = _mentioned_person(shot_texts[k], film)
         shot = {"start": sh["start"], "end": plan[k + 1]["start"] if k + 1 < len(plan) else speech_end}
         portrait = portraits.get(str(person.get("name"))) if person else None
-        if portrait and portrait not in recent:
+        if k in user_at:
+            item = user_items[user_at[k]]
+            shot["image"] = item["image"]
+            if item["clip"]:
+                shot["clip"] = item["clip"]
+        elif portrait and portrait not in recent:
             shot["image"] = portrait
         else:
             shot["image"] = images[img_k % len(images)]
@@ -476,6 +562,8 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
     notes = []
     if video_note:
         notes.append(f"🎞 Фрагменты трейлера не вставлены: {video_note}.")
+    if user_media and skipped:
+        notes.append(f"📎 Не открылись ваши файлы ({len(skipped)} шт.) — пропущены.")
     if not voiced or daily.tts_note:
         notes.append(daily.no_voice_note(voiced))
     if notes:
