@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -44,6 +45,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from shorts import news as shorts_news
+from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
@@ -6293,6 +6295,11 @@ async def load_pronunciations() -> dict[str, str]:
     return shorts_pronounce.CUSTOM
 
 
+async def load_voice() -> None:
+    """Свой голос (клон, команда /clone) — поверх голоса по умолчанию."""
+    shorts_lumean.use_voice(await shorts_setting("lumean_service"), await shorts_setting("lumean_voice"))
+
+
 async def news_feeds() -> list[str]:
     raw = await shorts_setting("news_feeds")
     try:
@@ -6369,6 +6376,7 @@ async def run_short(
         )
         exclude = {int(r["movie_id"]) for r in rows}
         await load_pronunciations()
+        await load_voice()
         now = datetime.now(MSK)
         work = SHORTS_DIR / now.strftime("%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
@@ -6645,6 +6653,7 @@ async def voice_action(message: Message, text: str) -> None:
     path = SHORTS_DIR / f"voice_test_{message.chat.id}.mp3"
     try:
         await load_pronunciations()
+        await load_voice()
         spoken = shorts_pronounce.apply(text[:500])
         path.parent.mkdir(parents=True, exist_ok=True)
         await shorts_say_to_file(spoken, path)
@@ -6799,6 +6808,81 @@ async def clips_command(
         "Трейлеры ищутся на Rutube (работает с сервера в Европе), 5 секунд без звука.\n\n"
         "<code>/clips on</code> — включить, <code>/clips off</code> — выключить"
     )
+
+
+CLONE_POLL_SECONDS = 20
+CLONE_WAIT_SECONDS = 40 * 60
+
+
+@router.message(Command("clone"))
+async def clone_command(message: Message) -> None:
+    """Клон своего голоса для озвучки (Lumean, Fish Audio): ответить /clone на голосовое сообщение."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip().lower()
+    if arg in ("off", "выкл", "default"):
+        await set_shorts_setting("lumean_service", None)
+        await set_shorts_setting("lumean_voice", None)
+        await message.answer("✅ Вернул стандартный голос ElevenLabs.")
+        return
+    if not shorts_lumean.enabled():
+        await message.answer("Нет ключа Lumean: добавьте переменную LUMEAN_API_KEY на Railway.")
+        return
+    reply = message.reply_to_message
+    media = (reply.voice or reply.audio) if reply else None
+    if media is None:
+        current = await shorts_setting("lumean_voice")
+        await message.answer(
+            "🎙 <b>Свой голос для роликов</b>\n\n"
+            "1. Запишите голосовое сообщение 30–60 секунд: обычная речь, как в роликах, "
+            "в тишине, без музыки и чужих голосов.\n"
+            "2. Ответьте на него командой <code>/clone</code> (свайп по сообщению влево → написать /clone).\n\n"
+            "Клонирование занимает несколько минут, бот напишет, когда голос будет готов.\n"
+            "Вернуть стандартный голос: <code>/clone off</code>\n\n"
+            + ("Сейчас: <b>ваш голос</b> (клон)." if current else "Сейчас: стандартный голос ElevenLabs.")
+        )
+        return
+    if (media.duration or 0) < 10:
+        await message.answer("Запись слишком короткая — нужно хотя бы 10 секунд, лучше 30–60.")
+        return
+    buf = io.BytesIO()
+    await message.bot.download(media.file_id, destination=buf)
+    try:
+        clone = await shorts_lumean.create_clone(buf.getvalue(), f"KinoMir360 {datetime.now(MSK):%d.%m %H:%M}")
+    except Exception as exc:
+        logging.exception("Voice clone failed")
+        await message.answer(f"❌ Не получилось отправить голос на клонирование: <code>{escape(str(exc)[:400])}</code>")
+        return
+    await message.answer("⏳ Голос отправлен на клонирование. Обычно это несколько минут — напишу, когда будет готов.")
+
+    async def wait_ready() -> None:
+        waited = 0
+        status, info = clone.get("status"), clone
+        while status not in ("ready", "failed", "archived") and waited < CLONE_WAIT_SECONDS:
+            await asyncio.sleep(CLONE_POLL_SECONDS)
+            waited += CLONE_POLL_SECONDS
+            try:
+                info = await shorts_lumean.clone_status(str(clone["id"]))
+                status = info.get("status")
+            except Exception:
+                logging.exception("Voice clone status failed")
+        if status == "ready" and info.get("voice_id"):
+            await set_shorts_setting("lumean_service", "fishaudio")
+            await set_shorts_setting("lumean_voice", str(info["voice_id"]))
+            await message.answer(
+                "✅ Ваш голос готов! Теперь ролики озвучиваются им.\n"
+                "Проверить: <code>/voice Привет, это мой голос</code>\nВернуть стандартный: <code>/clone off</code>"
+            )
+        else:
+            reason = (info.get("error") or {}).get("reason") if isinstance(info.get("error"), dict) else info.get("error")
+            await message.answer(
+                f"❌ Клон не получился ({escape(str(reason or status))}). "
+                "Попробуйте запись длиннее и чище — без музыки и шума."
+            )
+
+    task = asyncio.create_task(wait_ready())
+    shorts_jobs.add(task)
+    task.add_done_callback(shorts_jobs.discard)
 
 
 @router.message(Command("music"))
@@ -7062,6 +7146,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
+        BotCommand(command="clone", description="Свой голос: ответить /clone на голосовое"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="trailer", description="Проверить скачивание трейлера"),
