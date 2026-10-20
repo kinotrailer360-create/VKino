@@ -155,24 +155,24 @@ async def create_clone(audio: bytes, name: str, service: str = "fishaudio") -> d
 
     if service not in CLONE_SERVICES:
         raise LumeanError(f"клонирование есть только у {', '.join(CLONE_SERVICES)}")
-    audio = await _to_mp3(audio)  # голосовые Telegram — OGG/Opus, Lumean надёжнее принимает MP3
+    audio = await _to_wav(audio)  # голосовые Telegram — OGG/Opus, а OGG и MP3 Lumean не опознаёт
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         return await _call(session, "POST", f"/voices/{service}/clones", json={
-            "display_name": name[:128], "reference_audio": base64.b64encode(audio).decode(),
+            "display_name": name[:128], "reference_audio": "data:audio/wav;base64," + base64.b64encode(audio).decode(),
             "language": "ru", "consent_confirmed": True})
 
 
-async def _to_mp3(audio: bytes) -> bytes:
-    """Образец голоса → MP3 моно 44.1 кГц (через ffmpeg)."""
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-v", "error", "-i", "pipe:0", "-vn", "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame",
-        "-b:a", "128k", "-f", "mp3", "pipe:1",
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate(audio)
-    if proc.returncode or not out:
-        raise LumeanError(f"не удалось перекодировать запись: {err.decode(errors='ignore')[-200:]}")
-    return out
+async def _to_wav(audio: bytes) -> bytes:
+    """Образец голоса → WAV моно 44.1 кГц, до 2 минут (по WAV Lumean точно узнаёт формат)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp) / "voice.in", Path(tmp) / "voice.wav"
+        src.write_bytes(audio)
+        await _run("ffmpeg", "-v", "error", "-y", "-i", str(src), "-vn", "-t", "120", "-ac", "1", "-ar", "44100",
+                   "-c:a", "pcm_s16le", str(dst))
+        return dst.read_bytes()
 
 
 async def clone_status(clone_id: str, service: str = "fishaudio") -> dict[str, Any]:
