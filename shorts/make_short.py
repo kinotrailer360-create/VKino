@@ -152,6 +152,16 @@ class IntroSlide(Slide):
 DARK = 22  # средняя яркость кадра (0–255), ниже — считаем чёрным/затемнением
 
 
+def _dark_or_titles(gray: Image.Image) -> bool:
+    """Чёрный кадр/затемнение или титры — светлые буквы на почти чёрном фоне («ОШЕЛОМЛЯЮЩИЙ…», «скоро»)."""
+    if ImageStat.Stat(gray).mean[0] < DARK:
+        return True
+    px = list(gray.getdata())
+    black = sum(v < 35 for v in px) / len(px)
+    bright = sum(v > 190 for v in px) / len(px)
+    return black > 0.6 and bright > 0.02
+
+
 def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
     """Кадры трейлера в JPEG на диск заранее, до запуска кодировщика.
 
@@ -169,7 +179,7 @@ def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
     dark = []
     for f in frames:
         with Image.open(f) as im:
-            if ImageStat.Stat(im.convert("L").resize((64, 36))).mean[0] < DARK:
+            if _dark_or_titles(im.convert("L").resize((96, 54))):
                 dark.append(f)
     for f in (frames if len(frames) - len(dark) < FPS else dark):
         f.unlink(missing_ok=True)

@@ -64,6 +64,9 @@ async def download_clip(url: str, out: Path, start: float = 20.0, length: float 
 
 RUTUBE_SEARCH = "https://rutube.ru/api/search/video/"
 TRAILER_WORDS = ("трейлер", "тизер", "trailer", "teaser")
+NOT_TRAILER = ("интервью", "о съемках", "о съёмках", "за кадром", "со съемок", "со съёмок", "фильм о фильме",
+               "как снимали", "пресс конференц", "премьера фильма", "behind the scenes", "featurette",
+               "making of", "interview", "подкаст", "стрим")
 
 
 def _norm(text: object) -> str:
@@ -102,6 +105,8 @@ async def rutube_trailer(titles: list[str], year: int | None = None) -> dict | N
         score += 3 if v.get("is_official") else 0
         score += 1 if "русск" in title or "дубл" in title else 0
         score += 1 if year and str(year) in title else 0
+        if any(w in title for w in NOT_TRAILER):
+            continue  # интервью, рассказ о съёмках и т.п. — не трейлер, хоть слово «трейлер» и есть
         score -= 2 if any(w in title for w in ("обзор", "реакция", "разбор", "фанатск", "fan")) else 0
         if score > best_score:
             best, best_score = v, score
