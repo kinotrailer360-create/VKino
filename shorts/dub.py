@@ -146,27 +146,68 @@ async def _edge(text: str, gender: str, path: Path) -> None:
     await asyncio.wait_for(edge_tts.Communicate(text, EDGE_VOICES[gender], rate="+10%").save(str(path)), 30)
 
 
+async def _silence(path: Path, sec: float = 0.5) -> None:
+    await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+               "-t", f"{sec:.2f}", "-c:a", "libmp3lame", str(path))
+
+
+async def _edge_safe(text: str, gender: str, path: Path) -> bool:
+    """Голос Microsoft с повтором: «No audio was received» обычно — временное ограничение частых запросов."""
+    for delay in (0, 8, 20):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await _edge(text, gender, path)
+            if path.exists() and path.stat().st_size > 0:
+                return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: Edge dub line failed (%s): %r", exc, text[:60])
+    return False
+
+
+async def _lumean_voice(texts: list[str], parts: list[Path], work: Path, voice_id: str) -> None:
+    """Все реплики героя одним заказом; если дорожку не разрезать на реплики — по заказу на реплику."""
+    try:
+        await lumean.synthesize(texts, parts, work, DUB_PAUSE, "elevenlabs", voice_id)
+    except lumean.LumeanError as exc:
+        if "разрезать" not in str(exc):
+            raise
+        log.info("shorts: dub split failed (%s), ordering lines one by one", exc)
+        for text, part in zip(texts, parts):
+            await lumean.synthesize([text], [part], work, DUB_PAUSE, "elevenlabs", voice_id)
+
+
 async def _voice_lines(lines: list[dict[str, Any]], voices: dict[str, dict[str, str]], work: Path) -> list[Path]:
-    """mp3 на каждую реплику: одним заказом Lumean на голос; не вышло — голос Microsoft."""
+    """mp3 на каждую реплику: голос героя из Lumean; не вышло — голос Microsoft; и он не смог — тишина."""
     spoken = await daily.spoken_lines([ln["ru"] for ln in lines])
     spoken = [t.replace(pronounce.STRESS, "") for t in spoken]
     parts = [work / f"dub_{i}.mp3" for i in range(len(lines))]
+    notes: list[str] = []
+    lost: list[int] = []
     by_voice: dict[str, list[int]] = {}
     for i, ln in enumerate(lines):
+        if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", spoken[i]):  # одни знаки — озвучивать нечего
+            await _silence(parts[i])
+            continue
         by_voice.setdefault(ln["speaker"], []).append(i)
     for spk, idx in by_voice.items():
         v = voices[spk]
         if v["id"]:
             try:
-                await lumean.synthesize([spoken[i] for i in idx], [parts[i] for i in idx], work, DUB_PAUSE,
-                                        "elevenlabs", v["id"])
+                await _lumean_voice([spoken[i] for i in idx], [parts[i] for i in idx], work, v["id"])
                 continue
             except Exception as exc:  # noqa: BLE001
                 log.warning("shorts: Lumean dub for %s failed (%s), using Edge", spk, exc)
-                daily.tts_note = f"🗣 Голос {v['name']} (Lumean) не сработал: {str(exc)[:200]} — озвучено голосом Microsoft."
+                notes.append(f"🗣 Голос {v['name']} (Lumean) не сработал: {str(exc)[:200]} — "
+                             "его реплики озвучены голосом Microsoft.")
         for i in idx:
-            await _edge(spoken[i], v["gender"], parts[i])
-            await asyncio.sleep(0.4)
+            if not await _edge_safe(spoken[i], v["gender"], parts[i]):
+                await _silence(parts[i])
+                lost.append(i + 1)
+            await asyncio.sleep(1.0)
+    if lost:
+        notes.append(f"⚠️ Не озвучились реплики № {', '.join(map(str, lost))} — в видео они без перевода.")
+    daily.tts_note = "\n".join(notes) or None
     return parts
 
 
