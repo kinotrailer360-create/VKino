@@ -694,7 +694,9 @@ async def _tts(text: str, path: Path) -> list[float]:
     return words
 
 
-TTS_RETRY_DELAYS = (3, 8)  # сервис голоса иногда сбоит на секунды — повторяем, а не сдаёмся
+TTS_RETRY_DELAYS = (4, 12)  # сервис голоса иногда сбоит/ограничивает частые запросы — повторяем, а не сдаёмся
+TTS_PAUSE = 0.5  # пауза между фразами: частые запросы подряд сервис иногда отвергает «No audio»
+TTS_COOLDOWN = 20  # фраза не прошла — ждём подольше и пробуем её целиком ещё раз
 tts_error: str | None = None  # причина, если голос так и не получился — показываем админу
 tts_note: str | None = None  # пометка, если ролик озвучен запасным голосом
 
@@ -801,6 +803,8 @@ async def _edge_pieces(text: str, path: Path, stem: Path) -> tuple[list[float], 
     t = 0.0
     for k, piece in enumerate(_pieces(text)):
         out = stem.with_name(f"{stem.name}_p{k}.mp3")
+        if k:
+            await asyncio.sleep(TTS_PAUSE * 2)
         try:
             got = await _say_once(piece, out)
         except Exception as exc:  # noqa: BLE001
@@ -833,11 +837,20 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
     dropped: list[str] = []
     try:
         for i, text in enumerate(speak):
+            if i:
+                await asyncio.sleep(TTS_PAUSE)
             try:
                 words.append(await _edge_to_file(text, parts[i]))
+                continue
             except Exception as exc:  # noqa: BLE001
                 if not words:
                     raise  # первая же фраза не озвучилась — сервис недоступен целиком
+                log.warning("shorts: Edge TTS rejected phrase %d (%r), cooling down", i + 1, exc)
+            await asyncio.sleep(TTS_COOLDOWN)  # чаще всего это временное ограничение частых запросов
+            try:
+                words.append(await _say_once(text, parts[i]))
+                continue
+            except Exception as exc:  # noqa: BLE001
                 # сервис работает, но эта фраза ему не нравится — озвучиваем её по кусочкам
                 log.warning("shorts: Edge TTS rejected phrase %d (%r), trying pieces", i + 1, exc)
                 got, lost = await _edge_pieces(text, parts[i], work / f"voice_{i}")
