@@ -87,7 +87,7 @@ def apply(text: str, extra: dict[str, str] | None = None) -> str:
     """Заменяет слова на их произношение; длинные варианты — первыми (HBO Max раньше HBO)."""
     table = {**DEFAULT, **CUSTOM, **(extra or {})}
     for word in sorted(table, key=len, reverse=True):
-        pattern = rf"(?<![\w-]){re.escape(word)}(?![\w-])"
+        pattern = rf"(?<![\w-]){re.escape(word)}(?!\w)"  # «IMAX-камера» тоже заменяем
         flags = 0 if word.isupper() else re.IGNORECASE  # аббревиатуры (DC, IMAX) — строго заглавными
         text = re.sub(pattern, lambda m, w=word: _keep_case(m.group(0), mark_stress(table[w])), text, flags=flags)
     return text
