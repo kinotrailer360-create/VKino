@@ -1,8 +1,8 @@
-"""Озвучка через Lumean (голоса ElevenLabs): https://lumean.app, документация — api.lumean.app/docs/llm.md.
+"""Озвучка через Lumean (ElevenLabs, Fish Audio, Cartesia): https://lumean.app, документация — api.lumean.app/docs/llm.md.
 
-Ключ — LUMEAN_API_KEY. Голос — LUMEAN_VOICE_ID (если не задан, берётся первый мужской русский голос
-из библиотеки ElevenLabs), готовый шаблон — LUMEAN_TEMPLATE_ID (если не задан, бот создаёт свой
-«KinoMir360 TTS» и дальше переиспользует).
+Ключ — LUMEAN_API_KEY. Сервис и голос — из настроек бота (свой клон голоса, команда /clone), иначе
+LUMEAN_SERVICE / LUMEAN_VOICE_ID, иначе ElevenLabs и первый мужской русский голос его библиотеки.
+Шаблон под сервис и голос бот находит по имени или создаёт сам и дальше переиспользует.
 
 Озвучка в Lumean асинхронная: заказ → ждём статус → скачиваем mp3. Чтобы не платить минимум за каждую
 фразу, весь ролик идёт одним заказом, фразы разделены бесплатными паузами {{pause=…}}, а потом
@@ -24,18 +24,19 @@ from .ai import _env_key
 
 API = os.getenv("LUMEAN_API_URL", "https://api.lumean.app/api/public").rstrip("/")
 KEY = _env_key("LUMEAN_API_KEY")  # находит и имя, набранное с русскими буквами-двойниками
+SERVICE = os.getenv("LUMEAN_SERVICE", "elevenlabs").strip() or "elevenlabs"  # elevenlabs | fishaudio | cartesia
 VOICE_ID = os.getenv("LUMEAN_VOICE_ID", "").strip()
-TEMPLATE_ID = os.getenv("LUMEAN_TEMPLATE_ID", "").strip()
 MODEL = os.getenv("LUMEAN_MODEL", "eleven_multilingual_v2").strip()
 SPEED = float(os.getenv("LUMEAN_SPEED", "1.12"))  # 0.7..1.2; ~как +22% у голоса Microsoft
 TEMPLATE_NAME = "KinoMir360 TTS"
+CLONE_SERVICES = ("fishaudio", "cartesia")
 PAUSE = 1.0  # сек тишины между фразами — по ним режем дорожку
 WAIT = 240  # сек на готовность заказа
 DONE = {"completed", "result_delivered"}
 FAILED = {"failed", "compensated", "cancelled"}
 
 log = logging.getLogger("shorts")
-_template: str = TEMPLATE_ID
+_templates: dict[tuple[str, str], str] = {}  # (сервис, голос) -> id шаблона
 voice_name = ""  # какой голос выбран — для подписи в /voice
 
 
@@ -45,6 +46,13 @@ class LumeanError(RuntimeError):
 
 def enabled() -> bool:
     return bool(KEY)
+
+
+def use_voice(service: str | None, voice_id: str | None) -> None:
+    """Голос из настроек бота (например, свой клон) — поверх переменных окружения."""
+    global SERVICE, VOICE_ID
+    SERVICE = service or os.getenv("LUMEAN_SERVICE", "elevenlabs").strip() or "elevenlabs"
+    VOICE_ID = voice_id or os.getenv("LUMEAN_VOICE_ID", "").strip()
 
 
 async def _call(session: aiohttp.ClientSession, method: str, path: str, **kw: Any) -> Any:
@@ -80,28 +88,65 @@ async def _pick_voice(session: aiohttp.ClientSession) -> str:
     return str(best["voice_id"])
 
 
-async def _template_id(session: aiohttp.ClientSession) -> str:
-    """Свой шаблон ElevenLabs: найти по имени или создать один раз."""
-    global _template
-    if _template:
-        return _template
-    data = await _call(session, "GET", "/templates", params={"page": 1, "search": TEMPLATE_NAME,
-                                                              "service": "elevenlabs"})
-    for t in (data or {}).get("items") or []:
-        if t.get("name") == TEMPLATE_NAME and t.get("id"):
-            _template = str(t["id"])
-            return _template
-    config = {"tts_settings": {
-        "mode": "mode_v1", "model_id": MODEL, "voice_id": await _pick_voice(session), "language_code": "ru",
+def _config(service: str, voice: str) -> dict[str, Any]:
+    if service == "cartesia":
+        speed = min(max(SPEED, 0.6), 1.5)
+        return {"tts_settings": {"voice_id": voice, "model_id": "sonic-3", "language_code": "ru",
+                                 "voice_settings": {"speed": speed}}}
+    if service == "fishaudio":
+        return {"tts_settings": {"voice_id": voice}}  # язык Fish определяет сам
+    return {"tts_settings": {
+        "mode": "mode_v1", "model_id": MODEL, "voice_id": voice, "language_code": "ru",
         "advanced_voice_settings": True,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "use_speaker_boost": True, "speed": SPEED},
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "use_speaker_boost": True,
+                           "speed": min(max(SPEED, 0.7), 1.2)},
         "output_settings": {"audio_format": "mp3"},
     }}
+
+
+async def _template_id(session: aiohttp.ClientSession) -> str:
+    """Шаблон под текущий сервис и голос: найти по имени или создать один раз."""
+    service = SERVICE
+    voice = VOICE_ID if (VOICE_ID or service != "elevenlabs") else await _pick_voice(session)
+    if not voice:
+        raise LumeanError(f"для сервиса {service} не задан голос (LUMEAN_VOICE_ID или /clone)")
+    if (service, voice) in _templates:
+        return _templates[(service, voice)]
+    name = TEMPLATE_NAME if service == "elevenlabs" and not VOICE_ID else f"{TEMPLATE_NAME} {service} {voice[:8]}"
+    data = await _call(session, "GET", "/templates", params={"page": 1, "search": name, "service": service})
+    for t in (data or {}).get("items") or []:
+        if t.get("name") == name and t.get("id"):
+            _templates[(service, voice)] = str(t["id"])
+            return _templates[(service, voice)]
     created = await _call(session, "POST", "/templates",
-                          json={"service_key": "elevenlabs", "name": TEMPLATE_NAME, "config": config})
-    _template = str(created["id"])
-    log.info("shorts: Lumean template %s created", _template)
-    return _template
+                          json={"service_key": service, "name": name, "config": _config(service, voice)})
+    _templates[(service, voice)] = str(created["id"])
+    log.info("shorts: Lumean template %s (%s) created", created["id"], name)
+    return _templates[(service, voice)]
+
+
+async def create_clone(audio: bytes, name: str, service: str = "fishaudio") -> dict[str, Any]:
+    """Отправить образец голоса на клонирование; возвращает клон (status pending/cloning/…)."""
+    import base64
+
+    if service not in CLONE_SERVICES:
+        raise LumeanError(f"клонирование есть только у {', '.join(CLONE_SERVICES)}")
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await _call(session, "POST", f"/voices/{service}/clones", json={
+            "display_name": name[:128], "reference_audio": base64.b64encode(audio).decode(),
+            "language": "ru", "consent_confirmed": True})
+
+
+async def clone_status(clone_id: str, service: str = "fishaudio") -> dict[str, Any]:
+    """Найти свой клон по id: status (pending/cloning/ready/failed), voice_id, error."""
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _call(session, "GET", f"/voices/{service}/clones", params={"per_page": 100})
+    for c in (data or {}).get("items") or []:
+        if str(c.get("id")) == clone_id:
+            return c
+    raise LumeanError("клон не найден")
 
 
 async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path) -> Path:
