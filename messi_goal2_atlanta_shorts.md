@@ -33,3 +33,30 @@ Lionel Messi goal vs Atlanta United — Messi splits two defenders and scores, I
 - Это **второй ролик с того же матча** — выложи через **1 день** после «Гол Месси против Атланты», в поле «Связанное видео» укажи первый ролик.
 - Место: Mercedes-Benz Stadium, Atlanta · Спорт · Не для детей · синтетический контент — не отмечать.
 - **Закреп:** `Как тебе проход между двумя защитниками? 🔥 А «кино»-повтор нужен в каждом ролике? 🎬`
+
+
+---
+## 🔄 Обновление SEO по подсказкам поиска YouTube (бесплатно, `yt_suggest.py`)
+Что реально ищут:
+- 🇷🇺 «месси интер майами» (самый частый), «месси интер майами **голы**», «месси интер майами лучшие моменты», «реакция на гол месси интер майами». «Месси атланта» по-русски **не ищут** (YouTube подставляет «атлетик»).
+- 🇬🇧 «**messi goal today**» (№1), «messi goal today inter miami», «messi vs atlanta united today», «messi atlanta goal», «messi dribble goal», «messi dribble slow motion», «messi dribble edit».
+
+**Название (обновлённое):** `Месси прошёл между двумя защитниками 🐐 Гол за Интер Майами #shorts`
+**Перевод на английский:** `Messi goal today 🐐 Splits two defenders vs Atlanta United | Inter Miami #shorts`
+
+**Описание (первые строки):**
+```
+Месси Интер Майами: гол Атланте — проход между двумя защитниками 🐐 0:2
+Разбор гола + повтор «в кино» 🎬 Как тебе этот дриблинг? Пиши 👇
+
+Подпишись — эдиты, голы и разборы каждый день ⚽
+
+Messi goal today vs Atlanta United — Messi dribble goal, slow motion breakdown. Inter Miami, MLS.
+
+#месси #интермайами #футбол #messi #shorts
+```
+
+**Теги (обновлённые):**
+```
+месси интер майами, месси интер майами голы, месси интер майами лучшие моменты, реакция на гол месси интер майами, месси гол, месси, лионель месси, гол месси, футбол, messi goal today, messi goal today inter miami, messi vs atlanta united today, messi atlanta goal, messi dribble goal, messi dribble slow motion, messi dribble edit, lionel messi, inter miami, atlanta united, mls highlights, football shorts
+```
