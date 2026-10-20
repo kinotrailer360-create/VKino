@@ -170,6 +170,27 @@ async def _voice_lines(lines: list[dict[str, Any]], voices: dict[str, dict[str, 
     return parts
 
 
+VOICE_DB = -17.0  # средняя громкость русского голоса, дБ (как у диктора поверх трейлера)
+DUCK_BELOW = 14.0  # на столько дБ оригинал тише голоса, пока звучит перевод
+
+
+async def _mean_db(files: list[Path], work: Path) -> float:
+    """Средняя громкость (RMS, дБ) речи/звука из файлов, тишину не считаем."""
+    inputs: list[str] = []
+    for f in files:
+        inputs += ["-i", str(f)]
+    concat = "".join(f"[{k}:a]aresample=48000,aformat=channel_layouts=mono[c{k}];" for k in range(len(files)))
+    concat += "".join(f"[c{k}]" for k in range(len(files))) + f"concat=n={len(files)}:v=0:a=1,"
+    concat += "silenceremove=stop_periods=-1:stop_threshold=-45dB,volumedetect[o]"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-nostats", *inputs, "-filter_complex", concat, "-map", "[o]", "-f", "null", "-",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    log_text = err.decode(errors="ignore")  # volumedetect пишет в stderr
+    m = re.search(r"mean_volume: (-?[\d.]+) dB", log_text)
+    return float(m.group(1)) if m else VOICE_DB
+
+
 async def _fit(part: Path, slot: float, out: Path) -> float:
     """Ускорить реплику (до MAX_TEMPO), чтобы влезла в slot секунд; вернуть итоговую длину."""
     dur = await _duration(part)
@@ -192,7 +213,7 @@ async def make_dub(src: Path, lines: list[dict[str, Any]], work: Path, title: st
     parts = await _voice_lines(lines, voices, work)
 
     await _progress(70, "Подгоняю реплики под время")
-    fitted, delays = [], []
+    fitted, delays, spans = [], [], []
     prev_end = 0.0
     for i, ln in enumerate(lines):
         nxt = lines[i + 1]["start"] if i + 1 < len(lines) else total
@@ -202,24 +223,34 @@ async def make_dub(src: Path, lines: list[dict[str, Any]], work: Path, title: st
         length = await _fit(parts[i], slot, out)
         fitted.append(out)
         delays.append(start)
+        spans.append((start, start + length))
         prev_end = start + length
 
     await _progress(85, "Свожу звук")
+    # громкость меряем, а не угадываем: голос — к VOICE_DB, оригинал под голосом — на DUCK_BELOW тише
+    voice_db = await _mean_db(fitted, work)
+    voice_gain = VOICE_DB - voice_db
+    with_audio = await has_audio(src)
+    orig_db = await _mean_db([src], work) if with_audio else -90.0
+    duck = min(VOICE_DB - DUCK_BELOW - orig_db, -8.0)  # дБ для оригинала, пока звучит перевод
     inputs = ["-i", str(src)]
     chains = []
     for k, (f, t) in enumerate(zip(fitted, delays), 1):
         inputs += ["-i", str(f)]
         ms = round(t * 1000)
-        chains.append(f"[{k}:a]volume=1.4,adelay={ms}|{ms}[p{k}]")
+        chains.append(f"[{k}:a]volume={voice_gain:.1f}dB,adelay={ms}|{ms}[p{k}]")
     n = len(fitted)
-    orig = "[0:a]aresample=48000,aformat=channel_layouts=stereo[orig];" if await has_audio(src) else \
+    # где звучит перевод (с запасом на вдох и затухание) — оригинал тише, в паузах — как был
+    zones = "+".join(f"between(t,{a - 0.15:.2f},{b + 0.3:.2f})" for a, b in spans)
+    level = 10 ** (duck / 20)
+    orig = (f"[0:a]aresample=48000,aformat=channel_layouts=stereo,"
+            f"volume='if(gt({zones},0),{level:.3f},1)':eval=frame[orig];") if with_audio else \
         f"anullsrc=r=48000:cl=stereo,atrim=0:{total:.2f}[orig];"
     filt = (";".join(chains) + ";" + "".join(f"[p{k}]" for k in range(1, n + 1))
             + f"amix=inputs={n}:normalize=0:duration=longest,aformat=channel_layouts=stereo,"
-            + f"apad=whole_dur={total:.2f},asplit=2[dub][key];"  # до конца видео, иначе оригинал обрежется
+            + f"apad=whole_dur={total:.2f}[dub];"  # до конца видео, иначе оригинал обрежется
             + orig
-            + "[orig][key]sidechaincompress=threshold=0.012:ratio=5:attack=15:release=400[duck];"
-            + "[duck][dub]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.95[a]")
+            + "[orig][dub]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.95[a]")
     audio = work / "dub_mix.m4a"
     await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[a]",
                "-c:a", "aac", "-b:a", "160k", str(audio))
