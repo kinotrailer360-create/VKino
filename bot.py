@@ -50,6 +50,7 @@ from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
+from shorts import review as shorts_review
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
@@ -179,6 +180,13 @@ class ShortsState(StatesGroup):
     feed_url = State()
     music_file = State()
     clone_audio = State()
+
+
+class ReviewState(StatesGroup):
+    title = State()
+    notes = State()
+    own = State()
+    edit = State()
 
 
 class AdminSourceState(StatesGroup):
@@ -6347,12 +6355,12 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         await bot.send_message(chat_id, escape(seo["warning"]))
 
 
-def progress_bar(pct: int, stage: str) -> str:
+def progress_bar(pct: int, stage: str, what: str = "шортс") -> str:
     filled = pct // 10
-    return f"⏳ Собираю шортс\n<code>{'▓' * filled}{'░' * (10 - filled)}</code> {pct}%\n{escape(stage)}"
+    return f"⏳ Собираю {what}\n<code>{'▓' * filled}{'░' * (10 - filled)}</code> {pct}%\n{escape(stage)}"
 
 
-def progress_updater(status: Message | None):
+def progress_updater(status: Message | None, what: str = "шортс"):
     """Двигает полоску в сообщении status; правит не чаще раза в 3 с, чтобы не упереться в лимиты Telegram."""
     last = {"pct": -1, "at": 0.0}
 
@@ -6364,7 +6372,7 @@ def progress_updater(status: Message | None):
             return
         last.update(pct=pct, at=now)
         try:
-            await status.edit_text(progress_bar(pct, stage))
+            await status.edit_text(progress_bar(pct, stage, what))
         except Exception as exc:  # noqa: BLE001 — «message is not modified», сеть и т.п.
             logging.debug("Progress edit failed: %s", exc)
 
@@ -6960,6 +6968,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
         [_btn("💡 Факты: случайный", "sh:go:facts")],
+        [_btn("🎞 Обзор фильма 16:9", "rv:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
         [_btn("✍️ Факты: ввести название", "sh:ask:facts")],
@@ -7229,6 +7238,273 @@ async def shorts_clone_audio(message: Message, state: FSMContext) -> None:
     await clone_action(message, message.voice or message.audio)
 
 
+# ---------------------------------------------------------------- обзор фильма 16:9
+
+REVIEW_TIMEOUT = 30 * 60
+
+
+async def custom_music(bot: Bot, work: Path) -> Path | None:
+    """Своя фоновая музыка (кнопка «Сменить музыку»), если задана."""
+    file_id = await shorts_setting("music_file_id")
+    if not file_id:
+        return None
+    music = work / "music_custom"
+    try:
+        await bot.download(file_id, destination=music)
+        return music
+    except Exception:
+        logging.exception("Shorts: custom music download failed")
+        return None
+
+
+def review_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🤖 ИИ напишет сам", "rv:ai")],
+        [_btn("✍️ Мой текст + ИИ дополнит", "rv:mix")],
+        [_btn("📝 Только мой текст", "rv:own")],
+        [_btn("❌ Отмена", "rv:cancel")],
+    ])
+
+
+async def review_ask_title(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(ReviewState.title)
+    await message.answer(
+        "🎞 <b>Обзор фильма 16:9</b>\n\nНапиши название фильма или сериала (можно с годом: "
+        "<code>Дюна 2021</code>).\n\n<i>Передумал — /cancel</i>"
+    )
+
+
+async def review_pick(message: Message, state: FSMContext, query: str) -> None:
+    wait = await message.answer("🔎 Ищу фильм…")
+    try:
+        film = await shorts_review.find_film(kp._get, query)
+    except Exception as exc:
+        logging.exception("Review film search failed")
+        await wait.edit_text(f"❌ Не нашёл: <code>{escape(str(exc)[:300])}</code>\nНапиши название иначе.")
+        return
+    title = shorts_daily._title(film)
+    year = f" ({film['year']})" if film.get("year") else ""
+    await state.set_state(None)
+    await state.update_data(review_film=int(film["id"]), review_title=title, review_notes="", review_script=None)
+    await wait.edit_text(
+        f"🎞 Обзор: <b>«{escape(title)}»{year}</b>\n\n"
+        "Как напишем текст?\n"
+        "• <b>ИИ напишет сам</b> — по данным Кинопоиска: сюжет, создатели, факты.\n"
+        "• <b>Мой текст + ИИ</b> — пришлёшь слух, разбор или мысли, ИИ дополнит и оформит.\n"
+        "• <b>Только мой текст</b> — озвучу как есть.\n\n"
+        "Перед озвучкой текст придёт на проверку — его можно поправить.",
+        reply_markup=review_menu(),
+    )
+
+
+async def show_script(message: Message, state: FSMContext, script: dict[str, Any], can_redo: bool) -> None:
+    await state.update_data(review_script=script)
+    data = await state.get_data()
+    chars = shorts_review.script_chars(script)
+    service = await shorts_setting("lumean_service")
+    if shorts_lumean.enabled():
+        tokens = chars * (2 if service in ("fishaudio", "cartesia") else 1)
+        cost = f", ≈{tokens:,} токенов Lumean".replace(",", " ")
+    else:
+        cost = ""
+    head = (f"📝 <b>Сценарий обзора «{escape(data.get('review_title') or '')}»</b>\n"
+            f"{chars} символов ≈ {max(1, round(chars / 14 / 60 * 10) / 10)} мин{cost}"
+            + (f"\nНазвание для YouTube: <i>{escape(script['title'])}</i>" if script.get("title") else ""))
+    chunks, cur = [], head
+    for block in shorts_review.script_text(script).split("\n\n"):
+        piece = escape(block)
+        if len(cur) + len(piece) + 2 > 3800:
+            chunks.append(cur)
+            cur = piece
+        else:
+            cur = f"{cur}\n\n{piece}"
+    chunks.append(cur)
+    rows = [[_btn("✅ Озвучить и собрать видео", "rv:go")], [_btn("✏️ Поправить текст", "rv:edit")]]
+    if can_redo:
+        rows.append([_btn("🔄 Написать заново", "rv:redo")])
+    rows.append([_btn("❌ Отмена", "rv:cancel")])
+    for k, chunk in enumerate(chunks):
+        last = k == len(chunks) - 1
+        await message.answer(chunk, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if last else None)
+
+
+async def review_generate(message: Message, state: FSMContext, notes: str) -> None:
+    data = await state.get_data()
+    wait = await message.answer("✍️ ИИ пишет сценарий, обычно до минуты…")
+    try:
+        film = await kp._get(f"/movie/{data['review_film']}")
+        script = await shorts_review.write_script(film, notes, GEMINI_API_KEY)
+    except Exception as exc:
+        logging.exception("Review script failed")
+        await wait.edit_text(f"❌ Сценарий не написался: <code>{escape(str(exc)[:400])}</code>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("🔄 Ещё раз", "rv:redo")], [_btn("❌ Отмена", "rv:cancel")]]))
+        return
+    await state.update_data(review_notes=notes)
+    await wait.delete()
+    await show_script(message, state, script, can_redo=True)
+
+
+async def send_review(bot: Bot, chat_id: int, result: Any) -> None:
+    seo = result.seo
+    await bot.send_photo(chat_id, FSInputFile(result.cover, filename="cover.jpg"),
+                         caption="🖼 Обложка для YouTube (1280×720)")
+    await bot.send_video(
+        chat_id,
+        FSInputFile(result.video, filename="kinomir360_review.mp4"),
+        caption=f"🎞 <b>{escape(seo['title'])}</b>",
+        width=1280,
+        height=720,
+        supports_streaming=True,
+        request_timeout=600,  # файл до 50 МБ — загрузка дольше обычного
+    )
+    for label, key in (("Название", "title"), ("Описание (с таймкодами)", "description"),
+                       ("Теги", "tags"), ("Закреплённый комментарий", "pinned")):
+        await bot.send_message(chat_id, f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>")
+    if seo.get("warning"):
+        await bot.send_message(chat_id, escape(seo["warning"]))
+
+
+async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Message) -> None:
+    async with shorts_lock:
+        await load_pronunciations()
+        await load_voice()
+        work = SHORTS_DIR / datetime.now(MSK).strftime("review_%Y%m%d_%H%M%S")
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            music = await custom_music(bot, work)
+            await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "обзор фильма"}))
+            progress = progress_updater(status, "обзор")
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            result = await asyncio.wait_for(shorts_review.make_review(
+                kp._get, work, script, music, TMDB_API_KEY,
+                trailer_clips=await shorts_setting("clips") != "off",
+            ), timeout=REVIEW_TIMEOUT)
+            await progress(100, "Готово — отправляю видео")
+            await send_review(bot, chat_id, result)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"сборка шла дольше {REVIEW_TIMEOUT // 60} минут и была прервана — "
+                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}."
+            ) from None
+        finally:
+            shorts_daily.on_progress = None
+            await set_shorts_setting("running", None)
+            shutil.rmtree(work, ignore_errors=True)
+
+
+async def start_review(message: Message, script: dict[str, Any]) -> None:
+    if shorts_lock.locked():
+        await message.answer("⏳ Сейчас собирается другой ролик — нажми «Озвучить» ещё раз через пару минут.")
+        return
+    status = await message.answer(progress_bar(0, "Начинаю, обычно это 5–15 минут", "обзор"))
+
+    async def job() -> None:
+        try:
+            await run_review(message.bot, message.chat.id, script, status)
+        except Exception as exc:
+            logging.exception("Review failed")
+            try:
+                await status.edit_text("❌ Сборка остановилась — причина ниже")
+            except TelegramBadRequest:
+                pass
+            await message.answer(f"❌ Обзор не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+
+    task = asyncio.create_task(job())
+    shorts_jobs.add(task)
+    task.add_done_callback(shorts_jobs.discard)
+
+
+@router.message(Command("review"))
+async def review_command(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    query = (message.text or "").partition(" ")[2].strip()
+    if query:
+        await state.clear()
+        await review_pick(message, state, query)
+    else:
+        await review_ask_title(message, state)
+
+
+@router.callback_query(F.data.startswith("rv:"))
+async def review_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message, action = callback.message, (callback.data or "")[3:]
+    data = await state.get_data()
+    if action == "start":
+        await review_ask_title(message, state)
+        return
+    if action == "cancel":
+        await state.clear()
+        await message.answer("Обзор отменён.")
+        return
+    if not data.get("review_film"):
+        await message.answer("Начни заново: кнопка «🎞 Обзор фильма 16:9» или /review")
+        return
+    if action == "ai":
+        await review_generate(message, state, "")
+    elif action == "redo":
+        await review_generate(message, state, data.get("review_notes") or "")
+    elif action == "mix":
+        await state.set_state(ReviewState.notes)
+        await message.answer(
+            "✍️ Пришли свой текст одним сообщением: слух, разбор, мнение, тезисы — как угодно. "
+            "ИИ сохранит твои мысли, дополнит фактами о фильме и разложит по разделам.\n\n"
+            "<i>Передумал — /cancel</i>")
+    elif action == "own":
+        await state.set_state(ReviewState.own)
+        await message.answer(
+            "📝 Пришли готовый текст обзора одним сообщением — озвучу как есть.\n"
+            "Разделы можно отметить строкой <code>## Название</code> — они станут плашками в видео "
+            "и главами на YouTube. Без них разделю по абзацам.\n\n<i>Передумал — /cancel</i>")
+    elif action == "edit":
+        if not data.get("review_script"):
+            return
+        await state.set_state(ReviewState.edit)
+        await message.answer(
+            "✏️ Скопируй сценарий выше, поправь и пришли одним сообщением. "
+            "Строки <code>## Название</code> — начало раздела.\n\n<i>Передумал — /cancel</i>")
+    elif action == "go":
+        script = data.get("review_script")
+        if not script:
+            await message.answer("Сначала нужен сценарий — выбери, как его написать.", reply_markup=review_menu())
+            return
+        await state.clear()
+        await start_review(message, script)
+
+
+@router.message(ReviewState.title, F.text, ~F.text.startswith("/"))
+async def review_title(message: Message, state: FSMContext) -> None:
+    await review_pick(message, state, _typed(message))
+
+
+@router.message(ReviewState.notes, F.text, ~F.text.startswith("/"))
+async def review_notes(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    await review_generate(message, state, _typed(message))
+
+
+@router.message(ReviewState.own, F.text, ~F.text.startswith("/"))
+@router.message(ReviewState.edit, F.text, ~F.text.startswith("/"))
+async def review_own_text(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    editing = await state.get_state() == ReviewState.edit.state
+    old = data.get("review_script") or {}
+    try:
+        script = shorts_review.parse_script(_typed(message), int(data["review_film"]),
+                                            old.get("title", "") if editing else "")
+    except (ValueError, KeyError):
+        await message.answer("Не вижу текста — пришли его одним сообщением.")
+        return
+    await state.set_state(None)
+    await show_script(message, state, script, can_redo=editing and bool(old.get("title")))
+
+
 KP_TYPES = {
     "movie": "Фильм",
     "tv-series": "Сериал",
@@ -7283,6 +7559,7 @@ async def set_admin_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="shorts", description="🎬 Панель шортсов (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
+        BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),

@@ -851,7 +851,8 @@ async def _edge_pieces(text: str, path: Path, stem: Path) -> tuple[list[float], 
     return words, lost
 
 
-async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
+async def synthesize(lines: list[str], work: Path,
+                     pause: float | None = None) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     global tts_error, tts_note
     tts_error, tts_note = None, None
@@ -864,7 +865,8 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
     if lumean.enabled():
         # основной голос — ElevenLabs через Lumean; не вышло — как раньше, голос Microsoft
         try:
-            await lumean.synthesize([t.replace(pronounce.STRESS, "") for t in speak], parts, work)
+            await lumean.synthesize([t.replace(pronounce.STRESS, "") for t in speak], parts, work,
+                                    pause or lumean.PAUSE)
             words = [[] for _ in speak]
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Lumean TTS failed: %s", exc)
