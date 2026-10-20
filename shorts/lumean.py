@@ -146,15 +146,17 @@ async def _default_model(session: aiohttp.ClientSession, service: str) -> str:
     return model
 
 
-async def _template_id(session: aiohttp.ClientSession) -> str:
-    """Шаблон под текущий сервис и голос: найти по имени или создать один раз."""
-    service = SERVICE
-    voice = VOICE_ID if (VOICE_ID or service != "elevenlabs") else await _pick_voice(session)
+async def _template_id(session: aiohttp.ClientSession, service: str | None = None, voice: str | None = None) -> str:
+    """Шаблон под сервис и голос (по умолчанию — текущие): найти по имени или создать один раз."""
+    explicit = bool(voice)
+    service = service or SERVICE
+    voice = voice or (VOICE_ID if (VOICE_ID or service != "elevenlabs") else await _pick_voice(session))
     if not voice:
         raise LumeanError(f"для сервиса {service} не задан голос (LUMEAN_VOICE_ID или /clone)")
     if (service, voice) in _templates:
         return _templates[(service, voice)]
-    name = TEMPLATE_NAME if service == "elevenlabs" and not VOICE_ID else f"{TEMPLATE_NAME} {service} {voice[:8]}"
+    default = service == "elevenlabs" and not VOICE_ID and not explicit
+    name = TEMPLATE_NAME if default else f"{TEMPLATE_NAME} {service} {voice[:8]}"
     data = await _call(session, "GET", "/templates", params={"page": 1, "search": name, "service": service})
     for t in (data or {}).get("items") or []:
         if t.get("name") == name and t.get("id"):
@@ -207,17 +209,18 @@ async def clone_status(clone_id: str, service: str = "fishaudio") -> dict[str, A
     raise LumeanError("клон не найден")
 
 
-async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path) -> Path:
+async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT,
+                       service: str | None = None, voice: str | None = None) -> Path:
     order = await _call(session, "POST", "/orders", json={
-        "template_id": await _template_id(session), "input_text": text, "name": "KinoMir360 short"})
+        "template_id": await _template_id(session, service, voice), "input_text": text, "name": "KinoMir360 short"})
     oid = order["id"]
     status, waited = order.get("status"), 0.0
     while status not in DONE:
         if status in FAILED or status == "partially_completed":
             reason = (order.get("result") or {}).get("user_message") or status
             raise LumeanError(f"заказ не озвучен: {reason}")
-        if waited >= WAIT:
-            raise LumeanError(f"заказ не готов за {WAIT} с (статус {status})")
+        if waited >= wait:
+            raise LumeanError(f"заказ не готов за {wait:.0f} с (статус {status})")
         await asyncio.sleep(3)
         waited += 3
         order = await _call(session, "GET", f"/orders/{oid}")
@@ -240,10 +243,10 @@ async def _run(*cmd: str) -> str:
     return out.decode(errors="ignore") + err.decode(errors="ignore")
 
 
-async def _speech_spans(path: Path, parts: int) -> list[tuple[float, float]]:
+async def _speech_spans(path: Path, parts: int, pause: float = PAUSE) -> list[tuple[float, float]]:
     """Отрезки речи: режем по parts-1 самым длинным паузам (наши {{pause}} между фразами)."""
     log_text = await _run("ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
-                          "-af", f"silencedetect=noise=-38dB:d={PAUSE * 0.6:.2f}", "-f", "null", "-")
+                          "-af", f"silencedetect=noise=-38dB:d={pause * 0.6:.2f}", "-f", "null", "-")
     starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", log_text)]
     ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", log_text)]
     total = float((await _run("ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -256,14 +259,19 @@ async def _speech_spans(path: Path, parts: int) -> list[tuple[float, float]]:
     return [(bounds[2 * i], bounds[2 * i + 1]) for i in range(parts)]
 
 
-async def synthesize(lines: list[str], parts: list[Path], work: Path) -> None:
-    """Озвучить все фразы одним заказом и разложить по файлам parts (mp3, по фразе на файл)."""
-    text = f"\n{{{{pause={PAUSE:g}}}}}\n".join(lines)
-    full = work / "lumean_full.mp3"
-    timeout = aiohttp.ClientTimeout(total=WAIT + 60)
+async def synthesize(lines: list[str], parts: list[Path], work: Path, pause: float = PAUSE,
+                     service: str | None = None, voice: str | None = None) -> None:
+    """Озвучить все фразы одним заказом и разложить по файлам parts (mp3, по фразе на файл).
+
+    pause — тишина между фразами; у длинных фраз (обзор) свои паузы в речи длиннее — нужна и наша длиннее.
+    """
+    text = f"\n{{{{pause={pause:g}}}}}\n".join(lines)
+    full = work / f"lumean_full_{(voice or 'default')[:8]}.mp3"
+    wait = WAIT + len(text) / 5  # длинный текст Lumean озвучивает дольше
+    timeout = aiohttp.ClientTimeout(total=wait + 60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        await _order_audio(session, text, full)
-    spans = [(0.0, 0.0)] if len(lines) == 1 else await _speech_spans(full, len(lines))
+        await _order_audio(session, text, full, wait, service, voice)
+    spans = [(0.0, 0.0)] if len(lines) == 1 else await _speech_spans(full, len(lines), pause)
     for (start, end), part in zip(spans, parts):
         cut = ["-ss", f"{start:.3f}", "-to", f"{end:.3f}"] if end > start else []
         await _run("ffmpeg", "-v", "error", "-y", "-i", str(full), *cut,

@@ -306,3 +306,141 @@ async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | N
         return None
     # явно испорченную фразу (пустая, вдвое короче или втрое длиннее) оставляем как была
     return [new if new and len(old) / 2 <= len(new) <= len(old) * 3 + 40 else old for old, new in zip(texts, out)]
+
+
+REVIEW_CHARS = (1600, 2600)  # длина сценария обзора: примерно 2–3 минуты голоса
+
+
+async def write_review(key: str, brief: str, notes: str = "") -> dict[str, Any]:
+    """Сценарий обзора фильма для закадра: {"title": название для YouTube, "sections": [{heading, text}]}.
+
+    brief — данные о фильме (сюжет, создатели, рейтинги, факты); notes — текст автора (слух, разбор,
+    мнение), который надо сохранить и дополнить. Факты и пасхалки — только из brief и notes.
+    """
+    if not available(key):
+        raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY — ИИ не может написать сценарий")
+    lo, hi = REVIEW_CHARS
+    author = (
+        "\n\nТЕКСТ АВТОРА (главная основа обзора): сохрани его мнение, оценки, шутки и формулировки, "
+        "выстрой по разделам и дополни данными о фильме. Слухи из текста автора подавай как слухи "
+        "(«по слухам», «говорят»), не выдавай за факт.\n«««\n" + notes.strip()[:6000] + "\n»»»"
+    ) if notes.strip() else ""
+    prompt = (
+        "Ты автор YouTube-канала о кино KinoMir360. Напиши сценарий закадрового текста для "
+        f"горизонтального видео-обзора фильма, {lo}–{hi} символов (2–3 минуты речи). "
+        "Живо, разговорно, на «ты» со зрителем, короткими фразами, без канцелярита и без эмодзи.\n"
+        "Разделы (заголовок — 1–3 слова):\n"
+        "1. Вступление — цепляющая первая фраза, о чём обзор.\n"
+        "2. О чём фильм — завязка БЕЗ спойлеров.\n"
+        "3. Кто снимал и кто играет — режиссёр, главные актёры и роли.\n"
+        "4. Факты и пасхалки — ТОЛЬКО из данных ниже (факты Кинопоиска, текст автора). "
+        "Ничего не выдумывай; нет фактов — пропусти раздел.\n"
+        "5. Что получилось, а что нет — честное мнение: сильные и слабые стороны.\n"
+        "6. Итог — кому смотреть, оценка, призыв написать мнение в комментариях и подписаться на КиноМир360.\n"
+        "Названия фильмов — в «ёлочках». Никаких ссылок, хэштегов, ремарок в скобках и пометок "
+        "для монтажа — только текст, который прочитает диктор.\n"
+        "Ответь JSON: {\"title\": \"название ролика для YouTube до 90 символов\", "
+        "\"sections\": [{\"heading\": \"...\", \"text\": \"...\"}, ...]}.\n\n"
+        "ДАННЫЕ О ФИЛЬМЕ:\n" + brief + author
+    )
+    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    sections = [{"heading": str(s.get("heading") or "").strip()[:40], "text": str(s.get("text") or "").strip()}
+                for s in (data.get("sections") if isinstance(data, dict) else None) or [] if isinstance(s, dict)]
+    sections = [s for s in sections if s["text"]]
+    if len(sections) < 3:
+        raise AIError("ИИ вернул сценарий без разделов — попробуй ещё раз")
+    return {"title": str(data.get("title") or "").strip()[:95], "sections": sections}
+
+
+DUB_CPS = 15  # символов в секунду — столько русского текста успевает прозвучать
+
+
+def _dub_task(duration: float) -> str:
+    return (
+        f"Переводи для закадрового русского перевода трейлера (длина {duration:.0f} с). "
+        "Перевод живой, разговорный, как в профессиональном дубляже, а не дословный. Каждая русская "
+        f"реплика должна успеть прозвучать за время оригинала: не длиннее {DUB_CPS} символов на секунду "
+        "реплики — сокращай, сохраняя смысл. Имена и названия — как в русском прокате. "
+        "gender — пол говорящего (male/female), speaker — метка голоса (A, B, C… один человек — одна метка; "
+        "закадровый голос диктора — тоже отдельная метка)."
+    )
+
+
+def _dub_lines(data: Any, duration: float) -> list[dict[str, Any]]:
+    out = []
+    for ln in (data.get("lines") if isinstance(data, dict) else None) or []:
+        try:
+            start, end = float(ln["start"]), float(ln["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        ru = str(ln.get("ru") or "").strip()
+        if not ru or end <= start or start >= duration + 1:
+            continue
+        out.append({"start": round(max(start, 0.0), 2), "end": round(min(end, duration), 2),
+                    "speaker": str(ln.get("speaker") or "A")[:3],
+                    "gender": "female" if str(ln.get("gender") or "").lower().startswith("f") else "male",
+                    "text": str(ln.get("text") or "").strip(), "ru": ru})
+    out.sort(key=lambda ln: ln["start"])
+    return out
+
+
+async def _groq_whisper(audio: bytes) -> list[dict[str, Any]]:
+    """Распознавание речи Whisper на Groq (тот же ключ резервного ИИ): сегменты со временем."""
+    url = RESERVE_URL.split("/chat/completions")[0] + "/audio/transcriptions"
+    form = aiohttp.FormData()
+    form.add_field("file", audio, filename="audio.mp3", content_type="audio/mpeg")
+    form.add_field("model", os.getenv("RESERVE_STT_MODEL", "whisper-large-v3"))
+    form.add_field("response_format", "verbose_json")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session, \
+            session.post(url, data=form, headers={"Authorization": f"Bearer {RESERVE_KEY}"}) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise AIError(f"распознавание речи HTTP {resp.status}: {str(data)[:200]}")
+    return [{"start": s["start"], "end": s["end"], "text": str(s.get("text") or "").strip()}
+            for s in data.get("segments") or [] if str(s.get("text") or "").strip()]
+
+
+async def transcribe_dub(key: str, audio: bytes, duration: float) -> list[dict[str, Any]]:
+    """Реплики трейлера для перевода: [{start, end, speaker, gender, text, ru}].
+
+    Gemini слушает дорожку сам; не вышло — Whisper на Groq + перевод резервным ИИ.
+    """
+    errors = []
+    if key:
+        prompt = (
+            "Это звуковая дорожка трейлера. Выпиши все реплики людей по порядку (диалоги и закадровый "
+            "голос; песни и надписи пропусти) с временем начала и конца в секундах (точность 0.1). "
+            + _dub_task(duration)
+            + " Ответь JSON: {\"lines\": [{\"start\": 0.0, \"end\": 0.0, \"speaker\": \"A\", "
+            "\"gender\": \"male\", \"text\": \"оригинал\", \"ru\": \"перевод\"}, ...]}."
+        )
+        parts = [{"text": prompt},
+                 {"inline_data": {"mime_type": "audio/mp3", "data": base64.b64encode(audio).decode()}}]
+        try:
+            lines = _dub_lines(await _ask(key, parts), duration)
+            if lines:
+                return lines
+            errors.append("Gemini не нашёл реплик")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Gemini: {exc}")
+            log.warning("shorts: Gemini dub transcription failed: %s", exc)
+    if RESERVE_KEY and "groq.com" in RESERVE_URL:
+        try:
+            segs = await _groq_whisper(audio)
+            if not segs:
+                raise AIError("в дорожке не распознано речи")
+            listing = "\n".join(f"{i + 1}. [{s['start']:.1f}–{s['end']:.1f}] {s['text']}" for i, s in enumerate(segs))
+            prompt = (
+                "Ниже реплики трейлера со временем (распознаны автоматически). " + _dub_task(duration)
+                + " Для каждой реплики угадай по смыслу пол и говорящего. Ответь JSON: {\"lines\": "
+                "[{\"start\": ..., \"end\": ..., \"speaker\": \"A\", \"gender\": \"male\", \"text\": \"оригинал\", "
+                "\"ru\": \"перевод\"}, ...]} — время бери из списка.\n\n" + listing
+            )
+            lines = _dub_lines(await _ask_reserve(prompt), duration)
+            if lines:
+                return lines
+            errors.append("резервный ИИ вернул пустой перевод")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"резерв: {exc}")
+            log.warning("shorts: reserve dub transcription failed: %s", exc)
+    raise AIError("; ".join(errors) or "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY (Groq)")
