@@ -784,6 +784,21 @@ async def say_to_file(text: str, path: Path) -> list[float]:
         return words
 
 
+async def spoken_lines(lines: list[str]) -> list[str]:
+    """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
+    русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
+    texts = [pronounce.apply(text) for text in lines]
+    todo = [i for i, text in enumerate(texts) if pronounce.needs_rewrite(text)]
+    if todo:
+        try:  # не задерживаем сборку, если ИИ тормозит
+            fixed = await asyncio.wait_for(ai.spoken_form([texts[i] for i in todo]), timeout=60)
+        except asyncio.TimeoutError:
+            fixed = None
+        for i, text in zip(todo, fixed or []):
+            texts[i] = text
+    return [_speakable(pronounce.plain_russian(text)) for text in texts]
+
+
 def _speakable(text: str) -> str:
     """Убираем эмодзи и редкие символы — на них сервис голоса может ответить «No audio»."""
     text = re.sub(rf"[^\w\s.,!?:;«»\"'()%+\-–—{pronounce.STRESS}]", " ", text)
@@ -840,7 +855,7 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     global tts_error, tts_note
     tts_error, tts_note = None, None
-    speak = [_speakable(pronounce.apply(text)) for text in lines]
+    speak = await spoken_lines(lines)
     parts: list[Path] = [work / f"voice_{i}.mp3" for i in range(len(lines))]
     words: list[list[float]] = []
     failed: list[int] = []

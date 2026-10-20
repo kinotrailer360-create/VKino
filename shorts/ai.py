@@ -276,3 +276,33 @@ async def retell_news(key: str, items: list[tuple[str, str, str]]) -> list[str] 
     if len(texts) != len(items) or not all(texts):
         return None
     return [t[:260] for t in texts]
+
+
+async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
+    """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
+    key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key
+    if not available(key) or not texts:
+        return None
+    listing = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    prompt = (
+        "Подготовь фразы для синтеза речи по-русски. Правила:\n"
+        "1. Все числа, годы, даты, проценты, рейтинги, номера сезонов — словами, в правильном падеже и роде: "
+        "«в 2024 году» → «в две тысячи двадцать четвёртом году», «7.8» → «семь и восемь», "
+        "«3 сезона» → «три сезона», «1990-х» → «девяностых», «15%» → «пятнадцать процентов».\n"
+        "2. Все слова латиницей — русскими буквами так, как их произносят: имена, названия, бренды "
+        "(«Christopher Nolan» → «Кристофер Нолан», «Warner Bros.» → «Уорнер Бразерс», "
+        "аббревиатуры по буквам: «FBI» → «эф-би-ай»).\n"
+        "3. Больше ничего не меняй: те же слова, порядок, смысл, знаки препинания, «ёлочки». "
+        "Знак ударения (символ U+0301 после гласной) сохраняй.\n"
+        "Ответь JSON: {\"texts\": [\"...\", ...]} — столько же фраз, в том же порядке.\n\n" + listing
+    )
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        out = [str(t).strip() for t in data["texts"]]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI spoken_form failed: %s", exc)
+        return None
+    if len(out) != len(texts):
+        return None
+    # явно испорченную фразу (пустая, вдвое короче или втрое длиннее) оставляем как была
+    return [new if new and len(old) / 2 <= len(new) <= len(old) * 3 + 40 else old for old, new in zip(texts, out)]
