@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, news, pronounce, tmdb, wiki
+from . import ai, clips, lumean, news, pronounce, tmdb, wiki
 from .cards import card_overlay, make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -761,6 +761,13 @@ last_engine = "edge"  # каким голосом озвучена послед�
 async def say_to_file(text: str, path: Path) -> list[float]:
     """Озвучить фразу в mp3 (время слов в ответе): основной голос, при сбое — запасной Piper."""
     global last_engine
+    if lumean.enabled():
+        try:
+            await lumean.synthesize([text.replace(pronounce.STRESS, "")], [path], path.parent)
+            last_engine = "lumean"
+            return []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: Lumean TTS failed (%s), using Edge", exc)
     try:
         words = await _edge_to_file(text, path)
         last_engine = "edge"
@@ -835,8 +842,17 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
     words: list[list[float]] = []
     failed: list[int] = []
     dropped: list[str] = []
+    lumean_note = ""
+    if lumean.enabled():
+        # основной голос — ElevenLabs через Lumean; не вышло — как раньше, голос Microsoft
+        try:
+            await lumean.synthesize([t.replace(pronounce.STRESS, "") for t in speak], parts, work)
+            words = [[] for _ in speak]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: Lumean TTS failed: %s", exc)
+            lumean_note = f"🗣 Голос ElevenLabs (Lumean) не сработал ({str(exc)[:200]}) — озвучено голосом Microsoft."
     try:
-        for i, text in enumerate(speak):
+        for i, text in enumerate(speak if not words else []):
             if i:
                 await asyncio.sleep(TTS_PAUSE)
             try:
@@ -877,6 +893,8 @@ async def synthesize(lines: list[str], work: Path) -> tuple[Path, list[float], b
                 await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
                            "-t", f"{sec:.2f}", str(parts[i]))
     voiced = not failed
+    if lumean_note and not tts_note:
+        tts_note = lumean_note
     if dropped and not tts_note:
         tts_note = ("🗣 Основной голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
                     + "; ".join(f"«{d[:60]}»" for d in dropped[:3]))
