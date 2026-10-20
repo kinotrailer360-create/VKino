@@ -350,3 +350,97 @@ async def write_review(key: str, brief: str, notes: str = "") -> dict[str, Any]:
     if len(sections) < 3:
         raise AIError("ИИ вернул сценарий без разделов — попробуй ещё раз")
     return {"title": str(data.get("title") or "").strip()[:95], "sections": sections}
+
+
+DUB_CPS = 15  # символов в секунду — столько русского текста успевает прозвучать
+
+
+def _dub_task(duration: float) -> str:
+    return (
+        f"Переводи для закадрового русского перевода трейлера (длина {duration:.0f} с). "
+        "Перевод живой, разговорный, как в профессиональном дубляже, а не дословный. Каждая русская "
+        f"реплика должна успеть прозвучать за время оригинала: не длиннее {DUB_CPS} символов на секунду "
+        "реплики — сокращай, сохраняя смысл. Имена и названия — как в русском прокате. "
+        "gender — пол говорящего (male/female), speaker — метка голоса (A, B, C… один человек — одна метка; "
+        "закадровый голос диктора — тоже отдельная метка)."
+    )
+
+
+def _dub_lines(data: Any, duration: float) -> list[dict[str, Any]]:
+    out = []
+    for ln in (data.get("lines") if isinstance(data, dict) else None) or []:
+        try:
+            start, end = float(ln["start"]), float(ln["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        ru = str(ln.get("ru") or "").strip()
+        if not ru or end <= start or start >= duration + 1:
+            continue
+        out.append({"start": round(max(start, 0.0), 2), "end": round(min(end, duration), 2),
+                    "speaker": str(ln.get("speaker") or "A")[:3],
+                    "gender": "female" if str(ln.get("gender") or "").lower().startswith("f") else "male",
+                    "text": str(ln.get("text") or "").strip(), "ru": ru})
+    out.sort(key=lambda ln: ln["start"])
+    return out
+
+
+async def _groq_whisper(audio: bytes) -> list[dict[str, Any]]:
+    """Распознавание речи Whisper на Groq (тот же ключ резервного ИИ): сегменты со временем."""
+    url = RESERVE_URL.split("/chat/completions")[0] + "/audio/transcriptions"
+    form = aiohttp.FormData()
+    form.add_field("file", audio, filename="audio.mp3", content_type="audio/mpeg")
+    form.add_field("model", os.getenv("RESERVE_STT_MODEL", "whisper-large-v3"))
+    form.add_field("response_format", "verbose_json")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session, \
+            session.post(url, data=form, headers={"Authorization": f"Bearer {RESERVE_KEY}"}) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise AIError(f"распознавание речи HTTP {resp.status}: {str(data)[:200]}")
+    return [{"start": s["start"], "end": s["end"], "text": str(s.get("text") or "").strip()}
+            for s in data.get("segments") or [] if str(s.get("text") or "").strip()]
+
+
+async def transcribe_dub(key: str, audio: bytes, duration: float) -> list[dict[str, Any]]:
+    """Реплики трейлера для перевода: [{start, end, speaker, gender, text, ru}].
+
+    Gemini слушает дорожку сам; не вышло — Whisper на Groq + перевод резервным ИИ.
+    """
+    errors = []
+    if key:
+        prompt = (
+            "Это звуковая дорожка трейлера. Выпиши все реплики людей по порядку (диалоги и закадровый "
+            "голос; песни и надписи пропусти) с временем начала и конца в секундах (точность 0.1). "
+            + _dub_task(duration)
+            + " Ответь JSON: {\"lines\": [{\"start\": 0.0, \"end\": 0.0, \"speaker\": \"A\", "
+            "\"gender\": \"male\", \"text\": \"оригинал\", \"ru\": \"перевод\"}, ...]}."
+        )
+        parts = [{"text": prompt},
+                 {"inline_data": {"mime_type": "audio/mp3", "data": base64.b64encode(audio).decode()}}]
+        try:
+            lines = _dub_lines(await _ask(key, parts), duration)
+            if lines:
+                return lines
+            errors.append("Gemini не нашёл реплик")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Gemini: {exc}")
+            log.warning("shorts: Gemini dub transcription failed: %s", exc)
+    if RESERVE_KEY and "groq.com" in RESERVE_URL:
+        try:
+            segs = await _groq_whisper(audio)
+            if not segs:
+                raise AIError("в дорожке не распознано речи")
+            listing = "\n".join(f"{i + 1}. [{s['start']:.1f}–{s['end']:.1f}] {s['text']}" for i, s in enumerate(segs))
+            prompt = (
+                "Ниже реплики трейлера со временем (распознаны автоматически). " + _dub_task(duration)
+                + " Для каждой реплики угадай по смыслу пол и говорящего. Ответь JSON: {\"lines\": "
+                "[{\"start\": ..., \"end\": ..., \"speaker\": \"A\", \"gender\": \"male\", \"text\": \"оригинал\", "
+                "\"ru\": \"перевод\"}, ...]} — время бери из списка.\n\n" + listing
+            )
+            lines = _dub_lines(await _ask_reserve(prompt), duration)
+            if lines:
+                return lines
+            errors.append("резервный ИИ вернул пустой перевод")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"резерв: {exc}")
+            log.warning("shorts: reserve dub transcription failed: %s", exc)
+    raise AIError("; ".join(errors) or "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY (Groq)")

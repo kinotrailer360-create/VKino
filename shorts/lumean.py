@@ -146,15 +146,17 @@ async def _default_model(session: aiohttp.ClientSession, service: str) -> str:
     return model
 
 
-async def _template_id(session: aiohttp.ClientSession) -> str:
-    """Шаблон под текущий сервис и голос: найти по имени или создать один раз."""
-    service = SERVICE
-    voice = VOICE_ID if (VOICE_ID or service != "elevenlabs") else await _pick_voice(session)
+async def _template_id(session: aiohttp.ClientSession, service: str | None = None, voice: str | None = None) -> str:
+    """Шаблон под сервис и голос (по умолчанию — текущие): найти по имени или создать один раз."""
+    explicit = bool(voice)
+    service = service or SERVICE
+    voice = voice or (VOICE_ID if (VOICE_ID or service != "elevenlabs") else await _pick_voice(session))
     if not voice:
         raise LumeanError(f"для сервиса {service} не задан голос (LUMEAN_VOICE_ID или /clone)")
     if (service, voice) in _templates:
         return _templates[(service, voice)]
-    name = TEMPLATE_NAME if service == "elevenlabs" and not VOICE_ID else f"{TEMPLATE_NAME} {service} {voice[:8]}"
+    default = service == "elevenlabs" and not VOICE_ID and not explicit
+    name = TEMPLATE_NAME if default else f"{TEMPLATE_NAME} {service} {voice[:8]}"
     data = await _call(session, "GET", "/templates", params={"page": 1, "search": name, "service": service})
     for t in (data or {}).get("items") or []:
         if t.get("name") == name and t.get("id"):
@@ -207,9 +209,10 @@ async def clone_status(clone_id: str, service: str = "fishaudio") -> dict[str, A
     raise LumeanError("клон не найден")
 
 
-async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT) -> Path:
+async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT,
+                       service: str | None = None, voice: str | None = None) -> Path:
     order = await _call(session, "POST", "/orders", json={
-        "template_id": await _template_id(session), "input_text": text, "name": "KinoMir360 short"})
+        "template_id": await _template_id(session, service, voice), "input_text": text, "name": "KinoMir360 short"})
     oid = order["id"]
     status, waited = order.get("status"), 0.0
     while status not in DONE:
@@ -256,17 +259,18 @@ async def _speech_spans(path: Path, parts: int, pause: float = PAUSE) -> list[tu
     return [(bounds[2 * i], bounds[2 * i + 1]) for i in range(parts)]
 
 
-async def synthesize(lines: list[str], parts: list[Path], work: Path, pause: float = PAUSE) -> None:
+async def synthesize(lines: list[str], parts: list[Path], work: Path, pause: float = PAUSE,
+                     service: str | None = None, voice: str | None = None) -> None:
     """Озвучить все фразы одним заказом и разложить по файлам parts (mp3, по фразе на файл).
 
     pause — тишина между фразами; у длинных фраз (обзор) свои паузы в речи длиннее — нужна и наша длиннее.
     """
     text = f"\n{{{{pause={pause:g}}}}}\n".join(lines)
-    full = work / "lumean_full.mp3"
+    full = work / f"lumean_full_{(voice or 'default')[:8]}.mp3"
     wait = WAIT + len(text) / 5  # длинный текст Lumean озвучивает дольше
     timeout = aiohttp.ClientTimeout(total=wait + 60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        await _order_audio(session, text, full, wait)
+        await _order_audio(session, text, full, wait, service, voice)
     spans = [(0.0, 0.0)] if len(lines) == 1 else await _speech_spans(full, len(lines), pause)
     for (start, end), part in zip(spans, parts):
         cut = ["-ss", f"{start:.3f}", "-to", f"{end:.3f}"] if end > start else []

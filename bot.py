@@ -50,6 +50,7 @@ from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
+from shorts import dub as shorts_dub
 from shorts import review as shorts_review
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
@@ -188,6 +189,11 @@ class ReviewState(StatesGroup):
     own = State()
     edit = State()
     media = State()
+
+
+class DubState(StatesGroup):
+    source = State()
+    edit = State()
 
 
 class AdminSourceState(StatesGroup):
@@ -6969,7 +6975,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
         [_btn("💡 Факты: случайный", "sh:go:facts")],
-        [_btn("🎞 Обзор фильма 16:9", "rv:start")],
+        [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
         [_btn("✍️ Факты: ввести название", "sh:ask:facts")],
@@ -7569,6 +7575,189 @@ async def review_own_text(message: Message, state: FSMContext) -> None:
     await show_script(message, state, script, can_redo=editing and bool(old.get("title")))
 
 
+# ---------------------------------------------------------------- закадровый перевод трейлера
+
+DUB_TIMEOUT = 20 * 60
+
+
+def dub_dir(chat_id: int) -> Path:
+    return SHORTS_DIR / f"dub_{chat_id}"
+
+
+async def dub_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    shutil.rmtree(dub_dir(message.chat.id), ignore_errors=True)
+    await state.set_state(DubState.source)
+    await message.answer(
+        "🎙 <b>Русский закадровый перевод трейлера</b>\n\n"
+        "Пришли ссылку на трейлер (Rutube, VK Видео…) или сам видеофайл до 20 МБ. "
+        "В подписи можно написать название фильма — пойдёт в SEO.\n\n"
+        "ИИ выпишет реплики и переведёт, ты проверишь перевод, потом каждого героя озвучит свой голос "
+        "из библиотеки Lumean (мужчин — мужские, женщин — женские), а оригинал станет тише под голосом.\n\n"
+        "<i>Передумал — /cancel</i>")
+
+
+async def show_dub(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    lines = data["dub_lines"]
+    voices = await shorts_dub.pick_voices([ln for ln in lines if ln["ru"]])
+    chars = sum(len(ln["ru"]) for ln in lines)
+    head = (f"📝 <b>Перевод: {len([ln for ln in lines if ln['ru']])} реплик, {chars} символов</b>\n"
+            f"Голоса: {escape(shorts_dub.voices_text(voices))}\n"
+            "Чтобы поправить — пришли строки с номером: <code>3. новый перевод</code>, "
+            "<code>3. -</code> — не озвучивать.")
+    chunks, cur = [], head
+    for row in shorts_dub.lines_text(lines).splitlines():
+        piece = escape(row)
+        if len(cur) + len(piece) + 1 > 3800:
+            chunks.append(cur)
+            cur = piece
+        else:
+            cur = f"{cur}\n{piece}" if cur != head else f"{cur}\n\n{piece}"
+    chunks.append(cur)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Озвучить и собрать", "dub:go")], [_btn("✏️ Поправить перевод", "dub:edit")],
+        [_btn("❌ Отмена", "dub:cancel")]])
+    for k, chunk in enumerate(chunks):
+        await message.answer(chunk, reply_markup=markup if k == len(chunks) - 1 else None)
+
+
+@router.message(Command("dub"))
+async def dub_command(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await dub_start(message, state)
+
+
+@router.message(DubState.source, F.video | F.document | F.text)
+async def dub_source(message: Message, state: FSMContext) -> None:
+    if (message.text or "").startswith("/"):
+        return
+    work = dub_dir(message.chat.id)
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    url = ""
+    title = (message.caption or "").strip()
+    wait = await message.answer("⏳ Скачиваю видео…")
+    try:
+        media = message.video or message.document
+        if media:
+            if media is message.document and not str(media.mime_type or "").startswith("video/"):
+                await wait.edit_text("Это не видео. Пришли видеофайл или ссылку.")
+                return
+            if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+                await wait.edit_text("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать. "
+                                     "Пришли ссылку на Rutube/VK или сжатую версию.")
+                return
+            src = work / "source.mp4"
+            await message.bot.download(media.file_id, destination=src)
+        else:
+            m = re.search(r"https?://\S+", message.text or "")
+            if not m:
+                await wait.edit_text("Нужна ссылка на видео (https://…) или сам видеофайл.")
+                return
+            url = m.group(0)
+            title = (message.text or "").replace(url, "").strip()
+            src = await shorts_dub.fetch_source(url, work)
+        await wait.edit_text("🎧 ИИ слушает трейлер и переводит, обычно до минуты…")
+        lines, _ = await shorts_dub.translate(src, work, GEMINI_API_KEY)
+    except Exception as exc:
+        logging.exception("Dub source failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>")
+        return
+    await wait.delete()
+    await state.set_state(None)
+    await state.update_data(dub_src=str(src), dub_lines=lines, dub_title=title, dub_url=url)
+    await show_dub(message, state)
+
+
+@router.message(DubState.edit, F.text, ~F.text.startswith("/"))
+async def dub_edit(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    lines = data.get("dub_lines") or []
+    if not shorts_dub.apply_edits(lines, _typed(message)):
+        await message.answer("Не нашёл строк с номером. Формат: <code>3. новый перевод</code>")
+        return
+    await state.set_state(None)
+    await state.update_data(dub_lines=lines)
+    await show_dub(message, state)
+
+
+async def run_dub(bot: Bot, chat_id: int, data: dict[str, Any], status: Message) -> None:
+    async with shorts_lock:
+        await load_pronunciations()
+        work = dub_dir(chat_id)
+        try:
+            progress = progress_updater(status, "перевод")
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            result = await asyncio.wait_for(shorts_dub.make_dub(
+                Path(data["dub_src"]), data["dub_lines"], work, data.get("dub_title") or "",
+                data.get("dub_url") or ""), timeout=DUB_TIMEOUT)
+            await progress(100, "Готово — отправляю видео")
+            seo = result.seo
+            await bot.send_video(chat_id, FSInputFile(result.video, filename="kinomir360_trailer_ru.mp4"),
+                                 caption=f"🎙 <b>{escape(seo['title'])}</b>", supports_streaming=True,
+                                 request_timeout=600)
+            for label, key in (("Название", "title"), ("Описание", "description"), ("Теги", "tags"),
+                               ("Закреплённый комментарий", "pinned")):
+                await bot.send_message(chat_id, f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>")
+            if seo.get("warning"):
+                await bot.send_message(chat_id, escape(seo["warning"]))
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"перевод собирался дольше {DUB_TIMEOUT // 60} минут — "
+                               f"застрял на этапе: {shorts_daily.last_stage or 'начало'}.") from None
+        finally:
+            shorts_daily.on_progress = None
+            shutil.rmtree(work, ignore_errors=True)
+
+
+@router.callback_query(F.data.startswith("dub:"))
+async def dub_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message, action = callback.message, (callback.data or "")[4:]
+    data = await state.get_data()
+    if action == "start":
+        await dub_start(message, state)
+        return
+    if action == "cancel":
+        await state.clear()
+        shutil.rmtree(dub_dir(message.chat.id), ignore_errors=True)
+        await message.answer("Перевод отменён.")
+        return
+    if not data.get("dub_lines") or not Path(str(data.get("dub_src"))).exists():
+        await message.answer("Начни заново: кнопка «🎙 Перевод трейлера» или /dub")
+        return
+    if action == "edit":
+        await state.set_state(DubState.edit)
+        await message.answer("✏️ Пришли строки с номером и новым переводом, можно сразу несколько:\n"
+                             "<code>3. Мы опоздали.\n7. -</code>  (минус — не озвучивать)\n\n"
+                             "<i>Передумал — /cancel</i>")
+    elif action == "go":
+        if shorts_lock.locked():
+            await message.answer("⏳ Сейчас собирается другой ролик — нажми «Озвучить» ещё раз через пару минут.")
+            return
+        await state.clear()
+        status = await message.answer(progress_bar(0, "Начинаю, обычно это 2–5 минут", "перевод"))
+
+        async def job() -> None:
+            try:
+                await run_dub(message.bot, message.chat.id, data, status)
+            except Exception as exc:
+                logging.exception("Dub failed")
+                try:
+                    await status.edit_text("❌ Сборка остановилась — причина ниже")
+                except TelegramBadRequest:
+                    pass
+                await message.answer(f"❌ Перевод не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+
+        task = asyncio.create_task(job())
+        shorts_jobs.add(task)
+        task.add_done_callback(shorts_jobs.discard)
+
+
 KP_TYPES = {
     "movie": "Фильм",
     "tv-series": "Сериал",
@@ -7624,6 +7813,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="shorts", description="🎬 Панель шортсов (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
+        BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
         BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
