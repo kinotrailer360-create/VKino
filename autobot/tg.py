@@ -73,31 +73,35 @@ def seo_messages(md_path):
     ru = [x for x in titles if x != en]
     warn = [re.sub(r'[*`]', '', l).strip() for l in t.splitlines() if l.strip().startswith('⚠️')]
     pub = sec('Публикация'); zak = next((x for l in pub.splitlines() if 'Закреп' in l for x in ticks(l)), None)
-    msgs = [f'🎬 <b>Ролик готов: {E(name)}</b>' + ('\n\n' + '\n'.join(E(w) for w in warn) if warn else '')]
+    # каждое копируемое — отдельным сообщением: (текст, что копирует кнопка)
+    def item(label, body): return (label + '\n<pre>' + E(body) + '</pre>', body)
+    msgs = [(f'🎬 <b>Ролик готов: {E(name)}</b>' + ('\n\n' + '\n'.join(E(w) for w in warn) if warn else ''), None)]
     if ru:
-        m = '📌 <b>Название</b> (нажми — скопируется):\n<code>' + E(ru[0]) + '</code>'
-        if len(ru) > 1: m += '\n\nЗапасные:\n' + '\n'.join('<code>' + E(x) + '</code>' for x in ru[1:3])
-        if en: m += '\n\n🇬🇧 <b>Перевод названия</b> (Studio → Переводы → English):\n<code>' + E(en) + '</code>'
-        msgs.append(m)
+        msgs.append(item('📌 <b>Название</b>', ru[0]))
+        for i, x in enumerate(ru[1:3], 1): msgs.append(item(f'🔁 <b>Запасное название {i}</b>', x))
+        if en: msgs.append(item('🇬🇧 <b>Перевод названия</b> (Studio → Переводы → English)', en))
     d = fence(sec('Описание'))
-    if d: msgs.append('📝 <b>Описание</b> (нажми — скопируется):\n<pre>' + E(d) + '</pre>')
+    if d: msgs.append(item('📝 <b>Описание</b>', d))
     tg_ = fence(sec('Теги'))
-    if tg_: msgs.append('🏷 <b>Теги</b>:\n<code>' + E(tg_) + '</code>')
-    tail = ['🖼 Обложка — первый кадр ролика (ползунок обложки в начало).']
-    if zak: tail.insert(0, '📍 <b>Закреплённый комментарий</b>:\n<code>' + E(zak) + '</code>')
-    msgs.append('\n\n'.join(tail))
+    if tg_: msgs.append(item('🏷 <b>Теги</b>', tg_))
+    if zak: msgs.append(item('📍 <b>Закреплённый комментарий</b>', zak))
+    msgs.append(('🖼 Обложка — первый кадр ролика (ползунок обложки в начало).', None))
     return msgs
 
 cmd = sys.argv[1] if len(sys.argv) > 1 else 'me'
 if cmd == 'seo-preview':
-    [print(m, '\n-----') for m in seo_messages(sys.argv[2])]; sys.exit()
+    [print(m, '| copy-btn:' if c and len(c) <= 256 else '', '\n-----') for m, c in seo_messages(sys.argv[2])]; sys.exit()
 if cmd == 'me': print(call('getMe'))
 elif cmd == 'pull': pull(sys.argv[2])
 elif cmd == 'send-video':
     print(call('sendVideo', {'chat_id': sys.argv[2], 'caption': (sys.argv[4] if len(sys.argv) > 4 else '')[:1024],
                              'supports_streaming': 'true'}, files={'video': sys.argv[3]}, timeout=600)['message_id'])
 elif cmd == 'send-seo':
-    for m in seo_messages(sys.argv[3]): call('sendMessage', {'chat_id': sys.argv[2], 'text': m, 'parse_mode': 'HTML'})
+    for m, c in seo_messages(sys.argv[3]):
+        d = {'chat_id': sys.argv[2], 'text': m, 'parse_mode': 'HTML'}
+        # кнопка «Копировать» (Bot API copy_text, до 256 символов); длинное — копируется нажатием на блок
+        if c and len(c) <= 256: d['reply_markup'] = json.dumps({'inline_keyboard': [[{'text': '📋 Копировать', 'copy_text': {'text': c}}]]})
+        call('sendMessage', d)
     print('seo sent')
 elif cmd == 'send-text':
     t = sys.argv[3]; t = open(t[1:]).read() if t.startswith('@') else t
