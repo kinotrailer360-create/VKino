@@ -37,6 +37,7 @@ FAILED = {"failed", "compensated", "cancelled"}
 
 log = logging.getLogger("shorts")
 _templates: dict[tuple[str, str], str] = {}  # (сервис, голос) -> id шаблона
+_library: dict[str, list[dict[str, Any]]] = {}  # пол -> голоса библиотеки
 voice_name = ""  # какой голос выбран — для подписи в /voice
 
 
@@ -86,6 +87,26 @@ async def _pick_voice(session: aiohttp.ClientSession) -> str:
     voice_name = str(best.get("name") or "")
     log.info("shorts: Lumean voice %s (%s)", best["voice_id"], voice_name)
     return str(best["voice_id"])
+
+
+async def library(gender: str) -> list[dict[str, Any]]:
+    """Русские голоса библиотеки ElevenLabs для выбора кнопками: [{voice_id, name, preview_url, …}]."""
+    if gender not in _library:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            data = await _call(session, "GET", "/voices/elevenlabs/library",
+                               params={"required_languages": "ru", "gender": gender, "page": 0, "page_size": 30})
+        voices = [v for v in (data or {}).get("voices") or [] if isinstance(v, dict) and v.get("voice_id")]
+        voices.sort(key=lambda v: not str(v.get("language") or "").lower().startswith("ru"))
+        _library[gender] = voices[:12]
+    return _library[gender]
+
+
+async def preview(url: str) -> bytes:
+    """Демо-запись голоса из библиотеки (бесплатно, без заказа)."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session, session.get(url) as resp:
+        resp.raise_for_status()
+        return await resp.read()
 
 
 def _config(service: str, voice: str) -> dict[str, Any]:

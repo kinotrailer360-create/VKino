@@ -30,6 +30,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
+    BufferedInputFile,
     FSInputFile,
     InlineQuery,
     InlineQueryResultArticle,
@@ -6667,7 +6668,7 @@ async def voice_action(message: Message, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         await shorts_say_to_file(spoken, path)
         engine = shorts_daily.last_engine
-        note = ("\n\n🎙 Голос ElevenLabs (Lumean)" if engine == "lumean" else "" if engine == "edge"
+        note = (f"\n\n🎙 Голос: {escape(await current_voice_name())} (Lumean)" if engine == "lumean" else "" if engine == "edge"
                 else f"\n\n⚠️ Основной голос не ответил — это запасной голос: {escape(engine[:300])}")
         if engine != "lumean" and shorts_daily.lumean_error:
             note += f"\n\n⚠️ ElevenLabs (Lumean) не сработал: {escape(shorts_daily.lumean_error)}"
@@ -6823,9 +6824,14 @@ CLONE_POLL_SECONDS = 20
 CLONE_WAIT_SECONDS = 40 * 60
 
 
+async def set_voice(service: str | None, voice: str | None, name: str | None) -> None:
+    await set_shorts_setting("lumean_service", service)
+    await set_shorts_setting("lumean_voice", voice)
+    await set_shorts_setting("lumean_voice_name", name)
+
+
 async def clone_off(message: Message) -> None:
-    await set_shorts_setting("lumean_service", None)
-    await set_shorts_setting("lumean_voice", None)
+    await set_voice(None, None, None)
     await message.answer("✅ Вернул стандартный голос ElevenLabs.")
 
 
@@ -6884,8 +6890,8 @@ async def clone_action(message: Message, media: Any) -> None:
             except Exception:
                 logging.exception("Voice clone status failed")
         if status == "ready" and info.get("voice_id"):
-            await set_shorts_setting("lumean_service", "fishaudio")
-            await set_shorts_setting("lumean_voice", str(info["voice_id"]))
+            await set_shorts_setting("clone_voice", str(info["voice_id"]))  # чтобы вернуться к нему кнопкой
+            await set_voice("fishaudio", str(info["voice_id"]), "ваш голос (клон)")
             await message.answer(
                 "✅ Ваш голос готов! Теперь ролики озвучиваются им.\n"
                 "Проверить и вернуть стандартный — кнопками ниже.",
@@ -6976,27 +6982,92 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
-        [_btn("🔊 Проверить голос", "sh:ask:voice"), _btn("🎙 Свой голос ▸", "sh:clone")],
+        [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
         [_btn("🎬 Проверить трейлер", "sh:ask:trailer")],
         [_btn("⬅️ Назад", "sh:menu")],
     ])
 
 
+async def current_voice_name() -> str:
+    if not await shorts_setting("lumean_voice"):
+        return "стандартный голос ElevenLabs"
+    return await shorts_setting("lumean_voice_name") or "выбранный голос"
+
+
 async def shorts_clone_menu() -> tuple[str, InlineKeyboardMarkup]:
-    own = bool(await shorts_setting("lumean_voice"))
     text = (
-        "🎙 <b>Свой голос для роликов</b>\n\n"
-        f"Сейчас: <b>{'ваш голос (клон)' if own else 'стандартный голос ElevenLabs'}</b>.\n\n"
-        "Нажмите «Записать свой голос» и пришлите голосовое 30–60 секунд: обычная речь, "
-        "как в роликах, в тишине, без музыки и чужих голосов."
+        "🎙 <b>Голос озвучки роликов</b>\n\n"
+        f"Сейчас: <b>{escape(await current_voice_name())}</b>.\n\n"
+        "• <b>Мужские / Женские голоса</b> — послушать образцы и выбрать любой (прослушивание бесплатно).\n"
+        "• <b>Записать свой голос</b> — пришлите голосовое 30–60 секунд: обычная речь, "
+        "как в роликах, в тишине, без музыки и чужих голосов.\n"
+        "• <b>Стандартный голос</b> — вернуть голос по умолчанию."
     )
-    return text, InlineKeyboardMarkup(inline_keyboard=[
+    rows = [[_btn("👨 Мужские голоса", "sh:vl:male"), _btn("👩 Женские голоса", "sh:vl:female")]]
+    if await shorts_setting("clone_voice"):
+        rows.append([_btn("👤 Мой голос (клон)", "sh:vmine")])
+    rows += [
         [_btn("🎤 Записать свой голос", "sh:ask:clone")],
-        [_btn("🔊 Проверить голос", "sh:ask:voice")],
-        [_btn("↩️ Стандартный голос", "sh:clone_off")],
+        [_btn("🔊 Проверить голос", "sh:ask:voice"), _btn("↩️ Стандартный голос", "sh:clone_off")],
         [_btn("⬅️ Назад", "sh:settings")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _voice_label(voice: dict[str, Any]) -> str:
+    name = str(voice.get("name") or voice["voice_id"]).split(" - ")[0]
+    return name[:40]
+
+
+async def find_library_voice(voice_id: str) -> tuple[dict[str, Any] | None, str]:
+    for gender in ("male", "female"):
+        for voice in await shorts_lumean.library(gender):
+            if voice["voice_id"] == voice_id:
+                return voice, gender
+    return None, "male"
+
+
+async def voice_list_action(message: Message, gender: str) -> tuple[str, InlineKeyboardMarkup] | None:
+    try:
+        voices = await shorts_lumean.library(gender)
+    except Exception as exc:
+        logging.exception("Voice library failed")
+        await message.answer(f"❌ Не получилось загрузить голоса: <code>{escape(str(exc)[:300])}</code>")
+        return None
+    rows = [[_btn(f"▶️ {_voice_label(v)}", f"sh:vp:{v['voice_id']}") for v in voices[k:k + 2]]
+            for k in range(0, len(voices), 2)]
+    rows.append([_btn("⬅️ Назад", "sh:clone")])
+    title = "👨 Мужские" if gender == "male" else "👩 Женские"
+    return (f"{title} <b>голоса</b>\n\nНажмите на голос — пришлю образец, под ним кнопка «Выбрать».",
+            InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def voice_preview_action(message: Message, voice_id: str) -> None:
+    try:
+        voice, gender = await find_library_voice(voice_id)
+        if not voice or not voice.get("preview_url"):
+            await message.answer("У этого голоса нет образца — выберите и проверьте кнопкой «🔊 Проверить голос».")
+            data = None
+        else:
+            data = await shorts_lumean.preview(str(voice["preview_url"]))
+    except Exception as exc:
+        logging.exception("Voice preview failed")
+        await message.answer(f"❌ Не получилось загрузить образец: <code>{escape(str(exc)[:300])}</code>")
+        return
+    name = _voice_label(voice) if voice else voice_id
+    about = escape(str((voice or {}).get("description") or "")[:300])
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Выбрать этот голос", f"sh:vs:{voice_id}")],
+        [_btn("⬅️ К списку", f"sh:vl:{gender}")],
     ])
+    caption = f"🎙 <b>{escape(name)}</b>" + (f"\n{about}" if about else "") + \
+        "\n\n<i>Образец может быть на другом языке — по-русски проверьте после выбора.</i>"
+    if data:
+        await message.answer_audio(BufferedInputFile(data, filename=f"{name}.mp3"), caption=caption,
+                                   reply_markup=markup)
+    else:
+        await message.answer(caption, reply_markup=markup)
 
 
 SHORTS_MENU_TEXT = (
@@ -7081,6 +7152,26 @@ async def shorts_panel(
         await show(*await shorts_clone_menu())
     elif data == "sh:clone_off":
         await clone_off(message)
+    elif data.startswith("sh:vl:"):
+        menu = await voice_list_action(message, data[len("sh:vl:"):])
+        if menu:
+            await show(*menu)
+    elif data.startswith("sh:vp:"):
+        await voice_preview_action(message, data[len("sh:vp:"):])
+    elif data.startswith("sh:vs:"):
+        voice_id = data[len("sh:vs:"):]
+        voice, _ = await find_library_voice(voice_id)
+        name = _voice_label(voice) if voice else voice_id
+        await set_voice("elevenlabs", voice_id, f"{name} (ElevenLabs)")
+        await message.answer(f"✅ Теперь ролики озвучивает голос <b>{escape(name)}</b>.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("🔊 Проверить по-русски", "sh:ask:voice")],
+                                 [_btn("⬅️ К голосам", "sh:clone")]]))
+    elif data == "sh:vmine":
+        clone = await shorts_setting("clone_voice")
+        if clone:
+            await set_voice("fishaudio", clone, "ваш голос (клон)")
+            await message.answer("✅ Снова озвучиваю вашим голосом.")
 
 
 def _typed(message: Message) -> str:
