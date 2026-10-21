@@ -1230,6 +1230,51 @@ def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
 FACT_CARD_H = 1000  # высота картинки на слайдах фактов и новостей
 
 
+async def _own_for_facts(files: list[Path], facts: list[str], work: Path,
+                         gemini_key: str) -> tuple[dict[int, Image.Image], dict[int, str]]:
+    """Свои фото/видео автора к фактам: ИИ — по смыслу, остальные — по порядку; один файл — один факт.
+
+    Возвращает ({факт: картинка}, {факт: файл клипа}); у видео картинка — его кадр (запасной).
+    """
+    items: list[tuple[Image.Image, str | None]] = []
+    for n, path in enumerate(files):
+        try:
+            if path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                items.append((Image.open(path).convert("RGB"), None))
+                continue
+            dur = await _duration(path)
+            clip = work / f"own{n}.mp4"
+            await clips.cut_clip(path, clip, max(0.0, dur / 2 - CLIP_SECONDS / 2) if dur > CLIP_SECONDS else 0.0,
+                                 min(CLIP_SECONDS, dur))
+            still = work / f"own{n}.jpg"
+            await _run("ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(clip), "-frames:v", "1", str(still))
+            items.append((Image.open(still).convert("RGB"), clip.name))
+        except Exception as exc:  # noqa: BLE001 — битый файл пропускаем
+            log.warning("shorts: own material %s skipped: %s", path.name, exc)
+    if not items:
+        return {}, {}
+    choices = await ai.match_images(gemini_key, facts, [im for im, _ in items]) if gemini_key else None
+    used: set[int] = set()
+    at: dict[int, int] = {}
+    for i, c in enumerate(choices or []):
+        if c >= 0 and c not in used:
+            at[i] = c
+            used.add(c)
+    free = [i for i in range(len(facts)) if i not in at]
+    for c in range(len(items)):
+        if c not in used and free:
+            at[free.pop(0)] = c
+            used.add(c)
+    own: dict[int, Image.Image] = {}
+    videos: dict[int, str] = {}
+    for i, c in at.items():
+        img, clip = items[c]
+        own[i] = img if img.width >= img.height * 1.2 else _portrait(img)  # вертикальное — целиком на фоне
+        if clip:
+            videos[i] = clip
+    return own, videos
+
+
 def _portrait(img: Image.Image, w: int = 1080, h: int = FACT_CARD_H) -> Image.Image:
     """Портрет целиком по центру на размытом фоне из него же (иначе обрезка срежет лицо)."""
     from PIL import ImageFilter
@@ -1246,8 +1291,10 @@ def _portrait(img: Image.Image, w: int = 1080, h: int = FACT_CARD_H) -> Image.Im
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
                            music: Path | None = None, tmdb_key: str = "",
                            gemini_key: str = "", trailer_clips: bool = True,
-                           custom_facts: list[str] | None = None) -> ShortResult:
-    """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем."""
+                           custom_facts: list[str] | None = None,
+                           user_media: list[Path] | None = None) -> ShortResult:
+    """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
+    user_media — свои фото и видео автора: идут к фактам первыми."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
         film = await find_film(fetch, query)
@@ -1283,9 +1330,17 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                 images.append(await _download(session, url))
             except Exception:  # noqa: BLE001
                 continue
+        # свои фото и видео автора — в первую очередь, к фактам, о которых они
+        own: dict[int, Image.Image] = {}
+        own_videos: dict[int, str] = {}
+        if user_media:
+            await _progress(14, "Разбираю ваши фото и видео")
+            own, own_videos = await _own_for_facts(user_media, facts, work, gemini_key)
         # факт про актёра/режиссёра — его фото (TMDB, запасной — Кинопоиск)
         portraits: dict[int, Image.Image] = {}
         for i, fact in enumerate(facts):
+            if i in own:
+                continue
             person = _mentioned_person(fact, film)
             if not person:
                 continue
@@ -1294,18 +1349,19 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                 portraits[i] = _portrait(await _download_first(session, urls_p))
             except Exception:  # noqa: BLE001
                 continue
-    if not images:
+    rest = [i for i in range(n) if i not in portraits and i not in own]
+    if not images and rest:
         raise RuntimeError(f"Не скачались картинки для «{t}»")
 
     ai.last_error = None
-    rest = [i for i in range(n) if i not in portraits]
     # факты без фото — сначала момент из трейлера, который Gemini счёл подходящим
-    videos: dict[int, str] = {}
+    videos: dict[int, str] = dict(own_videos)
     video_note = ""
     if trailer_clips and rest:
         await _progress(18, "Ищу моменты в трейлере")
         if ai.available(gemini_key):
-            videos, video_note = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
+            found, video_note = await _fact_clips(film, [(i, facts[i]) for i in rest], work, gemini_key)
+            videos.update(found)
         else:
             video_note = "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY — без ИИ моменты не подобрать"
     # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
@@ -1313,8 +1369,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     await _progress(32, "ИИ подбирает кадры")
     choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
     used: set[int] = set()
-    picked: dict[int, Image.Image] = dict(portraits)
-    for k, i in enumerate(stills + list(videos)):  # у фактов с видео кадр — запасной
+    picked: dict[int, Image.Image] = {**portraits, **own}
+    for k, i in enumerate(stills + [v for v in videos if v not in own]):  # у фактов с видео кадр — запасной
         c = choices[k] if choices and k < len(stills) else -1
         if c < 0 or c in used:
             c = next((j for j in range(len(images)) if j not in used), k % len(images))
