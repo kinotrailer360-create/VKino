@@ -7743,7 +7743,7 @@ async def facts_media(message: Message, state: FSMContext) -> None:
 @router.message(FactsState.edit, F.text, ~F.text.startswith("/"))
 async def facts_edit(message: Message, state: FSMContext) -> None:
     facts = [re.sub(r"^\s*\d+[.)]\s*", "", ln).strip() for ln in _typed(message).splitlines()]
-    facts = [f for f in facts if len(f) >= 10][:7]
+    facts = [f for f in facts if len(f) >= 10][:8]
     if len(facts) < 3:
         await message.answer("Нужно хотя бы 3 факта — каждый с новой строки.")
         return
@@ -7791,7 +7791,7 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     elif action == "edit" and data.get("fx_facts"):
         await state.set_state(FactsState.edit)
         await message.answer("✏️ Скопируй факты, поправь и пришли одним сообщением — каждый с новой строки "
-                             "(3–7 фактов).\n\n<i>Передумал — /cancel</i>")
+                             "(3–8 фактов).\n\n<i>Передумал — /cancel</i>")
     elif action == "go" and data.get("fx_facts"):
         if shorts_lock.locked():
             await message.answer("⏳ Сейчас собирается другой ролик — нажми «Собрать» ещё раз через пару минут.")
