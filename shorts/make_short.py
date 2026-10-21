@@ -437,16 +437,22 @@ class WordCaptions:
 
 # ---------------------------------------------------------------- render
 
+# голос: без гула снизу, меньше «бубнения» на 250 Гц, разборчивость на 3 кГц, ровная громкость
+VOICE_CHAIN = ("highpass=f=90,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3200:t=q:w=1.2:g=4,"
+               "acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=2,loudnorm=I=-16:TP=-2:LRA=7")
+
+
 def mix_audio(voice: Path, music: Path, total: float, out: Path, music_db: float,
               sfx: list[tuple[float, Path, float]] | None = None):
-    """Голос + музыка (приглушается под голос) + звуковые эффекты (время, файл, громкость дБ)."""
+    """Голос (с обработкой для разборчивости) + музыка (заметно тише голоса и приглушается под него)
+    + звуковые эффекты (время, файл, громкость дБ)."""
     fade = max(total - 2.0, 0)
     sfx = [(t, f, db) for t, f, db in sfx or [] if 0 <= t < total and f.exists()]
     inputs = ["-i", str(voice), "-i", str(music)]
     filt = (
         f"[1:a]volume={music_db}dB,atrim=0:{total},afade=t=in:d=0.5,afade=t=out:st={fade}:d=2[m];"
-        f"[0:a]apad=whole_dur={total},asplit=2[v][sc];"
-        f"[m][sc]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=400[md];"
+        f"[0:a]aresample=48000,{VOICE_CHAIN},apad=whole_dur={total},asplit=2[v][sc];"
+        f"[m][sc]sidechaincompress=threshold=0.02:ratio=10:attack=15:release=350[md];"
     )
     for k, (t, f, db) in enumerate(sfx):
         inputs += ["-i", str(f)]
@@ -503,7 +509,8 @@ def render(cfg: dict, base: Path) -> Path:
     wm = logo.resize((wm_w, round(logo.height * wm_w / logo.width)), Image.LANCZOS)
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * cfg.get("watermark_opacity", 0.85))))
     wm_pos = (W - wm_w - 36, 40)
-    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 1250)) if cfg.get("words") else None
+    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 1650)) if cfg.get("words") else None
+    word_y = captions.y if captions else 0
 
     out.parent.mkdir(parents=True, exist_ok=True)
     audio = out.with_suffix(".m4a")
@@ -540,6 +547,8 @@ def render(cfg: dict, base: Path) -> Path:
         if i < len(makers) - 1:
             img.paste(wm, wm_pos, wm)
             if captions:  # на концовке с кнопками подписки слова не нужны
+                # на обложке внизу текст обложки — слово выше; на карточках — в полосе под картинкой
+                captions.y = 1120 if i == 0 else word_y
                 captions.draw(img, t)
         try:
             enc.stdin.write(img.tobytes())

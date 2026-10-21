@@ -1170,7 +1170,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         "logo": str(ASSETS / "logo.png"),
         "voice": voice.name,
         "music": str(music or ASSETS / "music.mp3"),
-        "music_db": -14 if voiced else -6,
+        "music_db": -16 if voiced else -6,
         "tail": 1.2,
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
         "tag": tag,
