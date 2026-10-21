@@ -198,6 +198,7 @@ class FactsState(StatesGroup):
     title = State()
     text = State()
     edit = State()
+    media = State()
 
 
 class CustomState(StatesGroup):
@@ -7637,8 +7638,10 @@ async def show_facts(message: Message, state: FSMContext) -> None:
     facts = data["fx_facts"]
     rows = [f"💡 <b>{len(facts)} фактов о «{escape(data['fx_title'])}»</b> — проверь, всё ли правда:", ""]
     rows += [f"{i}. {escape(f)}" for i, f in enumerate(facts, 1)]
+    media = data.get("fx_media") or []
     await message.answer("\n".join(rows)[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "fx:go")], [_btn("✏️ Поправить факты", "fx:edit")],
+        [_btn(f"📎 Свои фото/видео ({len(media)})" if media else "📎 Добавить свои фото/видео", "fx:media")],
         [_btn("🔄 Выбрать заново", "fx:redo")], [_btn("❌ Отмена", "fx:cancel")]]))
 
 
@@ -7658,7 +7661,8 @@ async def facts_condense(message: Message, state: FSMContext) -> None:
     await show_facts(message, state)
 
 
-async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], status: Message) -> None:
+async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], status: Message,
+                         media: list[dict[str, str]] | None = None) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -7667,11 +7671,20 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
         try:
             music = await custom_music(bot, work)
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "факты: свой текст"}))
+            files: list[Path] = []
+            for k, item in enumerate(media or []):
+                path = work / f"user{k}{item['ext']}"
+                try:
+                    await bot.download(item["file_id"], destination=path)
+                    files.append(path)
+                except Exception:
+                    logging.exception("Facts: user file download failed")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(shorts_daily.make_facts_short(
                 kp._get, work, title, set(), music, TMDB_API_KEY, GEMINI_API_KEY,
-                trailer_clips=await shorts_setting("clips") != "off", custom_facts=facts), timeout=SHORTS_TIMEOUT)
+                trailer_clips=await shorts_setting("clips") != "off", custom_facts=facts, user_media=files),
+                timeout=SHORTS_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
@@ -7699,10 +7712,38 @@ async def facts_text(message: Message, state: FSMContext) -> None:
     await facts_condense(message, state)
 
 
+@router.message(FactsState.media, F.photo | F.video | F.animation | F.document)
+async def facts_media(message: Message, state: FSMContext) -> None:
+    if message.photo:
+        file, ext = message.photo[-1], ".jpg"
+    elif message.video or message.animation:
+        file, ext = message.video or message.animation, ".mp4"
+    else:
+        doc = message.document
+        mime = str(doc.mime_type or "")
+        if not mime.startswith(("image/", "video/")):
+            await message.answer("Это не фото и не видео — пропускаю.")
+            return
+        file = doc
+        ext = Path(doc.file_name or "").suffix.lower() or (".jpg" if mime.startswith("image/") else ".mp4")
+    if (file.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать. Пришли сжатую версию.")
+        return
+    async with review_media_lock:
+        media = (await state.get_data()).get("fx_media") or []
+        if len(media) >= 10:
+            await message.answer("Хватит: уже 10 файлов. Нажми «✅ Готово».")
+            return
+        media.append({"file_id": file.file_id, "ext": ext})
+        await state.update_data(fx_media=media)
+    await message.answer(f"📎 Принято: {len(media)}", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[_btn("✅ Готово", "fx:media_done")]]))
+
+
 @router.message(FactsState.edit, F.text, ~F.text.startswith("/"))
 async def facts_edit(message: Message, state: FSMContext) -> None:
     facts = [re.sub(r"^\s*\d+[.)]\s*", "", ln).strip() for ln in _typed(message).splitlines()]
-    facts = [f for f in facts if len(f) >= 10][:7]
+    facts = [f for f in facts if len(f) >= 10][:8]
     if len(facts) < 3:
         await message.answer("Нужно хотя бы 3 факта — каждый с новой строки.")
         return
@@ -7734,10 +7775,23 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action == "redo":
         await facts_condense(message, state)
+    elif action == "media":
+        await state.set_state(FactsState.media)
+        await message.answer(
+            "📎 Присылай свои фото и видео — по одному или альбомом (до 10). ИИ поставит каждый файл к "
+            "факту, о котором он; из видео возьму 5 секунд. Файлы до 20 МБ.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("✅ Готово", "fx:media_done")], [_btn("🗑 Убрать все мои файлы", "fx:media_clear")]]))
+    elif action in ("media_done", "media_clear"):
+        if action == "media_clear":
+            await state.update_data(fx_media=[])
+        await state.set_state(None)
+        if data.get("fx_facts"):
+            await show_facts(message, state)
     elif action == "edit" and data.get("fx_facts"):
         await state.set_state(FactsState.edit)
         await message.answer("✏️ Скопируй факты, поправь и пришли одним сообщением — каждый с новой строки "
-                             "(3–7 фактов).\n\n<i>Передумал — /cancel</i>")
+                             "(3–8 фактов).\n\n<i>Передумал — /cancel</i>")
     elif action == "go" and data.get("fx_facts"):
         if shorts_lock.locked():
             await message.answer("⏳ Сейчас собирается другой ролик — нажми «Собрать» ещё раз через пару минут.")
@@ -7747,7 +7801,8 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
         async def job() -> None:
             try:
-                await run_text_facts(message.bot, message.chat.id, data["fx_title"], data["fx_facts"], status)
+                await run_text_facts(message.bot, message.chat.id, data["fx_title"], data["fx_facts"], status,
+                                     data.get("fx_media") or [])
             except Exception as exc:
                 logging.exception("Text facts short failed")
                 try:
