@@ -62,13 +62,20 @@ def prebuilt():
          f"drawtext=fontfile={FONT}:text='РАЗБОР':fontsize=32:fontcolor=black:x=38:y=68,"
          f"drawtext=fontfile={FONTI}:text='УДАР РАНЬШЕ ПОДКАТА':fontsize=40:fontcolor={GOLD}:borderw=4:bordercolor=black:x=(w-tw)/2:y=800:enable='gte(t\\,2.4)',format=yuv420p",
          '-frames:v',str(n),'-r','30','-c:v','libx264','-crf','16','-preset','medium',f'{W}/tseg.mp4'])
-    # ВЛЁТ: вплотную, slow-mo 0.35x, кольцо на мяче мимо вратаря к ближней штанге, зум к воротам
-    keys=[(1.85,329,374),(1.90,372,357),(1.95,452,331),(2.00,486,320),(2.10,592,320),(2.20,675,337)]
-    ring_seg(f'{W}/dseg.mp4',1,1.82,0.35,keys,fr(23)-fr(20),Z(1.0,560,360,0.003))
-    # ГОЛ на дроп: из-за ворот мяч уже в сетке — кольцо на мяче, зум, шейк/флеш
-    keys=[(4.02,214,625),(4.10,200,616),(4.20,204,622),(4.30,208,612),(4.36,258,612),(4.45,259,617)]
-    ring_seg(f'{W}/eseg.mp4',2,4.02,0.5,keys,fr(25)-fr(23),Z(1.45,200,610,0.004),
-             f",{shake(20)},{SCORE},{txt('ГОООЛ',150,250,FONTI,':enable=lt(t\\,0.75)')},fade=in:st=0:d=0.3:color=white")
+    # СЛЕЖЕНИЕ ЗА МЯЧОМ (branding/balltrack.py): атака, ведение, удар, влёт; маркер пропадает при касании сетки (src1 ≈2.22)
+    BT=['python3',f'{R}/balltrack.py']
+    run(BT+[SRCS[2],f'{W}/bt_a.mp4',f'{W}/ptsA.json','--ss','0.2','--frames',str(fr(6)-fr(0)),'--zoom','1.4','--post',GRADE])
+    nb=fr(10)-fr(6); run(BT+[SRCS[1],f'{W}/bt_b.mp4',f'{W}/ptsB.json','--ss',f'{FREEZE_T-nb/FPS*0.95:.3f}','--speed','0.95','--frames',str(nb),
+        '--zoom','1.35','--post',f'{GRADE},{PLATE}'])
+    run(BT+[SRCS[1],f'{W}/bt_b2.mp4',f'{W}/ptsB.json','--ss',str(FREEZE_T),'--speed','0.45','--frames',str(fr(20)-fr(18)),
+        '--zoom','1.4','--pre',MI,'--post',GRADE,'--smooth','3'])
+    run(BT+[SRCS[1],f'{W}/bt_d.mp4',f'{W}/ptsB.json','--ss','1.82','--speed','0.35','--frames',str(fr(23)-fr(20)),
+        '--zoom','1.45','--pre',MI,'--post',GRADE,'--smooth','4','--marker-end','2.22'])
+    # ГОЛ на дроп: из-за ворот мяч уже в сетке — маркер уже исчез (касание сетки), зум на мяч; шейк/флеш/ГОООЛ только тут
+    run(['ffmpeg','-v','error','-y','-ss','4.02','-t','0.8','-i',SRCS[2],'-vf',
+         f"setpts=(PTS-STARTPTS)/0.5,fps=30,{MI},{Z(1.6,205,615,0.004)},{GRADE},{shake(20)},{SCORE},"
+         f"{txt('ГОООЛ',150,250,FONTI,':enable=lt(t\\,0.75)')},fade=in:st=0:d=0.3:color=white,format=yuv420p",
+         '-an','-frames:v',str(fr(25)-fr(23)),'-r','30','-c:v','libx264','-crf','16','-preset','medium',f'{W}/eseg.mp4'])
     # КИНО-повтор (без тумана): из-за ворот, мяч в сетке
     run(['ffmpeg','-v','error','-y','-ss','3.7','-t','1.0','-i',SRCS[2],'-an','-c:v','libx264','-crf','14',f'{W}/cine_in.mp4'])
     d=(fr(38)-fr(34))/FPS
@@ -85,17 +92,17 @@ def prebuilt():
 
 # --- таймлайн ---------------------------------------------------------------
 # A: атака «Барсы» (из-за ворот, высоко)
-seg(0,6,0.2,f"{Z(1.1,360,450,0.001)}",src=2)
+seg(0,6,0,f"FILE:{W}/bt_a.mp4")   # атака: камера за мячом
 # B: Эспарт ведёт мяч к штрафной (вплотную) — заканчивается на кадре разбора
-seg(6,10,FREEZE_T-(fr(10)-fr(6))/FPS*0.95,f"{PLATE}",speed=0.95,src=1)
+seg(6,10,0,f"FILE:{W}/bt_b.mp4")   # ведение: камера за мячом + плашка
 # T: РАЗБОР
 seg(10,18,0,f"FILE:{W}/tseg.mp4")
 # B2: удар под подкатом — слоу-мо
-seg(18,20,FREEZE_T,f"{Z(1.1,200,420,0.004)},{MI}",speed=0.45,src=1)
+seg(18,20,0,f"FILE:{W}/bt_b2.mp4")   # удар: камера за мячом, slow-mo
 # D: ВЛЁТ — кольцо на мяче (prebuilt)
-seg(20,23,0,f"FILE:{W}/dseg.mp4")
+seg(20,23,0,f"FILE:{W}/bt_d.mp4")   # влёт: камера за мячом, slow-mo, маркер до сетки
 # E: ГОЛ на дроп — мяч в сетке из-за ворот; шейк/флеш только здесь, после сетки
-seg(23,25,0,f"FILE:{W}/eseg.mp4")   # мяч в сетке + кольцо; шейк/флеш/ГОООЛ только тут, после сетки
+seg(23,25,0,f"FILE:{W}/eseg.mp4")   # мяч в сетке; шейк/флеш/ГОООЛ только тут, после сетки
 # R: повторы — широкий, второй влёт из-за ворот, удар вплотную
 seg(25,28,1.9,f"{Z(1.35,560,400,0.002)},{MI},{WF},{SCORE}",speed=0.583,src=0)
 seg(28,31,3.6,f"{Z(1.25,220,560,0.003)},{MI},{WF},{SCORE}",speed=0.583,src=2)
