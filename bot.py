@@ -194,6 +194,12 @@ class ReviewState(StatesGroup):
     media = State()
 
 
+class FactsState(StatesGroup):
+    title = State()
+    text = State()
+    edit = State()
+
+
 class CustomState(StatesGroup):
     text = State()
     video = State()
@@ -7025,7 +7031,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
-        [_btn("✍️ Факты: ввести название", "sh:ask:facts")],
+        [_btn("✍️ Факты: ввести название", "sh:ask:facts"), _btn("📝 Факты: свой текст", "fx:start")],
         [_btn("⚙️ Настройки ▸", "sh:settings")],
         [_btn("⬅️ В админку", "admin:home")],
     ])
@@ -7622,6 +7628,137 @@ async def review_own_text(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(None)
     await show_script(message, state, script, can_redo=editing and bool(old.get("title")))
+
+
+# ---------------------------------------------------------------- факты из своего текста
+
+async def show_facts(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    facts = data["fx_facts"]
+    rows = [f"💡 <b>{len(facts)} фактов о «{escape(data['fx_title'])}»</b> — проверь, всё ли правда:", ""]
+    rows += [f"{i}. {escape(f)}" for i, f in enumerate(facts, 1)]
+    await message.answer("\n".join(rows)[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Собрать шортс", "fx:go")], [_btn("✏️ Поправить факты", "fx:edit")],
+        [_btn("🔄 Выбрать заново", "fx:redo")], [_btn("❌ Отмена", "fx:cancel")]]))
+
+
+async def facts_condense(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    wait = await message.answer("✍️ ИИ выбирает факты из текста…")
+    try:
+        facts = await shorts_ai.condense_facts(GEMINI_API_KEY, data["fx_title"], data["fx_text"])
+    except Exception as exc:
+        logging.exception("Facts condense failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("🔄 Ещё раз", "fx:redo")], [_btn("❌ Отмена", "fx:cancel")]]))
+        return
+    await wait.delete()
+    await state.update_data(fx_facts=facts)
+    await show_facts(message, state)
+
+
+async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], status: Message) -> None:
+    async with shorts_lock:
+        await load_pronunciations()
+        await load_voice()
+        work = SHORTS_DIR / datetime.now(MSK).strftime("facts_%Y%m%d_%H%M%S")
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            music = await custom_music(bot, work)
+            await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "факты: свой текст"}))
+            progress = progress_updater(status)
+            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            result = await asyncio.wait_for(shorts_daily.make_facts_short(
+                kp._get, work, title, set(), music, TMDB_API_KEY, GEMINI_API_KEY,
+                trailer_clips=await shorts_setting("clips") != "off", custom_facts=facts), timeout=SHORTS_TIMEOUT)
+            shorts_daily.add_english_seo(result)
+            await progress(100, "Готово — отправляю ролик")
+            await send_short(bot, chat_id, result)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"сборка шла дольше {SHORTS_TIMEOUT // 60} минут — "
+                               f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
+        finally:
+            shorts_daily.on_progress = None
+            await set_shorts_setting("running", None)
+            shutil.rmtree(work, ignore_errors=True)
+
+
+@router.message(FactsState.title, F.text, ~F.text.startswith("/"))
+async def facts_title(message: Message, state: FSMContext) -> None:
+    await state.update_data(fx_title=_typed(message))
+    await state.set_state(FactsState.text)
+    await message.answer("📝 Теперь вставь текст с фактами одним сообщением (ссылки на источники можно не убирать). "
+                         "ИИ выберет 5 самых интересных и ничего не добавит от себя.\n\n<i>Передумал — /cancel</i>")
+
+
+@router.message(FactsState.text, F.text, ~F.text.startswith("/"))
+async def facts_text(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    await state.update_data(fx_text=_typed(message))
+    await facts_condense(message, state)
+
+
+@router.message(FactsState.edit, F.text, ~F.text.startswith("/"))
+async def facts_edit(message: Message, state: FSMContext) -> None:
+    facts = [re.sub(r"^\s*\d+[.)]\s*", "", ln).strip() for ln in _typed(message).splitlines()]
+    facts = [f for f in facts if len(f) >= 10][:7]
+    if len(facts) < 3:
+        await message.answer("Нужно хотя бы 3 факта — каждый с новой строки.")
+        return
+    await state.set_state(None)
+    await state.update_data(fx_facts=facts)
+    await show_facts(message, state)
+
+
+@router.callback_query(F.data.startswith("fx:"))
+async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message, action = callback.message, (callback.data or "")[3:]
+    if action == "start":
+        await state.clear()
+        await state.set_state(FactsState.title)
+        await message.answer("📝 <b>Факты из своего текста</b>\n\nНапиши название фильма или сериала "
+                             "(можно с годом: <code>Человек-паук: Новый день 2026</code>).\n\n<i>Передумал — /cancel</i>")
+        return
+    if action == "cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    data = await state.get_data()
+    if not data.get("fx_text"):
+        await message.answer("Начни заново: кнопка «📝 Факты: свой текст».")
+        return
+    if action == "redo":
+        await facts_condense(message, state)
+    elif action == "edit" and data.get("fx_facts"):
+        await state.set_state(FactsState.edit)
+        await message.answer("✏️ Скопируй факты, поправь и пришли одним сообщением — каждый с новой строки "
+                             "(3–7 фактов).\n\n<i>Передумал — /cancel</i>")
+    elif action == "go" and data.get("fx_facts"):
+        if shorts_lock.locked():
+            await message.answer("⏳ Сейчас собирается другой ролик — нажми «Собрать» ещё раз через пару минут.")
+            return
+        await state.clear()
+        status = await message.answer(progress_bar(0, "Начинаю, обычно это 3–6 минут"))
+
+        async def job() -> None:
+            try:
+                await run_text_facts(message.bot, message.chat.id, data["fx_title"], data["fx_facts"], status)
+            except Exception as exc:
+                logging.exception("Text facts short failed")
+                try:
+                    await status.edit_text("❌ Сборка остановилась — причина ниже")
+                except TelegramBadRequest:
+                    pass
+                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+
+        task = asyncio.create_task(job())
+        shorts_jobs.add(task)
+        task.add_done_callback(shorts_jobs.discard)
 
 
 # ---------------------------------------------------------------- своя подборка и «по образцу»

@@ -1245,12 +1245,20 @@ def _portrait(img: Image.Image, w: int = 1080, h: int = FACT_CARD_H) -> Image.Im
 
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
                            music: Path | None = None, tmdb_key: str = "",
-                           gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
+                           gemini_key: str = "", trailer_clips: bool = True,
+                           custom_facts: list[str] | None = None) -> ShortResult:
+    """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем."""
     await _progress(5, "Ищу фильм и факты")
-    film, facts = await pick_fact_film(fetch, query, exclude or set())
+    if custom_facts:
+        film = await find_film(fetch, query)
+        if not film:
+            raise RuntimeError(f"Кинопоиск не нашёл «{query}»")
+        facts = list(custom_facts)
+    else:
+        film, facts = await pick_fact_film(fetch, query, exclude or set())
     await _progress(10, f"«{_title(film)}»: качаю кадры")
-    # награды из Викиданных — первым фактом
-    award_fact = wiki.awards_fact(_title(film), await wiki.awards(film))
+    # награды из Викиданных — первым фактом (в фактах автора — только его текст)
+    award_fact = None if custom_facts else wiki.awards_fact(_title(film), await wiki.awards(film))
     if award_fact:
         facts = [award_fact] + facts[: FACTS - 1]
     t, n, kind = _title(film), len(facts), _kind(film)
@@ -1265,7 +1273,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     pool_size = 12 if ai.available(gemini_key) else n
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        cover_src = await _download(session, _poster_url(film))
+        # у свежих фильмов на Кинопоиске может не быть постера — тогда кадр TMDB
+        cover_src = await _download_first(session, [_poster_url(film)] + backdrops[:2])
         images: list[Image.Image] = []
         for url in urls:
             if len(images) >= pool_size:

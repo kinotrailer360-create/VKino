@@ -636,3 +636,22 @@ async def extract_list(key: str, video: bytes, frames: list[Image.Image], audio:
         except Exception as exc:  # noqa: BLE001
             errors.append(f"резерв: {exc}")
     raise AIError("; ".join(errors) or "нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
+
+
+async def condense_facts(key: str, title: str, text: str, n: int = 5) -> list[str]:
+    """Факты для шортса из текста автора: n коротких фактов (до 170 символов), без выдумок и ссылок."""
+    if not available(key):
+        raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY — ИИ не может обработать текст")
+    prompt = (
+        f"Ниже текст автора о фильме «{title}». Выбери {n} самых интересных фактов и перескажи каждый "
+        "одной-двумя короткими фразами для озвучки в шортсе: 60–170 символов, живо, по-русски. "
+        "Используй ТОЛЬКО то, что есть в тексте, ничего не добавляй и не уточняй от себя. "
+        "Убери ссылки и названия сайтов-источников. Названия фильмов — в «ёлочках». "
+        "Ответь JSON: {\"facts\": [\"...\", ...]}.\n\nТЕКСТ:\n" + text.strip()[:8000]
+    )
+    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    facts = [re.sub(r"\s+", " ", str(f)).strip() for f in (data.get("facts") if isinstance(data, dict) else None) or []]
+    facts = [f for f in facts if len(f) >= 20][:n]
+    if len(facts) < 3:
+        raise AIError("ИИ не нашёл в тексте хотя бы 3 факта — пришли текст подлиннее")
+    return facts
