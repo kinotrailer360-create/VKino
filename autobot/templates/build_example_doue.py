@@ -51,6 +51,20 @@ def prebuilt():
          f"drawtext=fontfile={FONT}:text='РАЗБОР':fontsize=32:fontcolor=black:x=38:y=68,"
          f"drawtext=fontfile={FONTI}:text='1 ПРОТИВ 3 — И УДАР':fontsize=40:fontcolor={GOLD}:borderw=4:bordercolor=black:x=(w-tw)/2:y=800:enable='gte(t\\,2.6)',format=yuv420p",
          '-frames:v',str(n),'-r','30','-c:v','libx264','-crf','16','-preset','medium',f'{W}/tseg.mp4'])
+    # ВЛЁТ: у ворот, slow-mo 0.4x, плавный зум к ближней штанге, кольцо на мяче до пересечения линии
+    n=fr(23)-fr(20); sp=0.4; ss=5.5
+    keys=[(5.55,240,480),(5.65,165,510),(5.75,125,563),(5.85,120,625),(5.95,92,660)]   # мяч в кадре 720x960 src1
+    kt=[((t-ss)/sp,x,y) for t,x,y in keys]
+    def pw(i):   # кусочно-линейная интерполяция координаты i по времени выхода
+        e=str(kt[-1][i])
+        for (t0,*a),(t1,*b) in reversed(list(zip(kt,kt[1:]))):
+            e=f"if(lt(t,{t1:.3f}),{a[i-1]}+({b[i-1]}-{a[i-1]})*(t-{t0:.3f})/{t1-t0:.3f},{e})"
+        return e
+    run(['ffmpeg','-v','error','-y','-ss',str(ss),'-t',str(n/FPS*sp+0.3),'-i',SRCS[1],'-loop','1','-i',f'{W}/ring.png','-filter_complex',
+         f"[0:v]setpts=(PTS-STARTPTS)/{sp},fps=30,{MI}[v];[1]format=rgba,fade=out:st={kt[-1][0]+0.05:.3f}:d=0.15:alpha=1[r];"
+         f"[v][r]overlay=x='{pw(1)}-40':y='{pw(2)}-40':enable='between(t,{kt[0][0]:.3f},{kt[-1][0]+0.2:.3f})',"
+         f"{Z(1.0,200,600,0.004)},{GRADE},format=yuv420p",
+         '-an','-frames:v',str(n),'-r','30','-c:v','libx264','-crf','16','-preset','medium',f'{W}/dseg.mp4'])
     # КИНО-повтор: удар и мяч в воротах (src0, крупно)
     run(['ffmpeg','-v','error','-y','-ss','18.2','-t','1.2','-i',SRCS[0],'-an','-c:v','libx264','-crf','14',f'{W}/cine_in.mp4'])
     d=(fr(38)-fr(34))/FPS
@@ -75,13 +89,13 @@ seg(10,18,0,f"FILE:{W}/tseg.mp4")
 # B2: обыгрыш вплотную — слоу-мо
 seg(18,20,4.6,f"{Z(1.1,360,480,0.004)},{MI}",speed=0.5,src=1)
 # D: удар — слоу-мо (крупно)
-seg(20,23,18.2,f"{ZA},{Z(1.1,300,450,0.004)},{MI},{WF}",speed=0.39,src=0)
+seg(20,23,0,f"FILE:{W}/dseg.mp4")   # влёт: слоу-мо у ворот + кольцо на мяче (prebuilt)
 # E: ГОЛ на дроп — мяч в сетке (у ворот)
-seg(23,25,6.2,f"{shake(26)},{SCORE},"
+seg(23,25,6.3,f"{Z(1.35,340,580,0.004)},{shake(20)},{SCORE},"
     f"{txt('ГОООЛ',150,330,FONTI,':enable=lt(t\\,0.75)')},fade=in:st=0:d=0.3:color=white",speed=0.6,src=1)
 # R: повторы с трибун
 seg(25,28,18.3,f"{ZA},{Z(1.05,300,400,0.002)},{MI},{WF},{SCORE}",speed=0.583,src=0)
-seg(28,31,5.2,f"{Z(1.1,360,480,0.003)},{MI},{WF},{SCORE}",speed=0.583,src=1)
+seg(28,31,6.25,f"{Z(1.5,340,580,0.003)},{MI},{WF},{SCORE}",speed=0.583,src=1)   # мяч в сетке крупно
 seg(31,34,4.25,f"{Z(1.15,360,400,0.003)},{MI},{WF},{SCORE}",speed=0.583,src=2)
 # КИНО-повтор
 seg(34,38,0,f"FILE:{W}/cine.mp4")
