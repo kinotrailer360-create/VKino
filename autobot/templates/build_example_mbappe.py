@@ -72,14 +72,13 @@ def prebuilt():
     run(BTW+[SRCS[1],f'{W}/r1b.mp4',f'{W}/pts_r1.json','--ss',f'{(fr(38)-fr(25))/FPS:.3f}','--speed','0.45','--frames',str(fr(43)-fr(38)),'--zoom','1.35','--pre',MI,'--post',f'{GRADE},{SCORE},{WF}'])
     run(BTW+[SRCS[2],f'{W}/r2a.mp4',f'{W}/pts_r2.json','--ss','0.0','--frames',str(fr(54)-fr(43)),'--zoom','1.25','--post',f'{GRADE},{SCORE},{WF}'])
     run(BTW+[SRCS[2],f'{W}/r2b.mp4',f'{W}/pts_r2.json','--ss',f'{(fr(54)-fr(43))/FPS:.3f}','--speed','0.45','--frames',str(fr(59)-fr(54)),'--zoom','1.35','--pre',MI,'--post',f'{GRADE},{SCORE},{WF}'])
-    # КИНО-повтор (без тумана): комбинация + удар + влёт с ракурса 1, камера за мячом с маркером
+    # ПОВТОР ракурс 1 (кино-режим НЕ используем): вся комбинация + удар + влёт, камера за мячом с маркером
     nc=fr(69)-fr(59)
-    run(['python3',f'{R}/balltrack.py','--color','FEBE10',SRCS[0],f'{W}/cine_in.mp4',f'{W}/ptsA.json','--ss','0.9','--speed','0.55','--frames',str(nc),
-         '--zoom','1.3','--pre',MI,'--marker-end','3.0'])
-    run(['bash',f'{R}/cinematic.sh',f'{W}/cine_in.mp4',f'{W}/cine.mp4',"null",f'{nc/FPS:.3f}'])
+    run(['python3',f'{R}/balltrack.py','--color','FEBE10',SRCS[0],f'{W}/r0.mp4',f'{W}/ptsA.json','--ss','0.0','--speed','0.72','--frames',str(nc),
+         '--zoom','1.3','--pre',MI,'--marker-end','3.0','--post',f'{GRADE},{SCORE},{WF}'])
     run(['ffmpeg','-v','error','-y','-ss','9.2','-t','1.4','-i',SRCS[3],'-an','-c:v','libx264','-crf','14',f'{W}/card_in.mp4'])
     d=(fr(82)-fr(77))/FPS
-    run(['bash',f'{R}/cinematic.sh',f'{W}/card_in.mp4',f'{W}/card_raw.mp4',f"setpts=PTS/0.6,fps=30,{Z(1.2,360,420,0.002)}",str(d)])
+    run(['ffmpeg','-v','error','-y','-i',f'{W}/card_in.mp4','-vf',f"setpts=PTS/0.6,fps=30,{Z(1.2,360,420,0.002)},{GRADE},format=yuv420p",'-t',str(d),'-an','-c:v','libx264','-crf','14',f'{W}/card_raw.mp4'])   # без кино-режима
     run(['ffmpeg','-v','error','-y','-i',f'{W}/card_raw.mp4','-vf',
          f"drawbox=x=0:y=660:w=iw:h=170:color=black@0.45:t=fill,"
          f"{txt('КИЛИАН МБАППЕ',70,682,FONTI,':alpha=min(1\\,t/0.4)')},"
@@ -97,7 +96,7 @@ seg(25,38,0,f"FILE:{W}/r1a.mp4")    # ракурс 2: дальняя трибу�
 seg(38,43,0,f"FILE:{W}/r1b.mp4")    #           удар и влёт — slow-mo
 seg(43,54,0,f"FILE:{W}/r2a.mp4")    # ракурс 3: трибуна сбоку — комбинация целиком
 seg(54,59,0,f"FILE:{W}/r2b.mp4")    #           удар и влёт — slow-mo
-seg(59,69,0,f"FILE:{W}/cine.mp4")   # КИНО-повтор (без тумана): комбинация + гол, ракурс 1
+seg(59,69,0,f"FILE:{W}/r0.mp4")     # повтор ракурс 1: комбинация + гол с маркером (без кино-режима)
 for b0,ss,z,src in ((69,7.6,1.15,3),(71,8.6,1.15,3),(73,9.6,1.1,3),(75,9.0,1.1,1)):
     seg(b0,b0+2,ss,f"{shake(14)},zoompan=z='{z}+0.003*on':d=1:x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':s=720x960:fps=30,{WF},{SCORE}",src=src)
 seg(77,82,0,f"FILE:{W}/card.mp4")
