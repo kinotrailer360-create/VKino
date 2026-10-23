@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from datetime import date
 from typing import Any
 
 import aiohttp
@@ -668,6 +669,9 @@ async def condense_facts(key: str, title: str, text: str, n: int = 5) -> list[st
     return facts
 
 
+NOMINATIVE = {"фильме": "Фильм", "сериале": "Сериал", "мультфильме": "Мультфильм"}
+
+
 def _clean_facts(data: Any, n: int) -> list[str]:
     facts = [re.sub(r"\s+", " ", re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(f))).strip()
              for f in (data.get("facts") if isinstance(data, dict) else None) or []]
@@ -675,30 +679,50 @@ def _clean_facts(data: Any, n: int) -> list[str]:
 
 
 async def web_facts(key: str, title: str, en: str = "", year: int | None = None, kind: str = "фильме",
-                    known: list[str] | None = None, article: str = "", n: int = 5) -> tuple[list[str], list[str]]:
-    """Интересные факты о фильме из интернета: Gemini ищет в Google; не вышло — ИИ выбирает из Википедии
-    и фактов Кинопоиска. Возвращает (факты, источники)."""
+                    known: list[str] | None = None, article: str = "", n: int = 5,
+                    posts: str = "", rumors: bool = False) -> tuple[list[str], list[str]]:
+    """Интересные факты о фильме из интернета: Gemini ищет в Google; не вышло — ИИ выбирает из Википедии,
+    постов Telegram-каналов и фактов Кинопоиска. Возвращает (факты, источники).
+    rumors=True — фильм или сериал ещё не вышел: свежие новости и слухи о нём (слух помечен как слух)."""
     if not available(key):
         raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
     name = f"«{title}»" + (f" ({en}, {year})" if en and year else f" ({year})" if year else "")
-    rules = (
-        f"Нужно {n} самых интересных и малоизвестных фактов для шортса «{n} фактов о {kind} {name}»: "
-        "съёмки, кастинг, кто отказался от роли, трюки, бюджет и рекорды, пасхалки, вырезанные сцены, "
-        "реквизит, курьёзы на площадке. Без спойлеров сюжета и концовки. Только проверенное — никаких "
-        "слухов и догадок, не выдумывай цифры. Каждый факт — одна-две короткие фразы для озвучки, "
-        "60–170 символов, живо, по-русски, без ссылок и названий сайтов. Названия фильмов — в «ёлочках». "
-        "Самый сильный факт — первым."
-    )
+    style = ("Каждый пункт — одна-две короткие фразы для озвучки, 60–170 символов, живо, по-русски, без ссылок "
+             "и названий сайтов. Названия фильмов — в «ёлочках». Самое сильное — первым.")
+    if rumors:
+        rules = (
+            f"Сегодня {date.today():%d.%m.%Y}. {NOMINATIVE.get(kind, 'Фильм')} {name} ещё не вышел. Нужно {n} самых "
+            f"интересных новостей и слухов о нём для шортса «Что известно о {kind} «{title}»»: дата выхода, "
+            "кто кого сыграет, что известно о сюжете, съёмки, бюджет, трейлер и тизеры, отличия от книг или "
+            "оригинала, утечки со съёмок. Свежее важнее старого. Не путай с прошлыми фильмами и сериалами "
+            "с похожим названием. Подтверждённое подавай как факт, а слух — обязательно со словами "
+            "«по слухам», «инсайдеры говорят» или «пока не подтверждено»; не выдумывай. " + style
+        )
+    else:
+        rules = (
+            f"Нужно {n} самых интересных и малоизвестных фактов для шортса «{n} фактов о {kind} {name}»: "
+            "съёмки, кастинг, кто отказался от роли, трюки, бюджет и рекорды, пасхалки, вырезанные сцены, "
+            "реквизит, курьёзы на площадке. Без спойлеров сюжета и концовки. Только проверенное — никаких "
+            "слухов и догадок, не выдумывай цифры. " + style
+        )
     extra = ""
     if known:
         extra += "\n\nФакты с Кинопоиска (можно взять лучшие, но ищи и новые):\n" + "\n".join(f"- {f}" for f in known[:15])
     if article:
         extra += "\n\nСправка из Википедии:\n" + article[:12000]
+    if posts and rumors:
+        extra += ("\n\nПосты из Telegram-каналов о кино (новости и слухи; шутки и мнения пропускай, "
+                  "перескажи своими словами):\n" + posts[:12000])
+    elif posts:
+        extra += ("\n\nПосты из Telegram-каналов о кино (бери только то, что похоже на проверенный факт, "
+                  "а не слухи, шутки и мнения; перескажи своими словами):\n" + posts[:9000])
     tail = '\n\nОтветь только JSON: {"facts": ["...", ...]}'
     errors = []
     if key:
         try:
-            data = await _ask(key, [{"text": "Поищи в интернете. " + rules + extra + tail}], search=True)
+            look = ("Поищи в интернете, в том числе в открытых Telegram-каналах о кино (отдельным запросом "
+                    f"site:t.me «{title}»" + (f" и site:t.me {en}" if en else "") + "). ")
+            data = await _ask(key, [{"text": look + rules + extra + tail}], search=True)
             facts = _clean_facts(data, n)
             if len(facts) >= 3:
                 return facts, data.get("_sources") or []
@@ -713,5 +737,5 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
     facts = _clean_facts(data, n)
     if len(facts) < 3:
         raise AIError("ИИ не нашёл хотя бы 3 факта" + (f" ({'; '.join(errors)})" if errors else ""))
-    sources = ["Википедия"] if article else []
+    sources = (["Википедия"] if article else []) + (["Telegram-каналы"] if posts else [])
     return facts, sources + (["Кинопоиск"] if known else [])
