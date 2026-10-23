@@ -6901,12 +6901,20 @@ async def clips_command(
 
 
 async def ai_status_action(message: Message) -> None:
-    """Какие ИИ подключены; BeatAPI — проверка ключа, баланс и бесплатные модели (без платных запросов)."""
+    """Какие ИИ подключены; Gemini (и с поиском Google) и Groq — пробный запрос, BeatAPI — ключ, баланс
+    и бесплатные модели (без платных запросов)."""
     rows = [
         "🤖 <b>ИИ бота</b> (порядок: основной → запасные)",
         f"1. Gemini: {'ключ есть ✅' if GEMINI_API_KEY else 'нет GEMINI_API_KEY ❌'} ({escape(shorts_ai.MODEL)})",
         f"2. Groq: {'ключ есть ✅' if shorts_ai.RESERVE_KEY else 'нет RESERVE_AI_KEY ❌'} ({escape(shorts_ai.RESERVE_MODEL)})",
     ]
+    wait = await message.answer("⏳ Отправляю ИИ пробные запросы — до минуты…")
+    try:
+        for name, ok, info in await shorts_ai.probe(GEMINI_API_KEY):
+            rows.append(f"   {'✅' if ok else '❌'} {escape(name)}: {escape(info)}")
+    except Exception as exc:
+        rows.append(f"   ❌ проверка не удалась: {escape(str(exc)[:200])}")
+    await wait.delete()
     if not shorts_ai.BEAT_KEY:
         rows.append("3. BeatAPI: нет переменной BEAT_API_KEY ❌")
     else:
