@@ -29,6 +29,8 @@ def call(method, params=None, files=None, timeout=60):
     if not res.get('ok'): raise RuntimeError(res)
     return res['result']
 
+LINK_RE = re.compile(r'https?://(?:www\.)?(?:instagram\.com/(?:reels?|p)/[A-Za-z0-9_-]+|(?:[a-z]+\.)?tiktok\.com/@[^/\s]+/video/\d+|(?:vm|vt)\.tiktok\.com/[A-Za-z0-9]+)')
+
 def load_state():
     return json.load(open(STATE)) if os.path.exists(STATE) else {'offset': 0, 'chats': []}
 
@@ -53,18 +55,25 @@ def pull(out_root):
                 urllib.request.urlretrieve(FILE + f['file_path'], dst); item['file'] = dst
             except Exception as e:
                 item['error'] = f'не скачалось (лимит Bot API 20 МБ?): {e}'
-        elif re.search(r'instagram\.com/(?:reels?|p)/[A-Za-z0-9_-]+', item['caption']):
-            # ссылка на Instagram Reel → скачать через ig_dl.py (публичные рилсы, без входа)
-            import ig_dl, io, contextlib
-            for url in re.findall(r'https?://(?:www\.)?instagram\.com/(?:reels?|p)/[A-Za-z0-9_-]+', item['caption']):
+        elif LINK_RE.search(item['caption']):
+            # ссылки Instagram Reels / TikTok → скачать (ig_dl.py / tt_dl.py), все ссылки в сообщении
+            import io, contextlib, ig_dl, tt_dl
+            errs = []
+            for url in LINK_RE.findall(item['caption']):
+                mod = tt_dl if 'tiktok.com' in url else ig_dl
                 try:
                     buf = io.StringIO()
-                    with contextlib.redirect_stdout(buf): ig_dl.dl(url, out)
-                    line = buf.getvalue().strip(); path, _, cap = line.partition(' | ')
+                    with contextlib.redirect_stdout(buf): mod.dl(url, out)
+                    path, _, cap = buf.getvalue().strip().partition(' | ')
                     dst = os.path.join(out, f"{u['update_id']}_{os.path.basename(path)}"); os.replace(path, dst)
-                    item.setdefault('files', []).append(dst); item['file'] = dst; item['ig_caption'] = cap
+                    item.setdefault('files', []).append(dst); item['file'] = dst
+                    item.setdefault('link_captions', []).append(cap)
                 except BaseException as e:
-                    item['error'] = f'instagram не скачался: {e}'
+                    errs.append(f'{url}: {e}')
+            if errs:
+                item['error'] = '; '.join(errs)
+                try: call('sendMessage', {'chat_id': chat, 'text': '⚠️ Не скачалось по ссылке:\n' + '\n'.join(errs)[:3500]})
+                except Exception: pass
         man.append(item)
     json.dump(man, open(man_path, 'w'), ensure_ascii=False, indent=1)
     json.dump(st, open(STATE, 'w'))

@@ -18,7 +18,7 @@
 - Работать в ветке репозитория, коммитить результат; токен никогда не коммитить. `autobot/state.json` коммитить (offset).
 
 ## 1. Забрать видео
-`python3 autobot/tg.py pull inbox` → `inbox/<дата>/manifest.json` (файлы, подписи, chat_id). Ссылки на Instagram Reels в тексте скачиваются автоматически (`autobot/ig_dl.py`, нужен доступ к *.cdninstagram.com).
+`python3 autobot/tg.py pull inbox` → `inbox/<дата>/manifest.json` (файлы, подписи, chat_id). Можно присылать **ссылки TikTok/Instagram**: все ссылки в сообщении (instagram.com/reel|reels|p, tiktok.com/@…/video/…, vm./vt.tiktok.com) скачиваются автоматически (`autobot/ig_dl.py`, `autobot/tt_dl.py`); ошибки — коротко в бот.
 Нет новых видео → отправить короткое «Новых видео нет» и перейти к шагу 5 (подборка голов).
 
 ## 2. Разобрать
