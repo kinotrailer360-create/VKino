@@ -99,6 +99,17 @@ BUSY = {429, 500, 503}  # перегрузка у Google — обычно про
 RETRY_DELAYS = (4, 10)
 
 
+def _quota_value(data: Any) -> str:
+    """Размер лимита из ответа Google («20 в день»), если он там есть."""
+    details = (data.get("error") or {}).get("details") or [] if isinstance(data, dict) else []
+    for d in details:
+        for v in (d.get("violations") or []) if isinstance(d, dict) else []:
+            if isinstance(v, dict) and v.get("quotaValue") is not None:
+                per = "день" if "PerDay" in str(v.get("quotaId")) else "минуту"
+                return f"{v['quotaValue']} в {per}"
+    return ""
+
+
 def _quota(status: int, data: Any) -> tuple[str, float]:
     """Какой лимит Gemini кончился: ("day", 0) — на сегодня, ("minute", сек) — в минуту, подождать
     столько, сколько просит Google; ("", 0) — это не лимит. Google пишет это в error.details."""
@@ -225,7 +236,9 @@ async def _ask_key(key: str, parts: list[dict[str, Any]], search: bool, wait_min
             kind, _ = _quota(status, data)
             if kind:  # лимит этого ключа: на день — пауза 30 мин, в минуту — 1 мин; пробуем другой ключ
                 _quota_until[(key, search)] = time.monotonic() + (QUOTA_PAUSE if kind == "day" else 60)
-                raise QuotaError(f"лимит {'на день' if kind == 'day' else 'в минуту'} ({model})")
+                value = _quota_value(data)
+                raise QuotaError(f"лимит {'на день' if kind == 'day' else 'в минуту'} ({model}"
+                                 + (f", разрешено {value}" if value else "") + ")")
             raise AIError(f"Gemini HTTP {status} ({model}): {str(msg)[:200]}")
     try:
         if not search:
@@ -391,13 +404,14 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
             out.append((name, False, text[:300]))
 
     ask = 'Ответь только JSON: {"ok": true}'
-    if key:
-        await run("Gemini", _ask(key, [{"text": ask}]), lambda r: f"отвечает (ключ {last_key_no})")
-        await run("Gemini + поиск Google",
-                  _ask(key, [{"text": "Найди в Google, какой фильм получил «Оскар» за лучший фильм в 2025 году. "
-                                      'Ответь только JSON: {"film": "название по-русски"}'}], search=True),
-                  lambda r: f"нашёл «{r.get('film', '?')}», источников: {len(r.get('_sources') or [])} "
-                            f"(ключ {last_key_no})")
+    find = [{"text": "Найди в Google, какой фильм получил «Оскар» за лучший фильм в 2025 году. "
+                     'Ответь только JSON: {"film": "название по-русски"}'}]
+    # каждый ключ отдельно и напрямую (без паузы после лимита) — видно, какой ключ что умеет
+    for n, k in enumerate(gemini_keys(key), 1):
+        await run(f"Gemini ключ {n}", _ask_key(k, [{"text": ask}], False, wait_minute=False),
+                  lambda r: "отвечает")
+        await run(f"Gemini ключ {n} + поиск Google", _ask_key(k, find, True, wait_minute=False),
+                  lambda r: f"нашёл «{r.get('film', '?')}», источников: {len(r.get('_sources') or [])}")
     if RESERVE_KEY:
         await run("Groq", _ask_reserve(ask), lambda r: "отвечает")
     return out
