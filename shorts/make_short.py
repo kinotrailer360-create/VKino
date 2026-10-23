@@ -509,7 +509,8 @@ def render(cfg: dict, base: Path) -> Path:
     wm = logo.resize((wm_w, round(logo.height * wm_w / logo.width)), Image.LANCZOS)
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * cfg.get("watermark_opacity", 0.85))))
     wm_pos = (W - wm_w - 36, 40)
-    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 1650)) if cfg.get("words") else None
+    # середина картинки на карточке: ниже — название, актёры, даты, а низ экрана закрывают подписи YouTube/TikTok
+    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 880)) if cfg.get("words") else None
     word_y = captions.y if captions else 0
 
     out.parent.mkdir(parents=True, exist_ok=True)
