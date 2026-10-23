@@ -99,9 +99,34 @@ BUSY = {429, 500, 503}  # перегрузка у Google — обычно про
 RETRY_DELAYS = (4, 10)
 
 
+def _quota(status: int, data: Any) -> tuple[str, float]:
+    """Какой лимит Gemini кончился: ("day", 0) — на сегодня, ("minute", сек) — в минуту, подождать
+    столько, сколько просит Google; ("", 0) — это не лимит. Google пишет это в error.details."""
+    if status != 429:
+        return "", 0.0
+    details = (data.get("error") or {}).get("details") or [] if isinstance(data, dict) else []
+    ids = " ".join(str(v.get("quotaId") or "") for d in details if isinstance(d, dict)
+                   for v in d.get("violations") or [] if isinstance(v, dict))
+    delay = next((d.get("retryDelay") for d in details if isinstance(d, dict) and d.get("retryDelay")), "")
+    m = re.match(r"([\d.]+)s", str(delay))
+    wait = float(m.group(1)) if m else 0.0
+    if "PerDay" in ids:
+        return "day", 0.0
+    if "PerMinute" in ids or wait:
+        return "minute", min(max(wait, 5.0), 60.0)
+    text = json.dumps(data, ensure_ascii=False).lower()
+    return ("day", 0.0) if "quota" in text else ("", 0.0)
+
+
 def _quota_out(status: int, data: Any) -> bool:
-    """429 «You exceeded your current quota» — дневной лимит кончился, повторять бесполезно."""
-    return status == 429 and "quota" in json.dumps(data, ensure_ascii=False).lower()
+    """Дневной лимит кончился — повторять бесполезно до завтра."""
+    return _quota(status, data)[0] == "day"
+
+
+# у бесплатного Gemini ещё и лимит запросов в минуту: на ролик их 5–7 подряд — разносим во времени
+GEMINI_GAP = 4.0
+_gemini_lock = asyncio.Lock()
+_gemini_last = 0.0
 
 
 # Gemini исчерпал лимит — до этого времени (time.monotonic) не обращаемся, сразу идём к запасным ИИ;
@@ -111,11 +136,26 @@ _quota_until = {False: 0.0, True: 0.0}
 
 
 async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any]) -> tuple[int, Any]:
-    """Запрос к модели; при перегрузке ждём и повторяем."""
+    """Запрос к модели; при перегрузке ждём и повторяем; кончился лимит в минуту — ждём, сколько просит Google."""
+    global _gemini_last
+    minute_waits = 2
     for delay in (*RETRY_DELAYS, None):
+        async with _gemini_lock:  # не чаще раза в GEMINI_GAP секунд
+            pause = _gemini_last + GEMINI_GAP - time.monotonic()
+            if pause > 0:
+                await asyncio.sleep(pause)
+            _gemini_last = time.monotonic()
         async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
             status, data = resp.status, await resp.json(content_type=None)
-        if status not in BUSY or delay is None or _quota_out(status, data):
+        kind, wait = _quota(status, data)
+        while kind == "minute" and minute_waits:
+            minute_waits -= 1
+            log.info("shorts: Gemini per-minute limit, waiting %.0fs", wait)
+            await asyncio.sleep(wait)
+            async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
+                status, data = resp.status, await resp.json(content_type=None)
+            kind, wait = _quota(status, data)
+        if status not in BUSY or delay is None or kind:
             return status, data
         log.info("shorts: Gemini %s busy (HTTP %s), retry in %ss", model, status, delay)
         await asyncio.sleep(delay)
@@ -147,7 +187,7 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
                 log.warning("shorts: Gemini model %s unavailable, switching to %s", MODEL, newer)
                 MODEL = model = newer
                 status, data = await _post(session, key, model, body)
-        if status in BUSY and not _quota_out(status, data):
+        if status in BUSY and not _quota(status, data)[0]:
             # модель перегружена — разово пробуем другую Flash (в т.ч. облегчённую)
             backup = next((m for m in await _flash_models(session, key, lite=True) if m != model), None)
             if backup:
