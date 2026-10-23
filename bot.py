@@ -46,6 +46,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from shorts import ai as shorts_ai
+from shorts import tgsearch as shorts_tgsearch
 from shorts import news as shorts_news
 from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
@@ -184,6 +185,7 @@ class ShortsState(StatesGroup):
     feed_url = State()
     music_file = State()
     clone_audio = State()
+    fact_channels = State()
 
 
 class ReviewState(StatesGroup):
@@ -6347,6 +6349,35 @@ async def load_voice() -> None:
     shorts_lumean.use_voice(await shorts_setting("lumean_service"), await shorts_setting("lumean_voice"))
 
 
+async def fact_channels() -> list[str]:
+    raw = await shorts_setting("fact_channels")
+    try:
+        channels = json.loads(raw) if raw else None
+    except ValueError:
+        channels = None
+    return channels if isinstance(channels, list) and channels else list(shorts_tgsearch.DEFAULT_CHANNELS)
+
+
+async def load_fact_channels() -> None:
+    """Telegram-каналы, где ИИ ищет факты о фильмах (кнопка «📡 Каналы для фактов»)."""
+    shorts_daily.fact_channels = await fact_channels()
+
+
+async def channels_action(message: Message) -> None:
+    channels = await fact_channels()
+    await message.answer(f"⏳ Проверяю {len(channels)} каналов…")
+    lines = ["📡 <b>Каналы для фактов</b> — ИИ ищет в них посты о фильме:"]
+    for i, (ch, res) in enumerate(await shorts_tgsearch.check(channels), 1):
+        mark = "✅" if isinstance(res, int) and res else f"❌ {escape(str(res or 'постов не видно'))}"
+        lines.append(f"{i}. {mark} t.me/{escape(ch)}")
+    lines.append("\nЧитаются только открытые каналы (с @именем).")
+    await message.answer("\n".join(lines), disable_web_page_preview=True,
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [_btn("✏️ Изменить список", "sh:ask:tgch")],
+                             [_btn("↩️ Стандартный список", "sh:tgch_default")],
+                             [_btn("⬅️ Настройки", "sh:settings")]]))
+
+
 async def news_feeds() -> list[str]:
     raw = await shorts_setting("news_feeds")
     try:
@@ -6424,6 +6455,7 @@ async def run_short(
         exclude = {int(r["movie_id"]) for r in rows}
         await load_pronunciations()
         await load_voice()
+        await load_fact_channels()
         now = datetime.now(MSK)
         work = SHORTS_DIR / now.strftime("%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
@@ -6701,6 +6733,7 @@ async def voice_action(message: Message, text: str) -> None:
     try:
         await load_pronunciations()
         await load_voice()
+        await load_fact_channels()
         spoken = (await shorts_daily.spoken_lines([text[:500]]))[0]
         path.parent.mkdir(parents=True, exist_ok=True)
         await shorts_say_to_file(spoken, path)
@@ -7054,6 +7087,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
         [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
+        [_btn("📡 Каналы для фактов", "sh:tgch")],
         [_btn("🎬 Проверить трейлер", "sh:ask:trailer"), _btn("🤖 Проверить ИИ", "sh:ai")],
         [_btn("⬅️ Назад", "sh:menu")],
     ])
@@ -7174,6 +7208,9 @@ SHORTS_ASKS = {
     "feed": (ShortsState.feed_url, "📡 Пришли ссылку на RSS-ленту новостей кино."),
     "clone": (ShortsState.clone_audio,
               "🎤 Запишите и пришлите сюда голосовое сообщение на 30–60 секунд — сделаю из него ваш голос."),
+    "tgch": (ShortsState.fact_channels,
+             "📡 Пришли список каналов одним сообщением — каждый с новой строки, ссылкой или @именем "
+             "(например <code>https://t.me/KinoMir360</code>). Этот список заменит текущий."),
     "music": (ShortsState.music_file, "🎵 Пришли аудиофайл (mp3) — он станет фоновой музыкой. Только музыка без АП!"),
 }
 
@@ -7234,6 +7271,12 @@ async def shorts_panel(
         await say_action(message, "")
     elif data == "sh:feeds":
         await feeds_action(message, "")
+    elif data == "sh:tgch":
+        await channels_action(message)
+    elif data == "sh:tgch_default":
+        await set_shorts_setting("fact_channels", None)
+        await load_fact_channels()
+        await message.answer(f"✅ Вернул стандартный список: {len(shorts_tgsearch.DEFAULT_CHANNELS)} каналов.")
     elif data == "sh:ai":
         await ai_status_action(message)
     elif data == "sh:clone":
@@ -7301,6 +7344,22 @@ async def shorts_feed_url(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await feeds_action(message, f"add {_typed(message)}")
+
+
+@router.message(ShortsState.fact_channels, F.text, ~F.text.startswith("/"))
+async def shorts_fact_channels(message: Message, state: FSMContext) -> None:
+    raw = [ln for ln in re.split(r"[\s,]+", _typed(message)) if ln]
+    channels = list(dict.fromkeys(c for c in (shorts_tgsearch.channel_name(r) for r in raw) if c))
+    bad = [r for r in raw if not shorts_tgsearch.channel_name(r)]
+    if not channels:
+        await message.answer("Не вижу каналов — нужны ссылки вида https://t.me/имя или @имя.")
+        return
+    await state.clear()
+    await set_shorts_setting("fact_channels", json.dumps(channels[:30]))
+    await load_fact_channels()
+    note = f"\n⚠️ Не понял: {escape(', '.join(bad[:10]))}" if bad else ""
+    await message.answer(f"✅ Сохранил {len(channels[:30])} каналов.{note}")
+    await channels_action(message)
 
 
 @router.message(ShortsState.music_file, F.audio | F.document | F.voice)
@@ -7454,6 +7513,7 @@ async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Mes
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
+        await load_fact_channels()
         work = SHORTS_DIR / datetime.now(MSK).strftime("review_%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -7682,7 +7742,8 @@ async def facts_condense(message: Message, state: FSMContext) -> None:
 async def facts_web(message: Message, state: FSMContext) -> None:
     """Факты из интернета: ИИ ищет в Google и Википедии (плюс факты Кинопоиска), автор проверяет и правит."""
     data = await state.get_data()
-    wait = await message.answer("🔎 ИИ ищет факты в интернете — до минуты…")
+    await load_fact_channels()
+    wait = await message.answer("🔎 ИИ ищет факты в интернете и Telegram-каналах — до минуты…")
     try:
         film = await shorts_daily.find_film(kp._get, data["fx_title"])
         if not film:
@@ -7705,6 +7766,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
+        await load_fact_channels()
         work = SHORTS_DIR / datetime.now(MSK).strftime("facts_%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -7910,6 +7972,7 @@ async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
+        await load_fact_channels()
         work = SHORTS_DIR / datetime.now(MSK).strftime("custom_%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -8096,6 +8159,7 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
+        await load_fact_channels()
         work = SHORTS_DIR / datetime.now(MSK).strftime("lore_%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
         try:

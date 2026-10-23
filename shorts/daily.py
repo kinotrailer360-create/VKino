@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, lumean, news, pronounce, tmdb, wiki
+from . import ai, clips, lumean, news, pronounce, tgsearch, tmdb, wiki
 from .cards import card_overlay, make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -415,12 +415,19 @@ async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int],
     raise RuntimeError(f"Не нашёл фильм с {need}+ подходящими фактами" + (f" по запросу «{query}»" if query else ""))
 
 
+fact_channels: list[str] = list(tgsearch.DEFAULT_CHANNELS)  # бот подставляет список из настроек
+
+
 async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
                     n: int = FACTS) -> tuple[list[str], list[str]]:
-    """Факты из интернета (поиск Google через Gemini, Википедия) вместе с фактами Кинопоиска."""
+    """Факты из интернета (поиск Google через Gemini, Википедия, Telegram-каналы) и с Кинопоиска."""
     en = str(film.get("alternativeName") or film.get("enName") or "")
-    article = await wiki.film_article(_title(film), en, film.get("year"))
-    return await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts, article, n)
+    article, posts = await asyncio.gather(wiki.film_article(_title(film), en, film.get("year")),
+                                          tgsearch.search(fact_channels, [_title(film), en]))
+    facts, sources = await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts,
+                                        article, n, tgsearch.as_text(posts))
+    channels = list(dict.fromkeys(f"t.me/{p['channel']}" for p in posts))
+    return facts, [s for s in sources if s != "Telegram-каналы"] + channels
 
 
 async def gather_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str) -> tuple[list[str], str]:

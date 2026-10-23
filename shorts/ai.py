@@ -675,9 +675,10 @@ def _clean_facts(data: Any, n: int) -> list[str]:
 
 
 async def web_facts(key: str, title: str, en: str = "", year: int | None = None, kind: str = "фильме",
-                    known: list[str] | None = None, article: str = "", n: int = 5) -> tuple[list[str], list[str]]:
-    """Интересные факты о фильме из интернета: Gemini ищет в Google; не вышло — ИИ выбирает из Википедии
-    и фактов Кинопоиска. Возвращает (факты, источники)."""
+                    known: list[str] | None = None, article: str = "", n: int = 5,
+                    posts: str = "") -> tuple[list[str], list[str]]:
+    """Интересные факты о фильме из интернета: Gemini ищет в Google; не вышло — ИИ выбирает из Википедии,
+    постов Telegram-каналов и фактов Кинопоиска. Возвращает (факты, источники)."""
     if not available(key):
         raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
     name = f"«{title}»" + (f" ({en}, {year})" if en and year else f" ({year})" if year else "")
@@ -694,6 +695,9 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
         extra += "\n\nФакты с Кинопоиска (можно взять лучшие, но ищи и новые):\n" + "\n".join(f"- {f}" for f in known[:15])
     if article:
         extra += "\n\nСправка из Википедии:\n" + article[:12000]
+    if posts:
+        extra += ("\n\nПосты из Telegram-каналов о кино (бери только то, что похоже на проверенный факт, "
+                  "а не слухи, шутки и мнения; перескажи своими словами):\n" + posts[:9000])
     tail = '\n\nОтветь только JSON: {"facts": ["...", ...]}'
     errors = []
     if key:
@@ -713,5 +717,5 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
     facts = _clean_facts(data, n)
     if len(facts) < 3:
         raise AIError("ИИ не нашёл хотя бы 3 факта" + (f" ({'; '.join(errors)})" if errors else ""))
-    sources = ["Википедия"] if article else []
+    sources = (["Википедия"] if article else []) + (["Telegram-каналы"] if posts else [])
     return facts, sources + (["Кинопоиск"] if known else [])
