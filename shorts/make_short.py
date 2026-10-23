@@ -412,24 +412,63 @@ class WordCaptions:
         self.cache: dict[tuple[int, int], Image.Image] = {}
 
     def _group(self) -> list[list[int]]:
-        """Слова по фразам: не больше MAX_WORDS и двух строк; конец предложения или пауза — новая фраза."""
+        """Слова по фразам: не больше MAX_WORDS и двух строк; конец предложения или пауза — новая фраза.
+        Название в «ёлочках» и имя из нескольких слов («Гарри Поттер», «Ханс Циммер») не разрываем,
+        а одно слово в конце предложения («долларов.») не оставляем отдельной фразой."""
         probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        words = self.words
+
+        def fits(idx: list[int]) -> bool:
+            text = " ".join(self._clean(words[j]["w"]) for j in idx)
+            return len(wrap(probe, text, self.font, self.width - 100)) <= 2
+
+        def cap(word: str) -> bool:
+            word = self._clean(word)
+            return word[:1].isupper()
+
+        def ends(word: str) -> bool:
+            return bool(re.search(r"[.!?…]\W*$", word))
+
+        # cont[k] — слово k продолжает предыдущее: внутри «…» или имя из нескольких слов с заглавной
+        cont = [False] * len(words)
+        quoted = False
+        for k, w in enumerate(words):
+            if k:
+                prev = words[k - 1]["w"]
+                # «Ханс Циммер» — одно имя, а «Маклафлину, Аластеру» — уже два (запятая разделяет)
+                cont[k] = (quoted and "«" not in w["w"]) or (cap(prev) and cap(w["w"])
+                                                              and not re.search(r"[,;:.!?…—]\W*$", prev))
+            if "«" in w["w"]:
+                quoted = True
+            if "»" in w["w"] or ends(w["w"]):
+                quoted = False
+
         groups: list[list[int]] = []
         cur: list[int] = []
-        for k, w in enumerate(self.words):
+        for k, w in enumerate(words):
             if cur:
-                text = " ".join(self._clean(self.words[j]["w"]) for j in cur + [k])
-                pause = w["s"] - self.words[cur[-1]]["e"] > 0.45
-                if pause or len(cur) >= self.MAX_WORDS or len(wrap(probe, text, self.font, self.width - 100)) > 2:
+                pause = w["s"] - words[cur[-1]]["e"] > 0.45
+                if pause or len(cur) >= self.MAX_WORDS or not fits(cur + [k]):
+                    start = k
+                    if not pause:  # разрыв пришёлся внутрь имени или названия — переносим его целиком
+                        while cont[start] and len(cur) > 2 and cur[-1] == start - 1:
+                            start = cur.pop()
                     groups.append(cur)
-                    cur = []
+                    cur = list(range(start, k))
             cur.append(k)
-            if re.search(r"[.!?…]\W*$", w["w"]):  # конец предложения — фраза закончилась
+            if ends(w["w"]):  # конец предложения — фраза закончилась
                 groups.append(cur)
                 cur = []
         if cur:
             groups.append(cur)
-        return groups
+        # одно слово в конце предложения («долларов.») — забираем к нему слово из предыдущей фразы
+        out: list[list[int]] = []
+        for g in groups:
+            if out and len(g) == 1 and len(out[-1]) >= 3 and out[-1][-1] == g[0] - 1 \
+                    and not ends(words[out[-1][-1]]["w"]) and words[g[0]]["s"] - words[g[0] - 1]["e"] <= 0.45:
+                g = [out[-1].pop()] + g
+            out.append(g)
+        return out
 
     @staticmethod
     def _clean(word: str) -> str:
