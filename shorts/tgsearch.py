@@ -25,8 +25,10 @@ URL = "https://t.me/s/{channel}"
 DEFAULT_CHANNELS = [
     "KinoMir360", "harrypotter_hbo", "kino_filmach", "MarvelGeeksOffical2028", "QewbsNews", "littler0ckone",
     "Cronenberg1664", "Qewbite", "PokvmOfficial", "pluggedin", "FRESHTrailersNEWS", "otherworlds_tg",
-    "themovieblogteam",
+    "themovieblogteam", "trailerparkcinema", "POKDC", "scarylandteam", "rhsnews", "cherevatstreams",
+    "DetectiveComics_Stuff", "marvelgolik", "games_sportsru", "cutterpool",
 ]
+MAX_CHANNELS = 40
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0)", "Accept-Language": "ru,en;q=0.8"}
 POSTS_PER_CHANNEL = 4
 POST_MAX = 700
@@ -36,6 +38,14 @@ def channel_name(raw: str) -> str | None:
     """@name, t.me/name, https://t.me/s/name/123 → name; иначе None."""
     m = re.fullmatch(r"\s*(?:https?://)?(?:t\.me/(?:s/)?|@)?([A-Za-z][A-Za-z0-9_]{3,31})(?:/\d+)?/?\s*", raw)
     return m.group(1) if m and m.group(1).lower() not in ("joinchat", "addlist", "s") else None
+
+
+def split_channels(text: str) -> tuple[list[str], list[str]]:
+    """Каналы из сообщения автора: ссылки через пробел, с новой строки или слитно
+    («https://t.me/ahttps://t.me/b»). Возвращает (каналы без повторов, непонятые куски)."""
+    pieces = [x for x in re.split(r"[\s,;]+|(?=https?://)|(?<=\w)(?=@)", text) if x.strip()]
+    good = [c for c in (channel_name(x) for x in pieces) if c]
+    return list(dict.fromkeys(good)), [x for x in pieces if not channel_name(x)]
 
 
 class _Posts(HTMLParser):

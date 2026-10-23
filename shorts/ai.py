@@ -175,16 +175,32 @@ def _sheet(images: list[Image.Image]) -> Image.Image:
 
 def _json_from(text: str) -> Any:
     """JSON из ответа модели: без рассуждений <think> и обёрток ```json."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    text = str(text or "")
+    if "</think>" in text:  # рассуждения модели — до ответа
+        text = text.rsplit("</think>", 1)[1]
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
-        raise AIError("резервный ИИ: в ответе нет JSON")
-    return json.loads(text[start:end + 1])
+        raise AIError(f"в ответе нет JSON: «{text.strip()[:80]}»")
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:  # лишняя запятая в конце списка — частая ошибка моделей
+        return json.loads(re.sub(r",\s*([\]}])", r"\1", text[start:end + 1]))
+
+
+# у бесплатного Groq лимит ~7000 токенов в минуту (≈ 4 символа на токен по-русски): длинный материал
+# (статья Википедии, посты каналов) сокращаем — начало с заданием и конец с форматом ответа остаются
+RESERVE_MAX_CHARS = 16000
+
+
+def _fit(prompt: str, limit: int = RESERVE_MAX_CHARS) -> str:
+    if len(prompt) <= limit:
+        return prompt
+    return prompt[: limit - 2500] + "\n…\n" + prompt[-2500:]
 
 
 async def _ask_reserve(prompt: str, image: Image.Image | None = None) -> Any:
     """Запрос к резервному OpenAI-совместимому ИИ (по умолчанию Groq)."""
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content: list[dict[str, Any]] = [{"type": "text", "text": _fit(prompt)}]
     if image is not None:
         small = image.copy()
         small.thumbnail((1920, 1920))
@@ -286,7 +302,7 @@ async def _pick_beat_model() -> str:
 async def _ask_beat(prompt: str, image: Image.Image | None = None) -> Any:
     """Запрос к BeatAPI (/v1/chat/completions). Бесплатные модели — 1 запрос в минуту до пополнения."""
     model = BEAT_MODEL or await _pick_beat_model()
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content: list[dict[str, Any]] = [{"type": "text", "text": _fit(prompt, 30000)}]
     if image is not None:
         small = image.copy()
         small.thumbnail((1920, 1920))
