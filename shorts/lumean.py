@@ -198,6 +198,14 @@ async def _to_wav(audio: bytes) -> bytes:
         return dst.read_bytes()
 
 
+async def ready_clones(service: str = "fishaudio") -> list[dict[str, Any]]:
+    """Готовые клоны голоса в аккаунте Lumean, новые первыми (чтобы не записывать голос заново)."""
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _call(session, "GET", f"/voices/{service}/clones", params={"status": "ready", "per_page": 20})
+    return [c for c in (data or {}).get("items") or [] if c.get("voice_id")]
+
+
 async def clone_status(clone_id: str, service: str = "fishaudio") -> dict[str, Any]:
     """Найти свой клон по id: status (pending/cloning/ready/failed), voice_id, error."""
     timeout = aiohttp.ClientTimeout(total=30)

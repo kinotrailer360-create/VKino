@@ -7065,6 +7065,22 @@ async def current_voice_name() -> str:
     return await shorts_setting("lumean_voice_name") or "выбранный голос"
 
 
+async def find_saved_clone() -> str | None:
+    """Клон из настроек; нет (новая база после переезда) — уже готовый клон из аккаунта Lumean."""
+    clone = await shorts_setting("clone_voice")
+    if clone or not shorts_lumean.enabled():
+        return clone
+    try:
+        ready = await shorts_lumean.ready_clones()
+    except Exception:
+        logging.exception("Lumean clones lookup failed")
+        return None
+    if ready:
+        clone = str(ready[0]["voice_id"])
+        await set_shorts_setting("clone_voice", clone)
+    return clone
+
+
 async def shorts_clone_menu() -> tuple[str, InlineKeyboardMarkup]:
     text = (
         "🎙 <b>Голос озвучки роликов</b>\n\n"
@@ -7075,7 +7091,7 @@ async def shorts_clone_menu() -> tuple[str, InlineKeyboardMarkup]:
         "• <b>Стандартный голос</b> — вернуть голос по умолчанию."
     )
     rows = [[_btn("👨 Мужские голоса", "sh:vl:male"), _btn("👩 Женские голоса", "sh:vl:female")]]
-    if await shorts_setting("clone_voice"):
+    if await find_saved_clone():
         rows.append([_btn("👤 Мой голос (клон)", "sh:vmine")])
     rows += [
         [_btn("🎤 Записать свой голос", "sh:ask:clone")],
