@@ -6366,7 +6366,7 @@ async def load_fact_channels() -> None:
 async def channels_action(message: Message) -> None:
     channels = await fact_channels()
     await message.answer(f"⏳ Проверяю {len(channels)} каналов…")
-    lines = ["📡 <b>Каналы для фактов</b> — ИИ ищет в них посты о фильме:"]
+    lines = ["📡 <b>Каналы для фактов и новостей</b> — ИИ ищет в них посты о фильме и свежие новости:"]
     for i, (ch, res) in enumerate(await shorts_tgsearch.check(channels), 1):
         mark = "✅" if isinstance(res, int) and res else f"❌ {escape(str(res or 'постов не видно'))}"
         lines.append(f"{i}. {mark} t.me/{escape(ch)}")
@@ -7096,7 +7096,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
         [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
-        [_btn("📡 Каналы для фактов", "sh:tgch")],
+        [_btn("📡 Каналы для фактов и новостей", "sh:tgch")],
         [_btn("🎬 Проверить трейлер", "sh:ask:trailer"), _btn("🤖 Проверить ИИ", "sh:ai")],
         [_btn("⬅️ Назад", "sh:menu")],
     ])

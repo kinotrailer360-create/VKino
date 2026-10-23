@@ -574,6 +574,21 @@ def _placeholder() -> Image.Image:
     return img
 
 
+def _tg_news(posts: list[dict[str, Any]], exclude: set[int]) -> list[news.NewsItem]:
+    """Посты каналов как новости: первая фраза — заголовок, дальше — подробности."""
+    out = []
+    for p in posts[:20]:
+        first, _, rest = re.sub(r"\s+", " ", p["text"]).partition(". ")
+        title = first[:140].rstrip(" .") if len(first) <= 160 else first[:140].rsplit(" ", 1)[0] + "…"
+        item = news.NewsItem(title=title, lead=rest[:300], source=f"t.me/{p['channel']}", link=p["url"],
+                             published=p["time"], image=p.get("image"))
+        quoted = re.search(r"«([^»]{2,60})»", p["text"])
+        item.film_query = quoted.group(1) if quoted else None
+        if item.uid not in exclude:
+            out.append(item)
+    return out
+
+
 async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: set[int] | None = None,
                           music: Path | None = None, tmdb_key: str = "",
                           today: date | None = None, gemini_key: str = "") -> ShortResult:
@@ -583,9 +598,13 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     # ИИ-редактор: главные новости без местных событий и повторов, пересказ понятными словами
     ai.last_error = None
     retold: list[str] | None = None
+    if ai.available(gemini_key):
+        # свежие посты Telegram-каналов — ИИ сверяет их с новостями СМИ и берёт то, чего в лентах ещё нет
+        await _progress(7, "Читаю Telegram-каналы")
+        items = items[:25] + _tg_news(await tgsearch.latest(fact_channels, news.MAX_AGE_HOURS), exclude or set())
     if ai.available(gemini_key) and len(items) >= 3:
         await _progress(8, "ИИ выбирает главные новости")
-        candidates = items[:30]
+        candidates = items[:45]
         picked = await ai.pick_news(gemini_key, [(it.title, it.lead, it.source) for it in candidates], NEWS)
         if picked:
             items = [candidates[p["i"]] for p in picked]
@@ -859,7 +878,7 @@ async def spoken_lines(lines: list[str]) -> list[str]:
         except asyncio.TimeoutError:
             fixed = None
         for i, text in zip(todo, fixed or []):
-            texts[i] = text
+            texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
     return [_speakable(pronounce.plain_russian(text)) for text in texts]
 
 

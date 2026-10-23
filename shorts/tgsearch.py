@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any
@@ -36,41 +38,52 @@ def channel_name(raw: str) -> str | None:
 
 
 class _Posts(HTMLParser):
-    """Тексты постов из веб-версии канала: [(ссылка на пост, текст)]."""
+    """Посты из веб-версии канала: [{"url", "text", "time" (unix, 0 — нет), "image"}] в порядке страницы."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.posts: list[tuple[str, str]] = []
-        self.post = ""
+        self.all: list[dict[str, Any]] = []
         self.depth = 0  # >0 — внутри текста поста (считаем вложенные div)
         self.buf: list[str] = []
 
+    @property
+    def posts(self) -> list[dict[str, Any]]:
+        return [p for p in self.all if p["text"]]
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         a = dict(attrs)
-        if a.get("data-post"):
-            self.post = str(a["data-post"])
+        cls = a.get("class") or ""
+        if a.get("data-post") and "tgme_widget_message" in cls:
+            self.all.append({"url": f"https://t.me/{a['data-post']}", "text": "", "time": 0.0, "image": None})
+        cur = self.all[-1] if self.all else None
         if tag == "div":
             if self.depth:
                 self.depth += 1
-            elif "tgme_widget_message_text" in (a.get("class") or ""):
+            elif "tgme_widget_message_text" in cls and cur is not None:
                 self.depth, self.buf = 1, []
         elif tag == "br" and self.depth:
             self.buf.append("\n")
+        elif tag == "time" and cur is not None and a.get("datetime") and not cur["time"]:
+            try:
+                cur["time"] = datetime.fromisoformat(str(a["datetime"])).timestamp()
+            except ValueError:
+                pass
+        elif tag == "a" and "tgme_widget_message_photo_wrap" in cls and cur is not None and not cur["image"]:
+            m = re.search(r"background-image:url\(['\"]?([^'\")]+)", a.get("style") or "")
+            cur["image"] = m.group(1) if m else None
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "div" and self.depth:
             self.depth -= 1
-            if not self.depth:
-                text = re.sub(r"[ \t]+", " ", unescape("".join(self.buf))).strip()
-                if text:
-                    self.posts.append((f"https://t.me/{self.post}" if self.post else "", text))
+            if not self.depth and self.all:
+                self.all[-1]["text"] = re.sub(r"[ \t]+", " ", unescape("".join(self.buf))).strip()
 
     def handle_data(self, data: str) -> None:
         if self.depth:
             self.buf.append(data)
 
 
-async def _fetch(session: aiohttp.ClientSession, channel: str, query: str = "") -> list[tuple[str, str]]:
+async def _fetch(session: aiohttp.ClientSession, channel: str, query: str = "") -> list[dict[str, Any]]:
     async with session.get(URL.format(channel=channel), params={"q": query} if query else None) as resp:
         resp.raise_for_status()
         if "/s/" not in str(resp.url):  # закрытый канал или нет такого — t.me уводит на обычную страницу
@@ -78,6 +91,26 @@ async def _fetch(session: aiohttp.ClientSession, channel: str, query: str = "") 
         parser = _Posts()
         parser.feed(await resp.text())
     return parser.posts
+
+
+async def latest(channels: list[str], hours: float = 48, per_channel: int = 8) -> list[dict[str, Any]]:
+    """Свежие посты каналов (для новостей): [{"channel", "url", "text", "time", "image"}], новые первыми."""
+    since = time.time() - hours * 3600
+    sem = asyncio.Semaphore(4)
+
+    async def one(session: aiohttp.ClientSession, channel: str) -> list[dict[str, Any]]:
+        async with sem:
+            try:
+                posts = await _fetch(session, channel)
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: tg channel %s read failed: %s", channel, exc)
+                return []
+        fresh = [p for p in reversed(posts) if p["time"] >= since and len(p["text"]) >= 60]
+        return [{**p, "channel": channel, "text": p["text"][:POST_MAX]} for p in fresh[:per_channel]]
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
+        results = await asyncio.gather(*(one(session, c) for c in channels))
+    return sorted((p for chunk in results for p in chunk), key=lambda p: -p["time"])
 
 
 def _mentions(text: str, names: list[str]) -> bool:
@@ -102,7 +135,8 @@ async def search(channels: list[str], names: list[str], per_channel: int = POSTS
                 except Exception as exc:  # noqa: BLE001 — один канал не мешает остальным
                     log.info("shorts: tg channel %s search %r failed: %s", channel, name, exc)
                     return list(found.values())
-            for url, text in reversed(posts):  # свежие — первыми
+            for post in reversed(posts):  # свежие — первыми
+                url, text = post["url"], post["text"]
                 if len(text) >= 60 and _mentions(text, names) and url not in found:
                     found[url] = {"channel": channel, "url": url, "text": text[:POST_MAX]}
             if len(found) >= per_channel:
