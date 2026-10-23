@@ -720,7 +720,9 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
     errors = []
     if key:
         try:
-            data = await _ask(key, [{"text": "Поищи в интернете. " + rules + extra + tail}], search=True)
+            look = ("Поищи в интернете, в том числе в открытых Telegram-каналах о кино (отдельным запросом "
+                    f"site:t.me «{title}»" + (f" и site:t.me {en}" if en else "") + "). ")
+            data = await _ask(key, [{"text": look + rules + extra + tail}], search=True)
             facts = _clean_facts(data, n)
             if len(facts) >= 3:
                 return facts, data.get("_sources") or []
