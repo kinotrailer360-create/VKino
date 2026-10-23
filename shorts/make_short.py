@@ -400,19 +400,19 @@ class WordCaptions:
 
     def _render(self, text: str) -> Image.Image:
         probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-        for size in (104, 92, 80, 68, 58):
+        for size in (76, 68, 60, 52, 46):  # не крупно — картинку под словом видно
             f = font(self.cfg, "sans", size)
             if probe.textlength(text, font=f) <= self.width - 100:
                 break
-        box = probe.textbbox((0, 0), text, font=f, stroke_width=7)
+        box = probe.textbbox((0, 0), text, font=f, stroke_width=5)
         w, h = box[2] - box[0] + 30, box[3] - box[1] + 30
         layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         ImageDraw.Draw(shadow).text((15 - box[0] + 5, 15 - box[1] + 7), text, font=f, fill=(0, 0, 0, 170),
-                                    stroke_width=7, stroke_fill=(0, 0, 0, 170))
+                                    stroke_width=5, stroke_fill=(0, 0, 0, 170))
         layer.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(5)))
-        ImageDraw.Draw(layer).text((15 - box[0], 15 - box[1]), text, font=f, fill=(255, 255, 255),
-                                   stroke_width=7, stroke_fill=(0, 0, 0))
+        ImageDraw.Draw(layer).text((15 - box[0], 15 - box[1]), text, font=f, fill=(255, 184, 28),  # жёлто-оранжевый
+                                   stroke_width=5, stroke_fill=(0, 0, 0))
         return layer
 
     def draw(self, img: Image.Image, t: float) -> None:
@@ -509,7 +509,8 @@ def render(cfg: dict, base: Path) -> Path:
     wm = logo.resize((wm_w, round(logo.height * wm_w / logo.width)), Image.LANCZOS)
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * cfg.get("watermark_opacity", 0.85))))
     wm_pos = (W - wm_w - 36, 40)
-    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 1650)) if cfg.get("words") else None
+    # середина картинки на карточке: ниже — название, актёры, даты, а низ экрана закрывают подписи YouTube/TikTok
+    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 880)) if cfg.get("words") else None
     word_y = captions.y if captions else 0
 
     out.parent.mkdir(parents=True, exist_ok=True)

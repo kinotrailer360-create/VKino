@@ -631,6 +631,10 @@ SAVE_AND_SUBSCRIBE = "Сохрани и подпишись на КиноМир �
 def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
     """Обратный отсчёт: «Номер пять — «X». Комедия.» … «И номер один — «X»!»."""
     title = f"«{_title(item)}»"
+    if theme.key.startswith("genre:"):
+        # в жанровой подборке жанр и так ясен («Ужасы.» на каждом фильме звучит глупо) — называем год
+        year = f", {item['year']} год" if item.get("year") else ""
+        return f"И номер один — {title}{year}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}{year}."
     parts = [f"И номер один — {title}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}."]
     genres = _genres(item)
     if theme.upcoming and _premiere(item):
