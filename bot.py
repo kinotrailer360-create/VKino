@@ -186,6 +186,7 @@ class ShortsState(StatesGroup):
     music_file = State()
     clone_audio = State()
     fact_channels = State()
+    fact_channels_add = State()
 
 
 class ReviewState(StatesGroup):
@@ -6373,7 +6374,7 @@ async def channels_action(message: Message) -> None:
     lines.append("\nЧитаются только открытые каналы (с @именем).")
     await message.answer("\n".join(lines), disable_web_page_preview=True,
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                             [_btn("✏️ Изменить список", "sh:ask:tgch")],
+                             [_btn("➕ Добавить каналы", "sh:ask:tgadd"), _btn("✏️ Изменить список", "sh:ask:tgch")],
                              [_btn("↩️ Стандартный список", "sh:tgch_default")],
                              [_btn("⬅️ Настройки", "sh:settings")]]))
 
@@ -7220,6 +7221,8 @@ SHORTS_ASKS = {
     "tgch": (ShortsState.fact_channels,
              "📡 Пришли список каналов одним сообщением — каждый с новой строки, ссылкой или @именем "
              "(например <code>https://t.me/KinoMir360</code>). Этот список заменит текущий."),
+    "tgadd": (ShortsState.fact_channels_add,
+              "➕ Пришли ссылки на каналы (можно несколько, хоть слитно) — добавлю их к текущему списку."),
     "music": (ShortsState.music_file, "🎵 Пришли аудиофайл (mp3) — он станет фоновой музыкой. Только музыка без АП!"),
 }
 
@@ -7356,18 +7359,23 @@ async def shorts_feed_url(message: Message, state: FSMContext) -> None:
 
 
 @router.message(ShortsState.fact_channels, F.text, ~F.text.startswith("/"))
+@router.message(ShortsState.fact_channels_add, F.text, ~F.text.startswith("/"))
 async def shorts_fact_channels(message: Message, state: FSMContext) -> None:
-    raw = [ln for ln in re.split(r"[\s,]+", _typed(message)) if ln]
-    channels = list(dict.fromkeys(c for c in (shorts_tgsearch.channel_name(r) for r in raw) if c))
-    bad = [r for r in raw if not shorts_tgsearch.channel_name(r)]
+    """Список каналов: «Изменить список» заменяет его, «Добавить каналы» — дописывает к текущему."""
+    adding = await state.get_state() == ShortsState.fact_channels_add.state
+    channels, bad = shorts_tgsearch.split_channels(_typed(message))
     if not channels:
         await message.answer("Не вижу каналов — нужны ссылки вида https://t.me/имя или @имя.")
         return
     await state.clear()
-    await set_shorts_setting("fact_channels", json.dumps(channels[:30]))
+    old = await fact_channels() if adding else []
+    added = [c for c in channels if c.lower() not in {o.lower() for o in old}]
+    result = (old + added)[: shorts_tgsearch.MAX_CHANNELS]
+    await set_shorts_setting("fact_channels", json.dumps(result))
     await load_fact_channels()
     note = f"\n⚠️ Не понял: {escape(', '.join(bad[:10]))}" if bad else ""
-    await message.answer(f"✅ Сохранил {len(channels[:30])} каналов.{note}")
+    head = f"✅ Добавил {len(added)}, всего {len(result)} каналов." if adding else f"✅ Сохранил {len(result)} каналов."
+    await message.answer(head + note)
     await channels_action(message)
 
 
