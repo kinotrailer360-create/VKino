@@ -580,6 +580,18 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     today = today or date.today()
     await _progress(5, "Читаю ленты новостей")
     items = await news.latest_news(feeds, exclude or set())
+    # ИИ-редактор: главные новости без местных событий и повторов, пересказ понятными словами
+    ai.last_error = None
+    retold: list[str] | None = None
+    if ai.available(gemini_key) and len(items) >= 3:
+        await _progress(8, "ИИ выбирает главные новости")
+        candidates = items[:30]
+        picked = await ai.pick_news(gemini_key, [(it.title, it.lead, it.source) for it in candidates], NEWS)
+        if picked:
+            items = [candidates[p["i"]] for p in picked]
+            retold = [p["text"] for p in picked]
+            for it, p in zip(items, picked):
+                it.film_query = p["film"] or it.film_query  # по-русски — картинку найдём на Кинопоиске
     await _progress(12, "Качаю картинки к новостям")
     # сначала новости с картинкой (кадр фильма или фото из ленты), потом остальные
     with_img: list[tuple[news.NewsItem, list[str]]] = []
@@ -594,9 +606,12 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         if item.image:
             urls.append(item.image)
         (with_img if urls else without).append((item, urls))
-        if len(with_img) >= NEWS:
+        if len(with_img) >= NEWS and not retold:
             break
-    chosen = sorted((with_img + without)[:NEWS], key=lambda x: -x[0].published)
+    if retold:  # порядок редактора: самое интересное первым; картинки нет — будет заставка
+        chosen = [(it, next(u for i2, u in with_img + without if i2 is it)) for it in items]
+    else:
+        chosen = sorted((with_img + without)[:NEWS], key=lambda x: -x[0].published)
     if len(chosen) < 3:
         raise RuntimeError(f"Мало свежих новостей ({len(chosen)}). Проверь ленты: /feeds")
     n = len(chosen)
@@ -626,12 +641,13 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         title = item.title if item.title[-1] in ".!?…" else item.title + "."
         return f"{title} {item.lead}".strip()
 
-    # Gemini пересказывает своими словами; без ИИ — заголовок и лид как есть
-    ai.last_error = None
-    await _progress(30, "ИИ пересказывает новости")
-    retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
+    # пересказ редактора; не вышло — Gemini пересказывает по заголовкам; без ИИ — заголовок и лид как есть
+    if not retold:
+        await _progress(30, "ИИ пересказывает новости")
+        retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
     spoken = retold or [say(it) for it, _ in chosen]
-    lines = ([f"Главные новости кино на {day}!"] + spoken
+    # дата — только на обложке: голосом «на двадцать третье октября» звучит затянуто
+    lines = (["Главные новости кино!"] + spoken
              + [f"Какая новость удивила? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
     voiced = await _render(work, cover_path, cards, lines, "НОВОСТИ", "НОВОСТИ КИНО",
                            "КАКАЯ НОВОСТЬ\nУДИВИЛА БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
