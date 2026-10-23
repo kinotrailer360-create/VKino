@@ -85,7 +85,7 @@ def _mentions(text: str, names: list[str]) -> bool:
     return any(re.search(rf"(?<!\w){re.escape(n.lower().replace('ё', 'е'))}(?!\w)", low) for n in names if len(n) >= 2)
 
 
-async def search(channels: list[str], names: list[str]) -> list[dict[str, Any]]:
+async def search(channels: list[str], names: list[str], per_channel: int = POSTS_PER_CHANNEL) -> list[dict[str, Any]]:
     """Посты, где упомянут фильм (по русскому или английскому названию): [{"channel", "url", "text"}]."""
     names = [n.strip() for n in names if n and n.strip()]
     if not channels or not names:
@@ -105,9 +105,9 @@ async def search(channels: list[str], names: list[str]) -> list[dict[str, Any]]:
             for url, text in reversed(posts):  # свежие — первыми
                 if len(text) >= 60 and _mentions(text, names) and url not in found:
                     found[url] = {"channel": channel, "url": url, "text": text[:POST_MAX]}
-            if len(found) >= POSTS_PER_CHANNEL:
+            if len(found) >= per_channel:
                 break
-        return list(found.values())[:POSTS_PER_CHANNEL]
+        return list(found.values())[:per_channel]
 
     async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as session:
         results = await asyncio.gather(*(one(session, c) for c in channels))

@@ -419,13 +419,15 @@ fact_channels: list[str] = list(tgsearch.DEFAULT_CHANNELS)  # бот подст�
 
 
 async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
-                    n: int = FACTS) -> tuple[list[str], list[str]]:
-    """Факты из интернета (поиск Google через Gemini, Википедия, Telegram-каналы) и с Кинопоиска."""
+                    n: int = FACTS, rumors: bool = False) -> tuple[list[str], list[str]]:
+    """Факты из интернета (поиск Google через Gemini, Википедия, Telegram-каналы) и с Кинопоиска.
+    rumors=True — фильм ещё не вышел: новости и слухи о нём."""
     en = str(film.get("alternativeName") or film.get("enName") or "")
-    article, posts = await asyncio.gather(wiki.film_article(_title(film), en, film.get("year")),
-                                          tgsearch.search(fact_channels, [_title(film), en]))
+    article, posts = await asyncio.gather(
+        wiki.film_article(_title(film), en, film.get("year")),
+        tgsearch.search(fact_channels, [_title(film), en], per_channel=6 if rumors else tgsearch.POSTS_PER_CHANNEL))
     facts, sources = await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts,
-                                        article, n, tgsearch.as_text(posts))
+                                        article, n, tgsearch.as_text(posts, 14000 if rumors else 9000), rumors)
     channels = list(dict.fromkeys(f"t.me/{p['channel']}" for p in posts))
     return facts, [s for s in sources if s != "Telegram-каналы"] + channels
 
@@ -1093,6 +1095,31 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
     return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
 
 
+def build_rumors_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
+    t, kind = _title(film), _kind(film)
+    title = f"Что известно о {kind} «{t}»: новости и слухи 🔥 #shorts"
+    if len(title) > 100:
+        title = f"«{t}»: новости и слухи 🔥 #shorts"[:100]
+    year = film.get("year")
+    description = "\n".join([
+        f"Что известно о {kind} «{t}»" + (f" ({year})" if year else "") + " — главные новости и слухи 🔥", "",
+        *[f"{i}. {f}" for i, f in enumerate(facts, 1)], "",
+        "Ждёшь премьеру? Пиши в комментариях 👇", "",
+        f"📺 YouTube: {YOUTUBE_URL}",
+        f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
+        "#новостикино #слухи #KinoMir360",
+    ])
+    tags: list[str] = []
+    for tag in [t.lower(), f"{t.lower()} дата выхода", f"{t.lower()} новости", f"{t.lower()} слухи",
+                f"{t.lower()} трейлер", "новости кино", "скоро выйдет"] + \
+            [a.lower() for a in _actors(film, 3)] + ["KinoMir360", "киномир360", "шортс кино"]:
+        if tag and tag not in tags and len(", ".join(tags + [tag])) <= 480:
+            tags.append(tag)
+    pinned = (f"Ждёшь премьеру «{t}»? 👇\n"
+              f"Все новости о новинках — в нашем Telegram 👉 {TELEGRAM_URL}")
+    return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
+
+
 # ---------------------------------------------------------------- TikTok
 
 # в TikTok нет названия и кликабельных ссылок: короткая подпись с ключевыми словами + хэштеги
@@ -1106,6 +1133,7 @@ TIKTOK_THEME = {
     "series": ["#сериалы", "#новыесериалы", "#tvseries", "#series"],
     "genre": ["#топфильмов", "#подборкафильмов", "#movierecommendations", "#top5"],
     "facts": ["#фактыокино", "#интересныефакты", "#moviefacts", "#didyouknow"],
+    "rumors": ["#новостикино", "#слухи", "#скоровыйдет", "#comingsoon"],
     "news": ["#новостикино", "#киноновости", "#movienews", "#filmnews"],
     "birthday": ["#деньрождения", "#актеры", "#happybirthday", "#actor"],
     "lore": ["#историяперсонажа", "#комиксы", "#lore", "#comics"],
@@ -1163,6 +1191,7 @@ EN_KEYWORDS = {
     "series": ["new tv series", "tv shows"],
     "genre": ["movie recommendations", "best movies"],
     "facts": ["movie facts", "behind the scenes"],
+    "rumors": ["upcoming movies", "movie news"],
     "news": ["movie news", "film news"],
     "birthday": ["happy birthday", "best movies"],
     "lore": ["character origin", "comics lore"],
@@ -1337,12 +1366,13 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                            music: Path | None = None, tmdb_key: str = "",
                            gemini_key: str = "", trailer_clips: bool = True,
                            custom_facts: list[str] | None = None,
-                           user_media: list[Path] | None = None) -> ShortResult:
+                           user_media: list[Path] | None = None, rumors: bool = False) -> ShortResult:
     """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
-    user_media — свои фото и видео автора: идут к фактам первыми."""
+    user_media — свои фото и видео автора: идут к фактам первыми.
+    rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
-        film = await find_film(fetch, query)
+        film = await find_film(fetch, query, upcoming=rumors)
         if not film:
             raise RuntimeError(f"Кинопоиск не нашёл «{query}»")
         facts, web_note = list(custom_facts), ""
@@ -1355,8 +1385,15 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     if award_fact:
         facts = [award_fact] + facts[: FACTS - 1]
     t, n, kind = _title(film), len(facts), _kind(film)
-    hook = f"{n} {_facts_word(n)} о {kind} «{t}»"
-    theme = Theme("facts", "ФАКТЫ", t.upper(), hook, hook, [])
+    if rumors:
+        label, card_label, hook = "СЛУХИ", "НОВОСТЬ", f"Что известно о {kind} «{t}»"
+        intro, cover_text = f"{hook}? Главные новости и слухи!", f"{hook}: новости и слухи"
+        outro_line, outro = "Ждёшь премьеру? Пиши в комментариях!", "ЖДЁШЬ\nПРЕМЬЕРУ?\nПИШИ В КОММЕНТАРИЯХ"
+    else:
+        label, card_label, hook = "ФАКТЫ", "ФАКТ", f"{n} {_facts_word(n)} о {kind} «{t}»"
+        intro, cover_text = f"{hook}, которые ты точно не знал!", f"{hook}, которые ты не знал"
+        outro_line, outro = "Какой факт удивил? Пиши в комментариях!", "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ"
+    theme = Theme("rumors" if rumors else "facts", label, t.upper(), hook, hook, [])
 
     cards = []
     # пул кадров: без надписей с TMDB, затем кадры/фон/постер с Кинопоиска
@@ -1426,24 +1463,23 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     for i, fact in enumerate(facts, 1):
         # название уже в заголовке слайда — на карточке не повторяем
         card = await asyncio.to_thread(make_card, picked[i - 1], "", i, n,
-                                       None, "IMDb", None, f"ФАКТ №{i}", FACT_CARD_H)
+                                       None, "IMDb", None, f"{card_label} №{i}", FACT_CARD_H)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
         video: dict[str, str] = {}
         if (i - 1) in videos:
-            card_overlay("", i, n, None, "IMDb", None, f"ФАКТ №{i}", FACT_CARD_H).save(work / f"overlay{i}.png")
+            card_overlay("", i, n, None, "IMDb", None, f"{card_label} №{i}", FACT_CARD_H).save(work / f"overlay{i}.png")
             video = {"clip": videos[i - 1], "overlay": f"overlay{i}.png"}
         cards.append({"image": path.name, "caption": fact, "karaoke": True, **video})
 
-    cover = await asyncio.to_thread(make_cover, cover_src, "ФАКТЫ", f"{hook}, которые ты не знал")
+    cover = await asyncio.to_thread(make_cover, cover_src, label, cover_text)
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
-    lines = ([f"{hook}, которые ты точно не знал!"] + facts
-             + [f"Какой факт удивил? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
-    voiced = await _render(work, cover_path, cards, lines, "ФАКТЫ", t.upper(),
-                           "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
-    result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_facts_seo(film, facts))
+    lines = [intro] + facts + [f"{outro_line} {SAVE_AND_SUBSCRIBE}"]
+    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music)
+    seo = build_rumors_seo(film, facts) if rumors else build_facts_seo(film, facts)
+    result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
     notes = [web_note] if web_note else []
     if video_note:
         notes.append(f"🎞 Видео из трейлера не вставлено: {video_note}.")
@@ -1461,8 +1497,9 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 CUSTOM_MIN, CUSTOM_MAX = 3, 10
 
 
-async def find_film(fetch: Fetch, query: str) -> dict[str, Any] | None:
-    """Фильм по «Название» или «Название 2018»: самый известный из найденных (полная карточка)."""
+async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[str, Any] | None:
+    """Фильм по «Название» или «Название 2018»: самый известный из найденных (полная карточка).
+    upcoming=True — сначала те, что выходят в этом году или позже (новый сериал, а не старый фильм)."""
     query = query.strip()
     if query.startswith("id:") and query[3:].isdigit():
         return await fetch(f"/movie/{int(query[3:])}")
@@ -1475,7 +1512,10 @@ async def find_film(fetch: Fetch, query: str) -> dict[str, Any] | None:
         cands = [c for c in cands if c.get("year") in (year - 1, year, year + 1)] or cands
     if not cands:
         return None
-    cands.sort(key=lambda c: (c.get("year") != year if year else False, -int((c.get("votes") or {}).get("kp") or 0)))
+    this_year = date.today().year
+    cands.sort(key=lambda c: (c.get("year") != year if year else False,
+                              upcoming and int(c.get("year") or 0) < this_year,
+                              -int((c.get("votes") or {}).get("kp") or 0)))
     return await fetch(f"/movie/{cands[0]['id']}")
 
 
