@@ -62,6 +62,14 @@ if [ -n "${RAILWAY_DB_URL:-}" ]; then
     | docker compose exec -T db psql -q -U vkino vkino
 fi
 
+# автообновление: каждые 5 минут проверяем GitHub (deploy/autoupdate.sh); влили PR — бот обновится сам
+command -v cron >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cron; }
+if [ ! -f /etc/cron.d/vkino-update ]; then
+  echo "== Включаю автообновление (каждые 5 минут)"
+  echo "*/5 * * * * root /bin/bash $DIR/deploy/autoupdate.sh >> /var/log/vkino-update.log 2>&1" > /etc/cron.d/vkino-update
+  chmod 644 /etc/cron.d/vkino-update
+fi
+
 echo "== Собираю и запускаю бота (первый раз 5–10 минут)"
 docker compose up -d --build
 docker image prune -f >/dev/null
