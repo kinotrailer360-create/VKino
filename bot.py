@@ -7797,20 +7797,38 @@ async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | 
     rumors = shorts_daily.is_upcoming(film)
     label = shorts_daily._title(film) + (f", {film['year']}" if film.get("year") else "")
     await state.update_data(fx_mode="rumors" if rumors else "web", fx_film=f"id:{film['id']}", fx_label=label)
-    wait = await message.answer(
-        (f"📰 «{escape(label)}» ещё не вышел — ИИ собирает новости и слухи" if rumors
-         else f"🔎 «{escape(label)}» — ИИ ищет факты") + " в интернете и Telegram-каналах, до минуты…")
+    what = "новости и слухи" if rumors else "факты"
+    await message.answer(f"{'📰' if rumors else '🔎'} «{escape(label)}»"
+                         + (" ещё не вышел — собираю новости и слухи." if rumors else " — собираю факты."))
+    wait = await message.answer(progress_bar(5, "Ищу в интернете, обычно до минуты", what))
+    update = progress_updater(wait, what)
+    stage = {"pct": 5, "text": "Ищу в интернете, обычно до минуты"}
+
+    async def report(pct: int, text: str) -> None:
+        stage.update(pct=pct, text=text)
+        await update(pct, text)
+
+    async def tick() -> None:  # ИИ думает до минуты — полоска понемногу ползёт, чтобы было видно, что идёт работа
+        while True:
+            await asyncio.sleep(4)
+            if stage["pct"] < 90:
+                stage["pct"] += 3 if stage["pct"] >= 40 else 1
+                await update(stage["pct"], stage["text"])
+
+    ticker = asyncio.create_task(tick())
     try:
         tg_media: list[dict[str, Any]] = []
         facts, sources = await shorts_daily.web_facts(film, shorts_daily.usable_facts(film), GEMINI_API_KEY,
-                                                      n=8, rumors=rumors, media_out=tg_media)
+                                                      n=8, rumors=rumors, media_out=tg_media, progress=report)
     except Exception as exc:
+        ticker.cancel()
         logging.exception("Facts web search failed")
         await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("🔄 Ещё раз", "fx:redo")], [_btn("📝 Вставлю свой текст", "fx:own")],
                                  [_btn("❌ Отмена", "fx:cancel")]]))
         return
+    ticker.cancel()
     await wait.delete()
     await state.update_data(fx_facts=facts, fx_sources=sources,
                             fx_tg_media=[{"image": m.get("image"), "video": m.get("video")} for m in tg_media][:12])

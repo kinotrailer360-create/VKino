@@ -420,14 +420,20 @@ fact_channels: list[str] = list(tgsearch.DEFAULT_CHANNELS)  # бот подст�
 
 async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
                     n: int = FACTS, rumors: bool = False,
-                    media_out: list[dict[str, Any]] | None = None) -> tuple[list[str], list[str]]:
+                    media_out: list[dict[str, Any]] | None = None,
+                    progress: ProgressFn | None = None) -> tuple[list[str], list[str]]:
     """Факты из интернета (поиск Google через Gemini, Википедия, Telegram-каналы) и с Кинопоиска.
     rumors=True — фильм ещё не вышел: новости и слухи о нём.
-    media_out — сюда добавляются посты каналов с фото или видео (материал для ролика)."""
+    media_out — сюда добавляются посты каналов с фото или видео (материал для ролика).
+    progress(процент, этап) — для полоски в боте."""
     en = str(film.get("alternativeName") or film.get("enName") or "")
+    if progress:
+        await progress(15, "Читаю Википедию и Telegram-каналы")
     article, posts = await asyncio.gather(
         wiki.film_article(_title(film), en, film.get("year")),
         tgsearch.search(fact_channels, [_title(film), en], per_channel=6 if rumors else tgsearch.POSTS_PER_CHANNEL))
+    if progress:
+        await progress(40, f"Нашёл постов в каналах: {len(posts)}. ИИ ищет в Google и выбирает лучшее")
     facts, sources = await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts,
                                         article, n, tgsearch.as_text(posts, 14000 if rumors else 9000), rumors)
     if media_out is not None:
