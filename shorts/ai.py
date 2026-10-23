@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import date
 from typing import Any
 
@@ -98,12 +99,23 @@ BUSY = {429, 500, 503}  # перегрузка у Google — обычно про
 RETRY_DELAYS = (4, 10)
 
 
+def _quota_out(status: int, data: Any) -> bool:
+    """429 «You exceeded your current quota» — дневной лимит кончился, повторять бесполезно."""
+    return status == 429 and "quota" in json.dumps(data, ensure_ascii=False).lower()
+
+
+# Gemini исчерпал лимит — до этого времени (time.monotonic) не обращаемся, сразу идём к запасным ИИ;
+# отдельно для обычных запросов и для поиска Google (у поиска свой лимит)
+QUOTA_PAUSE = 30 * 60
+_quota_until = {False: 0.0, True: 0.0}
+
+
 async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any]) -> tuple[int, Any]:
     """Запрос к модели; при перегрузке ждём и повторяем."""
     for delay in (*RETRY_DELAYS, None):
         async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
             status, data = resp.status, await resp.json(content_type=None)
-        if status not in BUSY or delay is None:
+        if status not in BUSY or delay is None or _quota_out(status, data):
             return status, data
         log.info("shorts: Gemini %s busy (HTTP %s), retry in %ss", model, status, delay)
         await asyncio.sleep(delay)
@@ -120,6 +132,10 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
     if search:  # с поиском строгий JSON-режим недоступен — просим JSON в тексте
         body = {"contents": [{"parts": parts}], "tools": [{"google_search": {}}],
                 "generationConfig": {"temperature": 0.3}}
+    if time.monotonic() < _quota_until[search]:
+        left = round((_quota_until[search] - time.monotonic()) / 60)
+        raise AIError(f"Gemini{' (поиск Google)' if search else ''}: лимит бесплатного тарифа исчерпан, "
+                      f"пробую снова через {left} мин — пока работают запасные ИИ")
     timeout = aiohttp.ClientTimeout(total=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         model = MODEL
@@ -131,7 +147,7 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
                 log.warning("shorts: Gemini model %s unavailable, switching to %s", MODEL, newer)
                 MODEL = model = newer
                 status, data = await _post(session, key, model, body)
-        if status in BUSY:
+        if status in BUSY and not _quota_out(status, data):
             # модель перегружена — разово пробуем другую Flash (в т.ч. облегчённую)
             backup = next((m for m in await _flash_models(session, key, lite=True) if m != model), None)
             if backup:
@@ -139,6 +155,8 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
                 model = backup
                 status, data = await _post(session, key, model, body)
         if status != 200:
+            if _quota_out(status, data):
+                _quota_until[search] = time.monotonic() + QUOTA_PAUSE
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
             raise AIError(f"Gemini HTTP {status} ({model}): {str(msg)[:200]}")
     try:
