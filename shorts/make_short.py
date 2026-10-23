@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
 W, H = 1080, 1920
 FPS = 30
 XFADE = 0.2  # длительность перехода между слайдами, сек
+INFO_W = 760  # ширина подписей под картинкой: правее ~x=900 внизу кнопки YouTube и TikTok
 RED = (229, 9, 20)
 TG_BLUE = (42, 171, 238)
 YT_RED = (255, 0, 0)
@@ -217,7 +218,7 @@ class CardSlide(Slide):
             self.clip = ClipReader(Path(clip))
         bg = cover(card, int(W * 1.1), int(H * 1.1)).filter(ImageFilter.GaussianBlur(40))
         self.bg = Image.blend(bg, Image.new("RGB", bg.size), 0.55)
-        self.card_y = 380
+        self.card_y = 360
 
         # статичный слой с заголовком, подписью и прогрессом
         ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -234,14 +235,19 @@ class CardSlide(Slide):
                 break
         text_center(d, W / 2, 250 + (84 - size) // 2, header, head_f, stroke=3)
 
+        # под картинкой: слово-субтитр, ниже — строки с датами. Всё выше y≈1450: ниже YouTube и TikTok
+        # кладут название ролика и имя канала, а справа (x>900) — кнопки лайка и комментариев
         y = self.card_y + card.height + 26
+        self.word_y = y + 70  # центр субтитра-фразы (до двух строк)
+        if cfg.get("words"):
+            y += 150
         self.karaoke = None
         if caption:
             # факт/новость (караоке) — крупно, чтобы читалось с телефона; длинный — шрифт поменьше
             sizes, max_lines = ((60, 54, 48, 42), 4) if karaoke else ((46, 42, 38), 5)
             for size in sizes:
                 cap_f = font(cfg, "sans", size)
-                lines = wrap(d, caption, cap_f, W - 100)
+                lines = wrap(d, caption, cap_f, INFO_W + 100)
                 if len(lines) <= max_lines:
                     break
             if karaoke:
@@ -265,16 +271,16 @@ class CardSlide(Slide):
                 if k:
                     pieces.append(("  •  ", (170, 170, 170)))
                 pieces += [(f"{label}: ", (255, 196, 0)), (value, (255, 255, 255))]
-            for size in (38, 34, 30, 27):  # длинная строка — шрифт поменьше
+            for size in (36, 33, 30, 27, 24):  # длинная строка — шрифт поменьше; справа не заходим под кнопки
                 info_f = font(cfg, "sans", size)
                 width = sum(d.textlength(t, font=info_f) for t, _ in pieces)
-                if width <= W - 50:
+                if width <= INFO_W:
                     break
             x = (W - width) / 2
             for t, col in pieces:
                 d.text((x, y), t, font=info_f, fill=col, stroke_width=2, stroke_fill=(0, 0, 0))
                 x += d.textlength(t, font=info_f)
-            y += 54
+            y += 48
 
         # прогресс: total сегментов, заполнены до idx
         seg_w, gap, y = 70, 12, 110
@@ -391,47 +397,85 @@ class OutroSlide(Slide):
 # ---------------------------------------------------------------- субтитры по одному слову
 
 class WordCaptions:
-    """Крупное слово по центру — то, что голос говорит прямо сейчас (как в TikTok/Shorts)."""
+    """Субтитры фразами (как в TikTok/Shorts): на экране 1–2 строки по несколько слов, слово, которое голос
+    говорит прямо сейчас, — жёлто-оранжевое, остальные — белые."""
+
+    SIZE = 54
+    MAX_WORDS = 6  # в одной фразе — читается с одного взгляда
+    HOT = (255, 184, 28)  # жёлто-оранжевый
 
     def __init__(self, cfg: dict, words: list[dict], y: int, width: int = W):
         self.cfg, self.words, self.y, self.width = cfg, words, y, width
-        self.k = 0
-        self.cache: dict[int, Image.Image] = {}
+        self.font = font(cfg, "sans", self.SIZE)
+        self.groups = self._group()
+        self.g = 0
+        self.cache: dict[tuple[int, int], Image.Image] = {}
 
-    def _render(self, text: str) -> Image.Image:
+    def _group(self) -> list[list[int]]:
+        """Слова по фразам: не больше MAX_WORDS и двух строк; конец предложения или пауза — новая фраза."""
         probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-        for size in (76, 68, 60, 52, 46):  # не крупно — картинку под словом видно
-            f = font(self.cfg, "sans", size)
-            if probe.textlength(text, font=f) <= self.width - 100:
-                break
-        box = probe.textbbox((0, 0), text, font=f, stroke_width=5)
-        w, h = box[2] - box[0] + 30, box[3] - box[1] + 30
-        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow).text((15 - box[0] + 5, 15 - box[1] + 7), text, font=f, fill=(0, 0, 0, 170),
-                                    stroke_width=5, stroke_fill=(0, 0, 0, 170))
-        layer.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(5)))
-        ImageDraw.Draw(layer).text((15 - box[0], 15 - box[1]), text, font=f, fill=(255, 184, 28),  # жёлто-оранжевый
-                                   stroke_width=5, stroke_fill=(0, 0, 0))
-        return layer
+        groups: list[list[int]] = []
+        cur: list[int] = []
+        for k, w in enumerate(self.words):
+            if cur:
+                text = " ".join(self._clean(self.words[j]["w"]) for j in cur + [k])
+                pause = w["s"] - self.words[cur[-1]]["e"] > 0.45
+                if pause or len(cur) >= self.MAX_WORDS or len(wrap(probe, text, self.font, self.width - 100)) > 2:
+                    groups.append(cur)
+                    cur = []
+            cur.append(k)
+            if re.search(r"[.!?…]\W*$", w["w"]):  # конец предложения — фраза закончилась
+                groups.append(cur)
+                cur = []
+        if cur:
+            groups.append(cur)
+        return groups
+
+    @staticmethod
+    def _clean(word: str) -> str:
+        return re.sub(r"[«»\"\u0301]", "", word).strip()  # кавычки и знак ударения — только для голоса
+
+    def _render(self, g: int, hot: int) -> Image.Image:
+        idx = self.groups[g]
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        text = " ".join(self._clean(self.words[j]["w"]) for j in idx)
+        lines = wrap(probe, text, self.font, self.width - 100)
+        step = round(self.SIZE * 1.22)
+        w = max(probe.textlength(ln, font=self.font) for ln in lines) + 40
+        h = step * len(lines) + 30
+        layer = Image.new("RGBA", (round(w), h), (0, 0, 0, 0))
+        shadow = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        sd, d = ImageDraw.Draw(shadow), ImageDraw.Draw(layer)
+        k = 0
+        for n, line in enumerate(lines):
+            x = (w - probe.textlength(line, font=self.font)) / 2
+            y = 12 + n * step
+            for word in line.split(" "):
+                col = self.HOT if k < len(idx) and idx[k] == hot else (255, 255, 255)
+                sd.text((x + 4, y + 6), word, font=self.font, fill=(0, 0, 0, 170), stroke_width=5,
+                        stroke_fill=(0, 0, 0, 170))
+                d.text((x, y), word, font=self.font, fill=col, stroke_width=5, stroke_fill=(0, 0, 0))
+                x += probe.textlength(word + " ", font=self.font)
+                k += 1
+        out = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        out.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(5)))
+        out.alpha_composite(layer)
+        return out
 
     def draw(self, img: Image.Image, t: float) -> None:
-        words = self.words
-        while self.k + 1 < len(words) and words[self.k + 1]["s"] <= t:
-            self.k += 1
-        if not words or t < words[self.k]["s"]:
+        if not self.groups:
             return
-        cur = words[self.k]
-        nxt = words[self.k + 1]["s"] if self.k + 1 < len(words) else cur["e"] + 0.4
-        if t > max(cur["e"] + 0.35, cur["s"] + 0.25) and t < nxt:  # пауза в речи — слово гаснет
+        while self.g + 1 < len(self.groups) and self.words[self.groups[self.g + 1][0]]["s"] <= t:
+            self.g += 1
+        idx = self.groups[self.g]
+        first, last = self.words[idx[0]], self.words[idx[-1]]
+        if t < first["s"] or t > last["e"] + 0.35:  # до фразы и в паузе после неё — пусто
             return
-        if self.k not in self.cache:
-            self.cache = {self.k: self._render(cur["w"].strip(" ,.!?:;«»\"—"))}
-        layer = self.cache[self.k]
-        pop = 0.86 + 0.14 * ease_out((t - cur["s"]) / 0.09)  # слово чуть «выпрыгивает»
-        if pop < 0.999:
-            layer = layer.resize((max(1, round(layer.width * pop)), max(1, round(layer.height * pop))),
-                                 Image.BILINEAR)
+        hot = max((j for j in idx if self.words[j]["s"] <= t), default=idx[0])
+        key = (self.g, hot)
+        if key not in self.cache:
+            self.cache = {key: self._render(self.g, hot)}
+        layer = self.cache[key]
         img.paste(layer, ((img.width - layer.width) // 2, self.y - layer.height // 2), layer)
 
 
@@ -510,8 +554,9 @@ def render(cfg: dict, base: Path) -> Path:
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * cfg.get("watermark_opacity", 0.85))))
     wm_pos = (W - wm_w - 36, 40)
     # середина картинки на карточке: ниже — название, актёры, даты, а низ экрана закрывают подписи YouTube/TikTok
-    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 880)) if cfg.get("words") else None
-    word_y = captions.y if captions else 0
+    # субтитры — в полосе под картинкой (у каждой карточки своя высота, см. CardSlide.word_y), не шире 760 px:
+    # справа внизу кнопки YouTube
+    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 1250), INFO_W + 100) if cfg.get("words") else None
 
     out.parent.mkdir(parents=True, exist_ok=True)
     audio = out.with_suffix(".m4a")
@@ -547,9 +592,8 @@ def render(cfg: dict, base: Path) -> Path:
             img = Image.blend(prev, img, ease_out((t - starts[i]) / XFADE))
         if i < len(makers) - 1:
             img.paste(wm, wm_pos, wm)
-            if captions:  # на концовке с кнопками подписки слова не нужны
-                # на обложке внизу текст обложки — слово выше; на карточках — в полосе под картинкой
-                captions.y = 1120 if i == 0 else word_y
+            if captions and i > 0:  # на обложке свой заголовок, на концовке — кнопки подписки: там без слов
+                captions.y = getattr(slide(i), "word_y", captions.y)
                 captions.draw(img, t)
         try:
             enc.stdin.write(img.tobytes())

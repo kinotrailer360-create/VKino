@@ -420,14 +420,20 @@ fact_channels: list[str] = list(tgsearch.DEFAULT_CHANNELS)  # бот подст�
 
 async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
                     n: int = FACTS, rumors: bool = False,
-                    media_out: list[dict[str, Any]] | None = None) -> tuple[list[str], list[str]]:
+                    media_out: list[dict[str, Any]] | None = None,
+                    progress: ProgressFn | None = None) -> tuple[list[str], list[str]]:
     """Факты из интернета (поиск Google через Gemini, Википедия, Telegram-каналы) и с Кинопоиска.
     rumors=True — фильм ещё не вышел: новости и слухи о нём.
-    media_out — сюда добавляются посты каналов с фото или видео (материал для ролика)."""
+    media_out — сюда добавляются посты каналов с фото или видео (материал для ролика).
+    progress(процент, этап) — для полоски в боте."""
     en = str(film.get("alternativeName") or film.get("enName") or "")
+    if progress:
+        await progress(15, "Читаю Википедию и Telegram-каналы")
     article, posts = await asyncio.gather(
         wiki.film_article(_title(film), en, film.get("year")),
         tgsearch.search(fact_channels, [_title(film), en], per_channel=6 if rumors else tgsearch.POSTS_PER_CHANNEL))
+    if progress:
+        await progress(40, f"Нашёл постов в каналах: {len(posts)}. ИИ ищет в Google и выбирает лучшее")
     facts, sources = await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts,
                                         article, n, tgsearch.as_text(posts, 14000 if rumors else 9000), rumors)
     if media_out is not None:
@@ -437,13 +443,13 @@ async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
 
 
 async def gather_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
-                       media_out: list[dict[str, Any]] | None = None) -> tuple[list[str], str]:
+                       media_out: list[dict[str, Any]] | None = None, rumors: bool = False) -> tuple[list[str], str]:
     """(факты для ролика, заметка автору). Без ИИ или при сбое — факты Кинопоиска, как раньше.
     media_out — посты Telegram-каналов с фото и видео о фильме."""
     if ai.available(gemini_key):
         await _progress(7, "ИИ ищет факты в интернете")
         try:
-            facts, sources = await web_facts(film, kp_facts, gemini_key, media_out=media_out)
+            facts, sources = await web_facts(film, kp_facts, gemini_key, media_out=media_out, rumors=rumors)
             for f in kp_facts:  # ИИ нашёл меньше пяти — добираем Кинопоиском
                 if len(facts) >= FACTS:
                     break
@@ -889,7 +895,7 @@ async def say_to_file(text: str, path: Path) -> list[float]:
 async def spoken_lines(lines: list[str]) -> list[str]:
     """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
     русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
-    texts = [pronounce.apply(text) for text in lines]
+    texts = [pronounce.dates(pronounce.apply(text)) for text in lines]  # даты — сразу в нужном падеже
     todo = [i for i, text in enumerate(texts) if pronounce.needs_rewrite(text)]
     if todo:
         try:  # не задерживаем сборку, если ИИ тормозит
@@ -1355,7 +1361,7 @@ def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-FACT_CARD_H = 1000  # высота картинки на слайдах фактов и новостей
+FACT_CARD_H = 780  # высота картинки на слайдах фактов и новостей (как CARD_H)
 
 
 async def _own_for_facts(files: list[Path], facts: list[str], work: Path, gemini_key: str,
@@ -1435,8 +1441,10 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         facts, web_note = list(custom_facts), ""
     else:
         film, kp_facts = await pick_fact_film(fetch, query, exclude or set(), web=ai.available(gemini_key))
+        # ещё не вышел — вместо фактов «Что известно о …» из новостей и слухов (если есть ИИ)
+        rumors = rumors or (ai.available(gemini_key) and is_upcoming(film))
         tg_media = []
-        facts, web_note = await gather_facts(film, kp_facts, gemini_key, media_out=tg_media)
+        facts, web_note = await gather_facts(film, kp_facts, gemini_key, media_out=tg_media, rumors=rumors)
     await _progress(10, f"«{_title(film)}»: качаю кадры")
     # награды из Викиданных — первым фактом (в фактах автора — только его текст)
     award_fact = None if custom_facts else wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -1567,10 +1575,29 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 CUSTOM_MIN, CUSTOM_MAX = 3, 10
 
 
+UPCOMING_STATUS = ("announced", "pre-production", "filming", "post-production")
+
+
+def is_upcoming(item: dict[str, Any]) -> bool:
+    """Ещё не вышел: на Кинопоиске «в производстве», год впереди или премьера позже сегодняшнего дня."""
+    if str(item.get("status") or "") in UPCOMING_STATUS:
+        return True
+    today = date.today()
+    if int(item.get("year") or 0) > today.year:
+        return True
+    dates = [d for d in (_pdate(item, k) for k in ("world", "russia", "digital")) if d]
+    return bool(dates) and min(dates) > today
+
+
 async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[str, Any] | None:
     """Фильм по «Название» или «Название 2018»: самый известный из найденных (полная карточка).
-    upcoming=True — сначала те, что выходят в этом году или позже (новый сериал, а не старый фильм)."""
+    upcoming=True — сначала те, что выходят в этом году или позже (новый сериал, а не старый фильм).
+    Слово «сериал» или «фильм» в запросе — уточнение: ищем без него, но такой тип — первым."""
     query = query.strip()
+    kind_m = re.search(r"(?<!\w)(мультсериал|сериал|мультфильм|фильм)(?!\w)", query, re.I)
+    want_series = bool(kind_m) and "сериал" in kind_m.group(1).lower()
+    if kind_m:
+        query = re.sub(r"\s+", " ", query[: kind_m.start()] + query[kind_m.end():]).strip(" ,.-—")
     if query.startswith("id:") and query[3:].isdigit():
         return await fetch(f"/movie/{int(query[3:])}")
     year_m = re.search(r"[\s(]+(19\d\d|20\d\d)\)?$", query)
@@ -1583,7 +1610,12 @@ async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[st
     if not cands:
         return None
     this_year = date.today().year
+
+    def series(c: dict[str, Any]) -> bool:
+        return bool(c.get("isSeries")) or "series" in str(c.get("type") or "")
+
     cands.sort(key=lambda c: (c.get("year") != year if year else False,
+                              bool(kind_m) and series(c) != want_series,
                               upcoming and int(c.get("year") or 0) < this_year,
                               -int((c.get("votes") or {}).get("kp") or 0)))
     return await fetch(f"/movie/{cands[0]['id']}")
