@@ -7447,9 +7447,21 @@ async def review_pick(message: Message, state: FSMContext, query: str) -> None:
     try:
         film = await shorts_review.find_film(kp._get, query)
     except Exception as exc:
-        logging.exception("Review film search failed")
-        await wait.edit_text(f"❌ Не нашёл: <code>{escape(str(exc)[:300])}</code>\nНапиши название иначе.")
-        return
+        # на Кинопоиске так не называется — ИИ ищет настоящее название в интернете и Telegram-каналах
+        await wait.edit_text("🔎 На Кинопоиске так не называется — ищу настоящее название в интернете "
+                             "и Telegram-каналах…")
+        await load_fact_channels()
+        try:
+            film, note = await shorts_daily.find_film_smart(kp._get, query, GEMINI_API_KEY)
+        except Exception:
+            logging.exception("Review smart film search failed")
+            film, note = None, ""
+        if not film:
+            logging.warning("Review film search failed: %s", exc)
+            await wait.edit_text(f"❌ Не нашёл «{escape(query)}» ни на Кинопоиске, ни в интернете — "
+                                 "напиши название иначе (можно по-английски или с годом).")
+            return
+        await message.answer(escape(note))
     title = shorts_daily._title(film)
     year = f" ({film['year']})" if film.get("year") else ""
     await state.set_state(None)
@@ -7791,8 +7803,23 @@ async def facts_find(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Поиск на Кинопоиске не удался: <code>{escape(str(exc)[:300])}</code>")
         return
     if not old and not new:
-        await message.answer(f"Кинопоиск не нашёл «{escape(data['fx_title'])}» — уточни название или добавь год.",
-                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("❌ Отмена", "fx:cancel")]]))
+        # на Кинопоиске так не называется — ИИ ищет настоящее название в интернете и Telegram-каналах
+        await load_fact_channels()
+        wait = await message.answer(f"🔎 На Кинопоиске «{escape(data['fx_title'])}» нет — ищу настоящее название "
+                                    "в интернете и Telegram-каналах…")
+        try:
+            old, note = await shorts_daily.find_film_smart(kp._get, data["fx_title"], GEMINI_API_KEY)
+        except Exception as exc:
+            logging.exception("Smart film search failed")
+            old, note = None, ""
+            logging.warning("smart search: %s", exc)
+        if not old:
+            await wait.edit_text(f"Не нашёл «{escape(data['fx_title'])}» ни на Кинопоиске, ни в интернете — "
+                                 "напиши название иначе (можно по-английски или с годом).",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("❌ Отмена", "fx:cancel")]]))
+            return
+        await wait.edit_text(f"{escape(note)}\nНа Кинопоиске: «{escape(_film_label(old))}»")
+        await facts_web(message, state, old)
         return
     if old and new and old["id"] != new["id"] and shorts_daily.is_upcoming(new):
         await message.answer("Какой из них?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[

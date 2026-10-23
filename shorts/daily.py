@@ -1464,11 +1464,15 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     tg_media — посты Telegram-каналов с фото и видео о фильме: ИИ ставит их к фактам, к которым они подходят."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
-        film = await find_film(fetch, query, upcoming=rumors)
+        film, _ = await find_film_smart(fetch, query, gemini_key, upcoming=rumors)
         if not film:
             raise RuntimeError(f"Кинопоиск не нашёл «{query}»")
         facts, web_note = list(custom_facts), ""
     else:
+        if query and not query.startswith("id:") and ai.available(gemini_key):
+            # название с ошибкой или неофициальное — ИИ узнаёт настоящее в интернете
+            found, _ = await find_film_smart(fetch, query, gemini_key)
+            query = f"id:{found['id']}" if found else query
         film, kp_facts = await pick_fact_film(fetch, query, exclude or set(), web=ai.available(gemini_key))
         # ещё не вышел — вместо фактов «Что известно о …» из новостей и слухов (если есть ИИ)
         rumors = rumors or (ai.available(gemini_key) and is_upcoming(film))
@@ -1654,6 +1658,30 @@ async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[st
                               upcoming and int(c.get("year") or 0) < this_year,
                               -int((c.get("votes") or {}).get("kp") or 0)))
     return await fetch(f"/movie/{cands[0]['id']}")
+
+
+async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",
+                          upcoming: bool = False) -> tuple[dict[str, Any] | None, str]:
+    """find_film, а если Кинопоиск не нашёл — ИИ по интернету и Telegram-каналам узнаёт, как фильм называется
+    официально («Глиноликий» → «Клейфейс» / Clayface 2026), и ищем снова. (фильм | None, заметка автору)."""
+    film = await find_film(fetch, query, upcoming)
+    if film or not ai.available(gemini_key) or query.startswith("id:"):
+        return film, ""
+    name = re.sub(r"[\s(]+(19\d\d|20\d\d)\)?$", "", query).strip()
+    posts = await tgsearch.search(fact_channels, [name], per_channel=2)
+    for guess in await ai.identify_film(gemini_key, query, tgsearch.as_text(posts, 6000)):
+        y = f" {guess['year']}" if guess["year"] else ""
+        for q in dict.fromkeys(x for x in (guess["ru"] + y, guess["en"] + y, guess["ru"], guess["en"]) if x.strip()):
+            try:
+                film = await find_film(fetch, q, upcoming)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("shorts: film lookup %r failed: %s", q, exc)
+                continue
+            if film:
+                label = guess["ru"] or guess["en"]
+                return film, f"🔎 «{query}» на Кинопоиске нет — ИИ нашёл в интернете: «{label}»" + (
+                    f" ({guess['en']}, {guess['year']})" if guess["en"] and guess["year"] else "")
+    return None, ""
 
 
 def custom_theme(title: str, n: int) -> Theme:

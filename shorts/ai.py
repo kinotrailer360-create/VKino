@@ -417,6 +417,41 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
     return out
 
 
+async def identify_film(key: str, query: str, posts: str = "") -> list[dict[str, Any]]:
+    """Какой фильм или сериал имеет в виду автор («Глиноликий» → «Клейфейс», Clayface, 2026): ИИ ищет в Google
+    и смотрит посты Telegram-каналов. До 3 вариантов [{"ru", "en", "year"}], самый вероятный первым."""
+    if not available(key):
+        return []
+    prompt = (
+        f"Автор ищет фильм или сериал по названию «{query}». Название может быть неофициальным, переводом, "
+        "сленгом, именем персонажа или с ошибкой. Определи, какой это фильм или сериал, и назови его "
+        "официальное русское название (как на Кинопоиске и в российском прокате), оригинальное название "
+        "и год выхода. Если вариантов несколько — до трёх, самый вероятный первым. Не выдумывай."
+        + ("\n\nПосты из Telegram-каналов о кино, где встречается это название:\n" + posts[:6000] if posts else "")
+        + '\n\nОтветь только JSON: {"films": [{"ru": "...", "en": "...", "year": 2026}]}'
+    )
+    data = None
+    if key:
+        try:
+            data = await _ask(key, [{"text": "Поищи в интернете. " + prompt}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: identify film via search failed: %s", exc)
+    if data is None:
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: identify film failed: %s", exc)
+            return []
+    out = []
+    for f in (data.get("films") if isinstance(data, dict) else None) or []:
+        if not isinstance(f, dict):
+            continue
+        year = f.get("year")
+        out.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                    "year": int(year) if str(year or "").isdigit() else None})
+    return [f for f in out if f["ru"] or f["en"]][:3]
+
+
 async def proofread(key: str, texts: list[str]) -> list[str]:
     """Корректор: исправляет грамматику (род, число, падеж, предлоги) и написание имён в готовых фразах,
     не меняя смысла. Один запрос на все фразы: Gemini, если лимит есть; иначе бесплатная Gemini через
