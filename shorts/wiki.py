@@ -192,3 +192,48 @@ async def birthdays(month: int, day: int, limit: int = 10) -> list[dict[str, Any
         })
     out.sort(key=lambda p: p["_fame"], reverse=True)
     return out[:limit]
+
+
+ARTICLE_API = "https://{lang}.wikipedia.org/w/api.php"
+# разделы статьи, где обычно самое интересное для фактов
+FACT_SECTIONS = re.compile(r"(производств|съёмк|создани|кастинг|подбор актёр|интересн|факт|прокат|сборы|критик|"
+                           r"production|filming|casting|development|trivia|box office|reception|legacy)", re.I)
+
+
+async def _article(session: aiohttp.ClientSession, lang: str, query: str, limit: int) -> str:
+    api = ARTICLE_API.format(lang=lang)
+    base = {"format": "json", "formatversion": 2}
+    async with session.get(api, params={**base, "action": "query", "list": "search", "srsearch": query,
+                                        "srlimit": 1}) as resp:
+        hits = ((await resp.json(content_type=None)).get("query") or {}).get("search") or []
+    if not hits:
+        return ""
+    async with session.get(api, params={**base, "action": "query", "prop": "extracts", "explaintext": 1,
+                                        "redirects": 1, "titles": hits[0]["title"]}) as resp:
+        page = (((await resp.json(content_type=None)).get("query") or {}).get("pages") or [{}])[0]
+    text = str(page.get("extract") or "")
+    # вступление + разделы про съёмки, кастинг, сборы; пересказ сюжета пропускаем (там спойлеры)
+    parts = re.split(r"\n(?===+ )", text)
+    keep = [parts[0][:1500]] + [p for p in parts[1:] if FACT_SECTIONS.search(p.split("\n", 1)[0])]
+    return f"[{lang}.wikipedia.org — {hits[0]['title']}]\n" + "\n".join(keep)[:limit]
+
+
+async def film_article(title: str, en: str = "", year: int | None = None, limit: int = 9000) -> str:
+    """Текст о фильме из русской и английской Википедии (без сюжета) — материал для фактов. Пусто — не нашли."""
+    y = f" {year}" if year else ""
+    jobs = [("ru", f"{title}{y} фильм")] + ([("en", f"{en}{y} film")] if en else [])
+    out = []
+    try:
+        timeout = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
+            for lang, query in jobs:
+                try:
+                    text = await _article(session, lang, query, limit)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("shorts: wiki %s article %r failed: %s", lang, query, exc)
+                    continue
+                if text:
+                    out.append(text)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: wiki article for %r failed: %s", title, exc)
+    return "\n\n".join(out)
