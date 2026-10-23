@@ -419,25 +419,31 @@ fact_channels: list[str] = list(tgsearch.DEFAULT_CHANNELS)  # бот подст�
 
 
 async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
-                    n: int = FACTS, rumors: bool = False) -> tuple[list[str], list[str]]:
+                    n: int = FACTS, rumors: bool = False,
+                    media_out: list[dict[str, Any]] | None = None) -> tuple[list[str], list[str]]:
     """Факты из интернета (поиск Google через Gemini, Википедия, Telegram-каналы) и с Кинопоиска.
-    rumors=True — фильм ещё не вышел: новости и слухи о нём."""
+    rumors=True — фильм ещё не вышел: новости и слухи о нём.
+    media_out — сюда добавляются посты каналов с фото или видео (материал для ролика)."""
     en = str(film.get("alternativeName") or film.get("enName") or "")
     article, posts = await asyncio.gather(
         wiki.film_article(_title(film), en, film.get("year")),
         tgsearch.search(fact_channels, [_title(film), en], per_channel=6 if rumors else tgsearch.POSTS_PER_CHANNEL))
     facts, sources = await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts,
                                         article, n, tgsearch.as_text(posts, 14000 if rumors else 9000), rumors)
+    if media_out is not None:
+        media_out.extend(p for p in posts if p.get("image") or p.get("video"))
     channels = list(dict.fromkeys(f"t.me/{p['channel']}" for p in posts))
     return facts, [s for s in sources if s != "Telegram-каналы"] + channels
 
 
-async def gather_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str) -> tuple[list[str], str]:
-    """(факты для ролика, заметка автору). Без ИИ или при сбое — факты Кинопоиска, как раньше."""
+async def gather_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
+                       media_out: list[dict[str, Any]] | None = None) -> tuple[list[str], str]:
+    """(факты для ролика, заметка автору). Без ИИ или при сбое — факты Кинопоиска, как раньше.
+    media_out — посты Telegram-каналов с фото и видео о фильме."""
     if ai.available(gemini_key):
         await _progress(7, "ИИ ищет факты в интернете")
         try:
-            facts, sources = await web_facts(film, kp_facts, gemini_key)
+            facts, sources = await web_facts(film, kp_facts, gemini_key, media_out=media_out)
             for f in kp_facts:  # ИИ нашёл меньше пяти — добираем Кинопоиском
                 if len(facts) >= FACTS:
                     break
@@ -574,12 +580,43 @@ def _placeholder() -> Image.Image:
     return img
 
 
+def _tg_news(posts: list[dict[str, Any]], exclude: set[int]) -> list[news.NewsItem]:
+    """Посты каналов как новости: первая фраза — заголовок, дальше — подробности."""
+    out = []
+    for p in posts[:20]:
+        first, _, rest = re.sub(r"\s+", " ", p["text"]).partition(". ")
+        title = first[:140].rstrip(" .") if len(first) <= 160 else first[:140].rsplit(" ", 1)[0] + "…"
+        item = news.NewsItem(title=title, lead=rest[:300], source=f"t.me/{p['channel']}", link=p["url"],
+                             published=p["time"], image=p.get("image"), video=p.get("video"))
+        quoted = re.search(r"«([^»]{2,60})»", p["text"])
+        item.film_query = quoted.group(1) if quoted else None
+        if item.uid not in exclude:
+            out.append(item)
+    return out
+
+
 async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: set[int] | None = None,
                           music: Path | None = None, tmdb_key: str = "",
                           today: date | None = None, gemini_key: str = "") -> ShortResult:
     today = today or date.today()
     await _progress(5, "Читаю ленты новостей")
     items = await news.latest_news(feeds, exclude or set())
+    # ИИ-редактор: главные новости без местных событий и повторов, пересказ понятными словами
+    ai.last_error = None
+    retold: list[str] | None = None
+    if ai.available(gemini_key):
+        # свежие посты Telegram-каналов — ИИ сверяет их с новостями СМИ и берёт то, чего в лентах ещё нет
+        await _progress(7, "Читаю Telegram-каналы")
+        items = items[:25] + _tg_news(await tgsearch.latest(fact_channels, news.MAX_AGE_HOURS), exclude or set())
+    if ai.available(gemini_key) and len(items) >= 3:
+        await _progress(8, "ИИ выбирает главные новости")
+        candidates = items[:45]
+        picked = await ai.pick_news(gemini_key, [(it.title, it.lead, it.source) for it in candidates], NEWS)
+        if picked:
+            items = [candidates[p["i"]] for p in picked]
+            retold = [p["text"] for p in picked]
+            for it, p in zip(items, picked):
+                it.film_query = p["film"] or it.film_query  # по-русски — картинку найдём на Кинопоиске
     await _progress(12, "Качаю картинки к новостям")
     # сначала новости с картинкой (кадр фильма или фото из ленты), потом остальные
     with_img: list[tuple[news.NewsItem, list[str]]] = []
@@ -594,9 +631,12 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         if item.image:
             urls.append(item.image)
         (with_img if urls else without).append((item, urls))
-        if len(with_img) >= NEWS:
+        if len(with_img) >= NEWS and not retold:
             break
-    chosen = sorted((with_img + without)[:NEWS], key=lambda x: -x[0].published)
+    if retold:  # порядок редактора: самое интересное первым; картинки нет — будет заставка
+        chosen = [(it, next(u for i2, u in with_img + without if i2 is it)) for it in items]
+    else:
+        chosen = sorted((with_img + without)[:NEWS], key=lambda x: -x[0].published)
     if len(chosen) < 3:
         raise RuntimeError(f"Мало свежих новостей ({len(chosen)}). Проверь ленты: /feeds")
     n = len(chosen)
@@ -614,8 +654,21 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         card = await asyncio.to_thread(make_card, img, "", i, n, None, "IMDb", None, f"НОВОСТЬ №{i}", FACT_CARD_H)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
+        video: dict[str, str] = {}
+        if item.video:  # видео из поста канала — 5 секунд из середины
+            try:
+                files = await tgsearch.download_media([{"video": item.video}], work, 1, prefix=f"nv{i}_")
+                if files:
+                    dur = await _duration(files[0])
+                    clip = work / f"newsclip{i}.mp4"
+                    await clips.cut_clip(files[0], clip, max(0.0, dur / 2 - CLIP_SECONDS / 2), min(CLIP_SECONDS, dur))
+                    card_overlay("", i, n, None, "IMDb", None, f"НОВОСТЬ №{i}", FACT_CARD_H).save(
+                        work / f"overlay{i}.png")
+                    video = {"clip": clip.name, "overlay": f"overlay{i}.png"}
+            except Exception as exc:  # noqa: BLE001 — останется картинка
+                log.warning("shorts: news video %s skipped: %s", item.video[:80], exc)
         cards.append({"image": path.name, "caption": item.title, "info": [[("Источник", item.source)]],
-                      "karaoke": True})
+                      "karaoke": True, **video})
 
     day = _date_ru(today)
     cover = await asyncio.to_thread(make_cover, images[0], "НОВОСТИ", f"Главные новости кино\n{day}")
@@ -626,12 +679,13 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         title = item.title if item.title[-1] in ".!?…" else item.title + "."
         return f"{title} {item.lead}".strip()
 
-    # Gemini пересказывает своими словами; без ИИ — заголовок и лид как есть
-    ai.last_error = None
-    await _progress(30, "ИИ пересказывает новости")
-    retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
+    # пересказ редактора; не вышло — Gemini пересказывает по заголовкам; без ИИ — заголовок и лид как есть
+    if not retold:
+        await _progress(30, "ИИ пересказывает новости")
+        retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
     spoken = retold or [say(it) for it, _ in chosen]
-    lines = ([f"Главные новости кино на {day}!"] + spoken
+    # дата — только на обложке: голосом «на двадцать третье октября» звучит затянуто
+    lines = (["Главные новости кино!"] + spoken
              + [f"Какая новость удивила? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
     voiced = await _render(work, cover_path, cards, lines, "НОВОСТИ", "НОВОСТИ КИНО",
                            "КАКАЯ НОВОСТЬ\nУДИВИЛА БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
@@ -843,7 +897,7 @@ async def spoken_lines(lines: list[str]) -> list[str]:
         except asyncio.TimeoutError:
             fixed = None
         for i, text in zip(todo, fixed or []):
-            texts[i] = text
+            texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
     return [_speakable(pronounce.plain_russian(text)) for text in texts]
 
 
@@ -1304,9 +1358,10 @@ def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
 FACT_CARD_H = 1000  # высота картинки на слайдах фактов и новостей
 
 
-async def _own_for_facts(files: list[Path], facts: list[str], work: Path,
-                         gemini_key: str) -> tuple[dict[int, Image.Image], dict[int, str]]:
+async def _own_for_facts(files: list[Path], facts: list[str], work: Path, gemini_key: str,
+                         strict: bool = False, prefix: str = "own") -> tuple[dict[int, Image.Image], dict[int, str]]:
     """Свои фото/видео автора к фактам: ИИ — по смыслу, остальные — по порядку; один файл — один факт.
+    strict=True (материал из Telegram-каналов) — только то, что ИИ счёл подходящим, без раздачи по порядку.
 
     Возвращает ({факт: картинка}, {факт: файл клипа}); у видео картинка — его кадр (запасной).
     """
@@ -1317,10 +1372,10 @@ async def _own_for_facts(files: list[Path], facts: list[str], work: Path,
                 items.append((Image.open(path).convert("RGB"), None))
                 continue
             dur = await _duration(path)
-            clip = work / f"own{n}.mp4"
+            clip = work / f"{prefix}{n}.mp4"
             await clips.cut_clip(path, clip, max(0.0, dur / 2 - CLIP_SECONDS / 2) if dur > CLIP_SECONDS else 0.0,
                                  min(CLIP_SECONDS, dur))
-            still = work / f"own{n}.jpg"
+            still = work / f"{prefix}{n}.jpg"
             await _run("ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(clip), "-frames:v", "1", str(still))
             items.append((Image.open(still).convert("RGB"), clip.name))
         except Exception as exc:  # noqa: BLE001 — битый файл пропускаем
@@ -1334,7 +1389,7 @@ async def _own_for_facts(files: list[Path], facts: list[str], work: Path,
         if c >= 0 and c not in used:
             at[i] = c
             used.add(c)
-    free = [i for i in range(len(facts)) if i not in at]
+    free = [] if strict else [i for i in range(len(facts)) if i not in at]
     for c in range(len(items)):
         if c not in used and free:
             at[free.pop(0)] = c
@@ -1366,10 +1421,12 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                            music: Path | None = None, tmdb_key: str = "",
                            gemini_key: str = "", trailer_clips: bool = True,
                            custom_facts: list[str] | None = None,
-                           user_media: list[Path] | None = None, rumors: bool = False) -> ShortResult:
+                           user_media: list[Path] | None = None, rumors: bool = False,
+                           tg_media: list[dict[str, Any]] | None = None) -> ShortResult:
     """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
     user_media — свои фото и видео автора: идут к фактам первыми.
-    rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов."""
+    rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов.
+    tg_media — посты Telegram-каналов с фото и видео о фильме: ИИ ставит их к фактам, к которым они подходят."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
         film = await find_film(fetch, query, upcoming=rumors)
@@ -1378,7 +1435,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         facts, web_note = list(custom_facts), ""
     else:
         film, kp_facts = await pick_fact_film(fetch, query, exclude or set(), web=ai.available(gemini_key))
-        facts, web_note = await gather_facts(film, kp_facts, gemini_key)
+        tg_media = []
+        facts, web_note = await gather_facts(film, kp_facts, gemini_key, media_out=tg_media)
     await _progress(10, f"«{_title(film)}»: качаю кадры")
     # награды из Викиданных — первым фактом (в фактах автора — только его текст)
     award_fact = None if custom_facts else wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -1419,6 +1477,18 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         if user_media:
             await _progress(14, "Разбираю ваши фото и видео")
             own, own_videos = await _own_for_facts(user_media, facts, work, gemini_key)
+        # фото и видео из постов Telegram-каналов — к фактам, которым они подходят по смыслу
+        rest_tg = [i for i in range(len(facts)) if i not in own]
+        if tg_media and rest_tg and ai.available(gemini_key):
+            await _progress(16, "Фото и видео из Telegram-каналов")
+            try:
+                files = await tgsearch.download_media(tg_media, work)
+                tg_own, tg_videos = await _own_for_facts(files, [facts[i] for i in rest_tg], work, gemini_key,
+                                                         strict=True, prefix="tgc")
+                own.update({rest_tg[k]: img for k, img in tg_own.items()})
+                own_videos.update({rest_tg[k]: clip for k, clip in tg_videos.items()})
+            except Exception as exc:  # noqa: BLE001 — без материала из каналов ролик всё равно соберём
+                log.warning("shorts: tg media for facts failed: %s", exc)
         # факт про актёра/режиссёра — его фото (TMDB, запасной — Кинопоиск)
         portraits: dict[int, Image.Image] = {}
         for i, fact in enumerate(facts):

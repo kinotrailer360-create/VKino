@@ -373,6 +373,57 @@ async def retell_news(key: str, items: list[tuple[str, str, str]]) -> list[str] 
     return [t[:260] for t in texts]
 
 
+async def pick_news(key: str, items: list[tuple[str, str, str]], n: int = 5) -> list[dict[str, Any]] | None:
+    """Редактор новостей: из свежих заголовков (заголовок, лид, источник) выбирает n самых интересных —
+    без местных событий и без двух новостей об одном и том же — и пересказывает понятно для озвучки
+    (Gemini уточняет детали поиском Google). [{"i": индекс, "text": ..., "film": название}] или None."""
+    if not available(key) or not items:
+        return None
+    listing = "\n".join(f"{i + 1}. {t}\n   Подробности: {lead or '—'}\n   Источник: {src}"
+                        for i, (t, lead, src) in enumerate(items))
+    rules = (
+        f"Ты редактор короткого видео «Новости кино» для широкой аудитории. Ниже свежие заголовки. Выбери {n} "
+        "самых интересных новостей о фильмах, сериалах, мультфильмах, актёрах и режиссёрах: премьеры, трейлеры, "
+        "кастинг, продолжения, сборы, награды, скандалы. Пропускай местные события (показы в городском "
+        "кинотеатре, региональные фестивали и конкурсы, новости городов), рекламу и политику. Не бери две "
+        "новости об одном и том же фильме или человеке — только одну. Источники вида t.me/… — посты "
+        "Telegram-каналов: сверяй их со СМИ; что есть и там и там — надёжнее; новость только из канала бери, "
+        "если она правдоподобна, а неподтверждённое подавай со словами «по слухам». Для каждой выбранной напиши текст для "
+        "озвучки: 1–2 коротких живых предложения, до 220 символов, чтобы зритель сразу понял, о каком фильме "
+        "или сериале речь, кто в нём и что случилось (и когда выйдет, если известно). Названия — как в "
+        "российском прокате, по-русски, в «ёлочках» (Ramayana → «Рамаяна»). Не выдумывай. Самые интересные — "
+        "первыми. Ответь только JSON: {\"news\": [{\"n\": номер заголовка, \"text\": \"...\", "
+        "\"film\": \"название фильма или сериала по-русски или пусто\"}]}"
+    )
+    data = None
+    if key:
+        try:
+            data = await _ask(key, [{"text": "Если в заголовке мало деталей — уточни поиском в Google. " + rules
+                                     + "\n\n" + listing}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: news editor with search failed: %s", exc)
+    if data is None:
+        prompt = rules + " Используй только факты из заголовков и подробностей.\n\n" + listing
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            global last_error
+            last_error = str(exc)[:300]
+            log.warning("shorts: news editor failed: %s", exc)
+            return None
+    out, seen = [], set()
+    for row in (data.get("news") if isinstance(data, dict) else None) or []:
+        try:
+            i = int(row.get("n")) - 1
+        except (TypeError, ValueError, AttributeError):
+            continue
+        text = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(row.get("text") or "")).strip()
+        if 0 <= i < len(items) and i not in seen and len(text) >= 20:
+            seen.add(i)
+            out.append({"i": i, "text": text[:260], "film": str(row.get("film") or "").strip(" «»\"")})
+    return out[:n] if len(out) >= 3 else None
+
+
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key

@@ -6366,7 +6366,7 @@ async def load_fact_channels() -> None:
 async def channels_action(message: Message) -> None:
     channels = await fact_channels()
     await message.answer(f"⏳ Проверяю {len(channels)} каналов…")
-    lines = ["📡 <b>Каналы для фактов</b> — ИИ ищет в них посты о фильме:"]
+    lines = ["📡 <b>Каналы для фактов и новостей</b> — ИИ ищет в них посты о фильме и свежие новости:"]
     for i, (ch, res) in enumerate(await shorts_tgsearch.check(channels), 1):
         mark = "✅" if isinstance(res, int) and res else f"❌ {escape(str(res or 'постов не видно'))}"
         lines.append(f"{i}. {mark} t.me/{escape(ch)}")
@@ -7096,7 +7096,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
         [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
-        [_btn("📡 Каналы для фактов", "sh:tgch")],
+        [_btn("📡 Каналы для фактов и новостей", "sh:tgch")],
         [_btn("🎬 Проверить трейлер", "sh:ask:trailer"), _btn("🤖 Проверить ИИ", "sh:ai")],
         [_btn("⬅️ Назад", "sh:menu")],
     ])
@@ -7727,6 +7727,8 @@ async def show_facts(message: Message, state: FSMContext) -> None:
     rows += [f"{i}. {escape(f)}" for i, f in enumerate(facts, 1)]
     if data.get("fx_sources"):
         rows += ["", f"🔎 <i>Источники: {escape(', '.join(data['fx_sources'][:8]))}</i>"]
+    if data.get("fx_tg_media"):
+        rows.append(f"📸 <i>Из Telegram-каналов: {len(data['fx_tg_media'])} фото/видео — ИИ поставит подходящие к фактам</i>")
     media = data.get("fx_media") or []
     await message.answer("\n".join(rows)[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "fx:go")], [_btn("✏️ Поправить факты", "fx:edit")],
@@ -7764,8 +7766,9 @@ async def facts_web(message: Message, state: FSMContext) -> None:
             raise RuntimeError(f"Кинопоиск не нашёл «{data['fx_title']}» — уточни название или добавь год")
         label = shorts_daily._title(film) + (f", {film['year']}" if film.get("year") else "")
         await wait.edit_text(f"{wait.text}\nНашёл: «{escape(label)}»")
+        tg_media: list[dict[str, Any]] = []
         facts, sources = await shorts_daily.web_facts(film, shorts_daily.usable_facts(film), GEMINI_API_KEY,
-                                                      n=8, rumors=rumors)
+                                                      n=8, rumors=rumors, media_out=tg_media)
     except Exception as exc:
         logging.exception("Facts web search failed")
         await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
@@ -7774,12 +7777,14 @@ async def facts_web(message: Message, state: FSMContext) -> None:
                                  [_btn("❌ Отмена", "fx:cancel")]]))
         return
     await wait.delete()
-    await state.update_data(fx_facts=facts, fx_sources=sources, fx_film=f"id:{film['id']}", fx_label=label)
+    await state.update_data(fx_facts=facts, fx_sources=sources, fx_film=f"id:{film['id']}", fx_label=label,
+                            fx_tg_media=[{"image": m.get("image"), "video": m.get("video")} for m in tg_media][:12])
     await show_facts(message, state)
 
 
 async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], status: Message,
-                         media: list[dict[str, str]] | None = None, rumors: bool = False) -> None:
+                         media: list[dict[str, str]] | None = None, rumors: bool = False,
+                         tg_media: list[dict[str, Any]] | None = None) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -7802,7 +7807,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             result = await asyncio.wait_for(shorts_daily.make_facts_short(
                 kp._get, work, title, set(), music, TMDB_API_KEY, GEMINI_API_KEY,
                 trailer_clips=await shorts_setting("clips") != "off", custom_facts=facts, user_media=files,
-                rumors=rumors),
+                rumors=rumors, tg_media=tg_media),
                 timeout=SHORTS_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
@@ -7818,7 +7823,8 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
 
 @router.message(FactsState.title, F.text, ~F.text.startswith("/"))
 async def facts_title(message: Message, state: FSMContext) -> None:
-    await state.update_data(fx_title=_typed(message), fx_mode="", fx_film="", fx_label="", fx_sources=[])
+    await state.update_data(fx_title=_typed(message), fx_mode="", fx_film="", fx_label="", fx_sources=[],
+                            fx_tg_media=[])
     await state.set_state(None)
     await message.answer("Откуда взять факты?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🔎 ИИ найдёт в интернете", "fx:web")],
@@ -7830,7 +7836,8 @@ async def facts_title(message: Message, state: FSMContext) -> None:
 @router.message(FactsState.text, F.text, ~F.text.startswith("/"))
 async def facts_text(message: Message, state: FSMContext) -> None:
     await state.set_state(None)
-    await state.update_data(fx_text=_typed(message), fx_mode="text", fx_sources=[], fx_film="", fx_label="")
+    await state.update_data(fx_text=_typed(message), fx_mode="text", fx_sources=[], fx_film="", fx_label="",
+                            fx_tg_media=[])
     await facts_condense(message, state)
 
 
@@ -7934,7 +7941,7 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             try:
                 await run_text_facts(message.bot, message.chat.id, data.get("fx_film") or data["fx_title"],
                                      data["fx_facts"], status, data.get("fx_media") or [],
-                                     data.get("fx_mode") == "rumors")
+                                     data.get("fx_mode") == "rumors", data.get("fx_tg_media") or [])
             except Exception as exc:
                 logging.exception("Text facts short failed")
                 try:
