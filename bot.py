@@ -6470,7 +6470,7 @@ async def run_short(
                     logging.exception("Shorts: custom music download failed")
                     music = None
 
-            # если бот перезапустится посреди сборки (обновление на Railway), после старта скажем об этом
+            # если бот перезапустится посреди сборки (обновление), после старта скажем об этом
             await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": theme_key or ""}))
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
@@ -6504,8 +6504,17 @@ async def run_short(
             ) from None
         finally:
             shorts_daily.on_progress = None
-            await set_shorts_setting("running", None)
+            await clear_running()
             shutil.rmtree(work, ignore_errors=True)
+
+
+stopping = False  # бот останавливается (обновление, перезапуск) — сборки обрываются не по своей вине
+
+
+async def clear_running() -> None:
+    """Сборка закончилась — снять отметку. При остановке бота оставляем: после запуска сообщим автору."""
+    if not stopping:
+        await set_shorts_setting("running", None)
 
 
 async def report_interrupted_short(bot: Bot) -> None:
@@ -6521,7 +6530,7 @@ async def report_interrupted_short(bot: Bot) -> None:
             await bot.send_message(
                 chat_id,
                 f"⚠️ Сборка шортса ({escape(theme)}) прервалась: бот перезапустился "
-                "(обычно из-за обновления на Railway). Нажми тему ещё раз.",
+                "(обновление или перезапуск сервера). Нажми тему ещё раз.",
             )
     except Exception:
         logging.exception("Failed to report interrupted short")
@@ -7543,7 +7552,7 @@ async def run_review(bot: Bot, chat_id: int, script: dict[str, Any], status: Mes
             ) from None
         finally:
             shorts_daily.on_progress = None
-            await set_shorts_setting("running", None)
+            await clear_running()
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -7803,7 +7812,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
                                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
         finally:
             shorts_daily.on_progress = None
-            await set_shorts_setting("running", None)
+            await clear_running()
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -8004,7 +8013,7 @@ async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status:
                                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
         finally:
             shorts_daily.on_progress = None
-            await set_shorts_setting("running", None)
+            await clear_running()
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -8199,7 +8208,7 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
         finally:
             shorts_daily.on_progress = None
-            await set_shorts_setting("running", None)
+            await clear_running()
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -8639,6 +8648,8 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        global stopping
+        stopping = True
         provider_task.cancel()
         blender_task.cancel()
         reminder_task.cancel()

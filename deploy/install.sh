@@ -12,6 +12,16 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git; }
 
+# файл подкачки: на сервере с 1–2 ГБ памяти монтаж видео без него зависает или падает
+if [ -z "$(swapon --show --noheadings 2>/dev/null)" ] && [ ! -f /swapfile ]; then
+  echo "== Создаю файл подкачки 2 ГБ"
+  if fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none; then
+    chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile \
+      && { grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; } \
+      || { swapoff /swapfile 2>/dev/null; rm -f /swapfile; echo "   подкачку не включить (так бывает на некоторых VPS) — продолжаю без неё"; }
+  fi
+fi
+
 if [ -d "$DIR/.git" ]; then
   echo "== Обновляю код"
   git -C "$DIR" pull --ff-only
