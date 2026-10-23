@@ -334,6 +334,53 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
     return out
 
 
+async def proofread(key: str, texts: list[str]) -> list[str]:
+    """Корректор: исправляет грамматику (род, число, падеж, предлоги) и написание имён в готовых фразах,
+    не меняя смысла. Один запрос на все фразы: Gemini, если лимит есть; иначе бесплатная Gemini через
+    BeatAPI (по-русски пишет лучше), в крайнем случае Groq. Не вышло — фразы как были."""
+    texts = [t for t in texts]
+    if not texts or not available(key):
+        return texts
+    listing = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    prompt = (
+        "Ты корректор русского текста для озвучки. Исправь в каждой фразе только ошибки: род, число, падеж, "
+        "согласование, предлоги («интерес к новой экранизации», «сыграют Дамблдора и Снейпа», «среди сорока "
+        "тысяч участников»). Иностранные имена, издания и названия — так, как их пишут российские СМИ и "
+        "русский дубляж (The Times → «Таймс», Gilderoy Lockhart → Златопуст Локонс, Leavesden → «Ливсден»). "
+        "Не меняй смысл, факты, цифры, порядок и стиль, ничего не добавляй и не убирай. Безошибочную фразу "
+        "оставь как есть. Ответь только JSON: {\"texts\": [\"...\", ...]} — столько же фраз, в том же порядке."
+        "\n\n" + listing
+    )
+    attempts = []
+    if key:
+        attempts.append(("Gemini", lambda: _ask(key, [{"text": prompt}])))
+    if BEAT_KEY:
+        async def beat_gemini() -> Any:
+            free = await beat_free_models()
+            model = next((m for m in free if "gemini" in m.lower()), None)
+            return await _ask_beat(prompt, model=model)
+        attempts.append(("BeatAPI", beat_gemini))
+    if RESERVE_KEY:
+        attempts.append(("Groq", lambda: _ask_reserve(prompt)))
+    for name, call in attempts:
+        try:
+            data = await asyncio.wait_for(call(), timeout=120)
+            out = [str(t).strip() for t in (data.get("texts") if isinstance(data, dict) else None) or []]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: proofread via %s failed: %s", name, exc)
+            continue
+        if len(out) != len(texts):
+            log.warning("shorts: proofread via %s returned %s of %s", name, len(out), len(texts))
+            continue
+        # корректор не переписывает: заметно другая длина — оставляем исходную фразу
+        fixed = [new if new and 0.75 * len(old) <= len(new) <= 1.3 * len(old) + 10 else old
+                 for old, new in zip(texts, out)]
+        log.info("shorts: proofread via %s: %s of %s changed", name, sum(a != b for a, b in zip(texts, fixed)),
+                 len(texts))
+        return fixed
+    return texts
+
+
 async def _pick_beat_model() -> str:
     global _beat_model
     if not _beat_model:
@@ -344,9 +391,9 @@ async def _pick_beat_model() -> str:
     return _beat_model
 
 
-async def _ask_beat(prompt: str, image: Image.Image | None = None) -> Any:
+async def _ask_beat(prompt: str, image: Image.Image | None = None, model: str | None = None) -> Any:
     """Запрос к BeatAPI (/v1/chat/completions). Бесплатные модели — 1 запрос в минуту до пополнения."""
-    model = BEAT_MODEL or await _pick_beat_model()
+    model = model or BEAT_MODEL or await _pick_beat_model()
     content: list[dict[str, Any]] = [{"type": "text", "text": _fit(prompt, 30000)}]
     if image is not None:
         small = image.copy()

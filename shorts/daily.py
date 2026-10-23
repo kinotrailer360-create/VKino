@@ -438,6 +438,9 @@ async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
                                         article, n, tgsearch.as_text(posts, 14000 if rumors else 9000), rumors)
     if media_out is not None:
         media_out.extend(p for p in posts if p.get("image") or p.get("video"))
+    if progress:
+        await progress(85, "Корректор проверяет падежи и имена")
+    facts = await ai.proofread(gemini_key, facts)
     channels = list(dict.fromkeys(f"t.me/{p['channel']}" for p in posts))
     return facts, [s for s in sources if s != "Telegram-каналы"] + channels
 
@@ -620,7 +623,8 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         picked = await ai.pick_news(gemini_key, [(it.title, it.lead, it.source) for it in candidates], NEWS)
         if picked:
             items = [candidates[p["i"]] for p in picked]
-            retold = [p["text"] for p in picked]
+            await _progress(10, "Корректор проверяет падежи и имена")
+            retold = await ai.proofread(gemini_key, [p["text"] for p in picked])
             for it, p in zip(items, picked):
                 it.film_query = p["film"] or it.film_query  # по-русски — картинку найдём на Кинопоиске
     await _progress(12, "Качаю картинки к новостям")
