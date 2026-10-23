@@ -7032,7 +7032,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
-        [_btn("✍️ Факты: ввести название", "sh:ask:facts"), _btn("📝 Факты: свой текст", "fx:start")],
+        [_btn("✍️ Факты: ввести название", "sh:ask:facts"), _btn("🔎 Факты: интернет или свой текст", "fx:start")],
         [_btn("⚙️ Настройки ▸", "sh:settings")],
         [_btn("⬅️ В админку", "admin:home")],
     ])
@@ -7654,6 +7654,8 @@ async def show_facts(message: Message, state: FSMContext) -> None:
     facts = data["fx_facts"]
     rows = [f"💡 <b>{len(facts)} фактов о «{escape(data['fx_title'])}»</b> — проверь, всё ли правда:", ""]
     rows += [f"{i}. {escape(f)}" for i, f in enumerate(facts, 1)]
+    if data.get("fx_sources"):
+        rows += ["", f"🔎 <i>Источники: {escape(', '.join(data['fx_sources'][:8]))}</i>"]
     media = data.get("fx_media") or []
     await message.answer("\n".join(rows)[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "fx:go")], [_btn("✏️ Поправить факты", "fx:edit")],
@@ -7674,6 +7676,27 @@ async def facts_condense(message: Message, state: FSMContext) -> None:
         return
     await wait.delete()
     await state.update_data(fx_facts=facts)
+    await show_facts(message, state)
+
+
+async def facts_web(message: Message, state: FSMContext) -> None:
+    """Факты из интернета: ИИ ищет в Google и Википедии (плюс факты Кинопоиска), автор проверяет и правит."""
+    data = await state.get_data()
+    wait = await message.answer("🔎 ИИ ищет факты в интернете — до минуты…")
+    try:
+        film = await shorts_daily.find_film(kp._get, data["fx_title"])
+        if not film:
+            raise RuntimeError(f"Кинопоиск не нашёл «{data['fx_title']}» — уточни название или добавь год")
+        facts, sources = await shorts_daily.web_facts(film, shorts_daily.usable_facts(film), GEMINI_API_KEY, n=8)
+    except Exception as exc:
+        logging.exception("Facts web search failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("🔄 Ещё раз", "fx:redo")], [_btn("📝 Вставлю свой текст", "fx:own")],
+                                 [_btn("❌ Отмена", "fx:cancel")]]))
+        return
+    await wait.delete()
+    await state.update_data(fx_facts=facts, fx_sources=sources)
     await show_facts(message, state)
 
 
@@ -7715,16 +7738,17 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
 
 @router.message(FactsState.title, F.text, ~F.text.startswith("/"))
 async def facts_title(message: Message, state: FSMContext) -> None:
-    await state.update_data(fx_title=_typed(message))
-    await state.set_state(FactsState.text)
-    await message.answer("📝 Теперь вставь текст с фактами одним сообщением (ссылки на источники можно не убирать). "
-                         "ИИ выберет 5 самых интересных и ничего не добавит от себя.\n\n<i>Передумал — /cancel</i>")
+    await state.update_data(fx_title=_typed(message), fx_mode="")
+    await state.set_state(None)
+    await message.answer("Откуда взять факты?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🔎 ИИ найдёт в интернете", "fx:web")], [_btn("📝 Вставлю свой текст", "fx:own")],
+        [_btn("❌ Отмена", "fx:cancel")]]))
 
 
 @router.message(FactsState.text, F.text, ~F.text.startswith("/"))
 async def facts_text(message: Message, state: FSMContext) -> None:
     await state.set_state(None)
-    await state.update_data(fx_text=_typed(message))
+    await state.update_data(fx_text=_typed(message), fx_mode="text", fx_sources=[])
     await facts_condense(message, state)
 
 
@@ -7778,7 +7802,7 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if action == "start":
         await state.clear()
         await state.set_state(FactsState.title)
-        await message.answer("📝 <b>Факты из своего текста</b>\n\nНапиши название фильма или сериала "
+        await message.answer("📝 <b>Факты о фильме</b>: ИИ найдёт их в интернете или возьмёт из твоего текста.\n\nНапиши название фильма или сериала "
                              "(можно с годом: <code>Человек-паук: Новый день 2026</code>).\n\n<i>Передумал — /cancel</i>")
         return
     if action == "cancel":
@@ -7786,10 +7810,17 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("Отменено.")
         return
     data = await state.get_data()
-    if not data.get("fx_text"):
-        await message.answer("Начни заново: кнопка «📝 Факты: свой текст».")
+    if not data.get("fx_title"):
+        await message.answer("Начни заново: кнопка «🔎 Факты: интернет или свой текст».")
         return
-    if action == "redo":
+    if action == "own":
+        await state.set_state(FactsState.text)
+        await message.answer("📝 Вставь текст с фактами одним сообщением (ссылки на источники можно не убирать). "
+                             "ИИ выберет 5 самых интересных и ничего не добавит от себя.\n\n<i>Передумал — /cancel</i>")
+    elif action == "web" or (action == "redo" and data.get("fx_mode") != "text"):
+        await state.update_data(fx_mode="web")
+        await facts_web(message, state)
+    elif action == "redo":
         await facts_condense(message, state)
     elif action == "media":
         await state.set_state(FactsState.media)

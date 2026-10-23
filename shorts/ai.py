@@ -109,12 +109,16 @@ async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict
     raise AssertionError("unreachable")
 
 
-async def _ask(key: str, parts: list[dict[str, Any]]) -> Any:
+async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> Any:
+    """search=True — модель сама ищет в Google (ответ JSON-текстом, источники — в ключе "_sources")."""
     global MODEL
-    body = {
+    body: dict[str, Any] = {
         "contents": [{"parts": parts}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
+    if search:  # с поиском строгий JSON-режим недоступен — просим JSON в тексте
+        body = {"contents": [{"parts": parts}], "tools": [{"google_search": {}}],
+                "generationConfig": {"temperature": 0.3}}
     timeout = aiohttp.ClientTimeout(total=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         model = MODEL
@@ -137,8 +141,15 @@ async def _ask(key: str, parts: list[dict[str, Any]]) -> Any:
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
             raise AIError(f"Gemini HTTP {status} ({model}): {str(msg)[:200]}")
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
+        if not search:
+            return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+        cand = data["candidates"][0]
+        result = _json_from("".join(str(p.get("text") or "") for p in cand["content"]["parts"]))
+        chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+        sources = [str((c.get("web") or {}).get("title") or "") for c in chunks]
+        if isinstance(result, dict):
+            result["_sources"] = list(dict.fromkeys(x for x in sources if x))
+        return result
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise AIError(f"Gemini: неожиданный ответ ({exc})") from exc
 
@@ -655,3 +666,52 @@ async def condense_facts(key: str, title: str, text: str, n: int = 5) -> list[st
     if len(facts) < 3:
         raise AIError("ИИ не нашёл в тексте хотя бы 3 факта — пришли текст подлиннее")
     return facts
+
+
+def _clean_facts(data: Any, n: int) -> list[str]:
+    facts = [re.sub(r"\s+", " ", re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(f))).strip()
+             for f in (data.get("facts") if isinstance(data, dict) else None) or []]
+    return [f for f in facts if 30 <= len(f) <= 220][:n]
+
+
+async def web_facts(key: str, title: str, en: str = "", year: int | None = None, kind: str = "фильме",
+                    known: list[str] | None = None, article: str = "", n: int = 5) -> tuple[list[str], list[str]]:
+    """Интересные факты о фильме из интернета: Gemini ищет в Google; не вышло — ИИ выбирает из Википедии
+    и фактов Кинопоиска. Возвращает (факты, источники)."""
+    if not available(key):
+        raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
+    name = f"«{title}»" + (f" ({en}, {year})" if en and year else f" ({year})" if year else "")
+    rules = (
+        f"Нужно {n} самых интересных и малоизвестных фактов для шортса «{n} фактов о {kind} {name}»: "
+        "съёмки, кастинг, кто отказался от роли, трюки, бюджет и рекорды, пасхалки, вырезанные сцены, "
+        "реквизит, курьёзы на площадке. Без спойлеров сюжета и концовки. Только проверенное — никаких "
+        "слухов и догадок, не выдумывай цифры. Каждый факт — одна-две короткие фразы для озвучки, "
+        "60–170 символов, живо, по-русски, без ссылок и названий сайтов. Названия фильмов — в «ёлочках». "
+        "Самый сильный факт — первым."
+    )
+    extra = ""
+    if known:
+        extra += "\n\nФакты с Кинопоиска (можно взять лучшие, но ищи и новые):\n" + "\n".join(f"- {f}" for f in known[:15])
+    if article:
+        extra += "\n\nСправка из Википедии:\n" + article[:12000]
+    tail = '\n\nОтветь только JSON: {"facts": ["...", ...]}'
+    errors = []
+    if key:
+        try:
+            data = await _ask(key, [{"text": "Поищи в интернете. " + rules + extra + tail}], search=True)
+            facts = _clean_facts(data, n)
+            if len(facts) >= 3:
+                return facts, data.get("_sources") or []
+            errors.append("поиск Google: мало фактов")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"поиск Google: {exc}")
+            log.warning("shorts: web facts search failed: %s", exc)
+    if not extra:
+        raise AIError("; ".join(errors) or "нет материала для фактов")
+    prompt = rules + " Бери факты ТОЛЬКО из текстов ниже, ничего не добавляй от себя." + extra + tail
+    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    facts = _clean_facts(data, n)
+    if len(facts) < 3:
+        raise AIError("ИИ не нашёл хотя бы 3 факта" + (f" ({'; '.join(errors)})" if errors else ""))
+    sources = ["Википедия"] if article else []
+    return facts, sources + (["Кинопоиск"] if known else [])

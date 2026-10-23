@@ -373,11 +373,14 @@ def _facts_word(n: int) -> str:
     return "факта" if 2 <= n <= 4 else "фактов"
 
 
-async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int]) -> tuple[dict[str, Any], list[str]]:
+async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int],
+                         web: bool = False) -> tuple[dict[str, Any], list[str]]:
+    """Фильм и его факты с Кинопоиска (все подходящие). web=True — факты найдёт ИИ в интернете,
+    поэтому названный автором фильм берём, даже если на Кинопоиске фактов мало."""
     if query.startswith("id:") and query[3:].isdigit():
         # выбран из подсказок поиска — точный фильм по id Кинопоиска
         cands = [{"id": int(query[3:])}]
-        need = 3
+        need = 0 if web else 3
     elif query:
         # «Мастер и Маргарита 2024» — год в конце уточняет, какой из одноимённых фильмов
         year_m = re.search(r"\s(19\d\d|20\d\d)$", query)
@@ -392,7 +395,7 @@ async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int]) -> tuple[d
             cands = [c for c in cands if c.get("year") == year] or cands
         # одноимённые (фильм 2024 и сериал 2005) — берём самый известный, по числу оценок
         cands.sort(key=lambda c: -int((c.get("votes") or {}).get("kp") or 0))
-        need = 3
+        need = 0 if web else 3
     else:
         cands = await _query(fetch, page=random.randint(1, 5), sortField="votes.kp", sortType="-1",
                              notNullFields="name",
@@ -408,8 +411,39 @@ async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int]) -> tuple[d
             continue
         facts = usable_facts(full)
         if len(facts) >= need and _image_url(full):
-            return full, random.sample(facts[:12], min(FACTS, len(facts[:12])))
+            return full, facts
     raise RuntimeError(f"Не нашёл фильм с {need}+ подходящими фактами" + (f" по запросу «{query}»" if query else ""))
+
+
+async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
+                    n: int = FACTS) -> tuple[list[str], list[str]]:
+    """Факты из интернета (поиск Google через Gemini, Википедия) вместе с фактами Кинопоиска."""
+    en = str(film.get("alternativeName") or film.get("enName") or "")
+    article = await wiki.film_article(_title(film), en, film.get("year"))
+    return await ai.web_facts(gemini_key, _title(film), en, film.get("year"), _kind(film), kp_facts, article, n)
+
+
+async def gather_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str) -> tuple[list[str], str]:
+    """(факты для ролика, заметка автору). Без ИИ или при сбое — факты Кинопоиска, как раньше."""
+    if ai.available(gemini_key):
+        await _progress(7, "ИИ ищет факты в интернете")
+        try:
+            facts, sources = await web_facts(film, kp_facts, gemini_key)
+            for f in kp_facts:  # ИИ нашёл меньше пяти — добираем Кинопоиском
+                if len(facts) >= FACTS:
+                    break
+                if f not in facts:
+                    facts.append(f)
+            src = ", ".join(sources[:6]) or "интернет"
+            return facts, f"🔎 Факты нашёл ИИ в интернете ({src}) — проверь перед публикацией."
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: web facts for %s failed: %s", _title(film), exc)
+            note = f"⚠️ Факты в интернете не нашлись ({str(exc)[:200]}) — взял с Кинопоиска."
+    else:
+        note = ""
+    if len(kp_facts) < 3:
+        raise RuntimeError(f"У «{_title(film)}» мало фактов на Кинопоиске, а ИИ их в интернете не нашёл")
+    return random.sample(kp_facts[:12], min(FACTS, len(kp_facts[:12]))), note
 
 
 async def _stills(fetch: Fetch, item: dict[str, Any]) -> list[str]:
@@ -1304,9 +1338,10 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         film = await find_film(fetch, query)
         if not film:
             raise RuntimeError(f"Кинопоиск не нашёл «{query}»")
-        facts = list(custom_facts)
+        facts, web_note = list(custom_facts), ""
     else:
-        film, facts = await pick_fact_film(fetch, query, exclude or set())
+        film, kp_facts = await pick_fact_film(fetch, query, exclude or set(), web=ai.available(gemini_key))
+        facts, web_note = await gather_facts(film, kp_facts, gemini_key)
     await _progress(10, f"«{_title(film)}»: качаю кадры")
     # награды из Викиданных — первым фактом (в фактах автора — только его текст)
     award_fact = None if custom_facts else wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -1402,7 +1437,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     voiced = await _render(work, cover_path, cards, lines, "ФАКТЫ", t.upper(),
                            "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ", music)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_facts_seo(film, facts))
-    notes = []
+    notes = [web_note] if web_note else []
     if video_note:
         notes.append(f"🎞 Видео из трейлера не вставлено: {video_note}.")
     if ai.last_error:
