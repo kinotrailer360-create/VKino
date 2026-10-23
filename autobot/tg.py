@@ -43,7 +43,8 @@ def pull(out_root):
         media = m.get('video') or m.get('document') or m.get('animation')
         item = {'update_id': u['update_id'], 'chat_id': chat, 'date': m.get('date'),
                 'caption': m.get('caption') or m.get('text') or '', 'media_group': m.get('media_group_id'),
-                'forward_from': (m.get('forward_origin') or {}).get('type')}
+                'forward_from': (m.get('forward_origin') or {}).get('type'),
+                'media_meta': {k: (m.get('video') or m.get('document') or m.get('animation') or {}).get(k) for k in ('duration', 'width', 'height', 'file_size', 'file_name')}}
         if media:
             try:
                 f = call('getFile', {'file_id': media['file_id']})
