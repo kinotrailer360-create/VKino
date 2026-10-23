@@ -36,31 +36,31 @@ def plain(name,src,ss,b0,b1,vf,speed=1.0):
     out=f'{W}/{name}.mp4'; n=fr(b1)-fr(b0); pre=f"setpts=(PTS-STARTPTS)/{speed}," if speed!=1 else ""
     run(['ffmpeg','-v','error','-y','-ss',f'{ss:.3f}','-t',str(n/FPS*speed+0.3),'-i',S(src),'-vf',f"{pre}fps=30,{vf},{GRADE},format=yuv420p",
          '-an','-frames:v',str(n),'-r','30','-c:v','libx264','-crf','16','-preset','medium',out]); parts.append(out)
-GOOL=lambda: f"{shake(18)},{txt('ГОООЛ',150,250)},{WF}"
+GOOL=lambda lab: f"{shake(18)},{txt('ГОООЛ',150,230)},drawbox=x=0:y=400:w=iw:h=80:color=black@0.6:t=fill,{txt(lab,52,412,col='0xEDBB00')},{WF}"
 # 0) ИНТРО
 plain('i0',4,6.0,0,4,f"{Z(1.05,360,480,0.001)},drawbox=x=0:y=300:w=iw:h=300:color=black@0.55:t=fill,"
       f"{txt('БАВАРИЯ 2\\:2 АРСЕНАЛ',50,335)},{txt('ВСЕ ГОЛЫ',96,420,col='0xEDBB00')},{txt('ЛИГА ЧЕМПИОНОВ · 3-Й ТУР',30,535,FONT)}")
 # 1) 25' ЭЗЕ 0:1 (пас Эдегор) — мяч на дальнем ракурсе не читается: камера ведёт атаку, без маркера
 P1=PLATE("25’ ЭЗЕ · 0\\:1 · пас Эдегор"); SC1=SCORE(0,0,25); SC1b=SCORE(0,1,25)
 bt('g1a',8,'eze',0.0,4,10,speed=0.6,zoom=1.35,post=f"{SC1},{P1}")
-bt('g1b',8,'eze',0.36,10,14,speed=0.3,zoom=1.6,mi=True,post=f"{SC1},{P1}")
-plain('g1c',8,0.95,14,17,f"{Z(1.9,650,505,0.003)},{SC1b},{GOOL()}",speed=0.5)
+bt('g1b',8,'eze',0.36,10,14,speed=0.3,zoom=1.9,mi=True,post=f"{SC1},{P1}")
+plain('g1c',8,0.95,14,17,f"{Z(1.9,650,505,0.003)},{SC1b},{GOOL('0\\:1 · ГОЛ АРСЕНАЛА')}",speed=0.5)
 # 2) 35' ДЭВИС 1:1 (пас Кейн): обводка вратаря, маркер на мяче 0.8–1.45
 P2=PLATE("35’ ДЭВИС · 1\\:1 · пас Кейн"); SC2=SCORE(0,1,35); SC2b=SCORE(1,1,35)
 bt('g2a',1,'dav',0.0,17,27,speed=0.9,zoom=1.3,col=BAY,ms=0.8,me=1.45,post=f"{SC2},{P2},{WF}")
 bt('g2b',1,'dav',0.7,27,31,speed=0.4,zoom=1.45,col=BAY,ms=0.8,me=1.45,mi=True,post=f"{SC2},{P2}")
-plain('g2c',1,2.9,31,34,f"{Z(1.2,200,420,0.003)},{SC2b},{GOOL()}",speed=0.6)
+plain('g2c',1,2.9,31,34,f"{Z(1.2,200,420,0.003)},{SC2b},{GOOL('1\\:1 · ГОЛ БАВАРИИ')}",speed=0.6)
 # 3) 61' КЕЙН, ПЕНАЛЬТИ 2:1: разбег и удар, маркер на мяче до ворот
 P3=PLATE("61’ КЕЙН · 2\\:1 · пенальти"); SC3=SCORE(1,1,61); SC3b=SCORE(2,1,61)
 bt('g3a',4,'kane',4.4,34,41,speed=0.8,zoom=1.3,col=BAY,ms=6.5,me=6.85,post=f"{SC3},{P3},{WF}")
 bt('g3b',4,'kane',6.45,41,45,speed=0.35,zoom=1.5,col=BAY,ms=6.5,me=6.85,mi=True,post=f"{SC3},{P3}")
-plain('g3c',4,8.2,45,48,f"{Z(1.15,360,480,0.002)},{SC3b},{GOOL()}",speed=0.8)
+plain('g3c',4,8.2,45,48,f"{Z(1.15,360,480,0.002)},{SC3b},{GOOL('2\\:1 · ГОЛ БАВАРИИ')}",speed=0.8)
 plain('g3d',4,9.0,48,52,f"{Z(1.2,360,520,0.002)},{SC3b},{WF}",speed=0.8)   # мяч в сетке после пенальти, ближе
 # 4) 82' РАЙС 2:2 (пас Дьокереш): атака, затем влёт из-за ворот с маркером до сетки
 P4=PLATE("82’ РАЙС · 2\\:2 · пас Дьокереш"); SC4=SCORE(2,1,82); SC4b=SCORE(2,2,82)
 bt('g4a',7,'rice7',4.0,52,61,speed=1.0,zoom=1.25,post=f"{SC4},{P4},{WF}")
 bt('g4b',5,'rice5',1.15,61,66,speed=0.4,zoom=1.35,ms=1.35,me=2.15,mi=True,post=f"{SC4},{P4},{WF}")
-plain('g4c',5,2.15,66,69,f"{Z(1.6,450,590,0.003)},{SC4b},{GOOL()}",speed=0.5)
+plain('g4c',5,2.15,66,69,f"{Z(1.6,450,590,0.003)},{SC4b},{GOOL('2\\:2 · ГОЛ АРСЕНАЛА')}",speed=0.5)
 plain('g4d',5,10.4,69,73,f"{Z(1.15,360,520,0.002)},{SC4b},{WF}",speed=0.8)     # празднование №41
 # ФИНАЛ
 plain('fin',5,12.0,73,79,f"{Z(1.1,360,480,0.002)},drawbox=x=0:y=330:w=iw:h=250:color=black@0.55:t=fill,"
