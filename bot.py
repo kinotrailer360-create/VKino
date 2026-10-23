@@ -7752,20 +7752,55 @@ async def facts_condense(message: Message, state: FSMContext) -> None:
     await show_facts(message, state)
 
 
-async def facts_web(message: Message, state: FSMContext) -> None:
-    """Факты из интернета: ИИ ищет в Google, Википедии и Telegram-каналах (плюс факты Кинопоиска),
-    автор проверяет и правит. Режим «rumors» — новости и слухи о фильме, который ещё не вышел."""
+def _film_label(film: dict[str, Any]) -> str:
+    kind = "сериал" if film.get("isSeries") or "series" in str(film.get("type") or "") else ""
+    extra = ", ".join(x for x in (str(film.get("year") or ""), kind,
+                                  "ещё не вышел" if shorts_daily.is_upcoming(film) else "") if x)
+    return shorts_daily._title(film) + (f" ({extra})" if extra else "")
+
+
+async def facts_find(message: Message, state: FSMContext) -> None:
+    """Кнопка «ИИ найдёт в интернете»: ищем фильм; есть и старый, и ещё не вышедший с таким названием —
+    спрашиваем, какой. Дальше facts_web сам решает: факты или новости и слухи."""
     data = await state.get_data()
-    rumors = data.get("fx_mode") == "rumors"
-    await load_fact_channels()
-    wait = await message.answer(("📰 ИИ собирает новости и слухи" if rumors else "🔎 ИИ ищет факты")
-                                + " в интернете и Telegram-каналах — до минуты…")
     try:
-        film = await shorts_daily.find_film(kp._get, data["fx_title"], upcoming=rumors)
-        if not film:
-            raise RuntimeError(f"Кинопоиск не нашёл «{data['fx_title']}» — уточни название или добавь год")
-        label = shorts_daily._title(film) + (f", {film['year']}" if film.get("year") else "")
-        await wait.edit_text(f"{wait.text}\nНашёл: «{escape(label)}»")
+        old = await shorts_daily.find_film(kp._get, data["fx_title"])
+        new = await shorts_daily.find_film(kp._get, data["fx_title"], upcoming=True)
+    except Exception as exc:
+        logging.exception("Facts film search failed")
+        await message.answer(f"❌ Поиск на Кинопоиске не удался: <code>{escape(str(exc)[:300])}</code>")
+        return
+    if not old and not new:
+        await message.answer(f"Кинопоиск не нашёл «{escape(data['fx_title'])}» — уточни название или добавь год.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("❌ Отмена", "fx:cancel")]]))
+        return
+    if old and new and old["id"] != new["id"] and shorts_daily.is_upcoming(new):
+        await message.answer("Какой из них?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn(f"🆕 {_film_label(new)}"[:60], f"fx:film:{new['id']}")],
+            [_btn(_film_label(old)[:60], f"fx:film:{old['id']}")],
+            [_btn("❌ Отмена", "fx:cancel")]]))
+        return
+    await facts_web(message, state, old or new)
+
+
+async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | None = None) -> None:
+    """Факты из интернета: ИИ ищет в Google, Википедии и Telegram-каналах (плюс факты Кинопоиска),
+    автор проверяет и правит. Фильм ещё не вышел — вместо фактов новости и слухи о нём."""
+    data = await state.get_data()
+    await load_fact_channels()
+    try:
+        if film is None:  # «Ещё раз» — тот же фильм
+            film = await kp._get(f"/movie/{int(str(data['fx_film'])[3:])}")
+    except Exception as exc:
+        await message.answer(f"❌ Не получилось: <code>{escape(str(exc)[:300])}</code>")
+        return
+    rumors = shorts_daily.is_upcoming(film)
+    label = shorts_daily._title(film) + (f", {film['year']}" if film.get("year") else "")
+    await state.update_data(fx_mode="rumors" if rumors else "web", fx_film=f"id:{film['id']}", fx_label=label)
+    wait = await message.answer(
+        (f"📰 «{escape(label)}» ещё не вышел — ИИ собирает новости и слухи" if rumors
+         else f"🔎 «{escape(label)}» — ИИ ищет факты") + " в интернете и Telegram-каналах, до минуты…")
+    try:
         tg_media: list[dict[str, Any]] = []
         facts, sources = await shorts_daily.web_facts(film, shorts_daily.usable_facts(film), GEMINI_API_KEY,
                                                       n=8, rumors=rumors, media_out=tg_media)
@@ -7777,7 +7812,7 @@ async def facts_web(message: Message, state: FSMContext) -> None:
                                  [_btn("❌ Отмена", "fx:cancel")]]))
         return
     await wait.delete()
-    await state.update_data(fx_facts=facts, fx_sources=sources, fx_film=f"id:{film['id']}", fx_label=label,
+    await state.update_data(fx_facts=facts, fx_sources=sources,
                             fx_tg_media=[{"image": m.get("image"), "video": m.get("video")} for m in tg_media][:12])
     await show_facts(message, state)
 
@@ -7826,9 +7861,9 @@ async def facts_title(message: Message, state: FSMContext) -> None:
     await state.update_data(fx_title=_typed(message), fx_mode="", fx_film="", fx_label="", fx_sources=[],
                             fx_tg_media=[])
     await state.set_state(None)
-    await message.answer("Откуда взять факты?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await message.answer("Откуда взять факты? ИИ ищет везде — Google, Википедия, Telegram-каналы, Кинопоиск. "
+                         "Если фильм ещё не вышел, соберёт новости и слухи о нём.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🔎 ИИ найдёт в интернете", "fx:web")],
-        [_btn("📰 Новости и слухи (ещё не вышел)", "fx:rumors")],
         [_btn("📝 Вставлю свой текст", "fx:own")],
         [_btn("❌ Отмена", "fx:cancel")]]))
 
@@ -7906,11 +7941,20 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(FactsState.text)
         await message.answer("📝 Вставь текст с фактами одним сообщением (ссылки на источники можно не убирать). "
                              "ИИ выберет 5 самых интересных и ничего не добавит от себя.\n\n<i>Передумал — /cancel</i>")
-    elif action in ("web", "rumors"):
-        await state.update_data(fx_mode=action)
-        await facts_web(message, state)
+    elif action in ("web", "rumors"):  # «rumors» — кнопка из старых сообщений
+        await facts_find(message, state)
+    elif action.startswith("film:") and action[5:].isdigit():
+        try:
+            film = await kp._get(f"/movie/{int(action[5:])}")
+        except Exception as exc:
+            await message.answer(f"❌ Кинопоиск не ответил: <code>{escape(str(exc)[:300])}</code>")
+            return
+        await facts_web(message, state, film)
     elif action == "redo" and data.get("fx_mode") != "text":
-        await facts_web(message, state)
+        if data.get("fx_film"):
+            await facts_web(message, state)
+        else:
+            await facts_find(message, state)
     elif action == "redo":
         await facts_condense(message, state)
     elif action == "media":
