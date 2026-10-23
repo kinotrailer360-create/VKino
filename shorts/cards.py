@@ -7,8 +7,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 ASSETS = Path(__file__).resolve().parent / "assets"
-# высота 820: под картинкой — слово-субтитр и строки с датами, и всё это выше подписей и кнопок YouTube
-CARD_W, CARD_H = 1080, 820
+# высота 780: под картинкой — субтитр-фраза и строки с датами, и всё это выше подписей и кнопок YouTube
+CARD_W, CARD_H = 1080, 780
 COVER_W, COVER_H = 1080, 1920
 RED = (229, 9, 20)
 IMDB_YELLOW = (245, 197, 24)

@@ -1361,7 +1361,7 @@ def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-FACT_CARD_H = 820  # высота картинки на слайдах фактов и новостей (как CARD_H)
+FACT_CARD_H = 780  # высота картинки на слайдах фактов и новостей (как CARD_H)
 
 
 async def _own_for_facts(files: list[Path], facts: list[str], work: Path, gemini_key: str,
