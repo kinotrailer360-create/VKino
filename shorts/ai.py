@@ -289,6 +289,33 @@ async def beat_status() -> dict[str, Any]:
             "free": await beat_free_models(), "model": BEAT_MODEL or await _pick_beat_model()}
 
 
+async def probe(key: str) -> list[tuple[str, bool, str]]:
+    """Для кнопки «Проверить ИИ»: короткий настоящий запрос к каждому ИИ — [(название, работает, подробности)]."""
+    out: list[tuple[str, bool, str]] = []
+
+    async def run(name: str, coro: Any, show: Any) -> None:
+        start = asyncio.get_running_loop().time()
+        try:
+            res = await asyncio.wait_for(coro, timeout=90)
+            out.append((name, True, f"{show(res)} · {asyncio.get_running_loop().time() - start:.0f} с"))
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc) or type(exc).__name__
+            if "429" in text or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower():
+                text = "лимит запросов исчерпан (бесплатный тариф) — " + text
+            out.append((name, False, text[:300]))
+
+    ask = 'Ответь только JSON: {"ok": true}'
+    if key:
+        await run("Gemini", _ask(key, [{"text": ask}]), lambda r: "отвечает")
+        await run("Gemini + поиск Google",
+                  _ask(key, [{"text": "Найди в Google, какой фильм получил «Оскар» за лучший фильм в 2025 году. "
+                                      'Ответь только JSON: {"film": "название по-русски"}'}], search=True),
+                  lambda r: f"нашёл «{r.get('film', '?')}», источников: {len(r.get('_sources') or [])}")
+    if RESERVE_KEY:
+        await run("Groq", _ask_reserve(ask), lambda r: "отвечает")
+    return out
+
+
 async def _pick_beat_model() -> str:
     global _beat_model
     if not _beat_model:
