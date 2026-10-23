@@ -7,7 +7,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 ASSETS = Path(__file__).resolve().parent / "assets"
-CARD_W, CARD_H = 1080, 1000
+# высота 820: под картинкой — слово-субтитр и строки с датами, и всё это выше подписей и кнопок YouTube
+CARD_W, CARD_H = 1080, 820
 COVER_W, COVER_H = 1080, 1920
 RED = (229, 9, 20)
 IMDB_YELLOW = (245, 197, 24)
@@ -155,7 +156,7 @@ def _finish(card, d, title, cast, height):
 
 def make_cover(image: Image.Image, tag: str, headline: str, brand: str = "KinoMir360") -> Image.Image:
     """Вертикальная обложка 1080x1920: картинка сверху, тёмная панель с плашкой и заголовком снизу."""
-    panel_y = 1330
+    panel_y = 1080  # заголовок выше подписей YouTube — первые секунды ролика его не закрывают
     cover = Image.new("RGBA", (COVER_W, COVER_H), (28, 22, 18, 255))
     top = _cover(image.convert("RGB"), COVER_W, panel_y + 120, 0.25).convert("RGBA")
     cover.alpha_composite(top, (0, 0))
@@ -175,7 +176,7 @@ def make_cover(image: Image.Image, tag: str, headline: str, brand: str = "KinoMi
             cur = ""
             for word in para.split():
                 cand = f"{cur} {word}".strip()
-                if d.textlength(cand, font=hf) <= COVER_W - 120 or not cur:
+                if d.textlength(cand, font=hf) <= 760 or not cur:  # правее x≈900 — кнопки YouTube
                     cur = cand
                 else:
                     lines.append(cur)

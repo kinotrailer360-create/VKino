@@ -895,7 +895,7 @@ async def say_to_file(text: str, path: Path) -> list[float]:
 async def spoken_lines(lines: list[str]) -> list[str]:
     """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
     русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
-    texts = [pronounce.apply(text) for text in lines]
+    texts = [pronounce.dates(pronounce.apply(text)) for text in lines]  # даты — сразу в нужном падеже
     todo = [i for i, text in enumerate(texts) if pronounce.needs_rewrite(text)]
     if todo:
         try:  # не задерживаем сборку, если ИИ тормозит
@@ -1361,7 +1361,7 @@ def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-FACT_CARD_H = 1000  # высота картинки на слайдах фактов и новостей
+FACT_CARD_H = 820  # высота картинки на слайдах фактов и новостей (как CARD_H)
 
 
 async def _own_for_facts(files: list[Path], facts: list[str], work: Path, gemini_key: str,

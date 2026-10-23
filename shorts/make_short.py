@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
 W, H = 1080, 1920
 FPS = 30
 XFADE = 0.2  # длительность перехода между слайдами, сек
+INFO_W = 760  # ширина подписей под картинкой: правее ~x=900 внизу кнопки YouTube и TikTok
 RED = (229, 9, 20)
 TG_BLUE = (42, 171, 238)
 YT_RED = (255, 0, 0)
@@ -217,7 +218,7 @@ class CardSlide(Slide):
             self.clip = ClipReader(Path(clip))
         bg = cover(card, int(W * 1.1), int(H * 1.1)).filter(ImageFilter.GaussianBlur(40))
         self.bg = Image.blend(bg, Image.new("RGB", bg.size), 0.55)
-        self.card_y = 380
+        self.card_y = 360
 
         # статичный слой с заголовком, подписью и прогрессом
         ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -234,14 +235,19 @@ class CardSlide(Slide):
                 break
         text_center(d, W / 2, 250 + (84 - size) // 2, header, head_f, stroke=3)
 
+        # под картинкой: слово-субтитр, ниже — строки с датами. Всё выше y≈1450: ниже YouTube и TikTok
+        # кладут название ролика и имя канала, а справа (x>900) — кнопки лайка и комментариев
         y = self.card_y + card.height + 26
+        self.word_y = y + 44  # центр слова-субтитра
+        if cfg.get("words"):
+            y += 104
         self.karaoke = None
         if caption:
             # факт/новость (караоке) — крупно, чтобы читалось с телефона; длинный — шрифт поменьше
             sizes, max_lines = ((60, 54, 48, 42), 4) if karaoke else ((46, 42, 38), 5)
             for size in sizes:
                 cap_f = font(cfg, "sans", size)
-                lines = wrap(d, caption, cap_f, W - 100)
+                lines = wrap(d, caption, cap_f, INFO_W + 100)
                 if len(lines) <= max_lines:
                     break
             if karaoke:
@@ -265,16 +271,16 @@ class CardSlide(Slide):
                 if k:
                     pieces.append(("  •  ", (170, 170, 170)))
                 pieces += [(f"{label}: ", (255, 196, 0)), (value, (255, 255, 255))]
-            for size in (38, 34, 30, 27):  # длинная строка — шрифт поменьше
+            for size in (36, 33, 30, 27, 24):  # длинная строка — шрифт поменьше; справа не заходим под кнопки
                 info_f = font(cfg, "sans", size)
                 width = sum(d.textlength(t, font=info_f) for t, _ in pieces)
-                if width <= W - 50:
+                if width <= INFO_W:
                     break
             x = (W - width) / 2
             for t, col in pieces:
                 d.text((x, y), t, font=info_f, fill=col, stroke_width=2, stroke_fill=(0, 0, 0))
                 x += d.textlength(t, font=info_f)
-            y += 54
+            y += 48
 
         # прогресс: total сегментов, заполнены до idx
         seg_w, gap, y = 70, 12, 110
@@ -510,8 +516,9 @@ def render(cfg: dict, base: Path) -> Path:
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * cfg.get("watermark_opacity", 0.85))))
     wm_pos = (W - wm_w - 36, 40)
     # середина картинки на карточке: ниже — название, актёры, даты, а низ экрана закрывают подписи YouTube/TikTok
-    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 880)) if cfg.get("words") else None
-    word_y = captions.y if captions else 0
+    # слово — в полосе под картинкой (у каждой карточки своя высота, см. CardSlide.word_y), не шире 760 px:
+    # справа внизу кнопки YouTube
+    captions = WordCaptions(cfg, cfg["words"], cfg.get("word_y", 1250), INFO_W + 100) if cfg.get("words") else None
 
     out.parent.mkdir(parents=True, exist_ok=True)
     audio = out.with_suffix(".m4a")
@@ -547,9 +554,8 @@ def render(cfg: dict, base: Path) -> Path:
             img = Image.blend(prev, img, ease_out((t - starts[i]) / XFADE))
         if i < len(makers) - 1:
             img.paste(wm, wm_pos, wm)
-            if captions:  # на концовке с кнопками подписки слова не нужны
-                # на обложке внизу текст обложки — слово выше; на карточках — в полосе под картинкой
-                captions.y = 1120 if i == 0 else word_y
+            if captions and i > 0:  # на обложке свой заголовок, на концовке — кнопки подписки: там без слов
+                captions.y = getattr(slide(i), "word_y", captions.y)
                 captions.draw(img, t)
         try:
             enc.stdin.write(img.tobytes())
