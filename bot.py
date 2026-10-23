@@ -82,7 +82,10 @@ VIDEO_PROVIDER_API_TOKEN = os.getenv(
 ).strip()
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# основной ключ Gemini; запасные (GEMINI_API_KEY_2, _3 — с других аккаунтов Google) shorts.ai берёт сам,
+# когда у основного кончается лимит
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GEMINI_API_KEY_2", "")
+                  or os.getenv("GEMINI_API_KEY_3", "")).strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 RUTUBE_ENABLED = os.getenv(
@@ -6905,7 +6908,8 @@ async def ai_status_action(message: Message) -> None:
     и бесплатные модели (без платных запросов)."""
     rows = [
         "🤖 <b>ИИ бота</b> (порядок: основной → запасные)",
-        f"1. Gemini: {'ключ есть ✅' if GEMINI_API_KEY else 'нет GEMINI_API_KEY ❌'} ({escape(shorts_ai.MODEL)})",
+        f"1. Gemini: {f'ключей: {len(shorts_ai.gemini_keys(GEMINI_API_KEY))} ✅' if GEMINI_API_KEY else 'нет GEMINI_API_KEY ❌'}"
+        f" ({escape(shorts_ai.MODEL)})",
         f"2. Groq: {'ключ есть ✅' if shorts_ai.RESERVE_KEY else 'нет RESERVE_AI_KEY ❌'} ({escape(shorts_ai.RESERVE_MODEL)})",
     ]
     wait = await message.answer("⏳ Отправляю ИИ пробные запросы — до минуты…")

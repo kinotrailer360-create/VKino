@@ -118,11 +118,6 @@ def _quota(status: int, data: Any) -> tuple[str, float]:
     return ("day", 0.0) if "quota" in text else ("", 0.0)
 
 
-def _quota_out(status: int, data: Any) -> bool:
-    """Дневной лимит кончился — повторять бесполезно до завтра."""
-    return _quota(status, data)[0] == "day"
-
-
 # у бесплатного Gemini ещё и лимит запросов в минуту: на ролик их 5–7 подряд — разносим во времени
 GEMINI_GAP = 4.0
 _gemini_lock = asyncio.Lock()
@@ -132,13 +127,28 @@ _gemini_last = 0.0
 # Gemini исчерпал лимит — до этого времени (time.monotonic) не обращаемся, сразу идём к запасным ИИ;
 # отдельно для обычных запросов и для поиска Google (у поиска свой лимит)
 QUOTA_PAUSE = 30 * 60
-_quota_until = {False: 0.0, True: 0.0}
+_quota_until: dict[tuple[str, bool], float] = {}  # (ключ, поиск) -> до какого времени не трогаем
 
 
-async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any]) -> tuple[int, Any]:
-    """Запрос к модели; при перегрузке ждём и повторяем; кончился лимит в минуту — ждём, сколько просит Google."""
+class QuotaError(AIError):
+    """У этого ключа Gemini кончился лимит — пробуем следующий ключ."""
+
+
+# запасные ключи Gemini с других аккаунтов Google: у каждого свой бесплатный лимит
+EXTRA_KEYS = [k for k in (_env_key("GEMINI_API_KEY_2"), _env_key("GEMINI_API_KEY_3")) if k]
+last_key_no = 0  # каким по счёту ключом ответил Gemini в последний раз — для «Проверить ИИ»
+
+
+def gemini_keys(key: str) -> list[str]:
+    return list(dict.fromkeys(k for k in (key, *EXTRA_KEYS) if k))
+
+
+async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any],
+                wait_minute: bool = True) -> tuple[int, Any]:
+    """Запрос к модели; при перегрузке ждём и повторяем; кончился лимит в минуту — ждём, сколько просит Google
+    (wait_minute=False — не ждём: есть другой ключ)."""
     global _gemini_last
-    minute_waits = 2
+    minute_waits = 2 if wait_minute else 0
     for delay in (*RETRY_DELAYS, None):
         async with _gemini_lock:  # не чаще раза в GEMINI_GAP секунд
             pause = _gemini_last + GEMINI_GAP - time.monotonic()
@@ -163,7 +173,27 @@ async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict
 
 
 async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> Any:
-    """search=True — модель сама ищет в Google (ответ JSON-текстом, источники — в ключе "_sources")."""
+    """search=True — модель сама ищет в Google (ответ JSON-текстом, источники — в ключе "_sources").
+    У ключа кончился лимит — пробуем запасные ключи (GEMINI_API_KEY_2, _3), потом ошибка."""
+    global last_key_no
+    keys = gemini_keys(key)
+    errors: list[str] = []
+    for n, k in enumerate(keys, 1):
+        until = _quota_until.get((k, search), 0.0)
+        if time.monotonic() < until:
+            errors.append(f"ключ {n}: лимит исчерпан, снова через {round((until - time.monotonic()) / 60)} мин")
+            continue
+        try:
+            result = await _ask_key(k, parts, search, wait_minute=n == len(keys))
+            last_key_no = n
+            return result
+        except QuotaError as exc:
+            errors.append(f"ключ {n}: {exc}")
+            log.warning("shorts: Gemini key %s out of quota%s, next key", n, " (search)" if search else "")
+    raise AIError(f"Gemini{' (поиск Google)' if search else ''}: " + "; ".join(errors or ["нет ключа"]))
+
+
+async def _ask_key(key: str, parts: list[dict[str, Any]], search: bool, wait_minute: bool) -> Any:
     global MODEL
     body: dict[str, Any] = {
         "contents": [{"parts": parts}],
@@ -172,14 +202,10 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
     if search:  # с поиском строгий JSON-режим недоступен — просим JSON в тексте
         body = {"contents": [{"parts": parts}], "tools": [{"google_search": {}}],
                 "generationConfig": {"temperature": 0.3}}
-    if time.monotonic() < _quota_until[search]:
-        left = round((_quota_until[search] - time.monotonic()) / 60)
-        raise AIError(f"Gemini{' (поиск Google)' if search else ''}: лимит бесплатного тарифа исчерпан, "
-                      f"пробую снова через {left} мин — пока работают запасные ИИ")
     timeout = aiohttp.ClientTimeout(total=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         model = MODEL
-        status, data = await _post(session, key, model, body)
+        status, data = await _post(session, key, model, body, wait_minute)
         if status == 404:
             # модель сняли с поддержки — переходим на новейшую Flash насовсем
             newer = next(iter(await _flash_models(session, key)), None)
@@ -195,9 +221,11 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
                 model = backup
                 status, data = await _post(session, key, model, body)
         if status != 200:
-            if _quota_out(status, data):
-                _quota_until[search] = time.monotonic() + QUOTA_PAUSE
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
+            kind, _ = _quota(status, data)
+            if kind:  # лимит этого ключа: на день — пауза 30 мин, в минуту — 1 мин; пробуем другой ключ
+                _quota_until[(key, search)] = time.monotonic() + (QUOTA_PAUSE if kind == "day" else 60)
+                raise QuotaError(f"лимит {'на день' if kind == 'day' else 'в минуту'} ({model})")
             raise AIError(f"Gemini HTTP {status} ({model}): {str(msg)[:200]}")
     try:
         if not search:
@@ -358,17 +386,18 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
             out.append((name, True, f"{show(res)} · {asyncio.get_running_loop().time() - start:.0f} с"))
         except Exception as exc:  # noqa: BLE001
             text = str(exc) or type(exc).__name__
-            if "429" in text or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower():
+            if "429" in text or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower() or "лимит" in text:
                 text = "лимит запросов исчерпан (бесплатный тариф) — " + text
             out.append((name, False, text[:300]))
 
     ask = 'Ответь только JSON: {"ok": true}'
     if key:
-        await run("Gemini", _ask(key, [{"text": ask}]), lambda r: "отвечает")
+        await run("Gemini", _ask(key, [{"text": ask}]), lambda r: f"отвечает (ключ {last_key_no})")
         await run("Gemini + поиск Google",
                   _ask(key, [{"text": "Найди в Google, какой фильм получил «Оскар» за лучший фильм в 2025 году. "
                                       'Ответь только JSON: {"film": "название по-русски"}'}], search=True),
-                  lambda r: f"нашёл «{r.get('film', '?')}», источников: {len(r.get('_sources') or [])}")
+                  lambda r: f"нашёл «{r.get('film', '?')}», источников: {len(r.get('_sources') or [])} "
+                            f"(ключ {last_key_no})")
     if RESERVE_KEY:
         await run("Groq", _ask_reserve(ask), lambda r: "отвечает")
     return out
