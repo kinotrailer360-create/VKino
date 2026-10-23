@@ -7741,7 +7741,7 @@ async def review_own_text(message: Message, state: FSMContext) -> None:
 async def show_facts(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     facts = data["fx_facts"]
-    what = "новостей и слухов" if data.get("fx_mode") == "rumors" else "фактов"
+    what = {"rumors": "новостей и слухов", "review": "тезисов обзора"}.get(data.get("fx_mode") or "", "фактов")
     rows = [f"💡 <b>{len(facts)} {what} о «{escape(data.get('fx_label') or data['fx_title'])}»</b> — "
             "проверь, всё ли правда:", ""]
     rows += [f"{i}. {escape(f)}" for i, f in enumerate(facts, 1)]
@@ -7857,7 +7857,7 @@ async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | 
 
 async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], status: Message,
                          media: list[dict[str, str]] | None = None, rumors: bool = False,
-                         tg_media: list[dict[str, Any]] | None = None) -> None:
+                         tg_media: list[dict[str, Any]] | None = None, review: bool = False) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -7880,7 +7880,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             result = await asyncio.wait_for(shorts_daily.make_facts_short(
                 kp._get, work, title, set(), music, TMDB_API_KEY, GEMINI_API_KEY,
                 trailer_clips=await shorts_setting("clips") != "off", custom_facts=facts, user_media=files,
-                rumors=rumors, tg_media=tg_media),
+                rumors=rumors, tg_media=tg_media, review=review),
                 timeout=SHORTS_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
@@ -7903,11 +7903,24 @@ async def facts_title(message: Message, state: FSMContext) -> None:
                          "Если фильм ещё не вышел, соберёт новости и слухи о нём.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🔎 ИИ найдёт в интернете", "fx:web")],
         [_btn("📝 Вставлю свой текст", "fx:own")],
+        [_btn("🎬 Короткий обзор: свои тезисы", "fx:review")],
         [_btn("❌ Отмена", "fx:cancel")]]))
 
 
 @router.message(FactsState.text, F.text, ~F.text.startswith("/"))
 async def facts_text(message: Message, state: FSMContext) -> None:
+    if (await state.get_data()).get("fx_mode") == "review":
+        # короткий обзор: тезисы автора как есть — строка на карточку
+        points = [re.sub(r"^\s*(\d+[.)]|[-•—])\s*", "", ln).strip() for ln in _typed(message).splitlines()]
+        points = [p for p in points if len(p) >= 10][:8]
+        if len(points) < 3:
+            await message.answer("Нужно хотя бы 3 тезиса — каждый с новой строки.")
+            return
+        await state.set_state(None)
+        await state.update_data(fx_text=_typed(message), fx_facts=points, fx_sources=[], fx_film="", fx_label="",
+                                fx_tg_media=[])
+        await show_facts(message, state)
+        return
     await state.set_state(None)
     await state.update_data(fx_text=_typed(message), fx_mode="text", fx_sources=[], fx_film="", fx_label="",
                             fx_tg_media=[])
@@ -7976,9 +7989,17 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("Начни заново: кнопка «🔎 Факты: интернет или свой текст».")
         return
     if action == "own":
+        await state.update_data(fx_mode="text")
         await state.set_state(FactsState.text)
         await message.answer("📝 Вставь текст с фактами одним сообщением (ссылки на источники можно не убирать). "
                              "ИИ выберет 5 самых интересных и ничего не добавит от себя.\n\n<i>Передумал — /cancel</i>")
+    elif action == "review":
+        await state.update_data(fx_mode="review")
+        await state.set_state(FactsState.text)
+        await message.answer("🎬 <b>Короткий обзор</b> (вертикальный ролик ~45 с). Пришли 3–8 тезисов одним "
+                             "сообщением — каждый с новой строки: о чём фильм, что хорошо, что плохо, итог и "
+                             "оценка. Каждый тезис станет карточкой, голос прочитает их как есть.\n\n"
+                             "<i>Передумал — /cancel</i>")
     elif action in ("web", "rumors"):  # «rumors» — кнопка из старых сообщений
         await facts_find(message, state)
     elif action.startswith("film:") and action[5:].isdigit():
@@ -7988,6 +8009,9 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             await message.answer(f"❌ Кинопоиск не ответил: <code>{escape(str(exc)[:300])}</code>")
             return
         await facts_web(message, state, film)
+    elif action == "redo" and data.get("fx_mode") == "review":
+        await state.set_state(FactsState.text)
+        await message.answer("Пришли тезисы обзора заново — каждый с новой строки.")
     elif action == "redo" and data.get("fx_mode") != "text":
         if data.get("fx_film"):
             await facts_web(message, state)
@@ -8023,7 +8047,8 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             try:
                 await run_text_facts(message.bot, message.chat.id, data.get("fx_film") or data["fx_title"],
                                      data["fx_facts"], status, data.get("fx_media") or [],
-                                     data.get("fx_mode") == "rumors", data.get("fx_tg_media") or [])
+                                     data.get("fx_mode") == "rumors", data.get("fx_tg_media") or [],
+                                     data.get("fx_mode") == "review")
             except Exception as exc:
                 logging.exception("Text facts short failed")
                 try:

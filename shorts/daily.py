@@ -1159,6 +1159,30 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
     return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
 
 
+def build_review_seo(film: dict[str, Any], points: list[str]) -> dict[str, str]:
+    t = _title(film)
+    title = f"«{t}» — стоит ли смотреть? Короткий обзор 🎬 #shorts"
+    if len(title) > 100:
+        title = f"«{t}»: обзор 🎬 #shorts"[:100]
+    year = film.get("year")
+    description = "\n".join([
+        f"«{t}»" + (f" ({year})" if year else "") + " — стоит ли смотреть? Короткий обзор 🎬", "",
+        *[f"• {p}" for p in points], "",
+        "А ты посмотришь? Пиши в комментариях 👇", "",
+        f"📺 YouTube: {YOUTUBE_URL}",
+        f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
+        "#обзорфильма #кино #KinoMir360",
+    ])
+    tags: list[str] = []
+    for tag in [t.lower(), f"{t.lower()} обзор", f"{t.lower()} стоит ли смотреть", f"{t.lower()} отзывы",
+                "обзор фильма", "стоит ли смотреть", "что посмотреть"] + \
+            [a.lower() for a in _actors(film, 3)] + ["KinoMir360", "киномир360", "шортс кино"]:
+        if tag and tag not in tags and len(", ".join(tags + [tag])) <= 480:
+            tags.append(tag)
+    pinned = f"А ты посмотришь «{t}»? 👇\nБольше обзоров — в нашем Telegram 👉 {TELEGRAM_URL}"
+    return {"title": title, "description": description, "tags": ", ".join(tags), "pinned": pinned}
+
+
 def build_rumors_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
     t, kind = _title(film), _kind(film)
     title = f"Что известно о {kind} «{t}»: новости и слухи 🔥 #shorts"
@@ -1431,11 +1455,12 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                            music: Path | None = None, tmdb_key: str = "",
                            gemini_key: str = "", trailer_clips: bool = True,
                            custom_facts: list[str] | None = None,
-                           user_media: list[Path] | None = None, rumors: bool = False,
+                           user_media: list[Path] | None = None, rumors: bool = False, review: bool = False,
                            tg_media: list[dict[str, Any]] | None = None) -> ShortResult:
     """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
     user_media — свои фото и видео автора: идут к фактам первыми.
     rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов.
+    review=True — короткий обзор: custom_facts — тезисы обзора автора, ролик «Стоит ли смотреть?».
     tg_media — посты Telegram-каналов с фото и видео о фильме: ИИ ставит их к фактам, к которым они подходят."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
@@ -1455,7 +1480,11 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     if award_fact:
         facts = [award_fact] + facts[: FACTS - 1]
     t, n, kind = _title(film), len(facts), _kind(film)
-    if rumors:
+    if review:
+        label, card_label, hook = "ОБЗОР", "", f"«{t}» — стоит ли смотреть?"
+        intro, cover_text = f"{hook} Короткий обзор!", f"«{t}»: стоит ли смотреть?"
+        outro_line, outro = "А ты посмотришь? Пиши в комментариях!", "А ТЫ\nПОСМОТРИШЬ?\nПИШИ В КОММЕНТАРИЯХ"
+    elif rumors:
         label, card_label, hook = "СЛУХИ", "НОВОСТЬ", f"Что известно о {kind} «{t}»"
         intro, cover_text = f"{hook}? Главные новости и слухи!", f"{hook}: новости и слухи"
         outro_line, outro = "Ждёшь премьеру? Пиши в комментариях!", "ЖДЁШЬ\nПРЕМЬЕРУ?\nПИШИ В КОММЕНТАРИЯХ"
@@ -1463,7 +1492,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         label, card_label, hook = "ФАКТЫ", "ФАКТ", f"{n} {_facts_word(n)} о {kind} «{t}»"
         intro, cover_text = f"{hook}, которые ты точно не знал!", f"{hook}, которые ты не знал"
         outro_line, outro = "Какой факт удивил? Пиши в комментариях!", "КАКОЙ ФАКТ\nУДИВИЛ БОЛЬШЕ?\nПИШИ В КОММЕНТАРИЯХ"
-    theme = Theme("rumors" if rumors else "facts", label, t.upper(), hook, hook, [])
+    theme = Theme("review" if review else "rumors" if rumors else "facts", label, t.upper(), hook, hook, [])
 
     cards = []
     # пул кадров: без надписей с TMDB, затем кадры/фон/постер с Кинопоиска
@@ -1544,13 +1573,14 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 
     for i, fact in enumerate(facts, 1):
         # название уже в заголовке слайда — на карточке не повторяем
+        badge = f"{card_label} №{i}" if card_label else None  # в обзоре — без плашки, только n/N
         card = await asyncio.to_thread(make_card, picked[i - 1], "", i, n,
-                                       None, "IMDb", None, f"{card_label} №{i}", FACT_CARD_H)
+                                       None, "IMDb", None, badge, FACT_CARD_H)
         path = work / f"card{i}.jpg"
         card.save(path, quality=93)
         video: dict[str, str] = {}
         if (i - 1) in videos:
-            card_overlay("", i, n, None, "IMDb", None, f"{card_label} №{i}", FACT_CARD_H).save(work / f"overlay{i}.png")
+            card_overlay("", i, n, None, "IMDb", None, badge, FACT_CARD_H).save(work / f"overlay{i}.png")
             video = {"clip": videos[i - 1], "overlay": f"overlay{i}.png"}
         cards.append({"image": path.name, "caption": fact, "karaoke": True, **video})
 
@@ -1560,7 +1590,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
 
     lines = [intro] + facts + [f"{outro_line} {SAVE_AND_SUBSCRIBE}"]
     voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music)
-    seo = build_rumors_seo(film, facts) if rumors else build_facts_seo(film, facts)
+    seo = build_review_seo(film, facts) if review else build_rumors_seo(film, facts) if rumors \
+        else build_facts_seo(film, facts)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
     notes = [web_note] if web_note else []
     if video_note:
