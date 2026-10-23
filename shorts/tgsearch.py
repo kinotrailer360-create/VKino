@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -38,7 +39,7 @@ def channel_name(raw: str) -> str | None:
 
 
 class _Posts(HTMLParser):
-    """Посты из веб-версии канала: [{"url", "text", "time" (unix, 0 — нет), "image"}] в порядке страницы."""
+    """Посты из веб-версии канала: [{"url", "text", "time" (unix, 0 — нет), "image", "video"}] по порядку."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -54,7 +55,8 @@ class _Posts(HTMLParser):
         a = dict(attrs)
         cls = a.get("class") or ""
         if a.get("data-post") and "tgme_widget_message" in cls:
-            self.all.append({"url": f"https://t.me/{a['data-post']}", "text": "", "time": 0.0, "image": None})
+            self.all.append({"url": f"https://t.me/{a['data-post']}", "text": "", "time": 0.0, "image": None,
+                             "video": None})
         cur = self.all[-1] if self.all else None
         if tag == "div":
             if self.depth:
@@ -71,6 +73,8 @@ class _Posts(HTMLParser):
         elif tag == "a" and "tgme_widget_message_photo_wrap" in cls and cur is not None and not cur["image"]:
             m = re.search(r"background-image:url\(['\"]?([^'\")]+)", a.get("style") or "")
             cur["image"] = m.group(1) if m else None
+        elif tag == "video" and cur is not None and not cur["video"] and str(a.get("src") or "").startswith("http"):
+            cur["video"] = a["src"]
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "div" and self.depth:
@@ -138,7 +142,8 @@ async def search(channels: list[str], names: list[str], per_channel: int = POSTS
             for post in reversed(posts):  # свежие — первыми
                 url, text = post["url"], post["text"]
                 if len(text) >= 60 and _mentions(text, names) and url not in found:
-                    found[url] = {"channel": channel, "url": url, "text": text[:POST_MAX]}
+                    found[url] = {"channel": channel, "url": url, "text": text[:POST_MAX],
+                                  "image": post["image"], "video": post["video"]}
             if len(found) >= per_channel:
                 break
         return list(found.values())[:per_channel]
@@ -169,3 +174,36 @@ async def check(channels: list[str]) -> list[tuple[str, int | str]]:
             except Exception as exc:  # noqa: BLE001
                 return channel, str(exc)[:80] or type(exc).__name__
         return list(await asyncio.gather(*(one(c) for c in channels)))
+
+
+MEDIA_MAX = 25 * 1024 * 1024  # видео больше — не качаем (долго, а нужно 5 секунд)
+
+
+async def download_media(posts: list[dict[str, Any]], work: Path, limit: int = 8,
+                         prefix: str = "tg") -> list[Path]:
+    """Фото и видео из постов в папку ролика (видео поста важнее его обложки). Битые и огромные пропускаем."""
+    urls: list[tuple[str, str]] = []
+    for p in posts:
+        if p.get("video"):
+            urls.append((p["video"], ".mp4"))
+        elif p.get("image"):
+            urls.append((p["image"], ".jpg"))
+    out: list[Path] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), headers=HEADERS) as session:
+        for url, ext in urls:
+            if len(out) >= limit:
+                break
+            try:
+                async with session.get(url) as resp:
+                    resp.raise_for_status()
+                    if int(resp.headers.get("Content-Length") or 0) > MEDIA_MAX:
+                        continue
+                    data = await resp.content.read(MEDIA_MAX + 1)
+                if len(data) > MEDIA_MAX or len(data) < 2000:
+                    continue
+                path = work / f"{prefix}{len(out)}{ext}"
+                path.write_bytes(data)
+                out.append(path)
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: tg media %s skipped: %s", url[:80], exc)
+    return out

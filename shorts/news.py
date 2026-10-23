@@ -43,6 +43,7 @@ class NewsItem:
     image: str | None = None
     film_query: str | None = None  # «Название» из заголовка — ищем фильм
     film_name: str | None = None  # название найденного фильма (для тегов)
+    video: str | None = None  # видео поста Telegram-канала — идёт в ролик вместо картинки
 
     @property
     def uid(self) -> int:
