@@ -3,7 +3,7 @@
 # окно не выходит за кадр. Маркер (треугольник в цвете клуба) висит над мячом и пропадает в момент касания сетки.
 # Использование:
 #   python3 balltrack.py in.mp4 out.mp4 points.json --ss 1.8 --frames 39 [--speed 0.35] [--zoom 1.4] [--color EDBB00]
-#                        [--marker-end 2.22] [--pre "минтерполяция/грейд до кропа"] [--post "фильтры после кропа"]
+#                        [--marker-start 1.0] [--marker-end 2.22] [--pre "минтерполяция/грейд до кропа"] [--post "фильтры после кропа"]
 # points.json: [{"t":1.85,"x":329,"y":374}, ...] — время ИСТОЧНИКА (с), координаты в кадре 720x960 источника.
 import sys, json, argparse, subprocess, numpy as np
 from PIL import Image, ImageDraw
@@ -13,6 +13,7 @@ ap.add_argument('inp'); ap.add_argument('out'); ap.add_argument('points')
 ap.add_argument('--ss', type=float, required=True); ap.add_argument('--frames', type=int, required=True)
 ap.add_argument('--speed', type=float, default=1.0); ap.add_argument('--zoom', type=float, default=1.4)
 ap.add_argument('--color', default='EDBB00'); ap.add_argument('--marker-end', type=float, default=None)
+ap.add_argument('--marker-start', type=float, default=None, help='маркер только с этого времени источника (до него точки мяча приблизительные)')
 ap.add_argument('--lead', type=float, default=40, help='насколько держать мяч позади центра по ходу (px)')
 ap.add_argument('--smooth', type=float, default=5, help='сглаживание камеры, σ в кадрах')
 ap.add_argument('--pre', default=''); ap.add_argument('--post', default='')
@@ -46,9 +47,9 @@ for i in range(n):
     if len(buf) < W * H * 3: buf = last                            # исходник короче — держим последний кадр
     last = buf
     im = Image.frombytes('RGB', (W, H), buf)
-    show = a.marker_end is None or src_t[i] < a.marker_end
+    show = (a.marker_end is None or src_t[i] < a.marker_end) and (a.marker_start is None or src_t[i] >= a.marker_start)
     if show:                                                       # маркер: треугольник над мячом с мягким появлением
-        al = min(1.0, (i + 1) / 6)
+        al = min(1.0, (i + 1) / 6) if a.marker_start is None else min(1.0, (src_t[i] - a.marker_start) / (6 / FPS * a.speed) + 0.01)
         mx, my = bx[i], by[i] - 22 / a.zoom
         s = 20 / a.zoom
         L = Image.new('RGBA', (W, H), (0, 0, 0, 0)); d = ImageDraw.Draw(L)
