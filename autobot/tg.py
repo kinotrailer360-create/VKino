@@ -5,11 +5,11 @@
 #   python3 tg.py send-video <chat_id> <файл> [подпись]
 #   python3 tg.py send-text  <chat_id> <текст или @файл.md>
 #   python3 tg.py me                   — проверка токена
-import os, sys, json, time, urllib.request, urllib.parse, mimetypes, uuid, datetime
+import os, sys, json, time, urllib.request, urllib.parse, mimetypes, uuid, datetime, re
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN and 'seo-preview' not in sys.argv: sys.exit('Нет переменной TELEGRAM_BOT_TOKEN')
 API = f'https://api.telegram.org/bot{TOKEN}/'; FILE = f'https://api.telegram.org/file/bot{TOKEN}/'
-HERE = os.path.dirname(os.path.abspath(__file__)); STATE = os.path.join(HERE, 'state.json')
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); STATE = os.path.join(HERE, 'state.json')
 
 def call(method, params=None, files=None, timeout=60):
     if files:
@@ -53,6 +53,18 @@ def pull(out_root):
                 urllib.request.urlretrieve(FILE + f['file_path'], dst); item['file'] = dst
             except Exception as e:
                 item['error'] = f'не скачалось (лимит Bot API 20 МБ?): {e}'
+        elif re.search(r'instagram\.com/(?:reels?|p)/[A-Za-z0-9_-]+', item['caption']):
+            # ссылка на Instagram Reel → скачать через ig_dl.py (публичные рилсы, без входа)
+            import ig_dl, io, contextlib
+            for url in re.findall(r'https?://(?:www\.)?instagram\.com/(?:reels?|p)/[A-Za-z0-9_-]+', item['caption']):
+                try:
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf): ig_dl.dl(url, out)
+                    line = buf.getvalue().strip(); path, _, cap = line.partition(' | ')
+                    dst = os.path.join(out, f"{u['update_id']}_{os.path.basename(path)}"); os.replace(path, dst)
+                    item.setdefault('files', []).append(dst); item['file'] = dst; item['ig_caption'] = cap
+                except BaseException as e:
+                    item['error'] = f'instagram не скачался: {e}'
         man.append(item)
     json.dump(man, open(man_path, 'w'), ensure_ascii=False, indent=1)
     json.dump(st, open(STATE, 'w'))
