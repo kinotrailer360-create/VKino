@@ -980,6 +980,7 @@ async def synthesize(lines: list[str], work: Path,
             await lumean.synthesize([t.replace(pronounce.STRESS, "") for t in speak], parts, work,
                                     pause or lumean.PAUSE)
             words = [[] for _ in speak]
+            await _verify_parts(speak, parts, work, pause or lumean.PAUSE)
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Lumean TTS failed: %s", exc)
             lumean_note = f"🗣 Голос ElevenLabs (Lumean) не сработал ({str(exc)[:200]}) — озвучено голосом Microsoft."
@@ -1046,6 +1047,43 @@ async def synthesize(lines: list[str], work: Path,
     voice = work / "voice.wav"
     await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
     return voice, starts, voiced, spans
+
+
+def _extra_words(expected: str, heard: list[dict[str, Any]]) -> list[str]:
+    """Слова, которые голос произнёс сверх текста (вставки, а не ошибки распознавания в наших словах)."""
+    from difflib import SequenceMatcher
+    want = [_norm_word(w) for w in expected.split() if _norm_word(w)]
+    got = [_norm_word(h["w"]) for h in heard if _norm_word(h["w"])]
+    extra: list[str] = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, want, got, autojunk=False).get_opcodes():
+        if tag == "insert":
+            extra += got[j1:j2]
+        elif tag == "replace" and (j2 - j1) - (i2 - i1) >= 2:  # услышали заметно больше слов, чем было
+            extra += got[j1 + (i2 - i1):j2]
+    return extra
+
+
+async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: float) -> None:
+    """ElevenLabs иногда «бормочет» на месте паузы между фразами («Май. Май. Пиро.»): распознаём каждую фразу
+    и, если в ней есть лишние слова, переозвучиваем её отдельным заказом (лучший из двух вариантов)."""
+    if not (ai.RESERVE_KEY and "groq.com" in ai.RESERVE_URL):
+        return
+    for i, (text, part) in enumerate(zip(speak, parts)):
+        try:
+            extra = _extra_words(text, await ai.transcribe_words(part.read_bytes()))
+        except Exception as exc:  # noqa: BLE001 — проверка не должна ломать сборку
+            log.warning("shorts: voice check of phrase %d failed: %s", i + 1, exc)
+            return
+        if len(extra) < 2:
+            continue
+        log.warning("shorts: phrase %d has extra words %s — re-voicing it", i + 1, extra)
+        redo = work / f"voice_redo_{i}.mp3"
+        try:
+            await lumean.synthesize([text.replace(pronounce.STRESS, "")], [redo], work, pause)
+            if len(_extra_words(text, await ai.transcribe_words(redo.read_bytes()))) < len(extra):
+                redo.replace(part)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: re-voicing phrase %d failed: %s", i + 1, exc)
 
 
 def _norm_word(w: str) -> str:
@@ -1752,14 +1790,19 @@ def custom_theme(title: str, n: int) -> Theme:
 
 
 async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list[int], music: Path | None = None,
-                            tmdb_key: str = "", trailer_clips: bool = True) -> ShortResult:
-    """Своя подборка: тема и фильмы — от автора (или из чужого ролика), порядок — как в списке."""
+                            tmdb_key: str = "", trailer_clips: bool = True,
+                            notes: list[str] | None = None, user_media: list[Path] | None = None,
+                            gemini_key: str = "") -> ShortResult:
+    """Своя подборка: тема и фильмы — от автора (или из чужого ролика), порядок — как в списке.
+    notes — фраза для озвучки к каждому фильму (из описаний автора) вместо «Жанр.».
+    user_media — свои фото и видео автора: ИИ ставит каждый к фильму, о котором он."""
     work.mkdir(parents=True, exist_ok=True)
     if not CUSTOM_MIN <= len(film_ids) <= CUSTOM_MAX:
         raise RuntimeError(f"в подборке должно быть от {CUSTOM_MIN} до {CUSTOM_MAX} фильмов")
     await _progress(5, "Загружаю фильмы")
     films = [await fetch(f"/movie/{i}") for i in film_ids]
-    result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips)
+    result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips,
+                               notes, user_media, gemini_key)
     add_english_seo(result)
     return result
 
@@ -1998,10 +2041,19 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
 
 
 async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], music: Path | None,
-                      tmdb_key: str, trailer_clips: bool) -> ShortResult:
-    """Подборка-отсчёт по готовому списку: films в порядке показа (последний — №1)."""
+                      tmdb_key: str, trailer_clips: bool, notes: list[str] | None = None,
+                      user_media: list[Path] | None = None, gemini_key: str = "") -> ShortResult:
+    """Подборка-отсчёт по готовому списку: films в порядке показа (последний — №1).
+    notes — своя фраза к каждому фильму (из описаний автора); user_media — свои фото/видео автора."""
     n = len(films)
     cards = []
+    own: dict[int, Image.Image] = {}
+    own_videos: dict[int, str] = {}
+    if user_media:
+        await _progress(8, "Разбираю ваши фото и видео")
+        texts = [f"«{_title(f)}». " + (notes[i] if notes and i < len(notes) else ", ".join(_genres(f)[:2]))
+                 for i, f in enumerate(films)]
+        own, own_videos = await _own_for_facts(user_media, texts, work, gemini_key, prefix="ownl")
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         posters_tmdb: list[str] = []
@@ -2011,7 +2063,8 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
             backdrops, posters = await tmdb.images(tmdb_key, f, limit=1)
             if i == n:
                 posters_tmdb = posters
-            img = await _download_first(session, backdrops + [_image_url(f)])
+            # свой кадр автора — вместо кадра с TMDB/Кинопоиска
+            img = own[i - 1] if (i - 1) in own else await _download_first(session, backdrops + [_image_url(f)])
             rating, src = _rating(f)
             badge = None if rating else "НОВИНКА"
             if theme.upcoming:
@@ -2022,10 +2075,13 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
             path = work / f"card{i}.jpg"
             card.save(path, quality=93)
             video: dict[str, str] = {}
-            if trailer_clips and await _trailer_clip(f, work / f"clip{i}.mp4"):
+            clip = own_videos.get(i - 1)  # своё видео автора — вместо трейлера
+            if not clip and (i - 1) not in own and trailer_clips and await _trailer_clip(f, work / f"clip{i}.mp4"):
+                clip = f"clip{i}.mp4"
+            if clip:
                 overlay = card_overlay(_title(f), i, n, rating, src or "IMDb", _actors(f), badge, place=n - i + 1)
                 overlay.save(work / f"overlay{i}.png")
-                video = {"clip": f"clip{i}.mp4", "overlay": f"overlay{i}.png"}
+                video = {"clip": clip, "overlay": f"overlay{i}.png"}
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
             rows = info_rows(f)
@@ -2041,7 +2097,14 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
-    voiced = await _render(work, cover_path, cards, voice_lines(theme, films), theme.tag, theme.header,
+    lines = voice_lines(theme, films)
+    if notes and len(notes) == n:
+        for i, (f, note) in enumerate(zip(films, notes), 1):
+            if note:
+                place = n - i + 1
+                head = "И номер один" if place == 1 else f"Номер {NUMBERS.get(place, place)}"
+                lines[i] = f"{head} — «{_title(f)}». {note}"
+    voiced = await _render(work, cover_path, cards, lines, theme.tag, theme.header,
                            "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
