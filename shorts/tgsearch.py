@@ -208,7 +208,13 @@ async def download_media(posts: list[dict[str, Any]], work: Path, limit: int = 8
                     resp.raise_for_status()
                     if int(resp.headers.get("Content-Length") or 0) > MEDIA_MAX:
                         continue
-                    data = await resp.content.read(MEDIA_MAX + 1)
+                    chunks, size = [], 0
+                    async for chunk in resp.content.iter_chunked(1 << 16):  # read(n) отдаёт лишь доступный кусок
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > MEDIA_MAX:
+                            break
+                    data = b"".join(chunks)
                 if len(data) > MEDIA_MAX or len(data) < 2000:
                     continue
                 path = work / f"{prefix}{len(out)}{ext}"

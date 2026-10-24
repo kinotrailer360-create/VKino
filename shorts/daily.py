@@ -510,10 +510,41 @@ async def _trailer_clip(item: dict[str, Any], out: Path) -> bool:
         return out.exists()
 
     try:
-        return await asyncio.wait_for(fetch(), timeout=TRAILER_BUDGET)
+        if await asyncio.wait_for(fetch(), timeout=TRAILER_BUDGET):
+            return True
     except Exception as exc:  # noqa: BLE001 — без трейлера останется кадр
         log.warning("shorts: trailer clip for %s failed: %s", _title(item), exc)
+    # трейлера на Rutube нет (частое у новинок) — видео из постов Telegram-каналов о фильме
+    try:
+        return await asyncio.wait_for(_tg_clip(item, out), timeout=TG_CLIP_BUDGET)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: tg clip for %s failed: %s", _title(item), exc)
         return False
+
+
+TG_CLIP_BUDGET = 60
+
+
+async def _tg_clip(item: dict[str, Any], out: Path) -> bool:
+    """5 секунд из видео поста Telegram-канала, где упомянут фильм (свежие посты — первыми)."""
+    names = [str(item.get(k) or "") for k in ("name", "alternativeName", "enName")]
+    names = [n for n in dict.fromkeys(names) if len(n) >= 3]
+    if not names or not fact_channels:
+        return False
+    posts = [p for p in await tgsearch.search(fact_channels, names, per_channel=2) if p.get("video")]
+    for post in posts[:3]:
+        files = await tgsearch.download_media([{"video": post["video"]}], out.parent, 1, prefix=f"{out.stem}_tg")
+        if not files:
+            continue
+        try:
+            dur = await _duration(files[0])
+            await clips.cut_clip(files[0], out, max(0.0, dur / 2 - CLIP_SECONDS / 2), min(CLIP_SECONDS, dur))
+        finally:
+            files[0].unlink(missing_ok=True)
+        if out.exists():
+            log.info("shorts: clip for %s from %s", _title(item), post["url"])
+            return True
+    return False
 
 
 async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]], work: Path,
