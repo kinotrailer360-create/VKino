@@ -1790,14 +1790,17 @@ def custom_theme(title: str, n: int) -> Theme:
 
 
 async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list[int], music: Path | None = None,
-                            tmdb_key: str = "", trailer_clips: bool = True) -> ShortResult:
-    """Своя подборка: тема и фильмы — от автора (или из чужого ролика), порядок — как в списке."""
+                            tmdb_key: str = "", trailer_clips: bool = True,
+                            notes: list[str] | None = None) -> ShortResult:
+    """Своя подборка: тема и фильмы — от автора (или из чужого ролика), порядок — как в списке.
+    notes — фраза для озвучки к каждому фильму (из описаний автора) вместо «Жанр.»."""
     work.mkdir(parents=True, exist_ok=True)
     if not CUSTOM_MIN <= len(film_ids) <= CUSTOM_MAX:
         raise RuntimeError(f"в подборке должно быть от {CUSTOM_MIN} до {CUSTOM_MAX} фильмов")
     await _progress(5, "Загружаю фильмы")
     films = [await fetch(f"/movie/{i}") for i in film_ids]
-    result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips)
+    result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips,
+                               notes)
     add_english_seo(result)
     return result
 
@@ -2036,8 +2039,9 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
 
 
 async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], music: Path | None,
-                      tmdb_key: str, trailer_clips: bool) -> ShortResult:
-    """Подборка-отсчёт по готовому списку: films в порядке показа (последний — №1)."""
+                      tmdb_key: str, trailer_clips: bool, notes: list[str] | None = None) -> ShortResult:
+    """Подборка-отсчёт по готовому списку: films в порядке показа (последний — №1).
+    notes — своя фраза к каждому фильму (из описаний автора)."""
     n = len(films)
     cards = []
     timeout = aiohttp.ClientTimeout(total=30)
@@ -2079,7 +2083,14 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
-    voiced = await _render(work, cover_path, cards, voice_lines(theme, films), theme.tag, theme.header,
+    lines = voice_lines(theme, films)
+    if notes and len(notes) == n:
+        for i, (f, note) in enumerate(zip(films, notes), 1):
+            if note:
+                place = n - i + 1
+                head = "И номер один" if place == 1 else f"Номер {NUMBERS.get(place, place)}"
+                lines[i] = f"{head} — «{_title(f)}». {note}"
+    voiced = await _render(work, cover_path, cards, lines, theme.tag, theme.header,
                            "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))

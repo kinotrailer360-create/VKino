@@ -417,6 +417,36 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
     return out
 
 
+async def extract_plan(key: str, text: str, max_films: int = 10) -> dict[str, Any]:
+    """Своя подборка из любого текста автора (пост, список с описаниями): тема и фильмы/сериалы с короткой
+    фразой для озвучки по описанию автора. {"title", "films": [{"ru", "en", "year", "note"}]}."""
+    if not available(key):
+        raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
+    prompt = (
+        "Ниже текст автора про подборку фильмов и сериалов (пост, список, заметки). Вытащи из него:\n"
+        "1) title — короткую тему ролика по-русски, 3–6 слов, без эмодзи (например «Онлайн-премьеры недели»);\n"
+        f"2) films — до {max_films} фильмов и сериалов в том же порядке, что в тексте: ru — название по-русски "
+        "как в тексте, en — оригинальное название, если знаешь, year — год, если указан или известен, "
+        "note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если указано, "
+        "и о чём — пересказом описания автора, живо, без спойлеров, только факты из текста. Названия "
+        "сервисов пиши как в тексте (Netflix, Apple TV). Не выдумывай фильмы, которых нет в тексте." + GRAMMAR +
+        '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": 2025, '
+        '"note": "..."}]}\n\nТЕКСТ:\n' + text.strip()[:9000]
+    )
+    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    films = []
+    for f in (data.get("films") if isinstance(data, dict) else None) or []:
+        if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
+            year = f.get("year")
+            films.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                          "year": int(year) if str(year or "").isdigit() else None,
+                          "note": re.sub(r"\s+", " ", str(f.get("note") or "")).strip()[:220]})
+    if len(films) < 3:
+        raise AIError("ИИ не нашёл в тексте хотя бы 3 фильма или сериала")
+    title = re.sub(r"\s+", " ", str(data.get("title") or "")).strip(" .!«»\"") or "Подборка фильмов"
+    return {"title": title, "films": films[:max_films]}
+
+
 async def identify_film(key: str, query: str, posts: str = "") -> list[dict[str, Any]]:
     """Какой фильм или сериал имеет в виду автор («Глиноликий» → «Клейфейс», Clayface, 2026): ИИ ищет в Google
     и смотрит посты Telegram-каналов. До 3 вариантов [{"ru", "en", "year"}], самый вероятный первым."""

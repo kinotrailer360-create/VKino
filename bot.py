@@ -8102,7 +8102,9 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 CUSTOM_TIMEOUT = 15 * 60
 CUSTOM_HELP = (
-    "Первой строкой — тема, дальше фильмы, по одному на строку (год — по желанию):\n"
+    "Вставь любой текст: готовый пост с описаниями (ИИ сам вытащит тему, фильмы и напишет фразы для "
+    "озвучки по твоим описаниям — и сразу соберу ролик) или простой список — первой строкой тема, "
+    "дальше фильм на строку:\n"
     "<code>Фильмы, после которых не уснёшь\nСияние 1980\nРеинкарнация\nОно 2017</code>\n"
     "Порядок — как в ролике: последний станет №1.")
 
@@ -8127,7 +8129,7 @@ async def show_plan(message: Message, state: FSMContext, title: str, films: list
     items = await shorts_copycat.resolve(kp._get, films)
     await wait.delete()
     found = [it for it in items if it["id"]]
-    await state.update_data(cs_title=title, cs_items=items)
+    await state.update_data(cs_title=title, cs_items=items, cs_notes=None)
     rows = [f"🎯 <b>Тема:</b> {escape(title)}", ""]
     for i, it in enumerate(items, 1):
         mark = f"✅ {escape(it['label'])}" if it["id"] else "❌ не нашёл на Кинопоиске"
@@ -8141,7 +8143,8 @@ async def show_plan(message: Message, state: FSMContext, title: str, films: list
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
-async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status: Message) -> None:
+async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status: Message,
+                     notes: list[str] | None = None) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -8155,7 +8158,7 @@ async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status:
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(shorts_daily.make_custom_short(
                 kp._get, work, title, ids, music, TMDB_API_KEY,
-                trailer_clips=await shorts_setting("clips") != "off"), timeout=CUSTOM_TIMEOUT)
+                trailer_clips=await shorts_setting("clips") != "off", notes=notes), timeout=CUSTOM_TIMEOUT)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
         except asyncio.TimeoutError:
@@ -8174,8 +8177,80 @@ async def custom_command(message: Message, state: FSMContext) -> None:
     await custom_ask(message, state, video=False)
 
 
+def _free_text(text: str) -> bool:
+    """Пост с описаниями, а не простой список «тема + фильм на строку»."""
+    return any(len(ln) > 70 for ln in text.splitlines()) or bool(re.search(r"[\U0001F300-\U0001FAFF]", text))
+
+
+async def custom_from_post(message: Message, state: FSMContext, text: str) -> None:
+    """Своя подборка из любого текста: ИИ вытаскивает тему, фильмы и фразы для озвучки, бот находит фильмы
+    на Кинопоиске (не нашёл — ищет настоящее название в интернете) и сразу собирает ролик."""
+    await load_fact_channels()
+    wait = await message.answer("🤖 ИИ разбирает текст и ищет фильмы на Кинопоиске, обычно до минуты…")
+    try:
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, text, shorts_daily.CUSTOM_MAX)
+        items = await shorts_copycat.resolve(kp._get, plan["films"])
+        for it, f in zip(items, plan["films"]):
+            if not it["id"]:
+                film, _ = await shorts_daily.find_film_smart(kp._get, f["ru"] or f["en"], GEMINI_API_KEY)
+                if film:
+                    it.update(id=int(film["id"]), label=shorts_daily._title(film) + (
+                        f" ({film['year']})" if film.get("year") else ""))
+    except Exception as exc:
+        logging.exception("Custom post parsing failed")
+        await wait.edit_text(f"❌ Не получилось разобрать текст: <code>{escape(str(exc)[:300])}</code>\n\n"
+                             + CUSTOM_HELP)
+        await state.set_state(CustomState.text)
+        return
+    await wait.delete()
+    notes = [f["note"] for f in plan["films"]]
+    await state.update_data(cs_title=plan["title"], cs_items=items, cs_notes=notes)
+    found = [(it, note) for it, note in zip(items, notes) if it["id"]]
+    rows = [f"🎯 <b>{escape(plan['title'])}</b>", ""]
+    rows += [f"{i}. {escape(it['query'])} — " + (f"✅ {escape(it['label'])}" if it["id"] else "❌ не нашёл")
+             for i, it in enumerate(items, 1)]
+    if not shorts_daily.CUSTOM_MIN <= len(found) <= shorts_daily.CUSTOM_MAX:
+        rows += ["", f"⚠️ Нашёл {len(found)} — нужно от {shorts_daily.CUSTOM_MIN} до {shorts_daily.CUSTOM_MAX}. "
+                     "Поправь список."]
+        await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("✏️ Изменить тему или список", "cs:edit")], [_btn("❌ Отмена", "cs:cancel")]]))
+        return
+    rows += ["", "Собираю ролик — не найденные пропущу."]
+    await message.answer("\n".join(rows))
+    await start_custom(message, state, plan["title"], [it["id"] for it, _ in found], [n for _, n in found])
+
+
+async def start_custom(message: Message, state: FSMContext, title: str, ids: list[int],
+                       notes: list[str] | None = None) -> None:
+    if shorts_lock.locked():
+        await message.answer("⏳ Сейчас собирается другой ролик — нажми «✅ Собрать шортс» через пару минут.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✅ Собрать шортс", "cs:go")]]))
+        return
+    await state.clear()
+    status = await message.answer(progress_bar(0, "Начинаю, обычно это 3–6 минут"))
+
+    async def job() -> None:
+        try:
+            await run_custom(message.bot, message.chat.id, title, ids, status, notes)
+        except Exception as exc:
+            logging.exception("Custom short failed")
+            try:
+                await status.edit_text("❌ Сборка остановилась — причина ниже")
+            except TelegramBadRequest:
+                pass
+            await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+
+    task = asyncio.create_task(job())
+    shorts_jobs.add(task)
+    task.add_done_callback(shorts_jobs.discard)
+
+
 @router.message(CustomState.text, F.text, ~F.text.startswith("/"))
 async def custom_text(message: Message, state: FSMContext) -> None:
+    if _free_text(_typed(message)) and shorts_ai.available(GEMINI_API_KEY):
+        await state.set_state(None)
+        await custom_from_post(message, state, _typed(message))
+        return
     try:
         title, films = shorts_copycat.parse_plan(_typed(message))
     except ValueError:
@@ -8248,27 +8323,10 @@ async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("✏️ Скопируй, поправь и пришли обратно (можно убрать, добавить, поменять порядок):\n\n"
                              f"<code>{escape(chr(10).join(lines))}</code>")
     elif action == "go":
-        if shorts_lock.locked():
-            await message.answer("⏳ Сейчас собирается другой ролик — нажми «Собрать» ещё раз через пару минут.")
-            return
-        ids = [it["id"] for it in data["cs_items"] if it["id"]]
-        await state.clear()
-        status = await message.answer(progress_bar(0, "Начинаю, обычно это 3–6 минут"))
-
-        async def job() -> None:
-            try:
-                await run_custom(message.bot, message.chat.id, data["cs_title"], ids, status)
-            except Exception as exc:
-                logging.exception("Custom short failed")
-                try:
-                    await status.edit_text("❌ Сборка остановилась — причина ниже")
-                except TelegramBadRequest:
-                    pass
-                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
-
-        task = asyncio.create_task(job())
-        shorts_jobs.add(task)
-        task.add_done_callback(shorts_jobs.discard)
+        items, notes = data["cs_items"], data.get("cs_notes")
+        keep = [k for k, it in enumerate(items) if it["id"]]
+        await start_custom(message, state, data["cs_title"], [items[k]["id"] for k in keep],
+                           [notes[k] for k in keep] if notes and len(notes) == len(items) else None)
 
 
 # ---------------------------------------------------------------- история персонажа (лор)
