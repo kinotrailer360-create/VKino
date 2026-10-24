@@ -1791,16 +1791,18 @@ def custom_theme(title: str, n: int) -> Theme:
 
 async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list[int], music: Path | None = None,
                             tmdb_key: str = "", trailer_clips: bool = True,
-                            notes: list[str] | None = None) -> ShortResult:
+                            notes: list[str] | None = None, user_media: list[Path] | None = None,
+                            gemini_key: str = "") -> ShortResult:
     """Своя подборка: тема и фильмы — от автора (или из чужого ролика), порядок — как в списке.
-    notes — фраза для озвучки к каждому фильму (из описаний автора) вместо «Жанр.»."""
+    notes — фраза для озвучки к каждому фильму (из описаний автора) вместо «Жанр.».
+    user_media — свои фото и видео автора: ИИ ставит каждый к фильму, о котором он."""
     work.mkdir(parents=True, exist_ok=True)
     if not CUSTOM_MIN <= len(film_ids) <= CUSTOM_MAX:
         raise RuntimeError(f"в подборке должно быть от {CUSTOM_MIN} до {CUSTOM_MAX} фильмов")
     await _progress(5, "Загружаю фильмы")
     films = [await fetch(f"/movie/{i}") for i in film_ids]
     result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips,
-                               notes)
+                               notes, user_media, gemini_key)
     add_english_seo(result)
     return result
 
@@ -2039,11 +2041,19 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
 
 
 async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], music: Path | None,
-                      tmdb_key: str, trailer_clips: bool, notes: list[str] | None = None) -> ShortResult:
+                      tmdb_key: str, trailer_clips: bool, notes: list[str] | None = None,
+                      user_media: list[Path] | None = None, gemini_key: str = "") -> ShortResult:
     """Подборка-отсчёт по готовому списку: films в порядке показа (последний — №1).
-    notes — своя фраза к каждому фильму (из описаний автора)."""
+    notes — своя фраза к каждому фильму (из описаний автора); user_media — свои фото/видео автора."""
     n = len(films)
     cards = []
+    own: dict[int, Image.Image] = {}
+    own_videos: dict[int, str] = {}
+    if user_media:
+        await _progress(8, "Разбираю ваши фото и видео")
+        texts = [f"«{_title(f)}». " + (notes[i] if notes and i < len(notes) else ", ".join(_genres(f)[:2]))
+                 for i, f in enumerate(films)]
+        own, own_videos = await _own_for_facts(user_media, texts, work, gemini_key, prefix="ownl")
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         posters_tmdb: list[str] = []
@@ -2053,7 +2063,8 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
             backdrops, posters = await tmdb.images(tmdb_key, f, limit=1)
             if i == n:
                 posters_tmdb = posters
-            img = await _download_first(session, backdrops + [_image_url(f)])
+            # свой кадр автора — вместо кадра с TMDB/Кинопоиска
+            img = own[i - 1] if (i - 1) in own else await _download_first(session, backdrops + [_image_url(f)])
             rating, src = _rating(f)
             badge = None if rating else "НОВИНКА"
             if theme.upcoming:
@@ -2064,10 +2075,13 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
             path = work / f"card{i}.jpg"
             card.save(path, quality=93)
             video: dict[str, str] = {}
-            if trailer_clips and await _trailer_clip(f, work / f"clip{i}.mp4"):
+            clip = own_videos.get(i - 1)  # своё видео автора — вместо трейлера
+            if not clip and (i - 1) not in own and trailer_clips and await _trailer_clip(f, work / f"clip{i}.mp4"):
+                clip = f"clip{i}.mp4"
+            if clip:
                 overlay = card_overlay(_title(f), i, n, rating, src or "IMDb", _actors(f), badge, place=n - i + 1)
                 overlay.save(work / f"overlay{i}.png")
-                video = {"clip": f"clip{i}.mp4", "overlay": f"overlay{i}.png"}
+                video = {"clip": clip, "overlay": f"overlay{i}.png"}
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
                                              str(f.get("year") or "")] if x)
             rows = info_rows(f)

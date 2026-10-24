@@ -8121,7 +8121,10 @@ async def custom_ask(message: Message, state: FSMContext, video: bool) -> None:
             "свои картинки, текст и голос.\n\n<i>Передумал — /cancel</i>")
     else:
         await state.set_state(CustomState.text)
-        await message.answer("🎯 <b>Своя подборка</b>\n\n" + CUSTOM_HELP + "\n\n<i>Передумал — /cancel</i>")
+        await message.answer("🎯 <b>Своя подборка</b>\n\n" + CUSTOM_HELP +
+                             "\n\n📎 Свои фото и видео (по желанию) пришли <b>до текста</b> — по одному или альбомом, "
+                             "до 10 файлов по 20 МБ. ИИ сам поставит каждый к нужному фильму."
+                             "\n\n<i>Передумал — /cancel</i>")
 
 
 async def show_plan(message: Message, state: FSMContext, title: str, films: list[dict[str, Any]]) -> None:
@@ -8144,7 +8147,7 @@ async def show_plan(message: Message, state: FSMContext, title: str, films: list
 
 
 async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status: Message,
-                     notes: list[str] | None = None) -> None:
+                     notes: list[str] | None = None, media: list[dict[str, str]] | None = None) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -8154,11 +8157,20 @@ async def run_custom(bot: Bot, chat_id: int, title: str, ids: list[int], status:
         try:
             music = await custom_music(bot, work)
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "своя подборка"}))
+            files: list[Path] = []
+            for k, item in enumerate(media or []):
+                path = work / f"user{k}{item['ext']}"
+                try:
+                    await bot.download(item["file_id"], destination=path)
+                    files.append(path)
+                except Exception:
+                    logging.exception("Custom: user file download failed")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(shorts_daily.make_custom_short(
                 kp._get, work, title, ids, music, TMDB_API_KEY,
-                trailer_clips=await shorts_setting("clips") != "off", notes=notes), timeout=CUSTOM_TIMEOUT)
+                trailer_clips=await shorts_setting("clips") != "off", notes=notes, user_media=files,
+                gemini_key=GEMINI_API_KEY), timeout=CUSTOM_TIMEOUT)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
         except asyncio.TimeoutError:
@@ -8215,13 +8227,16 @@ async def custom_from_post(message: Message, state: FSMContext, text: str) -> No
         await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("✏️ Изменить тему или список", "cs:edit")], [_btn("❌ Отмена", "cs:cancel")]]))
         return
-    rows += ["", "Собираю ролик — не найденные пропущу."]
+    media = (await state.get_data()).get("cs_media") or []
+    rows += ["", "Собираю ролик — не найденные пропущу."
+             + (f" Ваших фото/видео: {len(media)} — ИИ поставит их к нужным фильмам." if media else "")]
     await message.answer("\n".join(rows))
     await start_custom(message, state, plan["title"], [it["id"] for it, _ in found], [n for _, n in found])
 
 
 async def start_custom(message: Message, state: FSMContext, title: str, ids: list[int],
                        notes: list[str] | None = None) -> None:
+    media = (await state.get_data()).get("cs_media") or []
     if shorts_lock.locked():
         await message.answer("⏳ Сейчас собирается другой ролик — нажми «✅ Собрать шортс» через пару минут.",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✅ Собрать шортс", "cs:go")]]))
@@ -8231,7 +8246,7 @@ async def start_custom(message: Message, state: FSMContext, title: str, ids: lis
 
     async def job() -> None:
         try:
-            await run_custom(message.bot, message.chat.id, title, ids, status, notes)
+            await run_custom(message.bot, message.chat.id, title, ids, status, notes, media)
         except Exception as exc:
             logging.exception("Custom short failed")
             try:
@@ -8245,14 +8260,53 @@ async def start_custom(message: Message, state: FSMContext, title: str, ids: lis
     task.add_done_callback(shorts_jobs.discard)
 
 
+@router.message(CustomState.text, F.photo | F.video | F.animation | F.document)
+async def custom_media(message: Message, state: FSMContext) -> None:
+    """Свои фото и видео для подборки — до текста; ИИ потом ставит каждый файл к нужному фильму."""
+    if message.photo:
+        file, ext = message.photo[-1], ".jpg"
+    elif message.video or message.animation:
+        file, ext = message.video or message.animation, ".mp4"
+    else:
+        doc = message.document
+        mime = str(doc.mime_type or "")
+        if not mime.startswith(("image/", "video/")):
+            await message.answer("Это не фото и не видео — пропускаю.")
+            return
+        file = doc
+        ext = Path(doc.file_name or "").suffix.lower() or (".jpg" if mime.startswith("image/") else ".mp4")
+    if (file.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать. Пришли сжатую версию.")
+        return
+    async with review_media_lock:  # альбом приходит пачкой сообщений одновременно — не теряем файлы
+        media = (await state.get_data()).get("cs_media") or []
+        if len(media) >= 10:
+            await message.answer("Хватит: уже 10 файлов. Теперь пришли текст подборки.")
+            return
+        media.append({"file_id": file.file_id, "ext": ext})
+        await state.update_data(cs_media=media)
+    caption = (message.caption or "").strip()
+    if caption and len(media) == 1 and (_free_text(caption) or len(caption.splitlines()) >= 3):
+        # текст пришёл подписью к альбому — дождёмся остальных файлов альбома и начнём
+        await asyncio.sleep(3)
+        await state.set_state(None)
+        await custom_text_go(message, state, caption)
+        return
+    await message.answer(f"📎 Принято: {len(media)}. Пришли ещё или вставь текст подборки.")
+
+
 @router.message(CustomState.text, F.text, ~F.text.startswith("/"))
 async def custom_text(message: Message, state: FSMContext) -> None:
-    if _free_text(_typed(message)) and shorts_ai.available(GEMINI_API_KEY):
+    await custom_text_go(message, state, _typed(message))
+
+
+async def custom_text_go(message: Message, state: FSMContext, text: str) -> None:
+    if _free_text(text) and shorts_ai.available(GEMINI_API_KEY):
         await state.set_state(None)
-        await custom_from_post(message, state, _typed(message))
+        await custom_from_post(message, state, text)
         return
     try:
-        title, films = shorts_copycat.parse_plan(_typed(message))
+        title, films = shorts_copycat.parse_plan(text)
     except ValueError:
         await message.answer("Не понял список.\n\n" + CUSTOM_HELP)
         return
