@@ -1048,12 +1048,55 @@ async def synthesize(lines: list[str], work: Path,
     return voice, starts, voiced, spans
 
 
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^\w]", "", w.lower().replace("ё", "е"))
+
+
+def _align_words(script: list[tuple[str, float, float]], heard: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Слова субтитров — из нашего текста (script: слово, начало и конец его фразы), время — из распознанной
+    дорожки (heard). Распознавание ошибается в написании («Дисси», «7 из 10», «мухи»), а время у него точное:
+    сопоставляем последовательности слов, несовпавшим словам время делим поровну между соседями."""
+    from difflib import SequenceMatcher
+    times: list[tuple[float, float] | None] = [None] * len(script)
+    sm = SequenceMatcher(None, [_norm_word(w) for w, _, _ in script], [_norm_word(h["w"]) for h in heard],
+                         autojunk=False)
+    for a, b, size in sm.get_matching_blocks():
+        for i in range(size):
+            h = heard[b + i]
+            times[a + i] = (float(h["s"]), float(h["e"]))
+    k = 0
+    while k < len(script):
+        if times[k] is not None:
+            k += 1
+            continue
+        j = k
+        while j < len(script) and times[j] is None and script[j][1] == script[k][1]:
+            j += 1  # пропуск внутри одной фразы
+        left = times[k - 1][1] if k and times[k - 1] and script[k - 1][1] == script[k][1] else script[k][1]
+        right = times[j][0] if j < len(script) and times[j] and script[j][1] == script[k][1] else script[k][2]
+        right = max(right, left + 0.2 * (j - k))
+        step = (right - left) / (j - k)
+        for i in range(k, j):
+            times[i] = (left + step * (i - k), left + step * (i - k + 1))
+        k = j
+    out = []
+    for (w, _, _), t in zip(script, times):
+        s0, e0 = t  # type: ignore[misc]
+        if out and s0 < out[-1]["s"]:
+            s0 = out[-1]["s"]
+        out.append({"w": w, "s": round(s0, 2), "e": round(max(e0, s0 + 0.05), 2)})
+    return out
+
+
 async def word_timeline(voice: Path, starts: list[float], spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Субтитры по одному слову: [{"w", "s", "e"}] на всю озвучку.
 
-    Точно — распознаванием готовой дорожки (Whisper на Groq); нет ключа или сбой — по тексту фраз:
-    время слова из синтеза (голос Microsoft его даёт) или пропорционально длине слова.
+    Слова — из нашего текста; время — распознаванием готовой дорожки (Whisper на Groq), а без ключа или
+    при сбое — из синтеза (голос Microsoft его даёт) или пропорционально длине слова.
     """
+    script = [(w, start, start + float(span.get("speech") or 0))
+              for start, span in zip(starts, spans)
+              for w in str(span.get("text") or "").split() if re.search(r"\w", w)]
     if ai.RESERVE_KEY and "groq.com" in ai.RESERVE_URL:
         mp3 = voice.with_suffix(".words.mp3")
         try:
@@ -1061,7 +1104,7 @@ async def word_timeline(voice: Path, starts: list[float], spans: list[dict[str, 
                        "-c:a", "libmp3lame", "-b:a", "48k", str(mp3))
             words = await ai.transcribe_words(mp3.read_bytes())
             if words:
-                return words
+                return _align_words(script, words) if script else words
         except Exception as exc:  # noqa: BLE001 — тогда по тексту
             log.warning("shorts: word timestamps failed: %s", exc)
         finally:
@@ -1456,17 +1499,21 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                            gemini_key: str = "", trailer_clips: bool = True,
                            custom_facts: list[str] | None = None,
                            user_media: list[Path] | None = None, rumors: bool = False, review: bool = False,
+                           display_title: str = "",
                            tg_media: list[dict[str, Any]] | None = None) -> ShortResult:
     """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
     user_media — свои фото и видео автора: идут к фактам первыми.
     rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов.
     review=True — короткий обзор: custom_facts — тезисы обзора автора, ролик «Стоит ли смотреть?».
+    display_title — название в ролике (голос, обложка, SEO), если на Кинопоиске фильм называется иначе.
     tg_media — посты Telegram-каналов с фото и видео о фильме: ИИ ставит их к фактам, к которым они подходят."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
-        film, _ = await find_film_smart(fetch, query, gemini_key, upcoming=rumors)
+        film, note = await find_film_smart(fetch, query, gemini_key, upcoming=rumors)
         if not film:
             raise RuntimeError(f"Кинопоиск не нашёл «{query}»")
+        if note and not display_title:  # нашёлся под другим названием — в ролике оставляем название автора
+            display_title = display_name(query)
         facts, web_note = list(custom_facts), ""
     else:
         if query and not query.startswith("id:") and ai.available(gemini_key):
@@ -1478,6 +1525,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         rumors = rumors or (ai.available(gemini_key) and is_upcoming(film))
         tg_media = []
         facts, web_note = await gather_facts(film, kp_facts, gemini_key, media_out=tg_media, rumors=rumors)
+    film = renamed(film, display_title)
     await _progress(10, f"«{_title(film)}»: качаю кадры")
     # награды из Викиданных — первым фактом (в фактах автора — только его текст)
     award_fact = None if custom_facts else wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -1658,6 +1706,18 @@ async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[st
                               upcoming and int(c.get("year") or 0) < this_year,
                               -int((c.get("votes") or {}).get("kp") or 0)))
     return await fetch(f"/movie/{cands[0]['id']}")
+
+
+def display_name(query: str) -> str:
+    """Название, как его ввёл автор, для ролика: без года и слов «фильм»/«сериал», с заглавной буквы."""
+    name = re.sub(r"(?<!\w)(мультсериал|сериал|мультфильм|фильм)(?!\w)", "", query, flags=re.I)
+    name = re.sub(r"[\s(]+(19\d\d|20\d\d)\)?\s*$", "", name).strip(" ,.-—«»\"")
+    return name[:1].upper() + name[1:]
+
+
+def renamed(film: dict[str, Any], name: str) -> dict[str, Any]:
+    """Фильм под названием, которое знают зрители («Глиноликий» вместо «Клейфейс» с Кинопоиска)."""
+    return {**film, "name": name} if name else film
 
 
 async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",

@@ -399,6 +399,8 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
                       gemini_key: str = "") -> ShortResult:
     await _progress(3, "Загружаю фильм")
     film = await fetch(f"/movie/{script['film_id']}")
+    if script.get("display"):  # название, под которым фильм знают зрители («Глиноликий»)
+        film = {**film, "name": script["display"]}
     t = _title(film)
     sections = script["sections"]
 

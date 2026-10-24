@@ -7444,6 +7444,7 @@ async def review_ask_title(message: Message, state: FSMContext) -> None:
 
 async def review_pick(message: Message, state: FSMContext, query: str) -> None:
     wait = await message.answer("🔎 Ищу фильм…")
+    display = ""  # название автора, если на Кинопоиске фильм называется иначе
     try:
         film = await shorts_review.find_film(kp._get, query)
     except Exception as exc:
@@ -7456,16 +7457,18 @@ async def review_pick(message: Message, state: FSMContext, query: str) -> None:
         except Exception:
             logging.exception("Review smart film search failed")
             film, note = None, ""
+        display = shorts_daily.display_name(query) if film else ""
         if not film:
             logging.warning("Review film search failed: %s", exc)
             await wait.edit_text(f"❌ Не нашёл «{escape(query)}» ни на Кинопоиске, ни в интернете — "
                                  "напиши название иначе (можно по-английски или с годом).")
             return
-        await message.answer(escape(note))
-    title = shorts_daily._title(film)
+        await message.answer(escape(note) + f"\nВ ролике оставлю ваше название: «{escape(display)}»")
+    title = display or shorts_daily._title(film)
     year = f" ({film['year']})" if film.get("year") else ""
     await state.set_state(None)
     await state.update_data(review_film=int(film["id"]), review_title=title, review_notes="", review_script=None,
+                            review_display=display,
                             review_media=[])
     await wait.edit_text(
         f"🎞 Обзор: <b>«{escape(title)}»{year}</b>\n\n"
@@ -7480,8 +7483,10 @@ async def review_pick(message: Message, state: FSMContext, query: str) -> None:
 
 async def show_script(message: Message, state: FSMContext, script: dict[str, Any], can_redo: bool,
                       brief: bool = False) -> None:
-    await state.update_data(review_script=script)
     data = await state.get_data()
+    if data.get("review_display"):  # фильм нашёлся под другим названием — в ролике название автора
+        script["display"] = data["review_display"]
+    await state.update_data(review_script=script)
     chars = shorts_review.script_chars(script)
     service = await shorts_setting("lumean_service")
     if shorts_lumean.enabled():
@@ -7516,7 +7521,7 @@ async def review_generate(message: Message, state: FSMContext, notes: str) -> No
     data = await state.get_data()
     wait = await message.answer("✍️ ИИ пишет сценарий, обычно до минуты…")
     try:
-        film = await kp._get(f"/movie/{data['review_film']}")
+        film = shorts_daily.renamed(await kp._get(f"/movie/{data['review_film']}"), data.get("review_display") or "")
         script = await shorts_review.write_script(film, notes, GEMINI_API_KEY)
     except Exception as exc:
         logging.exception("Review script failed")
@@ -7818,7 +7823,9 @@ async def facts_find(message: Message, state: FSMContext) -> None:
                                  "напиши название иначе (можно по-английски или с годом).",
                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("❌ Отмена", "fx:cancel")]]))
             return
-        await wait.edit_text(f"{escape(note)}\nНа Кинопоиске: «{escape(_film_label(old))}»")
+        await wait.edit_text(f"{escape(note)}\nНа Кинопоиске: «{escape(_film_label(old))}»\n"
+                             f"В ролике оставлю ваше название: «{escape(shorts_daily.display_name(data['fx_title']))}»")
+        await state.update_data(fx_display=shorts_daily.display_name(data["fx_title"]))
         await facts_web(message, state, old)
         return
     if old and new and old["id"] != new["id"] and shorts_daily.is_upcoming(new):
@@ -7842,6 +7849,7 @@ async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | 
         await message.answer(f"❌ Не получилось: <code>{escape(str(exc)[:300])}</code>")
         return
     rumors = shorts_daily.is_upcoming(film)
+    film = shorts_daily.renamed(film, data.get("fx_display") or "")
     label = shorts_daily._title(film) + (f", {film['year']}" if film.get("year") else "")
     await state.update_data(fx_mode="rumors" if rumors else "web", fx_film=f"id:{film['id']}", fx_label=label)
     what = "новости и слухи" if rumors else "факты"
@@ -7884,7 +7892,8 @@ async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | 
 
 async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], status: Message,
                          media: list[dict[str, str]] | None = None, rumors: bool = False,
-                         tg_media: list[dict[str, Any]] | None = None, review: bool = False) -> None:
+                         tg_media: list[dict[str, Any]] | None = None, review: bool = False,
+                         display_title: str = "") -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -7907,7 +7916,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             result = await asyncio.wait_for(shorts_daily.make_facts_short(
                 kp._get, work, title, set(), music, TMDB_API_KEY, GEMINI_API_KEY,
                 trailer_clips=await shorts_setting("clips") != "off", custom_facts=facts, user_media=files,
-                rumors=rumors, tg_media=tg_media, review=review),
+                rumors=rumors, tg_media=tg_media, review=review, display_title=display_title),
                 timeout=SHORTS_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
@@ -7924,7 +7933,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
 @router.message(FactsState.title, F.text, ~F.text.startswith("/"))
 async def facts_title(message: Message, state: FSMContext) -> None:
     await state.update_data(fx_title=_typed(message), fx_mode="", fx_film="", fx_label="", fx_sources=[],
-                            fx_tg_media=[])
+                            fx_tg_media=[], fx_display="")
     await state.set_state(None)
     await message.answer("Откуда взять факты? ИИ ищет везде — Google, Википедия, Telegram-каналы, Кинопоиск. "
                          "Если фильм ещё не вышел, соберёт новости и слухи о нём.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -8075,7 +8084,7 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 await run_text_facts(message.bot, message.chat.id, data.get("fx_film") or data["fx_title"],
                                      data["fx_facts"], status, data.get("fx_media") or [],
                                      data.get("fx_mode") == "rumors", data.get("fx_tg_media") or [],
-                                     data.get("fx_mode") == "review")
+                                     data.get("fx_mode") == "review", data.get("fx_display") or "")
             except Exception as exc:
                 logging.exception("Text facts short failed")
                 try:
