@@ -1499,17 +1499,21 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                            gemini_key: str = "", trailer_clips: bool = True,
                            custom_facts: list[str] | None = None,
                            user_media: list[Path] | None = None, rumors: bool = False, review: bool = False,
+                           display_title: str = "",
                            tg_media: list[dict[str, Any]] | None = None) -> ShortResult:
     """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
     user_media — свои фото и видео автора: идут к фактам первыми.
     rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов.
     review=True — короткий обзор: custom_facts — тезисы обзора автора, ролик «Стоит ли смотреть?».
+    display_title — название в ролике (голос, обложка, SEO), если на Кинопоиске фильм называется иначе.
     tg_media — посты Telegram-каналов с фото и видео о фильме: ИИ ставит их к фактам, к которым они подходят."""
     await _progress(5, "Ищу фильм и факты")
     if custom_facts:
-        film, _ = await find_film_smart(fetch, query, gemini_key, upcoming=rumors)
+        film, note = await find_film_smart(fetch, query, gemini_key, upcoming=rumors)
         if not film:
             raise RuntimeError(f"Кинопоиск не нашёл «{query}»")
+        if note and not display_title:  # нашёлся под другим названием — в ролике оставляем название автора
+            display_title = display_name(query)
         facts, web_note = list(custom_facts), ""
     else:
         if query and not query.startswith("id:") and ai.available(gemini_key):
@@ -1521,6 +1525,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         rumors = rumors or (ai.available(gemini_key) and is_upcoming(film))
         tg_media = []
         facts, web_note = await gather_facts(film, kp_facts, gemini_key, media_out=tg_media, rumors=rumors)
+    film = renamed(film, display_title)
     await _progress(10, f"«{_title(film)}»: качаю кадры")
     # награды из Викиданных — первым фактом (в фактах автора — только его текст)
     award_fact = None if custom_facts else wiki.awards_fact(_title(film), await wiki.awards(film))
@@ -1701,6 +1706,18 @@ async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[st
                               upcoming and int(c.get("year") or 0) < this_year,
                               -int((c.get("votes") or {}).get("kp") or 0)))
     return await fetch(f"/movie/{cands[0]['id']}")
+
+
+def display_name(query: str) -> str:
+    """Название, как его ввёл автор, для ролика: без года и слов «фильм»/«сериал», с заглавной буквы."""
+    name = re.sub(r"(?<!\w)(мультсериал|сериал|мультфильм|фильм)(?!\w)", "", query, flags=re.I)
+    name = re.sub(r"[\s(]+(19\d\d|20\d\d)\)?\s*$", "", name).strip(" ,.-—«»\"")
+    return name[:1].upper() + name[1:]
+
+
+def renamed(film: dict[str, Any], name: str) -> dict[str, Any]:
+    """Фильм под названием, которое знают зрители («Глиноликий» вместо «Клейфейс» с Кинопоиска)."""
+    return {**film, "name": name} if name else film
 
 
 async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",
