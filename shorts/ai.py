@@ -67,10 +67,10 @@ class AIError(RuntimeError):
 last_error: str | None = None  # причина последнего сбоя — бот показывает её админу
 
 
-def _thumb(img: Image.Image) -> dict[str, Any]:
+def _thumb(img: Image.Image, size: int = 448) -> dict[str, Any]:
     """Уменьшенная копия кадра для запроса — экономим лимиты и трафик."""
     small = img.copy()
-    small.thumbnail((448, 448))
+    small.thumbnail((size, size))
     buf = io.BytesIO()
     small.convert("RGB").save(buf, "JPEG", quality=80)
     return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode()}}
@@ -254,10 +254,9 @@ async def _ask_key(key: str, parts: list[dict[str, Any]], search: bool, wait_min
         raise AIError(f"Gemini: неожиданный ответ ({exc})") from exc
 
 
-def _sheet(images: list[Image.Image]) -> Image.Image:
+def _sheet(images: list[Image.Image], tw: int = 320, th: int = 180, cols: int = 0) -> Image.Image:
     """Все кадры на одном листе с крупными номерами — резервные модели берут 1–3 картинки за раз."""
-    cols = 6 if len(images) > 16 else 4
-    tw, th = 320, 180
+    cols = cols or (6 if len(images) > 16 else 4)
     rows = (len(images) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * tw, rows * th), "black")
     draw = ImageDraw.Draw(sheet)
@@ -417,23 +416,40 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
     return out
 
 
-async def extract_plan(key: str, text: str, max_films: int = 10) -> dict[str, Any]:
-    """Своя подборка из любого текста автора (пост, список с описаниями): тема и фильмы/сериалы с короткой
-    фразой для озвучки по описанию автора. {"title", "films": [{"ru", "en", "year", "note"}]}."""
+async def extract_plan(key: str, text: str, max_films: int = 10,
+                       images: list[Image.Image] | None = None) -> dict[str, Any]:
+    """Своя подборка из любого текста автора (пост, список с описаниями) или из его картинок (постеры, кадры,
+    скриншоты постов): тема и фильмы/сериалы с короткой фразой для озвучки.
+    {"title", "films": [{"ru", "en", "year", "note"}]}."""
     if not available(key):
         raise AIError("нет ключа GEMINI_API_KEY или RESERVE_AI_KEY")
+    if images:
+        source = ("На картинках автора — постеры, кадры или скриншоты постов про фильмы и сериалы"
+                  + (", ниже его текст" if text.strip() else "") + ". Узнай каждый фильм или сериал: по "
+                  "названию на картинке, а если его нет — по кадру и актёрам; не уверен — пропусти. ")
+        about = ("и о чём — пересказом текста на картинке или описания автора, а если описания нет — "
+                 "коротко то, что точно известно о фильме, без спойлеров. ")
+    else:
+        source, about = ("Ниже текст автора про подборку фильмов и сериалов (пост, список, заметки). ",
+                         "и о чём — пересказом описания автора, живо, без спойлеров, только факты из текста. ")
     prompt = (
-        "Ниже текст автора про подборку фильмов и сериалов (пост, список, заметки). Вытащи из него:\n"
+        source + "Вытащи:\n"
         "1) title — короткую тему ролика по-русски, 3–6 слов, без эмодзи (например «Онлайн-премьеры недели»);\n"
-        f"2) films — до {max_films} фильмов и сериалов в том же порядке, что в тексте: ru — название по-русски "
-        "как в тексте, en — оригинальное название, если знаешь, year — год, если указан или известен, "
-        "note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если указано, "
-        "и о чём — пересказом описания автора, живо, без спойлеров, только факты из текста. Названия "
-        "сервисов пиши как в тексте (Netflix, Apple TV). Не выдумывай фильмы, которых нет в тексте." + GRAMMAR +
+        f"2) films — до {max_films} фильмов и сериалов в том же порядке, что у автора: ru — название по-русски "
+        "(как в тексте или официальное), en — оригинальное название, если знаешь, year — год, если указан или "
+        "известен, note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если "
+        "указано, " + about + "Названия сервисов пиши как у автора (Netflix, Apple TV). Не выдумывай фильмы, "
+        "которых у автора нет." + GRAMMAR +
         '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": 2025, '
-        '"note": "..."}]}\n\nТЕКСТ:\n' + text.strip()[:9000]
+        '"note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
     )
-    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    if images:
+        parts: list[dict[str, Any]] = [{"text": prompt}]
+        for i, img in enumerate(images, 1):
+            parts += [{"text": f"Картинка {i}:"}, _thumb(img, 1024)]
+        data = await _with_reserve(key, parts, prompt, _sheet(images, 640, 640, 3))
+    else:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
     films = []
     for f in (data.get("films") if isinstance(data, dict) else None) or []:
         if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
@@ -442,7 +458,7 @@ async def extract_plan(key: str, text: str, max_films: int = 10) -> dict[str, An
                           "year": int(year) if str(year or "").isdigit() else None,
                           "note": re.sub(r"\s+", " ", str(f.get("note") or "")).strip()[:220]})
     if len(films) < 3:
-        raise AIError("ИИ не нашёл в тексте хотя бы 3 фильма или сериала")
+        raise AIError("ИИ не нашёл " + ("на картинках" if images else "в тексте") + " хотя бы 3 фильма или сериала")
     title = re.sub(r"\s+", " ", str(data.get("title") or "")).strip(" .!«»\"") or "Подборка фильмов"
     return {"title": title, "films": films[:max_films]}
 

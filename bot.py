@@ -44,6 +44,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 from dotenv import load_dotenv
+from PIL import Image
 
 from shorts import ai as shorts_ai
 from shorts import tgsearch as shorts_tgsearch
@@ -8194,13 +8195,15 @@ def _free_text(text: str) -> bool:
     return any(len(ln) > 70 for ln in text.splitlines()) or bool(re.search(r"[\U0001F300-\U0001FAFF]", text))
 
 
-async def custom_from_post(message: Message, state: FSMContext, text: str) -> None:
-    """Своя подборка из любого текста: ИИ вытаскивает тему, фильмы и фразы для озвучки, бот находит фильмы
-    на Кинопоиске (не нашёл — ищет настоящее название в интернете) и сразу собирает ролик."""
+async def custom_from_post(message: Message, state: FSMContext, text: str,
+                           images: list[Image.Image] | None = None) -> None:
+    """Своя подборка из любого текста или из картинок автора: ИИ вытаскивает тему, фильмы и фразы для озвучки,
+    бот находит фильмы на Кинопоиске (не нашёл — ищет настоящее название в интернете) и сразу собирает ролик."""
     await load_fact_channels()
-    wait = await message.answer("🤖 ИИ разбирает текст и ищет фильмы на Кинопоиске, обычно до минуты…")
+    wait = await message.answer(("🤖 ИИ узнаёт фильмы на картинках" if images else "🤖 ИИ разбирает текст")
+                                + " и ищет их на Кинопоиске, обычно до минуты…")
     try:
-        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, text, shorts_daily.CUSTOM_MAX)
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, text, shorts_daily.CUSTOM_MAX, images)
         items = await shorts_copycat.resolve(kp._get, plan["films"])
         for it, f in zip(items, plan["films"]):
             if not it["id"]:
@@ -8210,8 +8213,8 @@ async def custom_from_post(message: Message, state: FSMContext, text: str) -> No
                         f" ({film['year']})" if film.get("year") else ""))
     except Exception as exc:
         logging.exception("Custom post parsing failed")
-        await wait.edit_text(f"❌ Не получилось разобрать текст: <code>{escape(str(exc)[:300])}</code>\n\n"
-                             + CUSTOM_HELP)
+        await wait.edit_text(f"❌ Не получилось разобрать {'картинки' if images else 'текст'}: "
+                             f"<code>{escape(str(exc)[:300])}</code>\n\n" + CUSTOM_HELP)
         await state.set_state(CustomState.text)
         return
     await wait.delete()
@@ -8292,7 +8295,40 @@ async def custom_media(message: Message, state: FSMContext) -> None:
         await state.set_state(None)
         await custom_text_go(message, state, caption)
         return
-    await message.answer(f"📎 Принято: {len(media)}. Пришли ещё или вставь текст подборки.")
+    # альбом — это пачка сообщений: отвечаем один раз, когда файлы перестали приходить
+    tick = _custom_ack[message.chat.id] = _custom_ack.get(message.chat.id, 0) + 1
+    await asyncio.sleep(3)
+    if _custom_ack.get(message.chat.id) != tick or await state.get_state() != CustomState.text.state:
+        return
+    photos = sum(m["ext"] != ".mp4" for m in media)
+    await message.answer(
+        f"📎 Принято файлов: {len(media)}. Теперь вставь текст подборки"
+        + (" — или нажми кнопку, и ИИ сам узнает фильмы на фото (постеры, кадры, скриншоты постов) "
+           "и соберёт ролик." if photos else "."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🤖 Собрать по фото", "cs:photos")]])
+        if photos else None)
+
+
+_custom_ack: dict[int, int] = {}
+
+
+async def custom_from_photos(message: Message, state: FSMContext) -> None:
+    """Своя подборка без текста: ИИ узнаёт фильмы на присланных фото; сами фото идут в ролик."""
+    media = (await state.get_data()).get("cs_media") or []
+    images: list[Image.Image] = []
+    for item in media:
+        if item["ext"] == ".mp4":
+            continue
+        try:
+            buf = await message.bot.download(item["file_id"], destination=io.BytesIO())
+            images.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("Custom: photo download failed")
+    if not images:
+        await message.answer("Не вижу фото — пришли картинки или вставь текст подборки.")
+        return
+    await state.set_state(None)
+    await custom_from_post(message, state, "", images)
 
 
 @router.message(CustomState.text, F.text, ~F.text.startswith("/"))
@@ -8362,6 +8398,12 @@ async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     message, action = callback.message, (callback.data or "")[3:]
     if action in ("text", "video"):
         await custom_ask(message, state, video=action == "video")
+        return
+    if action == "photos":
+        if await state.get_state() != CustomState.text.state:
+            await message.answer("Начни заново: «🎯 Своя подборка».")
+            return
+        await custom_from_photos(message, state)
         return
     if action == "cancel":
         await state.clear()
