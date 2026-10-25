@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Харчо — анимация</title>
+<style>
+  @font-face { font-family: 'Montserrat'; src: url('../shorts/assets/Montserrat.ttf'); font-weight: 100 900; }
+  @font-face { font-family: 'PT Serif'; src: url('../shorts/assets/PTSerif-Bold.ttf'); font-weight: 700; }
+  html, body { margin: 0; background: #000; }
+  canvas { display: block; width: 100vw; height: auto; max-height: 100vh; object-fit: contain; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script src="kharcho_animation.js"></script>
+<script>
+  // ?render — кадры рисует Playwright через KHARCHO.renderFrame(t);
+  // без параметра страница проигрывает анимацию в реальном времени (предпросмотр).
+  window.ready = (async () => {
+    await Promise.all([
+      document.fonts.load('800 80px Montserrat'), document.fonts.load('600 36px Montserrat'),
+      document.fonts.load('500 30px Montserrat'), document.fonts.load('700 100px "PT Serif"'),
+    ]);
+    KHARCHO.init(document.getElementById('c'));
+    return true;
+  })();
+  if (!location.search.includes('render')) {
+    window.ready.then(() => {
+      const t0 = performance.now();
+      const tick = () => {
+        KHARCHO.renderFrame(((performance.now() - t0) / 1000) % KHARCHO.DURATION);
+        requestAnimationFrame(tick);
+      };
+      tick();
+    });
+  }
+</script>
+</body>
+</html>
