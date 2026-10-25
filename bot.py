@@ -8201,7 +8201,7 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
     бот находит фильмы на Кинопоиске (не нашёл — ищет настоящее название в интернете) и сразу собирает ролик."""
     await load_fact_channels()
     wait = await message.answer(("🤖 ИИ узнаёт фильмы на картинках" if images else "🤖 ИИ разбирает текст")
-                                + " и ищет их на Кинопоиске, обычно до минуты…")
+                                + " и ищет о них всё: Кинопоиск, интернет, Telegram-каналы. Обычно 1–2 минуты…")
     try:
         plan = await shorts_ai.extract_plan(GEMINI_API_KEY, text, shorts_daily.CUSTOM_MAX, images)
         items = await shorts_copycat.resolve(kp._get, plan["films"])
@@ -8211,6 +8211,7 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
                 if film:
                     it.update(id=int(film["id"]), label=shorts_daily._title(film) + (
                         f" ({film['year']})" if film.get("year") else ""))
+        await _fill_notes(wait, plan["films"], items)
     except Exception as exc:
         logging.exception("Custom post parsing failed")
         await wait.edit_text(f"❌ Не получилось разобрать {'картинки' if images else 'текст'}: "
@@ -8235,6 +8236,28 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
              + (f" Ваших фото/видео: {len(media)} — ИИ поставит их к нужным фильмам." if media else "")]
     await message.answer("\n".join(rows))
     await start_custom(message, state, plan["title"], [it["id"] for it, _ in found], [n for _, n in found])
+
+
+async def _fill_notes(wait: Message, films: list[dict[str, Any]], items: list[dict[str, Any]]) -> None:
+    """У автора нет описания фильма (часто при подборке по фото) — ИИ ищет, о чём он, в интернете и в
+    Telegram-каналах, чтобы озвучка была не просто «Жанр.»."""
+    empty = [k for k, (f, it) in enumerate(zip(films, items)) if it["id"] and len(f["note"]) < 25]
+    if not empty:
+        return
+    try:
+        await wait.edit_text("🌐 Ищу о фильмах в интернете и Telegram-каналах, чтобы было что рассказать…")
+    except TelegramBadRequest:
+        pass
+    names = [films[k]["ru"] or films[k]["en"] for k in empty]
+    try:  # каналов много, а запрос на каждое название — не ждём дольше 45 с
+        posts = await asyncio.wait_for(shorts_tgsearch.search(shorts_daily.fact_channels, names, per_channel=2), 45)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Custom: tg search for notes skipped: %s", exc)
+        posts = []
+    notes = await shorts_ai.film_notes(GEMINI_API_KEY, [films[k] for k in empty], shorts_tgsearch.as_text(posts, 6000))
+    for k, note in zip(empty, notes):
+        if note:
+            films[k]["note"] = note
 
 
 async def start_custom(message: Message, state: FSMContext, title: str, ids: list[int],

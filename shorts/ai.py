@@ -463,6 +463,38 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
     return {"title": title, "films": films[:max_films]}
 
 
+async def film_notes(key: str, films: list[dict[str, Any]], posts: str = "") -> list[str]:
+    """Фраза для озвучки к каждому фильму подборки, когда у автора нет описания: ИИ ищет в Google и
+    Википедии и смотрит посты Telegram-каналов. Порядок — как в films ({"ru", "en", "year"}); не нашёл — ""."""
+    if not films or not available(key):
+        return [""] * len(films)
+    rows = "\n".join(f"{i}. {f.get('ru') or f.get('en')}" + (f" ({f['en']})" if f.get("ru") and f.get("en") else "")
+                     + (f", {f['year']}" if f.get("year") else "") for i, f in enumerate(films, 1))
+    prompt = (
+        "Для ролика-подборки нужна к каждому фильму или сериалу одна-две короткие фразы для озвучки (до 150 "
+        "символов): о чём он — живо, без спойлеров; для новинки — когда и где выходит. Только проверенные "
+        "факты, не выдумывай; не знаешь — пустая строка." + GRAMMAR
+        + "\n\nФИЛЬМЫ:\n" + rows
+        + ("\n\nПосты из Telegram-каналов о кино:\n" + posts[:6000] if posts else "")
+        + '\n\nОтветь только JSON: {"notes": ["...", ...]} — по строке на каждый фильм, в том же порядке.'
+    )
+    data = None
+    if key:
+        try:
+            data = await _ask(key, [{"text": "Поищи в интернете (Google, Википедия). " + prompt}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: film notes via search failed: %s", exc)
+    if data is None:
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: film notes failed: %s", exc)
+            return [""] * len(films)
+    notes = (data.get("notes") if isinstance(data, dict) else None) or []
+    notes = [re.sub(r"\s+", " ", str(n or "")).strip()[:220] for n in notes][:len(films)]
+    return notes + [""] * (len(films) - len(notes))
+
+
 async def identify_film(key: str, query: str, posts: str = "") -> list[dict[str, Any]]:
     """Какой фильм или сериал имеет в виду автор («Глиноликий» → «Клейфейс», Clayface, 2026): ИИ ищет в Google
     и смотрит посты Telegram-каналов. До 3 вариантов [{"ru", "en", "year"}], самый вероятный первым."""
