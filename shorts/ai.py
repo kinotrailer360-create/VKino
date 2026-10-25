@@ -476,7 +476,7 @@ async def film_notes(key: str, films: list[dict[str, Any]], posts: str = "") -> 
         "факты, не выдумывай; не знаешь — пустая строка." + GRAMMAR
         + "\n\nФИЛЬМЫ:\n" + rows
         + ("\n\nПосты из Telegram-каналов о кино:\n" + posts[:6000] if posts else "")
-        + f'\n\nОтветь только JSON: {{"notes": ["...", ...]}} — по строке на каждый фильм, в том же порядке.'
+        + '\n\nОтветь только JSON: {"notes": ["...", ...]} — по строке на каждый фильм, в том же порядке.'
     )
     data = None
     if key:
