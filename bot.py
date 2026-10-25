@@ -8301,20 +8301,26 @@ async def custom_media(message: Message, state: FSMContext) -> None:
     if _custom_ack.get(message.chat.id) != tick or await state.get_state() != CustomState.text.state:
         return
     photos = sum(m["ext"] != ".mp4" for m in media)
+    if not photos:
+        await message.answer(f"📎 Принято файлов: {len(media)}. Теперь вставь текст подборки.")
+        return
     await message.answer(
-        f"📎 Принято файлов: {len(media)}. Теперь вставь текст подборки"
-        + (" — или нажми кнопку, и ИИ сам узнает фильмы на фото (постеры, кадры, скриншоты постов) "
-           "и соберёт ролик." if photos else "."),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🤖 Собрать по фото", "cs:photos")]])
-        if photos else None)
+        f"📎 Принято файлов: {len(media)}. Через {PHOTOS_WAIT} секунд ИИ сам узнает фильмы на фото (постеры, "
+        "кадры, скриншоты постов) и соберёт ролик. Хочешь добавить фото или свой текст — пришли сейчас.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🤖 Собрать сразу", "cs:photos")]]))
+    await asyncio.sleep(PHOTOS_WAIT)
+    if _custom_ack.get(message.chat.id) == tick and await state.get_state() == CustomState.text.state:
+        await custom_from_photos(message, state)
 
 
 _custom_ack: dict[int, int] = {}
+PHOTOS_WAIT = 15  # сек: успеть дослать фото или текст, потом ИИ собирает по фото сам
 
 
 async def custom_from_photos(message: Message, state: FSMContext) -> None:
     """Своя подборка без текста: ИИ узнаёт фильмы на присланных фото; сами фото идут в ролик."""
     media = (await state.get_data()).get("cs_media") or []
+    await state.set_state(None)  # сразу: кнопка и автозапуск не должны собрать ролик дважды
     images: list[Image.Image] = []
     for item in media:
         if item["ext"] == ".mp4":
@@ -8325,9 +8331,9 @@ async def custom_from_photos(message: Message, state: FSMContext) -> None:
         except Exception:
             logging.exception("Custom: photo download failed")
     if not images:
+        await state.set_state(CustomState.text)
         await message.answer("Не вижу фото — пришли картинки или вставь текст подборки.")
         return
-    await state.set_state(None)
     await custom_from_post(message, state, "", images)
 
 
