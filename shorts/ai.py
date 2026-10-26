@@ -183,9 +183,30 @@ async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict
     raise AssertionError("unreachable")
 
 
+GEMINI_BUDGET = 120  # с: дольше на один вопрос не ждём (с видео/звуком — MEDIA_BUDGET), дальше резервный ИИ
+MEDIA_BUDGET = 300
+SLOW_PAUSE = 10 * 60  # Gemini завис — столько времени сразу идём к резервному ИИ, не ждём его на каждом шаге
+_slow_until = 0.0
+
+
 async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> Any:
     """search=True — модель сама ищет в Google (ответ JSON-текстом, источники — в ключе "_sources").
-    У ключа кончился лимит — пробуем запасные ключи (GEMINI_API_KEY_2, _3), потом ошибка."""
+    У ключа кончился лимит — пробуем запасные ключи (GEMINI_API_KEY_2, _3), потом ошибка.
+    Gemini не ответил за GEMINI_BUDGET — ошибка, и SLOW_PAUSE его не ждём (сборка не должна висеть)."""
+    global _slow_until
+    media = any(str((p.get("inline_data") or {}).get("mime_type", "")).startswith(("video/", "audio/")) for p in parts)
+    if not media and time.monotonic() < _slow_until:
+        raise AIError(f"Gemini не отвечает — {round((_slow_until - time.monotonic()) / 60)} мин работаем без него")
+    budget = MEDIA_BUDGET if media else GEMINI_BUDGET
+    try:
+        return await asyncio.wait_for(_ask_keys(key, parts, search), budget)
+    except asyncio.TimeoutError:
+        if not media:
+            _slow_until = time.monotonic() + SLOW_PAUSE
+        raise AIError(f"Gemini не ответил за {budget} с") from None
+
+
+async def _ask_keys(key: str, parts: list[dict[str, Any]], search: bool) -> Any:
     global last_key_no
     keys = gemini_keys(key)
     errors: list[str] = []
@@ -326,6 +347,9 @@ async def _ask_reserve(prompt: str, image: Image.Image | None = None) -> Any:
         raise AIError(f"резервный ИИ: неожиданный ответ ({exc})") from exc
 
 
+RESERVE_BUDGET = 90  # с на ответ резервного ИИ
+
+
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
                         image: Image.Image | None = None) -> Any:
     """Сначала Gemini; не вышло — резервный ИИ. Ошибка — с причинами обоих."""
@@ -338,19 +362,19 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             log.warning("shorts: Gemini failed: %s", exc)
     if RESERVE_KEY:
         try:
-            result = await _ask_reserve(prompt, image)
+            result = await asyncio.wait_for(_ask_reserve(prompt, image), RESERVE_BUDGET)
             log.info("shorts: reserve AI (%s) answered", RESERVE_MODEL)
             return result
         except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
+            errors.append(str(exc) or f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
             log.warning("shorts: reserve AI failed: %s", exc)
     if BEAT_KEY:
         try:
-            result = await _ask_beat(prompt, image)
+            result = await asyncio.wait_for(_ask_beat(prompt, image), RESERVE_BUDGET)
             log.info("shorts: BeatAPI (%s) answered", _beat_model or BEAT_MODEL)
             return result
         except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
+            errors.append(str(exc) or f"BeatAPI не ответил за {RESERVE_BUDGET} с")
             log.warning("shorts: BeatAPI failed: %s", exc)
     if not RESERVE_KEY and not BEAT_KEY:
         errors.append("резервный ИИ не подключён: бот не видит переменную RESERVE_AI_KEY")
