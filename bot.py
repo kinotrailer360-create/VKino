@@ -6306,6 +6306,8 @@ SHORT_THEMES = {
     "upcoming": "скоро в кино",
     "genre": "топ случайного жанра",
     "facts": "5 фактов о фильме",
+    "facts_new": "5 фактов: новинки с 2015 года",
+    "facts_old": "5 фактов: классика до 2015 года",
     "news": "новости кино",
     "birthday": "день рождения звезды",
 }
@@ -6589,7 +6591,9 @@ async def short_command(
 
 async def start_short(message: Message, theme: str) -> None:
     """Собрать шортс по теме (как в /short) и прислать в этот чат — для команды и кнопок."""
-    if theme.lower().startswith("facts"):
+    if theme.lower() in ("facts_new", "facts_old"):
+        theme = theme.lower()
+    elif theme.lower().startswith("facts"):
         # /short facts Матрица — название фильма оставляем как есть
         query = theme[5:].strip(" :")
         theme = f"facts:{query}" if query else "facts"
@@ -7084,6 +7088,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
         [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
+        [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
