@@ -752,6 +752,75 @@ async def pick_news(key: str, items: list[tuple[str, str, str]], n: int = 5) -> 
     return out[:n] if len(out) >= 3 else None
 
 
+POST_STYLE = """🏜 ФИНАЛЬНЫЙ ТРЕЙЛЕР «ДЮНЫ 3»!
+
+Последний трейлер последней главы саги Дени Вильнёва уже здесь, и это мурашки 🔥
+
+👑 Прошло 17 лет. Пол Атрейдес стал императором и хочет подчинить себе всю вселенную. Но за его спиной уже плетут заговор, и даже самые близкие могут оказаться врагами 😳
+
+Шаламе, Зендея, Паттинсон в роли злодея и масштаб Вильнёва. Это будет финал, который мы запомним 🙌
+
+📅 Премьера — 18 декабря!
+
+❤️ — уже беру билеты 🔥 — только в IMAX 📤 Перешли другу, с которым пойдёшь на «Дюну»
+
+#Дюна3 #DunePartThree #Вильнёв #ТимотиШаламе #Зендея #Трейлер #КиноНовости"""
+
+
+async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -> dict[str, Any] | None:
+    """Пост для Telegram-канала автора в его стиле (POST_STYLE) по самой интересной свежей новости из постов
+    других каналов. recent — темы уже сделанных постов (не повторяем).
+    {"post": текст, "topic": тема, "media": [номера постов о той же новости — оттуда фото/видео]} или None."""
+    if not available(key) or not posts:
+        return None
+    listing = "\n\n".join(f"{i}. [t.me/{p['channel']}]\n{p['text']}" for i, p in enumerate(posts, 1))
+    rules = (
+        "Ты ведёшь Telegram-канал о кино KinoMir360. Ниже свежие посты других каналов о кино. Выбери ОДНУ самую "
+        "интересную для широкой аудитории новость: трейлер, премьера, кастинг, продолжение, сборы, награды, "
+        "громкие слухи. Пропускай рекламу, розыгрыши, политику, местные события и то, что уже было:\n"
+        + ("\n".join(f"— {t}" for t in recent[-40:]) or "—")
+        + "\n\nСверь новость с другими постами (и с Google, если можешь); неподтверждённое подавай как слух. "
+        "Напиши пост своими словами (не копируй чужой текст) точно в стиле и формате образца: заголовок "
+        "КАПСОМ с эмодзи, 2–4 коротких абзаца с эмодзи в начале, дата премьеры, если известна, строка реакций "
+        "«❤️ — … 🔥 — …» и призыв переслать другу, в конце 5–8 хэштегов. До 900 символов. Названия — как в "
+        "российском прокате, в «ёлочках». Не выдумывай фактов: только то, что есть в постах или найдено в "
+        "Google." + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
+        + '\n\nОтветь только JSON: {"post": "текст поста", "topic": "о чём новость, 3–6 слов", '
+        '"film": "название фильма или сериала по-русски или пусто", '
+        '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
+    )
+    data = None
+    if key:
+        try:
+            data = await _ask(key, [{"text": rules + "\n\nПОСТЫ:\n" + listing}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: tg post with search failed: %s", exc)
+    if data is None:
+        prompt = rules + "\n\nПОСТЫ:\n" + listing
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            global last_error
+            last_error = str(exc)[:300]
+            log.warning("shorts: tg post failed: %s", exc)
+            return None
+    if not isinstance(data, dict):
+        return None
+    post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip()
+    if len(post) < 80:
+        return None
+    media = []
+    for m in data.get("media") or []:
+        try:
+            i = int(m) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(posts) and i not in media:
+            media.append(i)
+    return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
+            "film": str(data.get("film") or "").strip(" «»\"")}
+
+
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key

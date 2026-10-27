@@ -49,7 +49,8 @@ def split_channels(text: str) -> tuple[list[str], list[str]]:
 
 
 class _Posts(HTMLParser):
-    """Посты из веб-версии канала: [{"url", "text", "time" (unix, 0 — нет), "image", "video"}] по порядку."""
+    """Посты из веб-версии канала: [{"url", "text", "time" (unix, 0 — нет), "image", "video", "thumb"}] по порядку
+    (thumb — маленькая обложка видео, которое веб-версия не отдаёт)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -83,6 +84,10 @@ class _Posts(HTMLParser):
         elif tag == "a" and "tgme_widget_message_photo_wrap" in cls and cur is not None and not cur["image"]:
             m = re.search(r"background-image:url\(['\"]?([^'\")]+)", a.get("style") or "")
             cur["image"] = m.group(1) if m else None
+        elif tag == "i" and "tgme_widget_message_video_thumb" in cls and cur is not None and not cur.get("thumb"):
+            # большое видео веб-версия не отдаёт — только его маленькую обложку (запасная картинка)
+            m = re.search(r"background-image:url\(['\"]?([^'\")]+)", a.get("style") or "")
+            cur["thumb"] = m.group(1) if m else None
         elif tag == "video" and cur is not None and not cur["video"] and str(a.get("src") or "").startswith("http"):
             cur["video"] = a["src"]
 

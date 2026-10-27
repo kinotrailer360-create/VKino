@@ -7084,6 +7084,7 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 def shorts_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
+        [_btn("📝 Пост для ТГ", "pt:make"), _btn("🔔 Авто-посты 30 мин", "pt:auto")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
@@ -8459,6 +8460,150 @@ async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                            [notes[k] for k in keep] if notes and len(notes) == len(items) else None)
 
 
+# ---------------------------------------------------------------- посты для Telegram-канала
+
+POST_CHANNEL = os.getenv("POST_CHANNEL", "@KinoMir360")  # свой канал: из него новости не берём, в него публикуем
+POSTS_EVERY = 30 * 60
+POSTS_NIGHT = range(0, 8)  # часы МСК: ночью авто-посты не присылаем
+post_lock = asyncio.Lock()
+
+
+async def _posts_history() -> dict[str, list[str]]:
+    try:
+        data = json.loads(await shorts_setting("posts_history") or "{}")
+    except ValueError:
+        data = {}
+    return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or [])}
+
+
+def _post_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"📢 Опубликовать в {POST_CHANNEL}", "pt:pub")], [_btn("🔄 Ещё пост", "pt:make")]])
+
+
+async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
+    """Пост в стиле канала автора по самой интересной свежей новости (за сутки) из Telegram-каналов, кроме
+    своего, с фото или видео из источника. Присылает в чаты; возвращает тему или "" (новых новостей нет)."""
+    async with post_lock:
+        own = POST_CHANNEL.lstrip("@").lower()
+        channels = [c for c in await fact_channels() if c.lower() != own]
+        posts = await shorts_tgsearch.latest(channels, hours=24, per_channel=5)
+        hist = await _posts_history()
+        used = set(hist["urls"])
+        fresh = [p for p in posts if p["url"] not in used][:30]
+        if not fresh:
+            return ""
+        res = await shorts_ai.write_post(GEMINI_API_KEY, fresh, hist["topics"])
+        if not res:
+            raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+        same = [fresh[i] for i in res["media"]]
+        hist["urls"] = (hist["urls"] + [p["url"] for p in same])[-500:]
+        hist["topics"] = (hist["topics"] + [res["topic"] or res["post"][:60]])[-60:]
+        await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+        work = SHORTS_DIR / f"post_{time.time_ns()}"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            with_media = [p for p in same if p.get("video") or p.get("image")]
+            if not with_media and res["film"]:  # у самой новости нет фото — ищем кадры фильма в каналах
+                try:
+                    found = await asyncio.wait_for(shorts_tgsearch.search(channels, [res["film"]], per_channel=2), 40)
+                    with_media = [p for p in found if p.get("video") or p.get("image")]
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Tg post: media search skipped: %s", exc)
+            if not with_media and res["film"]:  # кадр фильма с Кинопоиска
+                try:
+                    film = await shorts_daily.find_film(kp._get, res["film"])
+                    url = shorts_daily._image_url(film) if film else None
+                    with_media = [{"image": url}] if url else []
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Tg post: kinopoisk image skipped: %s", exc)
+            # последнее — маленькая обложка видео из самой новости
+            with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
+            files = await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post")
+            caption = escape(res["post"])
+            for chat_id in chat_ids:
+                if files and files[0].suffix == ".mp4":
+                    await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption,
+                                         reply_markup=_post_keyboard(), supports_streaming=True)
+                elif files:
+                    await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption,
+                                         reply_markup=_post_keyboard())
+                else:
+                    await bot.send_message(chat_id, caption, reply_markup=_post_keyboard())
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return res["topic"] or "пост"
+
+
+async def posts_auto_loop(bot: Bot) -> None:
+    """Кнопка «🔔 Авто-посты»: раз в 30 минут (кроме ночи) присылает админам новый пост."""
+    last = 0.0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if (await shorts_setting("posts_auto") != "on" or time.monotonic() - last < POSTS_EVERY
+                    or datetime.now(MSK).hour in POSTS_NIGHT):
+                continue
+            last = time.monotonic()
+            await make_tg_post(bot, sorted(ADMIN_IDS))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Auto post failed")
+
+
+@router.callback_query(F.data.startswith("pt:"))
+async def post_buttons(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    message, action = callback.message, (callback.data or "")[3:]
+    if action == "pub":
+        try:
+            await message.bot.copy_message(POST_CHANNEL, message.chat.id, message.message_id)
+        except Exception as exc:  # noqa: BLE001
+            await callback.answer()
+            await message.answer(
+                f"❌ Не получилось опубликовать в {escape(POST_CHANNEL)}: <code>{escape(str(exc)[:200])}</code>\n\n"
+                "Добавь бота в администраторы канала с правом «Публикация сообщений» "
+                "(канал → Управление каналом → Администраторы → Добавить → найди бота).")
+            return
+        await callback.answer("✅ Опубликовано")
+        try:
+            await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("✅ Опубликовано", "pt:noop")], [_btn("🔄 Ещё пост", "pt:make")]]))
+        except TelegramBadRequest:
+            pass
+        return
+    await callback.answer()
+    if action == "auto":
+        on = await shorts_setting("posts_auto") != "on"
+        await set_shorts_setting("posts_auto", "on" if on else None)
+        await message.answer(
+            "🔔 Авто-посты включены: раз в 30 минут (кроме ночи, 0–8 по Москве) пришлю новый пост по свежей "
+            "новости из каналов. Нажми «📢 Опубликовать» под тем, что нравится. Выключить — та же кнопка."
+            if on else "🔕 Авто-посты выключены.")
+        return
+    if action == "make":
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту.")
+            return
+        wait = await message.answer("📝 Читаю свежие посты каналов за сутки, ИИ выбирает новость и пишет пост…")
+
+        async def job() -> None:
+            try:
+                topic = await make_tg_post(message.bot, [message.chat.id])
+                await wait.edit_text("✅ Готово" if topic else
+                                     "🤷 Новых новостей за сутки нет — всё уже было в прошлых постах.")
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Tg post failed")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+        task = asyncio.create_task(job())
+        shorts_jobs.add(task)
+        task.add_done_callback(shorts_jobs.discard)
+
+
 # ---------------------------------------------------------------- история персонажа (лор)
 
 LORE_TIMEOUT = 20 * 60
@@ -8965,6 +9110,7 @@ async def main() -> None:
     shorts_task = asyncio.create_task(
         shorts_daily_loop(bot)
     )
+    posts_task = asyncio.create_task(posts_auto_loop(bot))
 
     dp = Dispatcher()
     dp.include_router(router)
@@ -8992,6 +9138,7 @@ async def main() -> None:
         blender_task.cancel()
         reminder_task.cancel()
         shorts_task.cancel()
+        posts_task.cancel()
         commands_task.cancel()
 
         try:
@@ -9011,6 +9158,11 @@ async def main() -> None:
 
         try:
             await shorts_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await posts_task
         except asyncio.CancelledError:
             pass
 
