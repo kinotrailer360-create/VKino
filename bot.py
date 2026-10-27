@@ -38,6 +38,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -6396,14 +6397,15 @@ async def news_feeds() -> list[str]:
 
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     seo = result.seo
-    await bot.send_video(
+    video = await bot.send_video(
         chat_id,
         FSInputFile(result.video, filename="kinomir360_short.mp4"),
-        caption=f"🎬 <b>{escape(seo['title'])}</b>",
+        caption=post_caption(short_caption(result)),  # готово и для Telegram-канала
         width=1080,
         height=1920,
         supports_streaming=True,
     )
+    await offer_post(bot, chat_id, [video.message_id], "caption", what="Шортс готов и для Telegram-канала")
     for label, key in (
         ("Название", "title"),
         ("Описание", "description"),
@@ -7084,6 +7086,7 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 def shorts_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
+        [_btn("📝 Пост для ТГ: новость или подборка ▸", "pt:menu")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
@@ -8459,6 +8462,436 @@ async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                            [notes[k] for k in keep] if notes and len(notes) == len(items) else None)
 
 
+# ---------------------------------------------------------------- посты для Telegram-канала
+
+POST_CHANNEL = os.getenv("POST_CHANNEL", "@KinoMir360")  # свой канал: из него новости не берём, в него публикуем
+POSTS_EVERY = 30 * 60
+POSTS_NIGHT = range(0, 8)  # часы МСК: ночью авто-посты не присылаем
+POST_SLOTS = (9, 12, 15, 18, 19, 20, 21)  # часы МСК для «⏰ Опубликовать позже»
+ANNOUNCE_HOUR = 11  # МСК: в четверг — «Премьеры недели в кино», в пятницу — «Что посмотреть на выходных»
+ANNOUNCES = {3: ("cinema", "Премьеры недели в кино"), 4: ("online", "Что посмотреть на выходных")}
+SIGNATURE = (f'\n\n🎬 <a href="https://t.me/{POST_CHANNEL.lstrip("@")}">KinoMir360</a> | '
+             f'<a href="{shorts_daily.YOUTUBE_URL}">YouTube</a>')
+SIGN_LEN = len("\n\n🎬 KinoMir360 | YouTube")  # столько символов подпись занимает в лимите Telegram (1024)
+post_lock = asyncio.Lock()
+
+
+class PostState(StatesGroup):
+    edit = State()
+
+
+async def _posts_history() -> dict[str, list[str]]:
+    try:
+        data = json.loads(await shorts_setting("posts_history") or "{}")
+    except ValueError:
+        data = {}
+    return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or []),
+            "films": list(data.get("films") or [])}
+
+
+def post_caption(text: str) -> str:
+    """Текст поста → подпись в HTML с подписью канала внизу, в пределах 1024 символов Telegram."""
+    text = re.sub(r"\s*🎬 KinoMir360 \| YouTube\s*$", "", text.strip())  # подпись добавим сами
+    return escape(text[: 1020 - SIGN_LEN].rstrip()) + SIGNATURE
+
+
+async def _json_setting(key: str, default: Any) -> Any:
+    try:
+        return json.loads(await shorts_setting(key) or "null") or default
+    except ValueError:
+        return default
+
+
+async def save_post(chat_id: int, ids: list[int], kind: str, poll: list[str] | None = None) -> None:
+    """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), варианты опроса."""
+    meta = await _json_setting("posts_meta", {})
+    meta[f"{chat_id}:{ids[0]}"] = {"ids": ids, "kind": kind, "poll": poll or []}
+    await set_shorts_setting("posts_meta", json.dumps(dict(list(meta.items())[-80:]), ensure_ascii=False))
+
+
+async def _post_meta(chat_id: int, first: int) -> dict[str, Any]:
+    return (await _json_setting("posts_meta", {})).get(f"{chat_id}:{first}") or {"ids": [first], "kind": "caption",
+                                                                                   "poll": []}
+
+
+def post_keyboard(first: int, more: str = "") -> InlineKeyboardMarkup:
+    rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
+            [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")]]
+    if more:
+        rows.append([_btn("🔄 Ещё такой же", more), _btn("📝 Другие посты", "pt:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: str = "",
+                     poll: list[str] | None = None, what: str = "Пост готов") -> None:
+    await save_post(chat_id, ids, kind, poll)
+    await bot.send_message(chat_id, f"👆 {what}"
+                           + (". После публикации в канале добавлю опрос «Что посмотрите первым?»." if poll else "."),
+                           reply_markup=post_keyboard(ids[0], more))
+
+
+async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
+    """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?»."""
+    meta = await _post_meta(chat_id, first)
+    await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
+    options = list(dict.fromkeys(t[:100] for t in meta["poll"] if t))[:10]
+    if len(options) >= 2:
+        try:
+            await bot.send_poll(POST_CHANNEL, "Что посмотрите первым? 🍿", options, is_anonymous=True)
+        except Exception:  # noqa: BLE001 — пост уже вышел, опрос не главное
+            logging.exception("Poll failed")
+
+
+PUBLISH_HELP = ("Добавь бота в администраторы канала с правом «Публикация сообщений» "
+                "(канал → Изменить → Администраторы → Добавить администратора → найди бота).")
+
+
+async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
+    """Пост в стиле канала автора по самой интересной свежей новости (за сутки) из Telegram-каналов, кроме
+    своего, с фото или видео из источника. Присылает в чаты; возвращает тему или "" (новых новостей нет)."""
+    async with post_lock:
+        own = POST_CHANNEL.lstrip("@").lower()
+        channels = [c for c in await fact_channels() if c.lower() != own]
+        posts = await shorts_tgsearch.latest(channels, hours=24, per_channel=5)
+        hist = await _posts_history()
+        used = set(hist["urls"])
+        fresh = [p for p in posts if p["url"] not in used][:30]
+        if not fresh:
+            return ""
+        res = await shorts_ai.write_post(GEMINI_API_KEY, fresh, hist["topics"])
+        if not res:
+            raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+        same = [fresh[i] for i in res["media"]]
+        hist["urls"] = (hist["urls"] + [p["url"] for p in same])[-500:]
+        hist["topics"] = (hist["topics"] + [res["topic"] or res["post"][:60]])[-60:]
+        await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+        work = SHORTS_DIR / f"post_{time.time_ns()}"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            with_media = [p for p in same if p.get("video") or p.get("image")]
+            if not with_media and res["film"]:  # у самой новости нет фото — ищем кадры фильма в каналах
+                try:
+                    found = await asyncio.wait_for(shorts_tgsearch.search(channels, [res["film"]], per_channel=2), 40)
+                    with_media = [p for p in found if p.get("video") or p.get("image")]
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Tg post: media search skipped: %s", exc)
+            if not with_media and res["film"]:  # кадр фильма с Кинопоиска
+                try:
+                    film = await shorts_daily.find_film(kp._get, res["film"])
+                    url = shorts_daily._image_url(film) if film else None
+                    with_media = [{"image": url}] if url else []
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Tg post: kinopoisk image skipped: %s", exc)
+            # последнее — маленькая обложка видео из самой новости
+            with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
+            files = await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post")
+            caption = post_caption(res["post"])
+            for chat_id in chat_ids:
+                if files and files[0].suffix == ".mp4":
+                    sent = await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption,
+                                                supports_streaming=True)
+                elif files:
+                    sent = await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)
+                else:
+                    sent = await bot.send_message(chat_id, caption, disable_web_page_preview=True)
+                await offer_post(bot, chat_id, [sent.message_id], "caption" if files else "text", "pt:make")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return res["topic"] or "пост"
+
+
+LIST_POSTS = {  # подборки для поста: ключ темы шортсов → кнопка
+    "online": "🆕 Новинки онлайн", "cinema": "🍿 Сейчас в кино", "series": "📺 Новые сериалы",
+    "upcoming": "⏳ Скоро в кино", "topfilms": "🏆 Топ фильмов", "topseries": "🏆 Топ сериалов",
+}
+
+
+def posts_menu() -> InlineKeyboardMarkup:
+    keys = list(LIST_POSTS)
+    rows = [[_btn("📰 Свежая новость из каналов", "pt:make")]]
+    rows += [[_btn(LIST_POSTS[a], f"pt:l:{a}"), _btn(LIST_POSTS[b], f"pt:l:{b}")] for a, b in zip(keys[::2], keys[1::2])]
+    rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
+             for k in range(0, len(SHORTS_GENRES), 3)]
+    rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _film_line(f: dict[str, Any]) -> str:
+    rating, label = shorts_daily._best_rating(f)
+    about = re.sub(r"\s+", " ", str(f.get("shortDescription") or f.get("description") or "")).strip()[:260]
+    return (f"«{shorts_daily._title(f)}» ({f.get('year') or '?'}), " + ", ".join(shorts_daily._genres(f)[:3])
+            + (f", {label} {rating:.1f}" if rating else "") + (f". {about}" if about else ""))
+
+
+BRAND = "🎬 Подборка от KinoMir360"
+
+
+def _brand(post: str) -> str:
+    """Под заголовком подборки — «Подборка от KinoMir360» (если ИИ сам не написал)."""
+    if "kinomir360" in post[:250].lower():
+        return post
+    head, _, rest = post.partition("\n")
+    return f"{head}\n{BRAND}\n{rest.lstrip(chr(10))}" if rest else f"{head}\n{BRAND}"
+
+
+def _list_fallback(title: str, films: list[dict[str, Any]]) -> str:
+    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+    rows = [f"🍿 {title.upper()}!", BRAND, ""]
+    for n, f in zip(nums, films):
+        rating, _ = shorts_daily._best_rating(f)
+        about = str(f.get("shortDescription") or "").strip()
+        rows.append(f"{n} «{shorts_daily._title(f)}» ({f.get('year') or '?'})" + (f" ⭐ {rating:.1f}" if rating else ""))
+        if about:
+            rows.append(about[:120])
+        rows.append("")
+    rows += ["❤️ — беру на вечер 🔥 — уже смотрел 📤 Перешли другу, с кем будешь смотреть", "",
+             "#ЧтоПосмотреть #KinoMir360 #Кино"]
+    return "\n".join(rows)
+
+
+async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
+    """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: альбом постеров, текст —
+    подписью к первому; ниже — кнопки публикации. Фильмы не повторяются подряд."""
+    today = datetime.now(MSK).date()
+    theme = shorts_daily.theme_for(key, today)
+    hist = await _posts_history()
+    films = await shorts_daily.pick_films(kp._get, theme, today, {int(x) for x in hist["films"]})
+    if len(films) < 3:
+        films = await shorts_daily.pick_films(kp._get, theme, today, set())
+    if len(films) < 3:
+        raise RuntimeError("Кинопоиск не дал фильмов для этой подборки — попробуй другую")
+    title = title or theme.hook
+    post = _brand(await shorts_ai.write_list_post(GEMINI_API_KEY, title, [_film_line(f) for f in films])
+                  or _list_fallback(title, films))
+    hist["films"] = (hist["films"] + [str(f["id"]) for f in films if f.get("id")])[-150:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    work = SHORTS_DIR / f"list_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        files = await shorts_tgsearch.download_media(
+            [{"image": shorts_daily._poster_url(f)} for f in films if shorts_daily._poster_url(f)], work,
+            limit=len(films), prefix="poster")
+        caption = post_caption(post)
+        if len(files) >= 2:
+            sent = await bot.send_media_group(chat_id, [
+                InputMediaPhoto(media=FSInputFile(path), caption=caption if k == 0 else None)
+                for k, path in enumerate(files)])
+            ids, kind = [m.message_id for m in sent], "caption"
+        elif files:
+            ids, kind = [(await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)).message_id], "caption"
+        else:
+            ids, kind = [(await bot.send_message(chat_id, caption, disable_web_page_preview=True)).message_id], "text"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", [shorts_daily._title(f) for f in films], "Подборка готова")
+
+
+def short_caption(result: Any) -> str:
+    """Подпись шортса для Telegram-канала: название, вопрос зрителям, хэштеги, подпись канала."""
+    seo = result.seo
+    title = re.sub(r"\s*#shorts\s*", " ", seo.get("title", "")).strip()
+    question = next((ln.strip() for ln in seo.get("pinned", "").splitlines() if ln.strip().endswith("👇")),
+                    "Пиши в комментариях 👇")
+    return f"🎬 {title}\n\n{question}\n\n" + " ".join(shorts_daily._hashtags(result)[:8])
+
+
+def _slots(now: datetime) -> list[datetime]:
+    out = []
+    for day in (0, 1):
+        for hour in POST_SLOTS:
+            at = (now + timedelta(days=day)).replace(hour=hour, minute=0, second=0, microsecond=0)
+            if at > now + timedelta(minutes=5):
+                out.append(at)
+    return out[:6]
+
+
+def _when(at: datetime, now: datetime) -> str:
+    return ("сегодня" if at.date() == now.date() else "завтра") + at.strftime(" в %H:%M")
+
+
+async def publish_due(bot: Bot) -> None:
+    """Очередь «⏰ Опубликовать позже»: подошло время — публикуем и сообщаем автору."""
+    queue = await _json_setting("posts_queue", [])
+    now = time.time()
+    due = [q for q in queue if q["at"] <= now]
+    if not due:
+        return
+    await set_shorts_setting("posts_queue", json.dumps([q for q in queue if q["at"] > now]))
+    for q in due:
+        try:
+            await publish_post(bot, q["chat"], q["first"])
+            text = "✅ Пост вышел в канале по расписанию."
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Scheduled post failed")
+            text = (f"❌ Пост по расписанию не вышел: <code>{escape(str(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
+        try:
+            await bot.send_message(q["chat"], text)
+        except Exception:  # noqa: BLE001
+            logging.exception("Scheduled post report failed")
+
+
+async def posts_auto_loop(bot: Bot) -> None:
+    """Каждую минуту: очередь отложенных постов; «🔔 Авто-посты» — раз в 30 минут (кроме ночи) новый пост;
+    в четверг и пятницу в ANNOUNCE_HOUR — готовая подборка-анонс."""
+    last = 0.0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await publish_due(bot)
+            now = datetime.now(MSK)
+            if (now.weekday() in ANNOUNCES and now.hour >= ANNOUNCE_HOUR
+                    and await shorts_setting("posts_announce_last") != now.date().isoformat()):
+                await set_shorts_setting("posts_announce_last", now.date().isoformat())
+                key, title = ANNOUNCES[now.weekday()]
+                for admin_id in sorted(ADMIN_IDS):
+                    async with post_lock:
+                        await make_list_post(bot, admin_id, key, title)
+            if (await shorts_setting("posts_auto") == "on" and time.monotonic() - last >= POSTS_EVERY
+                    and now.hour not in POSTS_NIGHT):
+                last = time.monotonic()
+                await make_tg_post(bot, sorted(ADMIN_IDS))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Posts loop failed")
+
+
+def _run_job(coro_fn: Any) -> None:
+    task = asyncio.create_task(coro_fn())
+    shorts_jobs.add(task)
+    task.add_done_callback(shorts_jobs.discard)
+
+
+@router.callback_query(F.data.startswith("pt:"))
+async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    message, action = callback.message, (callback.data or "")[3:]
+    chat_id = message.chat.id
+    kind, _, arg = action.partition(":")
+    if kind == "p" and arg.isdigit():  # опубликовать сейчас
+        try:
+            await publish_post(message.bot, chat_id, int(arg))
+        except Exception as exc:  # noqa: BLE001
+            await callback.answer()
+            await message.answer(f"❌ Не получилось опубликовать в {escape(POST_CHANNEL)}: "
+                                 f"<code>{escape(str(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
+            return
+        await callback.answer("✅ Опубликовано")
+        try:
+            await message.edit_text("✅ Опубликовано в канале.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("📝 Ещё посты", "pt:menu")]]))
+        except TelegramBadRequest:
+            pass
+        return
+    await callback.answer()
+    if kind == "t" and arg.isdigit():  # выбрать время
+        now = datetime.now(MSK)
+        rows = [[_btn(_when(at, now).capitalize(), f"pt:s:{arg}:{int(at.timestamp()) // 60}")
+                 for at in _slots(now)[k:k + 2]] for k in range(0, 6, 2)]
+        rows.append([_btn("⬅️ Назад", f"pt:b:{arg}")])
+        await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r]))
+        return
+    if kind == "b" and arg.isdigit():
+        await message.edit_reply_markup(reply_markup=post_keyboard(int(arg)))
+        return
+    if kind == "s":  # поставить в очередь
+        first, _, minute = arg.partition(":")
+        if not first.isdigit() or not minute.isdigit():
+            return
+        at = int(minute) * 60
+        queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == int(first))]
+        queue.append({"chat": chat_id, "first": int(first), "at": at})
+        await set_shorts_setting("posts_queue", json.dumps(queue))
+        when = _when(datetime.fromtimestamp(at, MSK), datetime.now(MSK))
+        await message.edit_text(f"⏰ Пост выйдет в канале {when} (МСК).", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[_btn("📢 Нет, опубликовать сейчас", f"pt:p:{first}")],
+                             [_btn("❌ Отменить", f"pt:u:{first}")]]))
+        return
+    if kind == "u" and arg.isdigit():
+        queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == int(arg))]
+        await set_shorts_setting("posts_queue", json.dumps(queue))
+        await message.edit_text("Отложенная публикация отменена.", reply_markup=post_keyboard(int(arg)))
+        return
+    if kind == "e" and arg.isdigit():  # поправить текст
+        await state.set_state(PostState.edit)
+        await state.update_data(post_first=int(arg))
+        await message.answer("✏️ Пришли новый текст поста целиком (можно скопировать старый и поправить). "
+                             "Подпись канала внизу добавлю сам.\n\n<i>Передумал — /cancel</i>")
+        return
+    if action == "menu":
+        await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
+                             "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
+        return
+    if kind == "l":
+        key = arg
+        if key not in LIST_POSTS and not key.startswith("genre:"):
+            return
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту.")
+            return
+        wait = await message.answer("🍿 Подбираю фильмы на Кинопоиске, ИИ пишет пост…")
+
+        async def list_job() -> None:
+            try:
+                async with post_lock:
+                    await make_list_post(message.bot, chat_id, key)
+                await wait.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("List post failed")
+                await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(str(exc)[:300])}</code>")
+
+        _run_job(list_job)
+        return
+    if action == "auto":
+        on = await shorts_setting("posts_auto") != "on"
+        await set_shorts_setting("posts_auto", "on" if on else None)
+        await message.answer(
+            "🔔 Авто-посты включены: раз в 30 минут (кроме ночи, 0–8 по Москве) пришлю новый пост по свежей "
+            "новости из каналов. Нажми «📢 Опубликовать» под тем, что нравится. Выключить — та же кнопка."
+            if on else "🔕 Авто-посты выключены.")
+        return
+    if action == "make":
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту.")
+            return
+        wait = await message.answer("📝 Читаю свежие посты каналов за сутки, ИИ выбирает новость и пишет пост…")
+
+        async def job() -> None:
+            try:
+                topic = await make_tg_post(message.bot, [chat_id])
+                if topic:
+                    await wait.delete()
+                else:
+                    await wait.edit_text("🤷 Новых новостей за сутки нет — всё уже было в прошлых постах.")
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Tg post failed")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+        _run_job(job)
+
+
+@router.message(PostState.edit, F.text, ~F.text.startswith("/"))
+async def post_edit_text(message: Message, state: FSMContext) -> None:
+    first = (await state.get_data()).get("post_first")
+    await state.clear()
+    if not first:
+        return
+    meta = await _post_meta(message.chat.id, first)
+    caption = post_caption(message.text or "")
+    try:
+        if meta["kind"] == "text":
+            await message.bot.edit_message_text(caption, chat_id=message.chat.id, message_id=first,
+                                                disable_web_page_preview=True)
+        else:
+            await message.bot.edit_message_caption(chat_id=message.chat.id, message_id=first, caption=caption)
+    except TelegramBadRequest as exc:
+        await message.answer(f"❌ Не получилось поправить: <code>{escape(str(exc)[:200])}</code>")
+        return
+    await message.answer("✅ Текст поста обновлён.", reply_markup=post_keyboard(first))
+
+
 # ---------------------------------------------------------------- история персонажа (лор)
 
 LORE_TIMEOUT = 20 * 60
@@ -8965,6 +9398,7 @@ async def main() -> None:
     shorts_task = asyncio.create_task(
         shorts_daily_loop(bot)
     )
+    posts_task = asyncio.create_task(posts_auto_loop(bot))
 
     dp = Dispatcher()
     dp.include_router(router)
@@ -8992,6 +9426,7 @@ async def main() -> None:
         blender_task.cancel()
         reminder_task.cancel()
         shorts_task.cancel()
+        posts_task.cancel()
         commands_task.cancel()
 
         try:
@@ -9011,6 +9446,11 @@ async def main() -> None:
 
         try:
             await shorts_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await posts_task
         except asyncio.CancelledError:
             pass
 

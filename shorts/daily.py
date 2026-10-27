@@ -264,6 +264,11 @@ def theme_for(key: str | None, today: date) -> Theme:
                      f"{n} самых ожидаемых премьер ⏳ Скоро в кино",
                      ["скоро в кино", "ожидаемые фильмы", "премьеры", "новинки кино", "афиша"],
                      upcoming=True)
+    if key in ("topfilms", "topseries"):  # для постов: лучшее за последние годы
+        what = "сериалов" if key == "topseries" else "фильмов"
+        return Theme(key, "ТОП", f"ТОП {what.upper()}", f"{n} лучших {what} последних лет",
+                     f"{n} лучших {what} последних лет 🏆",
+                     [f"лучшие {what}", "что посмотреть", "топ", f"{what} на вечер"])
     genre = key.split(":", 1)[1] if key.startswith("genre:") else random.choice(list(GENRES))
     header, hook, plural = GENRES.get(genre, GENRES["фантастика"])
     return Theme(f"genre:{genre}", "ПОДБОРКА", header, f"{n} {hook}",
@@ -289,6 +294,11 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         docs = await _query(fetch, isSeries="false", sortField="votes.await", sortType="-1",
                             notNullFields="name",
                             **{"premiere.russia": _range(today + timedelta(days=1), today + timedelta(days=60))})
+    elif theme.key in ("topfilms", "topseries"):
+        docs = await _query(fetch, page=random.randint(1, 3), isSeries=str(theme.key == "topseries").lower(),
+                            year=f"{today.year - 3}-{today.year}",
+                            **{"rating.kp": "7.3-10", "votes.kp": "20000-100000000"}, **common)
+        random.shuffle(docs)
     else:
         genre = theme.key.split(":", 1)[1]
         docs = await _query(fetch, page=random.randint(1, 3), isSeries="false",
