@@ -38,6 +38,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -7084,7 +7085,7 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 def shorts_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
-        [_btn("📝 Пост для ТГ", "pt:make"), _btn("🔔 Авто-посты 30 мин", "pt:auto")],
+        [_btn("📝 Пост для ТГ: новость или подборка ▸", "pt:menu")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
@@ -8473,12 +8474,14 @@ async def _posts_history() -> dict[str, list[str]]:
         data = json.loads(await shorts_setting("posts_history") or "{}")
     except ValueError:
         data = {}
-    return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or [])}
+    return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or []),
+            "films": list(data.get("films") or [])}
 
 
 def _post_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn(f"📢 Опубликовать в {POST_CHANNEL}", "pt:pub")], [_btn("🔄 Ещё пост", "pt:make")]])
+        [_btn(f"📢 Опубликовать в {POST_CHANNEL}", "pt:pub")],
+        [_btn("🔄 Ещё новость", "pt:make"), _btn("📝 Другие посты", "pt:menu")]])
 
 
 async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
@@ -8535,6 +8538,83 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
         return res["topic"] or "пост"
 
 
+LIST_POSTS = {  # подборки для поста: ключ темы шортсов → кнопка
+    "online": "🆕 Новинки онлайн", "cinema": "🍿 Сейчас в кино", "series": "📺 Новые сериалы",
+    "upcoming": "⏳ Скоро в кино", "topfilms": "🏆 Топ фильмов", "topseries": "🏆 Топ сериалов",
+}
+
+
+def posts_menu() -> InlineKeyboardMarkup:
+    keys = list(LIST_POSTS)
+    rows = [[_btn("📰 Свежая новость из каналов", "pt:make")]]
+    rows += [[_btn(LIST_POSTS[a], f"pt:l:{a}"), _btn(LIST_POSTS[b], f"pt:l:{b}")] for a, b in zip(keys[::2], keys[1::2])]
+    rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
+             for k in range(0, len(SHORTS_GENRES), 3)]
+    rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _film_line(f: dict[str, Any]) -> str:
+    rating, label = shorts_daily._best_rating(f)
+    about = re.sub(r"\s+", " ", str(f.get("shortDescription") or f.get("description") or "")).strip()[:260]
+    return (f"«{shorts_daily._title(f)}» ({f.get('year') or '?'}), " + ", ".join(shorts_daily._genres(f)[:3])
+            + (f", {label} {rating:.1f}" if rating else "") + (f". {about}" if about else ""))
+
+
+def _list_fallback(title: str, films: list[dict[str, Any]]) -> str:
+    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+    rows = [f"🍿 {title.upper()}!", ""]
+    for n, f in zip(nums, films):
+        rating, _ = shorts_daily._best_rating(f)
+        about = str(f.get("shortDescription") or "").strip()
+        rows.append(f"{n} «{shorts_daily._title(f)}» ({f.get('year') or '?'})" + (f" ⭐ {rating:.1f}" if rating else ""))
+        if about:
+            rows.append(about[:120])
+        rows.append("")
+    rows += ["❤️ — беру на вечер 🔥 — уже смотрел 📤 Перешли другу, с кем будешь смотреть", "",
+             "#ЧтоПосмотреть #KinoMir360 #Кино"]
+    return "\n".join(rows)[:1020]
+
+
+async def make_list_post(bot: Bot, chat_id: int, key: str) -> None:
+    """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: альбом постеров, текст —
+    подписью к первому; ниже — кнопки «Опубликовать» и «Другая подборка». Фильмы не повторяются подряд."""
+    theme = shorts_daily.theme_for(key, datetime.now(MSK).date())
+    hist = await _posts_history()
+    films = await shorts_daily.pick_films(kp._get, theme, datetime.now(MSK).date(),
+                                          {int(x) for x in hist["films"]})
+    if len(films) < 3:
+        films = await shorts_daily.pick_films(kp._get, theme, datetime.now(MSK).date(), set())
+    if len(films) < 3:
+        raise RuntimeError("Кинопоиск не дал фильмов для этой подборки — попробуй другую")
+    title = theme.hook
+    post = await shorts_ai.write_list_post(GEMINI_API_KEY, title, [_film_line(f) for f in films]) \
+        or _list_fallback(title, films)
+    hist["films"] = (hist["films"] + [str(f["id"]) for f in films if f.get("id")])[-150:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    work = SHORTS_DIR / f"list_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        files = await shorts_tgsearch.download_media(
+            [{"image": shorts_daily._poster_url(f)} for f in films if shorts_daily._poster_url(f)], work,
+            limit=len(films), prefix="poster")
+        caption = escape(post)
+        if len(files) >= 2:
+            sent = await bot.send_media_group(chat_id, [
+                InputMediaPhoto(media=FSInputFile(path), caption=caption if k == 0 else None)
+                for k, path in enumerate(files)])
+            ids = [m.message_id for m in sent]
+        elif files:
+            ids = [(await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)).message_id]
+        else:
+            ids = [(await bot.send_message(chat_id, caption)).message_id]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await bot.send_message(chat_id, "👆 Подборка готова.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"📢 Опубликовать в {POST_CHANNEL}", "pt:g:" + ",".join(map(str, ids)))],
+        [_btn("🔄 Другая такая же подборка", f"pt:l:{key}")], [_btn("📝 Другие посты", "pt:menu")]]))
+
+
 async def posts_auto_loop(bot: Bot) -> None:
     """Кнопка «🔔 Авто-посты»: раз в 30 минут (кроме ночи) присылает админам новый пост."""
     last = 0.0
@@ -8558,6 +8638,23 @@ async def post_buttons(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     message, action = callback.message, (callback.data or "")[3:]
+    if action.startswith("g:"):  # подборка — альбом из нескольких сообщений
+        try:
+            ids = [int(x) for x in action[2:].split(",") if x.isdigit()]
+            await message.bot.copy_messages(POST_CHANNEL, message.chat.id, ids)
+        except Exception as exc:  # noqa: BLE001
+            await callback.answer()
+            await message.answer(
+                f"❌ Не получилось опубликовать в {escape(POST_CHANNEL)}: <code>{escape(str(exc)[:200])}</code>\n\n"
+                "Добавь бота в администраторы канала с правом «Публикация сообщений».")
+            return
+        await callback.answer("✅ Опубликовано")
+        try:
+            await message.edit_text("✅ Подборка опубликована.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("📝 Другие посты", "pt:menu")]]))
+        except TelegramBadRequest:
+            pass
+        return
     if action == "pub":
         try:
             await message.bot.copy_message(POST_CHANNEL, message.chat.id, message.message_id)
@@ -8576,6 +8673,34 @@ async def post_buttons(callback: CallbackQuery) -> None:
             pass
         return
     await callback.answer()
+    if action == "noop":
+        return
+    if action == "menu":
+        await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
+                             "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
+        return
+    if action.startswith("l:"):
+        key = action[2:]
+        if key not in LIST_POSTS and not key.startswith("genre:"):
+            return
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту.")
+            return
+        wait = await message.answer("🍿 Подбираю фильмы на Кинопоиске, ИИ пишет пост…")
+
+        async def list_job() -> None:
+            try:
+                async with post_lock:
+                    await make_list_post(message.bot, message.chat.id, key)
+                await wait.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("List post failed")
+                await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(str(exc)[:300])}</code>")
+
+        task = asyncio.create_task(list_job())
+        shorts_jobs.add(task)
+        task.add_done_callback(shorts_jobs.discard)
+        return
     if action == "auto":
         on = await shorts_setting("posts_auto") != "on"
         await set_shorts_setting("posts_auto", "on" if on else None)

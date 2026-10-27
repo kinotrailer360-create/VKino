@@ -821,6 +821,32 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -
             "film": str(data.get("film") or "").strip(" «»\"")}
 
 
+async def write_list_post(key: str, title: str, films: list[str]) -> str | None:
+    """Пост-подборка для Telegram-канала в стиле POST_STYLE: films — строки с данными фильма (название, год,
+    жанры, рейтинг, о чём). Текст до 1020 символов или None."""
+    if not available(key) or not films:
+        return None
+    listing = "\n".join(f"{i}. {f}" for i, f in enumerate(films, 1))
+    prompt = (
+        f"Ты ведёшь Telegram-канал о кино KinoMir360. Напиши пост-подборку «{title}» точно в стиле образца: "
+        "заголовок КАПСОМ с эмодзи, одна живая вводная фраза, затем фильмы по порядку — у каждого строка "
+        "«1️⃣ «Название» (год) ⭐ рейтинг» и 1 короткая фраза, о чём и чем цепляет, без спойлеров; в конце "
+        "строка реакций «❤️ — … 🔥 — …», призыв сохранить или переслать другу и 5–7 хэштегов. Строго до 950 "
+        "символов. Только данные из списка, не выдумывай." + GRAMMAR
+        + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
+        + "\n\nФИЛЬМЫ:\n" + listing + '\n\nОтветь только JSON: {"post": "текст поста"}'
+    )
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        global last_error
+        last_error = str(exc)[:300]
+        log.warning("shorts: list post failed: %s", exc)
+        return None
+    post = str(data.get("post") or "").strip() if isinstance(data, dict) else ""
+    return post[:1020] if len(post) >= 80 else None
+
+
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key
