@@ -767,7 +767,8 @@ POST_STYLE = """🏜 ФИНАЛЬНЫЙ ТРЕЙЛЕР «ДЮНЫ 3»!
 #Дюна3 #DunePartThree #Вильнёв #ТимотиШаламе #Зендея #Трейлер #КиноНовости"""
 
 
-async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -> dict[str, Any] | None:
+async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
+                     own_posts: str = "") -> dict[str, Any] | None:
     """Пост для Telegram-канала автора в его стиле (POST_STYLE) по самой интересной свежей новости из постов
     других каналов. recent — темы уже сделанных постов (не повторяем).
     {"post": текст, "topic": тема, "media": [номера постов о той же новости — оттуда фото/видео]} или None."""
@@ -779,14 +780,18 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -
         "интересную для широкой аудитории новость: трейлер, премьера, кастинг, продолжение, сборы, награды, "
         "громкие слухи. Пропускай рекламу, розыгрыши, политику, местные события и то, что уже было:\n"
         + ("\n".join(f"— {t}" for t in recent[-40:]) or "—")
+        + ("\n\nУЖЕ ОПУБЛИКОВАНО В НАШЕМ КАНАЛЕ — эти новости не бери, даже другими словами:\n" + own_posts[:5000]
+           if own_posts else "")
         + "\n\nСверь новость с другими постами (и с Google, если можешь); неподтверждённое подавай как слух. "
-        "Напиши пост своими словами (не копируй чужой текст) точно в стиле и формате образца: заголовок "
+        "Напиши пост своими словами (не копируй ни чужие посты, ни образец — даже если новость похожа) "
+        "точно в стиле и формате образца: заголовок "
         "КАПСОМ с эмодзи, 2–4 коротких абзаца с эмодзи в начале, дата премьеры, если известна, строка реакций "
         "«❤️ — … 🔥 — …» и призыв переслать другу, в конце 5–8 хэштегов. До 900 символов. Названия — как в "
         "российском прокате, в «ёлочках». Не выдумывай фактов: только то, что есть в постах или найдено в "
         "Google." + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
         + '\n\nОтветь только JSON: {"post": "текст поста", "topic": "о чём новость, 3–6 слов", '
-        '"film": "название фильма или сериала по-русски или пусто", '
+        '"film": "название фильма или сериала по-русски или пусто", "film_en": "оригинальное название или пусто", '
+        '"trailer": true, если новость — вышел трейлер или тизер, иначе false, '
         '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
     )
     data = None
@@ -818,7 +823,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -
         if 0 <= i < len(posts) and i not in media:
             media.append(i)
     return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
-            "film": str(data.get("film") or "").strip(" «»\"")}
+            "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
+            "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true"}
 
 
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,

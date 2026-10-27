@@ -12,13 +12,13 @@ log = logging.getLogger("shorts")
 CLIP_FORMAT = "bv*[height<=720][ext=mp4]/bv*[height<=720]/b[height<=720]/b"
 
 
-async def _yt_dlp(url: str, outtmpl: str, extra: list[str], timeout: float) -> Path:
+async def _yt_dlp(url: str, outtmpl: str, extra: list[str], timeout: float, fmt: str = CLIP_FORMAT) -> Path:
     """yt-dlp отдельным процессом: по таймауту его можно убить, а память освобождается сразу.
 
     В потоке бота он оставался висеть после таймаута и держал память — Railway падал по нехватке.
     """
     cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings", "--no-progress",
-           "-f", CLIP_FORMAT, "-o", outtmpl, "--socket-timeout", "20", "--retries", "1",
+           "-f", fmt, "-o", outtmpl, "--socket-timeout", "20", "--retries", "1",
            "--print", "after_move:filepath", *extra, url]
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE)
@@ -159,3 +159,27 @@ async def cut_clip(src: Path, out: Path, start: float, length: float) -> Path:
     if proc.returncode:
         raise RuntimeError(f"ffmpeg cut: {err.decode(errors='ignore')[-200:]}")
     return out
+
+
+POST_VIDEO_MAX = 48 * 1024 * 1024  # бот Telegram отправляет файлы до 50 МБ
+
+
+async def download_trailer(url: str, out: Path, max_seconds: int = 180, timeout: float = 240) -> Path:
+    """Трейлер со звуком для поста в Telegram: до max_seconds, mp4 h264/aac, не больше POST_VIDEO_MAX."""
+    raw = await _yt_dlp(url, str(out.with_name(out.stem + "_src.%(ext)s")), ["--max-filesize", "150M"], timeout,
+                        fmt="b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]/b")
+    try:
+        for height, crf in ((720, 28), (480, 30)):
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-v", "error", "-y", "-i", str(raw), "-t", str(max_seconds), "-vf", f"scale=-2:{height}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-threads", "2",
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out),
+                stderr=asyncio.subprocess.PIPE)
+            _, err = await proc.communicate()
+            if proc.returncode:
+                raise RuntimeError(f"ffmpeg: {err.decode(errors='ignore')[-300:]}")
+            if out.stat().st_size <= POST_VIDEO_MAX:
+                return out
+        raise RuntimeError("трейлер больше 50 МБ даже в 480p")
+    finally:
+        raw.unlink(missing_ok=True)

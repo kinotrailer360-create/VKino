@@ -50,6 +50,7 @@ from PIL import Image
 from shorts import ai as shorts_ai
 from shorts import tgsearch as shorts_tgsearch
 from shorts import postcard as shorts_postcard
+from shorts import clips as shorts_clips
 from shorts import news as shorts_news
 from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
@@ -8553,6 +8554,18 @@ PUBLISH_HELP = ("Добавь бота в администраторы кана�
                 "(канал → Изменить → Администраторы → Добавить администратора → найди бота).")
 
 
+async def _rutube_post_trailer(titles: list[str], work: Path) -> Path | None:
+    """Трейлер фильма со звуком с Rutube для поста (до 3 минут, до 50 МБ); None — не нашёлся или не скачался."""
+    try:
+        found = await asyncio.wait_for(shorts_clips.rutube_trailer([t for t in titles if t]), 20)
+        if not found:
+            return None
+        return await asyncio.wait_for(shorts_clips.download_trailer(found["url"], work / "trailer.mp4"), 300)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: rutube trailer failed: %s", exc)
+        return None
+
+
 async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
     """Пост в стиле канала автора по самой интересной свежей новости (за сутки) из Telegram-каналов, кроме
     своего, с фото или видео из источника. Присылает в чаты; возвращает тему или "" (новых новостей нет)."""
@@ -8565,7 +8578,13 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
         fresh = [p for p in posts if p["url"] not in used][:30]
         if not fresh:
             return ""
-        res = await shorts_ai.write_post(GEMINI_API_KEY, fresh, hist["topics"])
+        try:  # что уже вышло в своём канале — ИИ эти новости не повторит
+            mine = await shorts_tgsearch.latest([POST_CHANNEL.lstrip("@")], hours=96, per_channel=25)
+        except Exception as exc:  # noqa: BLE001
+            logging.info("Tg post: own channel read failed: %s", exc)
+            mine = []
+        own_text = "\n".join("— " + re.sub(r"\s+", " ", p["text"])[:200] for p in mine)
+        res = await shorts_ai.write_post(GEMINI_API_KEY, fresh, hist["topics"], own_text)
         if not res:
             raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
         same = [fresh[i] for i in res["media"]]
@@ -8575,10 +8594,20 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
-            with_media = [p for p in same if p.get("video") or p.get("image")]
-            if not with_media and res["film"]:  # у самой новости нет фото — ищем кадры фильма в каналах
+            # 1) видео из постов об этой же новости
+            with_media = [p for p in same if p.get("video")]
+            # 2) новость о трейлере — сам трейлер со звуком с Rutube
+            if not with_media and res["trailer"] and res["film"]:
+                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work)
+                with_media = [{"file": trailer}] if trailer else []
+            # 3) фото из постов об этой новости
+            with_media = with_media or [p for p in same if p.get("image")]
+            if not with_media and res["film"]:  # 4) посты каналов о том же фильме (о трейлере — со словом «трейлер»)
                 try:
-                    found = await asyncio.wait_for(shorts_tgsearch.search(channels, [res["film"]], per_channel=2), 40)
+                    found = await asyncio.wait_for(shorts_tgsearch.search(
+                        channels, [n for n in (res["film"], res["film_en"]) if n], per_channel=2), 40)
+                    if res["trailer"]:
+                        found = [p for p in found if re.search(r"трейлер|тизер|trailer|teaser", p["text"], re.I)]
                     with_media = [p for p in found if p.get("video") or p.get("image")]
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: media search skipped: %s", exc)
@@ -8591,7 +8620,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
                     logging.info("Tg post: kinopoisk image skipped: %s", exc)
             # последнее — маленькая обложка видео из самой новости
             with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
-            files = await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post")
+            files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
+                     await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
             caption = post_caption(res["post"])
             for chat_id in chat_ids:
                 if files and files[0].suffix == ".mp4":
