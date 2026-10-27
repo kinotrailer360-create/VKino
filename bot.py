@@ -8672,6 +8672,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
     rows.append([_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")])
+    rows.append([_btn("📣 Пост для взаимного пиара", "pt:pr")])
     rows.append([_btn("🗓 Автоплан постов (вкл/выкл)", "pt:plan")])
     rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -9094,6 +9095,59 @@ async def make_week_post(bot: Bot, chat_id: int) -> None:
     await offer_post(bot, chat_id, ids, kind, what="Итоги недели готовы")
 
 
+def _subs_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "подписчик"
+    return "подписчика" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "подписчиков"
+
+
+async def make_promo_post(bot: Bot, chat_id: int) -> None:
+    """«📣 Взаимный пиар»: рекламный пост канала (картинка с логотипом и свежими постерами) — переслать
+    партнёрам, и готовое сообщение админам других каналов с предложением ВП."""
+    today = datetime.now(MSK).date()
+    films = await shorts_daily.pick_films(kp._get, shorts_daily.theme_for("online", today), today, set())
+    if len(films) < 4:
+        films += await _popular_films(3)
+    own = POST_CHANNEL.lstrip("@")
+    try:
+        members = await bot.get_chat_member_count(POST_CHANNEL)
+    except Exception:  # noqa: BLE001 — бот не админ канала: без числа подписчиков
+        members = 0
+    names = ", ".join(_label(f) for f in films[:4])
+    material = (f"Канал: KinoMir360 (t.me/{own}), YouTube: {shorts_daily.YOUTUBE_URL}, MAX: {MAX_URL}.\n"
+                "Что в канале каждый день: свежие новости кино и трейлеры, подборки «что посмотреть», новинки "
+                "онлайн, факты о фильмах, дни рождения звёзд, викторины «Угадай фильм по кадру», цитаты, сборы, "
+                f"итоги недели. Сейчас в канале, например: {names}.")
+    task = ("Напиши рекламный пост этого канала для взаимного пиара в чужом кино-канале: цепляющий заголовок "
+            "КАПСОМ, 2–3 коротких абзаца, почему стоит подписаться (польза для зрителя, не хвастовство), список "
+            "рубрик с эмодзи, призыв подписаться и ссылка t.me/" + own + ". Без строки реакций.")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material, search=False) or "\n".join([
+        "🎬 НЕ ЗНАЕШЬ, ЧТО ПОСМОТРЕТЬ ВЕЧЕРОМ?", "",
+        "В KinoMir360 каждый день — свежие новинки кино и сериалов, трейлеры и подборки на любое настроение 🍿", "",
+        "🔥 Новости и трейлеры", "🆕 Что вышло онлайн", "💡 Факты, которых ты не знал", "🧩 Викторины «Угадай фильм»",
+        "🎂 Дни рождения звёзд", "", f"Подписывайся 👉 t.me/{own}"])
+    work = SHORTS_DIR / f"promo_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        posters = [img for img in [await _image(shorts_daily._poster_url(f), work, f"p{k}_")
+                                   for k, f in enumerate(films[:4])] if img]
+        card = work / "promo.jpg"
+        (await asyncio.to_thread(shorts_postcard.make_promo_card, posters, link=f"t.me/{own}")).save(card, quality=92)
+        await bot.send_photo(chat_id, FSInputFile(card), caption=post_caption(post))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    offer = (f"Здравствуйте! Я админ кино-канала KinoMir360 — t.me/{own}"
+             + (f" ({members} {_subs_word(members)})" if members else "") + ". Каждый день новинки, трейлеры, подборки и "
+             "викторины о кино.\n\nПредлагаю взаимный пиар: ваш пост у нас и наш у вас, формат 1/24 (час в топе, "
+             "сутки в ленте), время согласуем. Рекламный пост пришлю. Интересно?")
+    await bot.send_message(
+        chat_id, "👆 Рекламный пост — перешли его админу канала-партнёра.\n\n✉️ Сообщение админу (нажми, чтобы "
+        f"скопировать):\n<code>{escape(offer)}</code>\n\n💡 Партнёров ищи в поиске Telegram и на tgstat.ru → "
+        "«Кино»: каналы примерно твоего размера (±50% подписчиков), с живыми просмотрами.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔄 Другой вариант", "pt:pr")],
+                                                           [_btn("📝 Другие посты", "pt:menu")]]))
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
     """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
     кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
@@ -9249,6 +9303,7 @@ POST_MAKERS.update({
     "qt": ("💬 ИИ ищет известную цитату из фильма…", make_quote_post),
     "bo": ("💰 ИИ ищет в Google сборы прошедшего уикенда…", make_box_office_post),
     "wk": ("🗞 Читаю каналы за неделю, ИИ собирает главное…", make_week_post),
+    "pr": ("📣 Готовлю рекламный пост канала для взаимного пиара…", make_promo_post),
 })
 PLAN_HELP = (
     "🗓 <b>Автоплан постов включён.</b> Бот сам готовит посты и присылает тебе — публикуешь кнопкой "

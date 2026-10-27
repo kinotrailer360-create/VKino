@@ -207,3 +207,33 @@ def make_quiz_card(img: Image.Image) -> Image.Image:
               font=_font("Montserrat.ttf", 36, "SemiBold"), fill="white", anchor="mm")
     _brand_pill(card, H - 118)
     return card.convert("RGB")
+
+
+def make_promo_card(posters: list[Image.Image], tagline: str = "Новинки · подборки · факты · трейлеры",
+                    link: str = "t.me/KinoMir360") -> Image.Image:
+    """Рекламная картинка канала для взаимного пиара: логотип, название, 4 свежих постера, ссылка."""
+    card = (_backdrop(posters[0], 0.7) if posters else Image.new("RGBA", (W, H), INK + (255,)))
+    draw = ImageDraw.Draw(card)
+    logo = Image.open(ASSETS / "logo.png").convert("RGBA")
+    logo.thumbnail((150, 150))
+    card.alpha_composite(logo, ((W - logo.width) // 2, 36))
+    y = 46 + logo.height
+    draw.text((W // 2, y), BRAND.upper(), font=_font("Oswald.ttf", 96, "Bold"), fill="white", anchor="mt",
+              stroke_width=2, stroke_fill=(0, 0, 0))
+    y += 120
+    draw.text((W // 2, y), tagline, font=_font("Montserrat.ttf", 34, "SemiBold"), fill=ACCENT, anchor="mt")
+    # 2×2 постера в рамках цвета канала
+    pw, ph, gap = 290, 390, 26
+    x0, y0 = (W - 2 * pw - gap) // 2, y + 70
+    for k, img in enumerate(posters[:4]):
+        x, yy = x0 + (k % 2) * (pw + gap), y0 + (k // 2) * (ph + gap)
+        draw.rounded_rectangle((x - 5, yy - 5, x + pw + 5, yy + ph + 5), radius=16, fill=ACCENT)
+        card.paste(_cover(img.convert("RGB"), pw, ph, 0.3), (x, yy))
+    rows = (min(len(posters), 4) + 1) // 2
+    link_y = y0 + rows * (ph + gap) + 20
+    draw = ImageDraw.Draw(card)
+    font = _font("Montserrat.ttf", 44, "Bold")
+    lw = draw.textlength(link, font=font)
+    draw.rounded_rectangle(((W - lw) // 2 - 40, link_y - 10, (W + lw) // 2 + 40, link_y + 70), radius=40, fill=ACCENT)
+    draw.text((W // 2, link_y + 30), link, font=font, fill=INK, anchor="mm")
+    return card.convert("RGB")
