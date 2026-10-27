@@ -910,6 +910,112 @@ async def write_styled_post(key: str, task: str, material: str, search: bool = T
     return post[:1020] if len(post) >= 80 else None
 
 
+async def _post_json(key: str, prompt: str, search: bool = True, need_search: bool = False) -> dict[str, Any] | None:
+    """JSON-ответ для поста: сначала Gemini с поиском Google; need_search — без поиска не отвечаем (свежие
+    цифры, которых модель знать не может), иначе — резервный ИИ."""
+    if not available(key):
+        return None
+    global last_error
+    if key and search:
+        try:
+            data = await _ask(key, [{"text": "Поищи в Google. " + prompt}], search=True)
+            return data if isinstance(data, dict) else None
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)[:300]
+            log.warning("shorts: post with search failed: %s", exc)
+            if need_search:
+                return None
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        last_error = str(exc)[:300]
+        log.warning("shorts: post failed: %s", exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _films_from(data: dict[str, Any], extra: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    out = []
+    for f in data.get("films") or []:
+        if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
+            year = f.get("year")
+            item = {"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                    "year": int(year) if str(year or "").isdigit() else None}
+            item.update({k: str(f.get(k) or "").strip() for k in extra})
+            out.append(item)
+    return out
+
+
+def _clean_post(data: dict[str, Any] | None) -> str:
+    post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str((data or {}).get("post") or "")).strip()
+    return post[:1020] if len(post) >= 80 else ""
+
+
+def _style_rules() -> str:  # GRAMMAR объявлен ниже в модуле — собираем при вызове
+    return ("Пиши точно в стиле и формате образца: заголовок КАПСОМ с эмодзи, короткие абзацы с эмодзи "
+            "в начале, строка реакций «❤️ — … 🔥 — …», призыв переслать другу и 5–7 хэштегов в конце. Строго "
+            "до 950 символов. Только проверенные факты, не выдумывай." + GRAMMAR
+            + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE)
+
+
+async def box_office_post(key: str, today: str) -> dict[str, Any] | None:
+    """Сборы прошедшего уикенда (мир и Россия) — только с поиском Google: цифры свежие.
+    {"post", "films": [{"ru", "en", "year", "gross"}]} или None."""
+    prompt = (f"Сегодня {today}. Найди в Google кассовые сборы прошедшего уикенда: топ-5 мирового (или "
+              "североамериканского) проката и лидеров проката в России — с цифрами и источником (Box Office "
+              "Mojo, Deadline, Variety, «Бюллетень кинопрокатчика», Кинопоиск). Напиши пост «Сборы уикенда» для "
+              "Telegram-канала KinoMir360: фильмы строками «1️⃣ «Название» — $… млн» (или ₽), коротко, кто "
+              "удивил, кто провалился. " + _style_rules()
+              + '\n\nОтветь только JSON: {"post": "текст поста", "films": [{"ru": "название по-русски", '
+              '"en": "оригинальное", "year": 2026, "gross": "$45 млн"}] — в порядке поста}')
+    data = await _post_json(key, prompt, need_search=True)
+    post = _clean_post(data)
+    films = _films_from(data or {}, ("gross",))
+    return {"post": post, "films": films[:8]} if post and len(films) >= 3 else None
+
+
+async def week_digest_post(key: str, posts: str, own: str, today: str) -> dict[str, Any] | None:
+    """Итоги недели в кино по постам Telegram-каналов за 7 дней (и вышедшему в своём канале).
+    {"post", "films": [{"ru", "en", "year"}]} или None."""
+    prompt = (f"Сегодня {today}. Ниже посты Telegram-каналов о кино за неделю. Выбери 5–7 главных новостей "
+              "недели (трейлеры, премьеры, кастинг, сборы, громкие слухи), без повторов, сверь с Google. Напиши "
+              "пост «Итоги недели в кино» для канала KinoMir360: каждая новость — строка «1️⃣ …» в одно-два "
+              "предложения. " + _style_rules()
+              + ("\n\nУЖЕ БЫЛО В НАШЕМ КАНАЛЕ (можно упомянуть одной строкой):\n" + own[:3000] if own else "")
+              + "\n\nПОСТЫ:\n" + posts[:9000]
+              + '\n\nОтветь только JSON: {"post": "текст поста", "films": [{"ru": "фильм или сериал из новости", '
+              '"en": "оригинальное", "year": 2026}] — по порядку новостей}')
+    data = await _post_json(key, prompt)
+    post = _clean_post(data)
+    return {"post": post, "films": _films_from(data or {})[:7]} if post else None
+
+
+async def quote_post(key: str, film: str) -> dict[str, Any] | None:
+    """Цитата из фильма для карточки: как в русском дубляже, с персонажем.
+    {"quote", "character", "post"} или None."""
+    prompt = (f"Фильм: {film}. Найди самую известную цитату из него — точно как в русском дубляже (до 140 "
+              "символов) и кто её говорит. Если не уверен в точности — возьми другую известную цитату из этого "
+              "фильма. Напиши к ней короткий пост «Цитата дня» для Telegram-канала KinoMir360: цитата, пара фраз о "
+              "сцене без спойлеров, вопрос подписчикам «А какая ваша любимая цитата из фильма?». " + _style_rules()
+              + '\n\nОтветь только JSON: {"quote": "цитата без кавычек", "character": "персонаж", '
+              '"post": "текст поста"}')
+    data = await _post_json(key, prompt)
+    quote = str((data or {}).get("quote") or "").strip(" «»\"")
+    post = _clean_post(data)
+    if not quote or not post:
+        return None
+    return {"quote": quote[:200], "character": str((data or {}).get("character") or "").strip()[:60], "post": post}
+
+
+async def anniversary_post(key: str, material: str, years: int) -> str | None:
+    """«Этот день в кино»: N лет назад вышел фильм — пост с интересными фактами о нём."""
+    prompt = (f"Сегодня круглая дата: {years} лет назад вышел фильм из материала. Напиши пост «Этот день в кино» "
+              f"для Telegram-канала KinoMir360: заголовок вроде «📅 {years} ЛЕТ НАЗАД ВЫШЕЛ «…»!», чем фильм "
+              "запомнился, 2–3 интересных факта о нём, вопрос подписчикам «Пересматривали?». " + _style_rules()
+              + "\n\nМАТЕРИАЛ:\n" + material[:6000] + '\n\nОтветь только JSON: {"post": "текст поста"}')
+    return _clean_post(await _post_json(key, prompt)) or None
+
+
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key

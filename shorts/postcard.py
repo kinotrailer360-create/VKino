@@ -145,3 +145,65 @@ def watermark(img: Image.Image, max_w: int = 1280) -> Image.Image:
     _center_mark(card, round(130 * scale), 20, card.height // 2)
     _brand_pill(card, card.height - round(100 * scale), scale)
     return card.convert("RGB")
+
+
+def _backdrop(img: Image.Image, dim: float) -> Image.Image:
+    """Фон 4:5 из картинки: размытый и затемнённый."""
+    from PIL import ImageFilter
+    bg = _cover(img.convert("RGB"), W, H).filter(ImageFilter.GaussianBlur(18))
+    return Image.blend(bg, Image.new("RGB", (W, H), INK), dim).convert("RGBA")
+
+
+def make_quote_card(img: Image.Image, quote: str, character: str, film: str) -> Image.Image:
+    """«Цитата дня»: крупная цитата на затемнённом кадре, кто сказал и из какого фильма, знак канала."""
+    card = _backdrop(img, 0.62)
+    draw = ImageDraw.Draw(card)
+    _center_mark(card, 150, 28, H // 2)
+    draw.text((W // 2, 150), "ЦИТАТА ДНЯ", font=_font("Montserrat.ttf", 34, "Bold"), fill=ACCENT, anchor="mm")
+    draw.text((W // 2, 300), "“", font=_font("PTSerif-Bold.ttf", 260), fill=ACCENT, anchor="mm")
+    for size in range(78, 40, -4):
+        font = _font("PTSerif-Bold.ttf", size)
+        rows = _wrap(draw, quote, font, W - 160, 7)
+        if "…" not in rows[-1] and len(rows) * size * 1.25 <= 620:
+            break
+    line_h = round(font.size * 1.25)
+    y = 410 + max(0, (520 - line_h * len(rows)) // 2)
+    for row in rows:
+        draw.text((W // 2, y), row, font=font, fill="white", anchor="mt")
+        y += line_h
+    y += 30
+    draw.rounded_rectangle((W // 2 - 70, y, W // 2 + 70, y + 8), radius=4, fill=ACCENT)
+    y += 40
+    if character:
+        draw.text((W // 2, y), f"— {character}", font=_font("Montserrat.ttf", 38, "SemiBold"), fill="white", anchor="mt")
+        y += 56
+    film_font = _font("Montserrat.ttf", 34, "Medium")
+    while draw.textlength(film, font=film_font) > W - 120 and len(film) > 10:
+        film = film[:-2].rstrip() + "…"
+    draw.text((W // 2, y), film, font=film_font, fill=ACCENT, anchor="mt")
+    _brand_pill(card, H - 118)
+    return card.convert("RGB")
+
+
+def make_quiz_card(img: Image.Image) -> Image.Image:
+    """«Угадай фильм по кадру»: кадр целиком по центру на размытом фоне, вопрос сверху, знак канала."""
+    card = _backdrop(img, 0.55)
+    frame = img.convert("RGB")
+    frame = frame.resize((W - 80, round(frame.height * (W - 80) / frame.width)), Image.LANCZOS)
+    if frame.height > 800:
+        frame = _cover(frame, W - 80, 800)
+    top = (H - frame.height) // 2 + 10
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle((34, top - 6, W - 34, top + frame.height + 6), radius=18, fill=ACCENT)
+    card.paste(frame, (40, top))
+    _center_mark(card, 110, 20, top + frame.height // 2)
+    draw = ImageDraw.Draw(card)
+    title_font = _font("Oswald.ttf", 96, "Bold")
+    draw.text((W // 2, top - 150), "УГАДАЙ ФИЛЬМ", font=title_font, fill="white", anchor="mm",
+              stroke_width=2, stroke_fill=(0, 0, 0))
+    draw.text((W // 2, top - 62), "ПО ОДНОМУ КАДРУ", font=_font("Montserrat.ttf", 38, "Bold"), fill=ACCENT,
+              anchor="mm")
+    draw.text((W // 2, top + frame.height + 70), "Ответ — в опросе под постом",
+              font=_font("Montserrat.ttf", 36, "SemiBold"), fill="white", anchor="mm")
+    _brand_pill(card, H - 118)
+    return card.convert("RGB")
