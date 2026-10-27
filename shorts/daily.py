@@ -38,7 +38,7 @@ YOUTUBE_URL = "https://youtube.com/@kinomir360"
 TELEGRAM_URL = "https://t.me/KinoMir360"
 
 # По дням недели (пн..вс)
-SCHEDULE = ["online", "cinema", "facts", "genre", "news", "upcoming", "facts"]
+SCHEDULE = ["online", "cinema", "facts_new", "genre", "news", "upcoming", "facts"]
 
 GENRES = {
     "фантастика": ("ТОП ФАНТАСТИКИ", "фантастических фильмов, которые взрывают мозг", "фантастика"),
@@ -373,10 +373,14 @@ def _facts_word(n: int) -> str:
     return "факта" if 2 <= n <= 4 else "фактов"
 
 
+NEW_FROM = 2015  # «Факты: новое» — фильмы и сериалы с этого года, «Факты: классика» — до него
+
+
 async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int],
-                         web: bool = False) -> tuple[dict[str, Any], list[str]]:
+                         web: bool = False, era: str = "") -> tuple[dict[str, Any], list[str]]:
     """Фильм и его факты с Кинопоиска (все подходящие). web=True — факты найдёт ИИ в интернете,
-    поэтому названный автором фильм берём, даже если на Кинопоиске фактов мало."""
+    поэтому названный автором фильм берём, даже если на Кинопоиске фактов мало.
+    era — для случайного: "new" — с NEW_FROM года, "old" — до него, "" — любой (пополам)."""
     if query.startswith("id:") and query[3:].isdigit():
         # выбран из подсказок поиска — точный фильм по id Кинопоиска
         cands = [{"id": int(query[3:])}]
@@ -397,12 +401,16 @@ async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int],
         cands.sort(key=lambda c: -int((c.get("votes") or {}).get("kp") or 0))
         need = 0 if web else 3
     else:
+        era = era or random.choice(("new", "old"))
+        if era == "new":  # у новых оценок меньше, а фактов на Кинопоиске — тоже, их добирает ИИ
+            years, votes, need = f"{NEW_FROM}-{date.today().year}", "40000-100000000", 3 if web else FACTS
+        else:
+            years, votes, need = f"1950-{NEW_FROM - 1}", "150000-100000000", FACTS
         cands = await _query(fetch, page=random.randint(1, 5), sortField="votes.kp", sortType="-1",
-                             notNullFields="name",
-                             **{"rating.kp": "7-10", "votes.kp": "150000-100000000"})
+                             notNullFields="name", year=years,
+                             **{"rating.kp": "7-10", "votes.kp": votes})
         random.shuffle(cands)
-        need = FACTS
-    for d in cands[:8]:
+    for d in cands[:12]:
         if not d.get("id") or (not query and d["id"] in exclude):
             continue
         try:
@@ -1569,8 +1577,9 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
                            custom_facts: list[str] | None = None,
                            user_media: list[Path] | None = None, rumors: bool = False, review: bool = False,
                            display_title: str = "",
-                           tg_media: list[dict[str, Any]] | None = None) -> ShortResult:
-    """custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
+                           tg_media: list[dict[str, Any]] | None = None, era: str = "") -> ShortResult:
+    """era — для случайного фильма: "new" (с 2015 года), "old" (до 2015), "" — любой.
+    custom_facts — факты автора (кнопка «Факты: свой текст»): фильм ищем по query, факты не меняем.
     user_media — свои фото и видео автора: идут к фактам первыми.
     rumors=True — фильм ещё не вышел: ролик «Что известно о …» из новостей и слухов.
     review=True — короткий обзор: custom_facts — тезисы обзора автора, ролик «Стоит ли смотреть?».
@@ -1589,7 +1598,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
             # название с ошибкой или неофициальное — ИИ узнаёт настоящее в интернете
             found, _ = await find_film_smart(fetch, query, gemini_key)
             query = f"id:{found['id']}" if found else query
-        film, kp_facts = await pick_fact_film(fetch, query, exclude or set(), web=ai.available(gemini_key))
+        film, kp_facts = await pick_fact_film(fetch, query, exclude or set(), web=ai.available(gemini_key), era=era)
         # ещё не вышел — вместо фактов «Что известно о …» из новостей и слухов (если есть ИИ)
         rumors = rumors or (ai.available(gemini_key) and is_upcoming(film))
         tg_media = []
@@ -2045,9 +2054,10 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
             theme_key = "genre"
     if theme_key.startswith("facts"):
         query = theme_key.partition(":")[2].strip()
+        era = {"facts_new": "new", "facts_old": "old"}.get(theme_key, "")
         try:
             return await make_facts_short(fetch, work, query, exclude, music, tmdb_key, gemini_key,
-                                          trailer_clips)
+                                          trailer_clips, era=era)
         except RuntimeError:
             if query:
                 raise
