@@ -821,30 +821,57 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -
             "film": str(data.get("film") or "").strip(" «»\"")}
 
 
-async def write_list_post(key: str, title: str, films: list[str]) -> str | None:
-    """Пост-подборка для Telegram-канала в стиле POST_STYLE: films — строки с данными фильма (название, год,
-    жанры, рейтинг, о чём). Текст до 1020 символов или None."""
-    if not available(key) or not films:
+async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
+                          today: str = "", n: int = 5) -> dict[str, Any] | None:
+    """Пост-подборка для Telegram-канала в стиле POST_STYLE. ИИ сам выбирает n фильмов из всех источников:
+    кандидаты Кинопоиска (films — строки с данными), посты Telegram-каналов (posts) и поиск Google.
+    {"post": текст до 1020 символов, "films": [{"ru", "en", "year"}] в порядке поста} или None."""
+    if not available(key):
         return None
-    listing = "\n".join(f"{i}. {f}" for i, f in enumerate(films, 1))
-    prompt = (
-        f"Ты ведёшь Telegram-канал о кино KinoMir360. Напиши пост-подборку «{title}» точно в стиле образца: "
-        "заголовок КАПСОМ с эмодзи, под ним строка «🎬 Подборка от KinoMir360», одна живая вводная фраза, затем фильмы по порядку — у каждого строка "
-        "«1️⃣ «Название» (год) ⭐ рейтинг» и 1 короткая фраза, о чём и чем цепляет, без спойлеров; в конце "
-        "строка реакций «❤️ — … 🔥 — …», призыв сохранить или переслать другу и 5–7 хэштегов. Строго до 950 "
-        "символов. Только данные из списка, не выдумывай." + GRAMMAR
-        + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
-        + "\n\nФИЛЬМЫ:\n" + listing + '\n\nОтветь только JSON: {"post": "текст поста"}'
+    listing = "\n".join(f"— {f}" for f in films) or "—"
+    rules = (
+        f"Ты ведёшь Telegram-канал о кино KinoMir360. Сегодня {today}. Составь подборку «{title}» из {n} фильмов "
+        "или сериалов. Ищи везде: кандидаты с Кинопоиска ниже (с рейтингами), свежие посты Telegram-каналов о "
+        "кино ниже и поиск Google (что сейчас вышло и обсуждают, отзывы, рейтинги). Бери то, что точно подходит "
+        "теме и сегодняшней дате, с хорошими отзывами; не бери то, что было недавно:\n"
+        + ("\n".join(f"— {t}" for t in (recent or [])[-40:]) or "—")
+        + "\n\nНапиши пост точно в стиле образца: заголовок КАПСОМ с эмодзи, под ним строка «🎬 Подборка от "
+        "KinoMir360», одна живая вводная фраза, затем фильмы по порядку — у каждого строка «1️⃣ «Название» (год) "
+        "⭐ рейтинг» (рейтинг, если знаешь) и 1 короткая фраза, о чём и чем цепляет, без спойлеров (где смотреть "
+        "или дата выхода, если известно); в конце строка реакций «❤️ — … 🔥 — …», призыв сохранить или "
+        "переслать другу и 5–7 хэштегов. Строго до 950 символов. Не выдумывай: только проверенные факты."
+        + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
+        + "\n\nКАНДИДАТЫ С КИНОПОИСКА:\n" + listing
+        + ("\n\nПОСТЫ TELEGRAM-КАНАЛОВ:\n" + posts[:7000] if posts else "")
+        + '\n\nОтветь только JSON: {"post": "текст поста", "films": [{"ru": "название по-русски", '
+        '"en": "оригинальное", "year": 2026}, ...] — в том же порядке, что в посте}'
     )
-    try:
-        data = await _with_reserve(key, [{"text": prompt}], prompt)
-    except Exception as exc:  # noqa: BLE001
-        global last_error
-        last_error = str(exc)[:300]
-        log.warning("shorts: list post failed: %s", exc)
+    data = None
+    if key:
+        try:
+            data = await _ask(key, [{"text": rules}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: list post with search failed: %s", exc)
+    if data is None:
+        try:
+            data = await _with_reserve(key, [{"text": rules}], rules)
+        except Exception as exc:  # noqa: BLE001
+            global last_error
+            last_error = str(exc)[:300]
+            log.warning("shorts: list post failed: %s", exc)
+            return None
+    if not isinstance(data, dict):
         return None
-    post = str(data.get("post") or "").strip() if isinstance(data, dict) else ""
-    return post[:1020] if len(post) >= 80 else None
+    post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip()
+    picked = []
+    for f in data.get("films") or []:
+        if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
+            year = f.get("year")
+            picked.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                           "year": int(year) if str(year or "").isdigit() else None})
+    if len(post) < 80 or len(picked) < 3:
+        return None
+    return {"post": post[:1020], "films": picked[:10]}
 
 
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
