@@ -8470,9 +8470,10 @@ POSTS_NIGHT = range(0, 8)  # часы МСК: ночью авто-посты н�
 POST_SLOTS = (9, 12, 15, 18, 19, 20, 21)  # часы МСК для «⏰ Опубликовать позже»
 ANNOUNCE_HOUR = 11  # МСК: в четверг — «Премьеры недели в кино», в пятницу — «Что посмотреть на выходных»
 ANNOUNCES = {3: ("cinema", "Премьеры недели в кино"), 4: ("online", "Что посмотреть на выходных")}
+MAX_URL = os.getenv("MAX_URL", "https://max.ru/se14155241_biz")  # канал KinoMir360 в мессенджере MAX
 SIGNATURE = (f'\n\n🎬 <a href="https://t.me/{POST_CHANNEL.lstrip("@")}">KinoMir360</a> | '
-             f'<a href="{shorts_daily.YOUTUBE_URL}">YouTube</a>')
-SIGN_LEN = len("\n\n🎬 KinoMir360 | YouTube")  # столько символов подпись занимает в лимите Telegram (1024)
+             f'<a href="{shorts_daily.YOUTUBE_URL}">YouTube</a> | <a href="{MAX_URL}">KinoMir360 в MAX</a>')
+SIGN_LEN = len("\n\n🎬 KinoMir360 | YouTube | KinoMir360 в MAX")  # столько подпись занимает в лимите Telegram (1024)
 post_lock = asyncio.Lock()
 
 
@@ -8491,7 +8492,7 @@ async def _posts_history() -> dict[str, list[str]]:
 
 def post_caption(text: str) -> str:
     """Текст поста → подпись в HTML с подписью канала внизу, в пределах 1024 символов Telegram."""
-    text = re.sub(r"\s*🎬 KinoMir360 \| YouTube\s*$", "", text.strip())  # подпись добавим сами
+    text = re.sub(r"\s*🎬 KinoMir360 \| YouTube( \| KinoMir360 в MAX)?\s*$", "", text.strip())  # подпись добавим сами
     return escape(text[: 1020 - SIGN_LEN].rstrip()) + SIGNATURE
 
 
