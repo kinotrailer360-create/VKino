@@ -767,7 +767,8 @@ POST_STYLE = """🏜 ФИНАЛЬНЫЙ ТРЕЙЛЕР «ДЮНЫ 3»!
 #Дюна3 #DunePartThree #Вильнёв #ТимотиШаламе #Зендея #Трейлер #КиноНовости"""
 
 
-async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -> dict[str, Any] | None:
+async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
+                     own_posts: str = "") -> dict[str, Any] | None:
     """Пост для Telegram-канала автора в его стиле (POST_STYLE) по самой интересной свежей новости из постов
     других каналов. recent — темы уже сделанных постов (не повторяем).
     {"post": текст, "topic": тема, "media": [номера постов о той же новости — оттуда фото/видео]} или None."""
@@ -779,14 +780,18 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -
         "интересную для широкой аудитории новость: трейлер, премьера, кастинг, продолжение, сборы, награды, "
         "громкие слухи. Пропускай рекламу, розыгрыши, политику, местные события и то, что уже было:\n"
         + ("\n".join(f"— {t}" for t in recent[-40:]) or "—")
+        + ("\n\nУЖЕ ОПУБЛИКОВАНО В НАШЕМ КАНАЛЕ — эти новости не бери, даже другими словами:\n" + own_posts[:5000]
+           if own_posts else "")
         + "\n\nСверь новость с другими постами (и с Google, если можешь); неподтверждённое подавай как слух. "
-        "Напиши пост своими словами (не копируй чужой текст) точно в стиле и формате образца: заголовок "
+        "Напиши пост своими словами (не копируй ни чужие посты, ни образец — даже если новость похожа) "
+        "точно в стиле и формате образца: заголовок "
         "КАПСОМ с эмодзи, 2–4 коротких абзаца с эмодзи в начале, дата премьеры, если известна, строка реакций "
         "«❤️ — … 🔥 — …» и призыв переслать другу, в конце 5–8 хэштегов. До 900 символов. Названия — как в "
         "российском прокате, в «ёлочках». Не выдумывай фактов: только то, что есть в постах или найдено в "
         "Google." + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
         + '\n\nОтветь только JSON: {"post": "текст поста", "topic": "о чём новость, 3–6 слов", '
-        '"film": "название фильма или сериала по-русски или пусто", '
+        '"film": "название фильма или сериала по-русски или пусто", "film_en": "оригинальное название или пусто", '
+        '"trailer": true, если новость — вышел трейлер или тизер, иначе false, '
         '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
     )
     data = None
@@ -818,7 +823,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str]) -
         if 0 <= i < len(posts) and i not in media:
             media.append(i)
     return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
-            "film": str(data.get("film") or "").strip(" «»\"")}
+            "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
+            "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true"}
 
 
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
@@ -872,6 +878,36 @@ async def write_list_post(key: str, title: str, films: list[str], posts: str = "
     if len(post) < 80 or len(picked) < 3:
         return None
     return {"post": post[:1020], "films": picked[:10]}
+
+
+async def write_styled_post(key: str, task: str, material: str, search: bool = True) -> str | None:
+    """Пост для Telegram-канала в стиле POST_STYLE по заданию (task) и материалу; search — ИИ уточняет в Google.
+    Текст до 1020 символов или None."""
+    if not available(key):
+        return None
+    prompt = (
+        "Ты ведёшь Telegram-канал о кино KinoMir360. " + task + " Пиши точно в стиле и формате образца: "
+        "заголовок КАПСОМ с эмодзи, короткие абзацы с эмодзи в начале, строка реакций «❤️ — … 🔥 — …», "
+        "призыв переслать другу и 5–7 хэштегов в конце. Строго до 950 символов. Только проверенные факты, "
+        "не выдумывай." + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
+        + "\n\nМАТЕРИАЛ:\n" + material[:9000] + '\n\nОтветь только JSON: {"post": "текст поста"}'
+    )
+    data = None
+    if key and search:
+        try:
+            data = await _ask(key, [{"text": "Уточни детали поиском в Google. " + prompt}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: styled post with search failed: %s", exc)
+    if data is None:
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            global last_error
+            last_error = str(exc)[:300]
+            log.warning("shorts: styled post failed: %s", exc)
+            return None
+    post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip() if isinstance(data, dict) else ""
+    return post[:1020] if len(post) >= 80 else None
 
 
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
