@@ -8486,7 +8486,7 @@ async def _posts_history() -> dict[str, list[str]]:
     except ValueError:
         data = {}
     return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or []),
-            "films": list(data.get("films") or [])}
+            "films": list(data.get("films") or []), "list_titles": list(data.get("list_titles") or [])}
 
 
 def post_caption(text: str) -> str:
@@ -8619,8 +8619,10 @@ def posts_menu() -> InlineKeyboardMarkup:
 def _film_line(f: dict[str, Any]) -> str:
     rating, label = shorts_daily._best_rating(f)
     about = re.sub(r"\s+", " ", str(f.get("shortDescription") or f.get("description") or "")).strip()[:260]
-    return (f"«{shorts_daily._title(f)}» ({f.get('year') or '?'}), " + ", ".join(shorts_daily._genres(f)[:3])
-            + (f", {label} {rating:.1f}" if rating else "") + (f". {about}" if about else ""))
+    parts = [f"«{shorts_daily._title(f)}» ({f.get('year') or '?'})", *shorts_daily._genres(f)[:3]]
+    if rating:
+        parts.append(f"{label} {rating:.1f}")
+    return ", ".join(parts) + (f". {about}" if about else "")
 
 
 BRAND = "🎬 Подборка от KinoMir360"
@@ -8649,28 +8651,69 @@ def _list_fallback(title: str, films: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
+def _same_title(a: str, b: str) -> bool:
+    norm = lambda x: re.sub(r"[^\w]+", "", x.lower().replace("ё", "е"))  # noqa: E731
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]], posts: list[dict[str, Any]]) -> str | None:
+    """Постер фильма из подборки: кандидат Кинопоиска, поиск на Кинопоиске, картинка из поста канала о нём."""
+    names = [x for x in (f["ru"], f["en"]) if x]
+    for d in kp_films:
+        if any(_same_title(n, t) for n in names for t in (shorts_daily._title(d), str(d.get("enName") or ""))):
+            return shorts_daily._poster_url(d)
+    for q in names:
+        try:
+            d = await shorts_daily.find_film(kp._get, f"{q} {f['year']}" if f["year"] else q)
+        except Exception as exc:  # noqa: BLE001
+            logging.info("List post: kinopoisk lookup %r failed: %s", q, exc)
+            continue
+        if d and shorts_daily._poster_url(d):
+            return shorts_daily._poster_url(d)
+    for p in posts:
+        if p.get("image") and shorts_tgsearch._mentions(p["text"], names):
+            return p["image"]
+    return None
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
-    """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: альбом постеров, текст —
-    подписью к первому; ниже — кнопки публикации. Фильмы не повторяются подряд."""
+    """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
+    кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
+    первому; ниже — кнопки публикации. Фильмы не повторяются подряд."""
     today = datetime.now(MSK).date()
     theme = shorts_daily.theme_for(key, today)
-    hist = await _posts_history()
-    films = await shorts_daily.pick_films(kp._get, theme, today, {int(x) for x in hist["films"]})
-    if len(films) < 3:
-        films = await shorts_daily.pick_films(kp._get, theme, today, set())
-    if len(films) < 3:
-        raise RuntimeError("Кинопоиск не дал фильмов для этой подборки — попробуй другую")
     title = title or theme.hook
-    post = _brand(await shorts_ai.write_list_post(GEMINI_API_KEY, title, [_film_line(f) for f in films])
-                  or _list_fallback(title, films))
-    hist["films"] = (hist["films"] + [str(f["id"]) for f in films if f.get("id")])[-150:]
+    hist = await _posts_history()
+    kp_films = await shorts_daily.pick_films(kp._get, theme, today, {int(x) for x in hist["films"]})
+    if len(kp_films) < 3:
+        kp_films = await shorts_daily.pick_films(kp._get, theme, today, set())
+    own = POST_CHANNEL.lstrip("@").lower()
+    try:  # свежие посты каналов — что вышло и что обсуждают
+        posts = await asyncio.wait_for(shorts_tgsearch.latest(
+            [c for c in await fact_channels() if c.lower() != own], hours=72, per_channel=6), 40)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("List post: tg channels skipped: %s", exc)
+        posts = []
+    res = await shorts_ai.write_list_post(
+        GEMINI_API_KEY, title, [_film_line(f) for f in kp_films], shorts_tgsearch.as_text(posts, 7000),
+        hist["list_titles"], f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    if res:
+        post, names = res["post"], [f["ru"] or f["en"] for f in res["films"]]
+        posters = [await _list_poster(f, kp_films, posts) for f in res["films"]]
+    elif len(kp_films) >= 3:  # ИИ не ответил — подборка только с Кинопоиска по шаблону
+        post, names = _list_fallback(title, kp_films), [shorts_daily._title(f) for f in kp_films]
+        posters = [shorts_daily._poster_url(f) for f in kp_films]
+    else:
+        raise RuntimeError("ни ИИ, ни Кинопоиск не дали фильмов для этой подборки — попробуй другую")
+    post = _brand(post)
+    hist["films"] = (hist["films"] + [str(f["id"]) for f in kp_films if f.get("id")])[-150:]
+    hist["list_titles"] = (hist["list_titles"] + names)[-80:]
     await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
     work = SHORTS_DIR / f"list_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
-        files = await shorts_tgsearch.download_media(
-            [{"image": shorts_daily._poster_url(f)} for f in films if shorts_daily._poster_url(f)], work,
-            limit=len(films), prefix="poster")
+        files = await shorts_tgsearch.download_media([{"image": u} for u in posters if u], work,
+                                                     limit=len(posters), prefix="poster")
         caption = post_caption(post)
         if len(files) >= 2:
             sent = await bot.send_media_group(chat_id, [
@@ -8683,7 +8726,7 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
             ids, kind = [(await bot.send_message(chat_id, caption, disable_web_page_preview=True)).message_id], "text"
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", [shorts_daily._title(f) for f in films], "Подборка готова")
+    await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", names, "Подборка готова")
 
 
 def short_caption(result: Any) -> str:
@@ -8831,7 +8874,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         if post_lock.locked():
             await message.answer("⏳ Пост уже пишется — подожди минуту.")
             return
-        wait = await message.answer("🍿 Подбираю фильмы на Кинопоиске, ИИ пишет пост…")
+        wait = await message.answer("🍿 Ищу фильмы везде: Кинопоиск, интернет, Telegram-каналы — ИИ собирает подборку…")
 
         async def list_job() -> None:
             try:
