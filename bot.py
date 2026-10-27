@@ -49,6 +49,7 @@ from PIL import Image
 
 from shorts import ai as shorts_ai
 from shorts import tgsearch as shorts_tgsearch
+from shorts import postcard as shorts_postcard
 from shorts import news as shorts_news
 from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
@@ -8602,7 +8603,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
 
 
 LIST_POSTS = {  # подборки для поста: ключ темы шортсов → кнопка
-    "online": "🆕 Новинки онлайн", "cinema": "🍿 Сейчас в кино", "series": "📺 Новые сериалы",
+    "fresh": "🔥 Только вышло онлайн", "online": "🆕 Новинки онлайн", "cinema": "🍿 Сейчас в кино", "series": "📺 Новые сериалы",
     "upcoming": "⏳ Скоро в кино", "topfilms": "🏆 Топ фильмов", "topseries": "🏆 Топ сериалов",
 }
 
@@ -8610,7 +8611,7 @@ LIST_POSTS = {  # подборки для поста: ключ темы шорт
 def posts_menu() -> InlineKeyboardMarkup:
     keys = list(LIST_POSTS)
     rows = [[_btn("📰 Свежая новость из каналов", "pt:make")]]
-    rows += [[_btn(LIST_POSTS[a], f"pt:l:{a}"), _btn(LIST_POSTS[b], f"pt:l:{b}")] for a, b in zip(keys[::2], keys[1::2])]
+    rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
     rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
              for k in range(0, len(SHORTS_GENRES), 3)]
     rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
@@ -8657,12 +8658,14 @@ def _same_title(a: str, b: str) -> bool:
     return bool(norm(a)) and norm(a) == norm(b)
 
 
-async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]], posts: list[dict[str, Any]]) -> str | None:
-    """Постер фильма из подборки: кандидат Кинопоиска, поиск на Кинопоиске, картинка из поста канала о нём."""
+async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
+                       posts: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any] | None]:
+    """Постер фильма из подборки и его карточка Кинопоиска (для рейтинга и актёров): кандидат Кинопоиска,
+    поиск на Кинопоиске, иначе — картинка из поста канала о нём (без карточки)."""
     names = [x for x in (f["ru"], f["en"]) if x]
     for d in kp_films:
         if any(_same_title(n, t) for n in names for t in (shorts_daily._title(d), str(d.get("enName") or ""))):
-            return shorts_daily._poster_url(d)
+            return shorts_daily._poster_url(d), d
     for q in names:
         try:
             d = await shorts_daily.find_film(kp._get, f"{q} {f['year']}" if f["year"] else q)
@@ -8670,11 +8673,34 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]], posts:
             logging.info("List post: kinopoisk lookup %r failed: %s", q, exc)
             continue
         if d and shorts_daily._poster_url(d):
-            return shorts_daily._poster_url(d)
+            return shorts_daily._poster_url(d), d
     for p in posts:
         if p.get("image") and shorts_tgsearch._mentions(p["text"], names):
-            return p["image"]
-    return None
+            return p["image"], None
+    return None, None
+
+
+async def _list_cards(work: Path, items: list[tuple[str, str | None, dict[str, Any] | None]]) -> list[Path]:
+    """Фирменные карточки KinoMir360 для альбома подборки: (название, картинка, карточка Кинопоиска)."""
+    out = []
+    for k, (name, url, film) in enumerate(items, 1):
+        if not url:
+            continue
+        got = await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix=f"src{k}_")
+        if not got:
+            continue
+        try:
+            rating, label = shorts_daily._best_rating(film) if film else (0.0, "")
+            card = await asyncio.to_thread(
+                shorts_postcard.make_post_card, Image.open(got[0]), name, k, len(items), rating or None, label,
+                (film or {}).get("year"), shorts_daily._genres(film)[:2] if film else None,
+                shorts_daily._actors(film, 3) if film else None)
+            path = work / f"card{k}.jpg"
+            card.save(path, quality=92)
+            out.append(path)
+        except Exception:  # noqa: BLE001 — битая картинка — без этой карточки
+            logging.exception("List post card failed")
+    return out
 
 
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
@@ -8700,10 +8726,11 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
         hist["list_titles"], f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
     if res:
         post, names = res["post"], [f["ru"] or f["en"] for f in res["films"]]
-        posters = [await _list_poster(f, kp_films, posts) for f in res["films"]]
+        found = [await _list_poster(f, kp_films, posts) for f in res["films"]]
+        items = [(name, url, film) for name, (url, film) in zip(names, found)]
     elif len(kp_films) >= 3:  # ИИ не ответил — подборка только с Кинопоиска по шаблону
         post, names = _list_fallback(title, kp_films), [shorts_daily._title(f) for f in kp_films]
-        posters = [shorts_daily._poster_url(f) for f in kp_films]
+        items = [(shorts_daily._title(f), shorts_daily._poster_url(f), f) for f in kp_films]
     else:
         raise RuntimeError("ни ИИ, ни Кинопоиск не дали фильмов для этой подборки — попробуй другую")
     post = _brand(post)
@@ -8713,8 +8740,7 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     work = SHORTS_DIR / f"list_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
-        files = await shorts_tgsearch.download_media([{"image": u} for u in posters if u], work,
-                                                     limit=len(posters), prefix="poster")
+        files = await _list_cards(work, items)
         caption = post_caption(post)
         if len(files) >= 2:
             sent = await bot.send_media_group(chat_id, [

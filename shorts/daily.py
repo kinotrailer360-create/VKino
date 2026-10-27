@@ -264,6 +264,10 @@ def theme_for(key: str | None, today: date) -> Theme:
                      f"{n} самых ожидаемых премьер ⏳ Скоро в кино",
                      ["скоро в кино", "ожидаемые фильмы", "премьеры", "новинки кино", "афиша"],
                      upcoming=True)
+    if key == "fresh":  # для постов: только что вышло онлайн
+        return Theme("fresh", "ТОЛЬКО ВЫШЛО", "ТОЛЬКО ВЫШЛО ОНЛАЙН",
+                     "Только что вышло онлайн: что посмотреть", "Только что вышло онлайн 🔥",
+                     ["новинки онлайн", "только вышло", "что посмотреть", "новые фильмы", "новые сериалы"])
     if key in ("topfilms", "topseries"):  # для постов: лучшее за последние годы
         what = "сериалов" if key == "topseries" else "фильмов"
         return Theme(key, "ТОП", f"ТОП {what.upper()}", f"{n} лучших {what} последних лет",
@@ -283,6 +287,12 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
                             **{"premiere.digital": _range(today - timedelta(days=30), today)}, **common)
         docs += await _query(fetch, isSeries="true",
                              **{"premiere.world": _range(today - timedelta(days=30), today)}, **common)
+        docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
+    elif theme.key == "fresh":  # вышло в цифре (фильмы) или стартовало (сериалы) за последние 10 дней
+        docs = await _query(fetch, isSeries="false",
+                            **{"premiere.digital": _range(today - timedelta(days=10), today)}, **common)
+        docs += await _query(fetch, isSeries="true",
+                             **{"premiere.world": _range(today - timedelta(days=10), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
     elif theme.key == "cinema":
         docs = await _query(fetch, isSeries="false",
