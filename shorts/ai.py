@@ -874,6 +874,36 @@ async def write_list_post(key: str, title: str, films: list[str], posts: str = "
     return {"post": post[:1020], "films": picked[:10]}
 
 
+async def write_styled_post(key: str, task: str, material: str, search: bool = True) -> str | None:
+    """Пост для Telegram-канала в стиле POST_STYLE по заданию (task) и материалу; search — ИИ уточняет в Google.
+    Текст до 1020 символов или None."""
+    if not available(key):
+        return None
+    prompt = (
+        "Ты ведёшь Telegram-канал о кино KinoMir360. " + task + " Пиши точно в стиле и формате образца: "
+        "заголовок КАПСОМ с эмодзи, короткие абзацы с эмодзи в начале, строка реакций «❤️ — … 🔥 — …», "
+        "призыв переслать другу и 5–7 хэштегов в конце. Строго до 950 символов. Только проверенные факты, "
+        "не выдумывай." + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
+        + "\n\nМАТЕРИАЛ:\n" + material[:9000] + '\n\nОтветь только JSON: {"post": "текст поста"}'
+    )
+    data = None
+    if key and search:
+        try:
+            data = await _ask(key, [{"text": "Уточни детали поиском в Google. " + prompt}], search=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: styled post with search failed: %s", exc)
+    if data is None:
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            global last_error
+            last_error = str(exc)[:300]
+            log.warning("shorts: styled post failed: %s", exc)
+            return None
+    post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip() if isinstance(data, dict) else ""
+    return post[:1020] if len(post) >= 80 else None
+
+
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key

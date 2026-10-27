@@ -41,26 +41,25 @@ def _title_font(draw: ImageDraw.ImageDraw, title: str) -> tuple[ImageFont.FreeTy
 
 def make_post_card(img: Image.Image, title: str, place: int = 0, total: int = 0, rating: float | None = None,
                    rating_label: str = "", year: int | str | None = None, genres: list[str] | None = None,
-                   actors: list[str] | None = None) -> Image.Image:
-    """Карточка фильма для подборки; без данных (фильм не с Кинопоиска) — только название и знак канала."""
+                   actors: list[str] | None = None, pill: tuple[str, str] | None = None,
+                   meta: str | None = None, extra: str | None = None) -> Image.Image:
+    """Карточка фильма для подборки; без данных (фильм не с Кинопоиска) — только название и знак канала.
+    pill — своя плашка вместо рейтинга (например («🎂», «51»)); meta и extra — свои строки вместо
+    «год · жанр» и «В ролях: …» (например «Роль: Нео»)."""
     card = _cover(img.convert("RGB"), W, H, y_bias=0.3).convert("RGBA")
     card.alpha_composite(_gradient(W, 300, 170, 0))
     card.alpha_composite(_gradient(W, 900, 0, 250, INK), (0, H - 900))
     draw = ImageDraw.Draw(card)
 
     # знак канала по центру — едва заметный, чтобы картинку не выдали за свою
-    mark = Image.new("RGBA", (W, 200), (0, 0, 0, 0))
-    ImageDraw.Draw(mark).text((W // 2, 100), BRAND, font=_font("Oswald.ttf", 150, "Bold"),
-                              fill=(255, 255, 255, 34), anchor="mm")
-    card.alpha_composite(mark.rotate(28, expand=False, resample=Image.BICUBIC), (0, H // 2 - 220))
+    _center_mark(card, 150, 28, H // 2 - 120)
 
     # рейтинг — плашка цвета канала
-    if rating:
+    if rating or pill:
         label_font, value_font = _font("Montserrat.ttf", 30, "Bold"), _font("Oswald.ttf", 64, "Bold")
-        label = (rating_label or "★").upper()
-        value = f"{rating:.1f}"
+        label, value = pill or ((rating_label or "★").upper(), f"{rating:.1f}")
         lw, vw = draw.textlength(label, font=label_font), draw.textlength(value, font=value_font)
-        box = (48, 48, 48 + 36 + lw + 18 + vw + 36, 48 + 100)
+        box = (48, 48, 48 + 36 + lw + (18 + vw if value else 0) + 36, 48 + 100)
         draw.rounded_rectangle(box, radius=50, fill=ACCENT)
         draw.text((box[0] + 36, 98), label, font=label_font, fill=INK, anchor="lm")
         draw.text((box[0] + 36 + lw + 18, 96), value, font=value_font, fill=INK, anchor="lm")
@@ -77,8 +76,11 @@ def make_post_card(img: Image.Image, title: str, place: int = 0, total: int = 0,
     font, rows = _title_font(draw, title.upper())
     line_h = round(font.size * 1.12)
     y = H - 250 - line_h * len(rows)
-    meta = " · ".join(x for x in [str(year or ""), ", ".join((genres or [])[:2])] if x)
-    if actors:
+    if meta is None:
+        meta = " · ".join(x for x in [str(year or ""), ", ".join((genres or [])[:2])] if x)
+    if extra is None and actors:
+        extra = "В ролях: " + ", ".join(actors[:3])
+    if extra:
         y -= 50
     if meta:
         y -= 50
@@ -91,21 +93,55 @@ def make_post_card(img: Image.Image, title: str, place: int = 0, total: int = 0,
     if meta:
         draw.text((W // 2, y), meta, font=_font("Montserrat.ttf", 34, "SemiBold"), fill=ACCENT, anchor="mt")
         y += 50
-    if actors:
+    if extra:
         text_font = _font("Montserrat.ttf", 32, "Medium")
-        names = ", ".join(actors[:3])
-        while draw.textlength(f"В ролях: {names}", font=text_font) > W - 100 and "," in names:
-            names = names.rsplit(",", 1)[0]
-        draw.text((W // 2, y), f"В ролях: {names}", font=text_font, fill=(235, 235, 235), anchor="mt")
+        while draw.textlength(extra, font=text_font) > W - 100 and "," in extra:
+            extra = extra.rsplit(",", 1)[0]
+        while draw.textlength(extra, font=text_font) > W - 100:
+            extra = extra[:-2].rstrip() + "…"
+        draw.text((W // 2, y), extra, font=text_font, fill=(235, 235, 235), anchor="mt")
 
-    # плашка канала — внизу по центру, с логотипом
-    brand_font = _font("Montserrat.ttf", 36, "Bold")
+    _brand_pill(card, H - 118)
+    return card.convert("RGB")
+
+
+def _center_mark(card: Image.Image, size: int, angle: float, cy: int) -> None:
+    """Едва заметная надпись KinoMir360 наискосок с центром в (середина, cy)."""
+    font = _font("Oswald.ttf", size, "Bold")
+    tw = round(ImageDraw.Draw(card).textlength(BRAND, font=font)) + 40
+    mark = Image.new("RGBA", (tw, size * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(mark).text((tw // 2, size), BRAND, font=font, fill=(255, 255, 255, 34), anchor="mm")
+    mark = mark.rotate(angle, expand=True, resample=Image.BICUBIC)
+    card.alpha_composite(mark, ((card.width - mark.width) // 2, cy - mark.height // 2))
+
+
+def _brand_pill(card: Image.Image, y0: int, scale: float = 1.0) -> None:
+    """Плашка канала с логотипом по центру по горизонтали."""
+    draw = ImageDraw.Draw(card)
+    W_ = card.width
+    brand_font = _font("Montserrat.ttf", round(36 * scale), "Bold")
     bw = draw.textlength(BRAND, font=brand_font)
     logo = Image.open(ASSETS / "logo.png").convert("RGBA")
-    logo.thumbnail((56, 56))
-    pill_w = 28 + logo.width + 14 + bw + 30
-    x0, y0 = (W - pill_w) // 2, H - 118
-    draw.rounded_rectangle((x0, y0, x0 + pill_w, y0 + 74), radius=37, fill=(0, 0, 0, 170), outline=ACCENT, width=3)
-    card.alpha_composite(logo, (int(x0 + 28), int(y0 + (74 - logo.height) // 2)))
-    draw.text((x0 + 28 + logo.width + 14, y0 + 37), BRAND, font=brand_font, fill="white", anchor="lm")
+    h = round(74 * scale)
+    logo.thumbnail((round(56 * scale), round(56 * scale)))
+    pill_w = 28 * scale + logo.width + 14 * scale + bw + 30 * scale
+    x0 = (W_ - pill_w) // 2
+    draw.rounded_rectangle((x0, y0, x0 + pill_w, y0 + h), radius=h // 2, fill=(0, 0, 0, 170), outline=ACCENT,
+                           width=3)
+    card.alpha_composite(logo, (int(x0 + 28 * scale), int(y0 + (h - logo.height) // 2)))
+    draw.text((x0 + 28 * scale + logo.width + 14 * scale, y0 + h // 2), BRAND, font=brand_font, fill="white",
+              anchor="lm")
+
+
+def watermark(img: Image.Image, max_w: int = 1280) -> Image.Image:
+    """Кадр для поста со знаками KinoMir360: плашка канала внизу и едва заметная надпись по центру."""
+    frame = img.convert("RGB")
+    if frame.width > max_w:
+        frame = frame.resize((max_w, round(frame.height * max_w / frame.width)), Image.LANCZOS)
+    card = frame.convert("RGBA")
+    scale = max(0.5, card.width / W)
+    band = round(200 * scale)
+    card.alpha_composite(_gradient(card.width, band, 0, 150), (0, card.height - band))
+    _center_mark(card, round(130 * scale), 20, card.height // 2)
+    _brand_pill(card, card.height - round(100 * scale), scale)
     return card.convert("RGB")

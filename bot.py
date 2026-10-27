@@ -8488,7 +8488,8 @@ async def _posts_history() -> dict[str, list[str]]:
     except ValueError:
         data = {}
     return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or []),
-            "films": list(data.get("films") or []), "list_titles": list(data.get("list_titles") or [])}
+            "films": list(data.get("films") or []), "list_titles": list(data.get("list_titles") or []),
+            "people": list(data.get("people") or []), "facts": list(data.get("facts") or [])}
 
 
 def post_caption(text: str) -> str:
@@ -8504,10 +8505,14 @@ async def _json_setting(key: str, default: Any) -> Any:
         return default
 
 
-async def save_post(chat_id: int, ids: list[int], kind: str, poll: list[str] | None = None) -> None:
-    """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), варианты опроса."""
+POLL_QUESTION = "Что посмотрите первым? 🍿"
+
+
+async def save_post(chat_id: int, ids: list[int], kind: str, poll: list[str] | None = None,
+                    question: str = POLL_QUESTION) -> None:
+    """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), опрос."""
     meta = await _json_setting("posts_meta", {})
-    meta[f"{chat_id}:{ids[0]}"] = {"ids": ids, "kind": kind, "poll": poll or []}
+    meta[f"{chat_id}:{ids[0]}"] = {"ids": ids, "kind": kind, "poll": poll or [], "question": question}
     await set_shorts_setting("posts_meta", json.dumps(dict(list(meta.items())[-80:]), ensure_ascii=False))
 
 
@@ -8525,10 +8530,10 @@ def post_keyboard(first: int, more: str = "") -> InlineKeyboardMarkup:
 
 
 async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: str = "",
-                     poll: list[str] | None = None, what: str = "Пост готов") -> None:
-    await save_post(chat_id, ids, kind, poll)
+                     poll: list[str] | None = None, what: str = "Пост готов", question: str = POLL_QUESTION) -> None:
+    await save_post(chat_id, ids, kind, poll, question)
     await bot.send_message(chat_id, f"👆 {what}"
-                           + (". После публикации в канале добавлю опрос «Что посмотрите первым?»." if poll else "."),
+                           + (f". После публикации в канале добавлю опрос «{escape(question)}»." if poll else "."),
                            reply_markup=post_keyboard(ids[0], more))
 
 
@@ -8539,7 +8544,7 @@ async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
     options = list(dict.fromkeys(t[:100] for t in meta["poll"] if t))[:10]
     if len(options) >= 2:
         try:
-            await bot.send_poll(POST_CHANNEL, "Что посмотрите первым? 🍿", options, is_anonymous=True)
+            await bot.send_poll(POST_CHANNEL, meta.get("question") or POLL_QUESTION, options, is_anonymous=True)
         except Exception:  # noqa: BLE001 — пост уже вышел, опрос не главное
             logging.exception("Poll failed")
 
@@ -8614,6 +8619,8 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
     rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
              for k in range(0, len(SHORTS_GENRES), 3)]
+    rows.append([_btn("🎂 День рождения звезды", "pt:bd")])
+    rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -8703,6 +8710,140 @@ async def _list_cards(work: Path, items: list[tuple[str, str | None, dict[str, A
     return out
 
 
+async def _send_album(bot: Bot, chat_id: int, files: list[Path], post: str) -> tuple[list[int], str]:
+    """Альбом фото с текстом поста подписью к первому (одно фото или только текст — как получится)."""
+    caption = post_caption(post)
+    if len(files) >= 2:
+        sent = await bot.send_media_group(chat_id, [
+            InputMediaPhoto(media=FSInputFile(path), caption=caption if k == 0 else None)
+            for k, path in enumerate(files[:10])])
+        return [m.message_id for m in sent], "caption"
+    if files:
+        return [(await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)).message_id], "caption"
+    return [(await bot.send_message(chat_id, caption, disable_web_page_preview=True)).message_id], "text"
+
+
+async def _image(url: str | None, work: Path, prefix: str) -> Image.Image | None:
+    if not url:
+        return None
+    got = await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix=prefix)
+    try:
+        return Image.open(got[0]).convert("RGB") if got else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def make_birthday_post(bot: Bot, chat_id: int) -> None:
+    """День рождения звезды кино: пара фраз о человеке, его лучшие фильмы с ролями и лёгкое поздравление.
+    Альбом: портрет «С днём рождения» и карточки фильмов; в канале — опрос «Какой фильм любимый?»."""
+    today = datetime.now(MSK).date()
+    hist = await _posts_history()
+    who, info, top = await shorts_daily.pick_birthday(today, {int(x) for x in hist["people"]}, TMDB_API_KEY)
+    name, female = who["name"], who["female"]
+    age = today.year - date.fromisoformat(who["born"]).year
+    years = shorts_daily._years(age)
+    director = info.get("known_for_department") == "Directing"
+    films = []
+    for f in top:
+        role = await shorts_daily._kp_role(kp._get, f, who) if f.get("job") != "Director" else ""
+        if not role and not shorts_daily._latin(str(f.get("character") or "")):
+            role = str(f.get("character") or "").strip()
+        films.append({"title": str(f.get("title") or f.get("original_title") or ""),
+                      "year": str(f.get("release_date") or "")[:4], "rating": float(f.get("vote_average") or 0),
+                      "role": role, "poster": f.get("poster_path") or f.get("backdrop_path")})
+    who_is = "режиссёр" if director else "актриса" if female else "актёр"
+    material = (f"{name}" + (f" ({who['en']})" if who["en"] else "") + f", {who_is}, сегодня {age} {years}.\n"
+                + "Лучшие фильмы:\n" + "\n".join(
+                    f"— «{f['title']}» ({f['year']})" + (f", роль: {f['role']}" if f["role"] else "")
+                    for f in films)
+                + "\n\nБиография:\n" + str(info.get("biography") or "—")[:2500])
+    task = (f"Сегодня день рождения: {name}, {age} {years}. Напиши пост-поздравление: заголовок «🎂 С ДНЁМ "
+            f"РОЖДЕНИЯ, …!» с возрастом; 2–3 предложения о том, чем {'она известна' if female else 'он известен'} "
+            "и какой ролью или фильмом запомнились зрителям; затем лучшие фильмы из материала строками «1️⃣ "
+            "«Название» (год) — роль»; лёгкое тёплое поздравление с эмодзи и строка реакций, чтобы подписчики "
+            "поздравили (например «🎉 — поздравляю! ❤️ — обожаю эти фильмы»).")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material) or "\n".join(
+        [f"🎂 С ДНЁМ РОЖДЕНИЯ, {name.upper()}!", "", f"Сегодня {'ей' if female else 'ему'} {age} {years} 🎉", "",
+         "Лучшие фильмы:"]
+        + [f"{n} «{f['title']}» ({f['year']})" + (f" — {f['role']}" if f["role"] else "")
+           for n, f in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"], films)]
+        + ["", "🎉 — поздравляю! ❤️ — обожаю эти фильмы", "", "#ДеньРождения #Кино #KinoMir360"])
+    hist["people"] = (hist["people"] + [str(shorts_daily.person_uid(who["imdb"]))])[-100:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    work = SHORTS_DIR / f"bday_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        cards: list[Path] = []
+        known = ", ".join(f"«{f['title']}»" for f in films[:2])
+        for url in shorts_daily.tmdb.profile_urls(info)[:2]:
+            photo = await _image(url, work, "face")
+            if photo:
+                card = await asyncio.to_thread(
+                    shorts_postcard.make_post_card, photo, name, pill=("С ДНЁМ РОЖДЕНИЯ", ""),
+                    meta=f"Сегодня {age} {years}", extra=f"{'Известна' if female else 'Известен'} по: {known}")
+                cards.append(work / "face.jpg")
+                card.save(cards[-1], quality=92)
+                break
+        for k, f in enumerate(films, 1):
+            img = await _image(f"{shorts_daily.tmdb.IMG}w780{f['poster']}" if f["poster"] else None, work, f"f{k}_")
+            if not img:
+                continue
+            rating = f["rating"] if f["rating"] >= shorts_daily.MIN_RATING else None
+            card = await asyncio.to_thread(shorts_postcard.make_post_card, img, f["title"], k, len(films), rating,
+                                           "TMDB", f["year"], None, None,
+                                           extra=f"Роль: {f['role']}" if f["role"] else None)
+            cards.append(work / f"film{k}.jpg")
+            card.save(cards[-1], quality=92)
+        ids, kind = await _send_album(bot, chat_id, cards, post)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "pt:bd", [f["title"] for f in films], "Пост ко дню рождения готов",
+                     f"Какой фильм с {'ней' if female else 'ним'} ваш любимый? 🎬")
+
+
+async def make_facts_post(bot: Bot, chat_id: int, era: str = "") -> None:
+    """5 фактов о фильме (Кинопоиск, интернет, Telegram-каналы): карточка фильма и кадры со знаком канала."""
+    hist = await _posts_history()
+    film, kp_facts = await shorts_daily.pick_fact_film(kp._get, "", {int(x) for x in hist["facts"]},
+                                                       web=shorts_ai.available(GEMINI_API_KEY), era=era)
+    facts, _ = await shorts_daily.gather_facts(film, kp_facts, GEMINI_API_KEY)
+    title, year = shorts_daily._title(film), film.get("year") or ""
+    kind_word = shorts_daily._kind(film)
+    material = (_film_line(film) + "\n\nФакты:\n" + "\n".join(f"— {f}" for f in facts[:7]))
+    task = (f"Напиши пост «Факты о {kind_word} «{title}» ({year}), которые знают не все»: заголовок КАПСОМ с "
+            "эмодзи, одна вводная фраза, затем 5 фактов из материала строками «1️⃣ …» — каждый 1–2 коротких "
+            "предложения своими словами, без спойлеров; в конце вопрос «Какой факт удивил больше всего?» и строка "
+            "реакций.")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material, search=False) or "\n".join(
+        [f"💡 ФАКТЫ О {kind_word.upper()} «{title.upper()}»!", ""]
+        + [f"{n} {f}" for n, f in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"], facts)]
+        + ["", "Какой факт удивил больше всего? 👇", "", "❤️ — не знал! 🔥 — знал всё", "",
+           "#ФактыОКино #Кино #KinoMir360"])
+    hist["facts"] = (hist["facts"] + [str(film["id"])])[-150:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    work = SHORTS_DIR / f"facts_post_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        cards: list[Path] = []
+        poster = await _image(shorts_daily._poster_url(film), work, "poster")
+        if poster:
+            rating, label = shorts_daily._best_rating(film)
+            card = await asyncio.to_thread(shorts_postcard.make_post_card, poster, title, 0, 0, rating or None, label,
+                                           year, shorts_daily._genres(film)[:2], shorts_daily._actors(film, 3))
+            cards.append(work / "card.jpg")
+            card.save(cards[-1], quality=92)
+        backdrops, _ = await shorts_daily.tmdb.images(TMDB_API_KEY, film, limit=6)
+        for k, url in enumerate(shorts_daily.tmdb.pick_varied(backdrops, 3)):
+            frame = await _image(url, work, f"frame{k}_")
+            if frame:
+                cards.append(work / f"frame{k}.jpg")
+                (await asyncio.to_thread(shorts_postcard.watermark, frame)).save(cards[-1], quality=92)
+        ids, kind = await _send_album(bot, chat_id, cards, post)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, f"pt:fx:{era or 'any'}", what="Пост с фактами готов")
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
     """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
     кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
@@ -8740,17 +8881,7 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     work = SHORTS_DIR / f"list_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
-        files = await _list_cards(work, items)
-        caption = post_caption(post)
-        if len(files) >= 2:
-            sent = await bot.send_media_group(chat_id, [
-                InputMediaPhoto(media=FSInputFile(path), caption=caption if k == 0 else None)
-                for k, path in enumerate(files)])
-            ids, kind = [m.message_id for m in sent], "caption"
-        elif files:
-            ids, kind = [(await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)).message_id], "caption"
-        else:
-            ids, kind = [(await bot.send_message(chat_id, caption, disable_web_page_preview=True)).message_id], "text"
+        ids, kind = await _send_album(bot, chat_id, await _list_cards(work, items), post)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", names, "Подборка готова")
@@ -8893,6 +9024,29 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if action == "menu":
         await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
                              "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
+        return
+    if action == "bd" or kind == "fx":
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту.")
+            return
+        era = arg if arg in ("new", "old") else ""
+        wait = await message.answer("🎂 Ищу именинника дня, его лучшие фильмы и роли, ИИ пишет поздравление…"
+                                    if action == "bd" else
+                                    "💡 Выбираю фильм, ищу факты везде: Кинопоиск, интернет, Telegram-каналы…")
+
+        async def other_job() -> None:
+            try:
+                async with post_lock:
+                    if action == "bd":
+                        await make_birthday_post(message.bot, chat_id)
+                    else:
+                        await make_facts_post(message.bot, chat_id, era)
+                await wait.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Post failed")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+        _run_job(other_job)
         return
     if kind == "l":
         key = arg
