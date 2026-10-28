@@ -8472,10 +8472,11 @@ async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 POST_CHANNEL = os.getenv("POST_CHANNEL", "@KinoMir360")  # свой канал: из него новости не берём, в него публикуем
 POSTS_EVERY = 30 * 60
-POSTS_NIGHT = range(0, 8)  # часы МСК: ночью авто-посты не присылаем
+POSTS_NIGHT = range(0, 8)  # часы по времени автора (POST_TZ): ночью авто-посты не присылаем
 POST_TZ = timezone(timedelta(hours=int(os.getenv("POST_TZ_HOURS", "5"))))  # «⏰ Позже» — время автора (Екатеринбург)
 POST_TZ_NAME = os.getenv("POST_TZ_NAME", "Екб")
-# автоплан: (дни недели, 0 — пн; час МСК; что) — бот сам готовит пост и присылает автору на публикацию
+# автоплан: (дни недели, 0 — пн; час по времени автора, POST_TZ; что) — бот сам готовит пост и присылает
+# автору на публикацию
 POSTS_PLAN = [
     (range(7), 9, "bd"),          # каждый день — день рождения звезды
     (range(7), 13, "an"),         # каждый день — «Этот день в кино» (если есть круглая дата)
@@ -9780,7 +9781,7 @@ async def posts_auto_loop(bot: Bot) -> None:
         await asyncio.sleep(60)
         try:
             await publish_due(bot)
-            now = datetime.now(MSK)
+            now = datetime.now(POST_TZ)  # автоплан и «ночь без авто-постов» — по времени автора (Екатеринбург)
             await run_posts_plan(bot, now)
             if (await shorts_setting("posts_auto") == "on" and time.monotonic() - last >= POSTS_EVERY
                     and now.hour not in POSTS_NIGHT):
@@ -9825,7 +9826,7 @@ PLAN_HELP = (
     "• пн 12:00 — 💰 сборы уикенда\n• пн 16:00 — 🗳 выбор подписчиков (голосование)\n• вт 17:00 — ⚔️ битва "
     "фильмов\n• ср 15:00 — 💬 цитата дня\n• чт 11:00 — 🍿 премьеры недели в кино\n• пт 11:00 — 🆕 что "
     "посмотреть на выходных\n• пт 16:00 — 🗳 факты о фильме, который выбрали подписчики\n• сб 15:00 — 🎭 ляпы "
-    "в кино\n• вс 18:00 — 🗞 итоги недели\n\nВремя московское. Выключить — та же кнопка.")
+    "в кино\n• вс 18:00 — 🗞 итоги недели\n\nВремя екатеринбургское. Выключить — та же кнопка.")
 
 
 @router.callback_query(F.data.startswith("pt:"))
@@ -9968,7 +9969,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         on = await shorts_setting("posts_auto") != "on"
         await set_shorts_setting("posts_auto", "on" if on else None)
         await message.answer(
-            "🔔 Авто-посты включены: раз в 30 минут (кроме ночи, 0–8 по Москве) пришлю новый пост по свежей "
+            "🔔 Авто-посты включены: раз в 30 минут (кроме ночи, 0–8 по Екатеринбургу) пришлю новый пост по свежей "
             "новости из каналов. Нажми «📢 Опубликовать» под тем, что нравится. Выключить — та же кнопка."
             if on else "🔕 Авто-посты выключены.")
         return
