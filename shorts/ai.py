@@ -1016,6 +1016,25 @@ async def anniversary_post(key: str, material: str, years: int) -> str | None:
     return _clean_post(await _post_json(key, prompt)) or None
 
 
+async def long_article(key: str, title: str, films: list[str], today: str) -> dict[str, Any] | None:
+    """Статья-подборка для Дзена или VK (3000–4500 знаков): заголовок, вступление, по разделу на фильм,
+    заключение. {"title", "text", "films": [{"ru", "en", "year"}]} или None."""
+    prompt = (f"Сегодня {today}. Напиши статью-подборку «{title}» для Яндекс Дзена и VK от кино-канала "
+              "KinoMir360: цепляющий заголовок (до 80 символов, с ключевыми словами для поиска), вступление в 2–3 "
+              "предложения, затем 5–7 фильмов — у каждого подзаголовок «1. Название (год)» и абзац 3–5 предложений: "
+              "о чём (без спойлеров), чем цепляет, кто играет, где посмотреть, если знаешь; в конце — короткое "
+              "заключение и призыв подписаться на Telegram-канал KinoMir360. Объём 3000–4500 знаков, живой язык, "
+              "без эмодзи в абзацах. Только проверенные факты." + GRAMMAR
+              + "\n\nКАНДИДАТЫ (можно взять другие, если лучше подходят):\n" + "\n".join(f"— {f}" for f in films)
+              + '\n\nОтветь только JSON: {"title": "заголовок", "text": "текст статьи без заголовка, абзацы через '
+              'пустую строку", "films": [{"ru": "...", "en": "...", "year": 2026}]}')
+    data = await _post_json(key, prompt)
+    text = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str((data or {}).get("text") or "")).strip()
+    if len(text) < 1000:
+        return None
+    return {"title": str(data.get("title") or title).strip(), "text": text, "films": _films_from(data)[:8]}
+
+
 async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key

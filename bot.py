@@ -8475,6 +8475,11 @@ POSTS_PLAN = [
     (range(7), 9, "bd"),          # каждый день — день рождения звезды
     (range(7), 13, "an"),         # каждый день — «Этот день в кино» (если есть круглая дата)
     (range(7), 19, "qz"),         # каждый день — «Угадай фильм по кадру»
+    (range(7), 20, "ev"),         # каждый день — фильм вечера
+    ((0,), 16, "vt"),             # понедельник — голосование «Выбор подписчиков»
+    ((1,), 17, "bt"),             # вторник — битва фильмов
+    ((4,), 16, "vr"),             # пятница — факты о фильме, который выбрали подписчики
+    ((5,), 15, "bl"),             # суббота — ляпы в кино
     ((0,), 12, "bo"),             # понедельник — сборы уикенда
     ((2,), 15, "qt"),             # среда — цитата дня
     ((3,), 11, "l:cinema"),       # четверг — премьеры недели в кино
@@ -8502,13 +8507,33 @@ async def _posts_history() -> dict[str, list[str]]:
             "films": list(data.get("films") or []), "list_titles": list(data.get("list_titles") or []),
             "people": list(data.get("people") or []), "facts": list(data.get("facts") or []),
             "quiz": list(data.get("quiz") or []), "quotes": list(data.get("quotes") or []),
-            "anniv": list(data.get("anniv") or [])}
+            "anniv": list(data.get("anniv") or []), "evening": list(data.get("evening") or []),
+            "battle": list(data.get("battle") or []), "bloopers": list(data.get("bloopers") or [])}
 
 
-def post_caption(text: str) -> str:
-    """Текст поста → подпись в HTML с подписью канала внизу, в пределах 1024 символов Telegram."""
+# рубрики — хэштег в каждом посте; закреп-навигатор ведёт по ним (тап по хэштегу ищет посты канала)
+RUBRICS = {
+    "#новости": "📰 Новости и трейлеры", "#подборка": "🍿 Подборки «что посмотреть»",
+    "#фильмвечера": "🎬 Фильм вечера", "#факты": "💡 Факты о фильмах", "#викторина": "🧩 Угадай фильм по кадру",
+    "#битвафильмов": "⚔️ Битва фильмов", "#деньрождения": "🎂 Дни рождения звёзд", "#цитата": "💬 Цитата дня",
+    "#этотденьвкино": "📅 Этот день в кино", "#ляпы": "🎭 Ляпы в кино", "#сборы": "💰 Сборы уикенда",
+    "#итогинедели": "🗞 Итоги недели", "#выборподписчиков": "🗳 Выбор подписчиков",
+}
+
+
+def post_caption(text: str, rubric: str = "", links: list[tuple[str, str]] | None = None) -> str:
+    """Текст поста → подпись в HTML: рубрика-хэштег, «Где смотреть» (ссылки на онлайн-кинотеатры) и подпись
+    канала внизу — всё в пределах 1024 символов Telegram."""
     text = re.sub(r"\s*🎬 KinoMir360 \| YouTube( \| KinoMir360 в MAX)?\s*$", "", text.strip())  # подпись добавим сами
-    return escape(text[: 1020 - SIGN_LEN].rstrip()) + SIGNATURE
+    tail, tail_len = "", SIGN_LEN
+    if rubric and rubric.lower() not in text.lower():
+        tail += f"\n{rubric}"
+        tail_len += len(rubric) + 1
+    if links:
+        shown = links[:4]
+        tail += "\n\n📺 Где смотреть: " + " · ".join(f'<a href="{escape(url)}">{escape(name)}</a>' for name, url in shown)
+        tail_len += len("\n\n📺 Где смотреть: ") + sum(len(name) + 3 for name, _ in shown)
+    return escape(text[: 1020 - tail_len].rstrip()) + tail + SIGNATURE
 
 
 async def _json_setting(key: str, default: Any) -> Any:
@@ -8521,12 +8546,17 @@ async def _json_setting(key: str, default: Any) -> Any:
 POLL_QUESTION = "Что посмотрите первым? 🍿"
 
 
+VOTE_QUESTION = "О каком фильме рассказать факты в пятницу? 🗳"
+
+
 async def save_post(chat_id: int, ids: list[int], kind: str, poll: list[str] | None = None,
-                    question: str = POLL_QUESTION, quiz: dict[str, Any] | None = None) -> None:
-    """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), опрос, викторина."""
+                    question: str = POLL_QUESTION, quiz: dict[str, Any] | None = None,
+                    extra: dict[str, Any] | None = None) -> None:
+    """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), опрос, викторина;
+    extra — {"button": {"text", "url"}} или {"vote": {"ids", "titles"}}."""
     meta = await _json_setting("posts_meta", {})
     meta[f"{chat_id}:{ids[0]}"] = {"ids": ids, "kind": kind, "poll": poll or [], "question": question,
-                                   "quiz": quiz}
+                                   "quiz": quiz, **(extra or {})}
     await set_shorts_setting("posts_meta", json.dumps(dict(list(meta.items())[-80:]), ensure_ascii=False))
 
 
@@ -8545,8 +8575,8 @@ def post_keyboard(first: int, more: str = "") -> InlineKeyboardMarkup:
 
 async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: str = "",
                      poll: list[str] | None = None, what: str = "Пост готов", question: str = POLL_QUESTION,
-                     quiz: dict[str, Any] | None = None) -> None:
-    await save_post(chat_id, ids, kind, poll, question, quiz)
+                     quiz: dict[str, Any] | None = None, extra: dict[str, Any] | None = None) -> None:
+    await save_post(chat_id, ids, kind, poll, question, quiz, extra)
     await bot.send_message(chat_id, f"👆 {what}"
                            + (f". После публикации в канале добавлю опрос «{escape(question)}»." if poll else "."),
                            reply_markup=post_keyboard(ids[0], more))
@@ -8555,7 +8585,18 @@ async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: st
 async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
     """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?»."""
     meta = await _post_meta(chat_id, first)
-    await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
+    button = meta.get("button")
+    if button and len(meta["ids"]) == 1:  # пост со ссылкой-кнопкой (бот, буст): копируем вместе с кнопкой
+        await bot.copy_message(POST_CHANNEL, chat_id, meta["ids"][0], reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=button["text"], url=button["url"])]]))
+    else:
+        await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
+    vote = meta.get("vote")
+    if vote:  # «Выбор подписчиков»: опрос запоминаем — в пятницу бот подведёт итог и сделает пост о победителе
+        sent = await bot.send_poll(POST_CHANNEL, VOTE_QUESTION, vote["titles"], is_anonymous=True)
+        await set_shorts_setting("vote_poll", json.dumps({"message_id": sent.message_id, "ids": vote["ids"],
+                                                           "titles": vote["titles"]}, ensure_ascii=False))
+        return
     quiz = meta.get("quiz")
     if quiz:  # «Угадай фильм»: викторина Telegram — правильный ответ виден сразу после голоса
         await bot.send_poll(POST_CHANNEL, "Что это за фильм? 🎬", quiz["options"], type="quiz",
@@ -8641,7 +8682,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
             with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
             files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
                      await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
-            caption = post_caption(res["post"])
+            caption = post_caption(res["post"], "#новости")
             for chat_id in chat_ids:
                 if files and files[0].suffix == ".mp4":
                     sent = await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption,
@@ -8672,7 +8713,12 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
     rows.append([_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")])
-    rows.append([_btn("📣 Пост для взаимного пиара", "pt:pr")])
+    rows.append([_btn("🎬 Фильм вечера", "pt:ev"), _btn("⚔️ Битва фильмов", "pt:bt")])
+    rows.append([_btn("🗳 Выбор подписчиков", "pt:vt"), _btn("🎭 Ляпы в кино", "pt:bl")])
+    rows.append([_btn("🗳 Итог голосования → факты", "pt:vr")])
+    rows.append([_btn("📣 Пост для взаимного пиара", "pt:pr"), _btn("🤖 Пост про бота", "pt:ab")])
+    rows.append([_btn("📌 Закреп-навигатор", "pt:nv"), _btn("⚡ Буст канала", "pt:bs")])
+    rows.append([_btn("🎁 Розыгрыш", "pt:gv"), _btn("📰 Статья для Дзен/VK", "pt:ar")])
     rows.append([_btn("🗓 Автоплан постов (вкл/выкл)", "pt:plan")])
     rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -8766,9 +8812,10 @@ async def _list_cards(work: Path, items: list[tuple[str, str | None, dict[str, A
     return out
 
 
-async def _send_album(bot: Bot, chat_id: int, files: list[Path], post: str) -> tuple[list[int], str]:
+async def _send_album(bot: Bot, chat_id: int, files: list[Path], post: str, rubric: str = "",
+                      links: list[tuple[str, str]] | None = None) -> tuple[list[int], str]:
     """Альбом фото с текстом поста подписью к первому (одно фото или только текст — как получится)."""
-    caption = post_caption(post)
+    caption = post_caption(post, rubric, links)
     if len(files) >= 2:
         sent = await bot.send_media_group(chat_id, [
             InputMediaPhoto(media=FSInputFile(path), caption=caption if k == 0 else None)
@@ -8850,17 +8897,19 @@ async def make_birthday_post(bot: Bot, chat_id: int) -> None:
                                            extra=f"Роль: {f['role']}" if f["role"] else None)
             cards.append(work / f"film{k}.jpg")
             card.save(cards[-1], quality=92)
-        ids, kind = await _send_album(bot, chat_id, cards, post)
+        ids, kind = await _send_album(bot, chat_id, cards, post, "#деньрождения")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, "pt:bd", [f["title"] for f in films], "Пост ко дню рождения готов",
                      f"Какой фильм с {'ней' if female else 'ним'} ваш любимый? 🎬")
 
 
-async def make_facts_post(bot: Bot, chat_id: int, era: str = "") -> None:
-    """5 фактов о фильме (Кинопоиск, интернет, Telegram-каналы): карточка фильма и кадры со знаком канала."""
+async def make_facts_post(bot: Bot, chat_id: int, era: str = "", film_id: int = 0, voted: bool = False) -> None:
+    """5 фактов о фильме (Кинопоиск, интернет, Telegram-каналы): карточка фильма и кадры со знаком канала.
+    film_id — этот фильм (voted — его выбрали подписчики в опросе), иначе — случайный."""
     hist = await _posts_history()
-    film, kp_facts = await shorts_daily.pick_fact_film(kp._get, "", {int(x) for x in hist["facts"]},
+    film, kp_facts = await shorts_daily.pick_fact_film(kp._get, f"id:{film_id}" if film_id else "",
+                                                       {int(x) for x in hist["facts"]},
                                                        web=shorts_ai.available(GEMINI_API_KEY), era=era)
     facts, _ = await shorts_daily.gather_facts(film, kp_facts, GEMINI_API_KEY)
     title, year = shorts_daily._title(film), film.get("year") or ""
@@ -8869,7 +8918,8 @@ async def make_facts_post(bot: Bot, chat_id: int, era: str = "") -> None:
     task = (f"Напиши пост «Факты о {kind_word} «{title}» ({year}), которые знают не все»: заголовок КАПСОМ с "
             "эмодзи, одна вводная фраза, затем 5 фактов из материала строками «1️⃣ …» — каждый 1–2 коротких "
             "предложения своими словами, без спойлеров; в конце вопрос «Какой факт удивил больше всего?» и строка "
-            "реакций.")
+            "реакций." + (" Начни с того, что этот фильм выбрали подписчики в опросе «Выбор подписчиков» — "
+                          "спасибо, что голосовали!" if voted else ""))
     post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material, search=False) or "\n".join(
         [f"💡 ФАКТЫ О {kind_word.upper()} «{title.upper()}»!", ""]
         + [f"{n} {f}" for n, f in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"], facts)]
@@ -8894,7 +8944,7 @@ async def make_facts_post(bot: Bot, chat_id: int, era: str = "") -> None:
             if frame:
                 cards.append(work / f"frame{k}.jpg")
                 (await asyncio.to_thread(shorts_postcard.watermark, frame)).save(cards[-1], quality=92)
-        ids, kind = await _send_album(bot, chat_id, cards, post)
+        ids, kind = await _send_album(bot, chat_id, cards, post, "#факты", kp.watch_links(film))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, f"pt:fx:{era or 'any'}", what="Пост с фактами готов")
@@ -8952,7 +9002,7 @@ async def make_quiz_post(bot: Bot, chat_id: int) -> None:
         post = ("🎬 УГАДАЙ ФИЛЬМ ПО КАДРУ!\n\nУзнаёшь, из какого фильма этот кадр? 🤔 Голосуй в викторине ниже — "
                 "правильный ответ откроется сразу после голоса 👇\n\n🔥 — угадал с первого взгляда ❤️ — сложно, но "
                 "интересно\n📤 Перешли другу — проверь, угадает ли он\n\n#УгадайФильм #КиноВикторина #KinoMir360")
-        ids, kind = await _send_album(bot, chat_id, [card], post)
+        ids, kind = await _send_album(bot, chat_id, [card], post, "#викторина")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["quiz"] = (hist["quiz"] + [str(film["id"])])[-200:]
@@ -8983,7 +9033,7 @@ async def make_quote_post(bot: Bot, chat_id: int) -> None:
             cards.append(work / "quote.jpg")
             (await asyncio.to_thread(shorts_postcard.make_quote_card, frames[0], res["quote"], res["character"],
                                      _label(film))).save(cards[0], quality=92)
-        ids, kind = await _send_album(bot, chat_id, cards, res["post"])
+        ids, kind = await _send_album(bot, chat_id, cards, res["post"], "#цитата")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["quotes"] = (hist["quotes"] + [str(film["id"])])[-200:]
@@ -9039,7 +9089,7 @@ async def make_anniversary_post(bot: Bot, chat_id: int) -> None:
         for k, frame in enumerate(await _frames(film, work, 2, "fr")):
             cards.append(work / f"frame{k}.jpg")
             (await asyncio.to_thread(shorts_postcard.watermark, frame)).save(cards[-1], quality=92)
-        ids, kind = await _send_album(bot, chat_id, cards, post)
+        ids, kind = await _send_album(bot, chat_id, cards, post, "#этотденьвкино")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["anniv"] = (hist["anniv"] + [f"{film['id']}:{today.year}"])[-200:]
@@ -9061,7 +9111,7 @@ async def make_box_office_post(bot: Bot, chat_id: int) -> None:
     try:
         cards = await _list_cards(work, [(n, url, film) for n, (url, film) in zip(names, found)],
                                   [f"Сборы уикенда: {f['gross']}" if f.get("gross") else "" for f in res["films"]])
-        ids, kind = await _send_album(bot, chat_id, cards, res["post"])
+        ids, kind = await _send_album(bot, chat_id, cards, res["post"], "#сборы")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, what="Пост «Сборы уикенда» готов")
@@ -9089,7 +9139,7 @@ async def make_week_post(bot: Bot, chat_id: int) -> None:
     work.mkdir(parents=True, exist_ok=True)
     try:
         cards = await _list_cards(work, [(n, url, film) for n, (url, film) in zip(names, found)])
-        ids, kind = await _send_album(bot, chat_id, cards, res["post"])
+        ids, kind = await _send_album(bot, chat_id, cards, res["post"], "#итогинедели")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, what="Итоги недели готовы")
@@ -9099,6 +9149,281 @@ def _subs_word(n: int) -> str:
     if n % 10 == 1 and n % 100 != 11:
         return "подписчик"
     return "подписчика" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "подписчиков"
+
+
+async def make_evening_post(bot: Bot, chat_id: int) -> None:
+    """«🎬 Фильм вечера»: один отличный фильм — почему стоит посмотреть, трейлер со звуком с Rutube
+    (или карточка), «Где смотреть» — ссылки на онлайн-кинотеатры."""
+    hist = await _posts_history()
+    used = {int(x) for x in hist["evening"]}
+    pick = next((f for f in await _popular_films(20) if f["id"] not in used
+                 and shorts_daily._best_rating(f)[0] >= 7.5), None)
+    if not pick:
+        raise RuntimeError("не нашлось фильма — попробуй ещё раз")
+    film = await kp._get(f"/movie/{pick['id']}")
+    title = shorts_daily._title(film)
+    task = (f"Напиши пост «🎬 ФИЛЬМ ВЕЧЕРА» про «{title}» ({film.get('year') or ''}): заголовок КАПСОМ с "
+            "эмодзи, о чём фильм в 2 предложениях без спойлеров, почему стоит посмотреть именно сегодня (2–3 "
+            "пункта с эмодзи), кто играет, для какого настроения; в конце строка реакций (например «🍿 — смотрю "
+            "сегодня ❤️ — уже видел»).")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, _film_line(film), search=False) or "\n".join([
+        f"🎬 ФИЛЬМ ВЕЧЕРА: {_label(film).upper()}", "",
+        str(film.get("shortDescription") or film.get("description") or "")[:400], "",
+        "🍿 — смотрю сегодня ❤️ — уже видел"])
+    links = kp.watch_links(film)
+    hist["evening"] = (hist["evening"] + [str(film["id"])])[-200:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    work = SHORTS_DIR / f"evening_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        trailer = await _rutube_post_trailer([title, str(film.get("enName") or film.get("alternativeName") or "")], work)
+        if trailer:
+            sent = await bot.send_video(chat_id, FSInputFile(trailer), caption=post_caption(post, "#фильмвечера", links),
+                                        supports_streaming=True)
+            ids, kind = [sent.message_id], "caption"
+        else:
+            cards: list[Path] = []
+            poster = await _image(shorts_daily._poster_url(film), work, "poster")
+            if poster:
+                rating, label = shorts_daily._best_rating(film)
+                cards.append(work / "card.jpg")
+                (await asyncio.to_thread(
+                    shorts_postcard.make_post_card, poster, title, 0, 0, rating or None, label, film.get("year"),
+                    shorts_daily._genres(film)[:2], shorts_daily._actors(film, 3))).save(cards[-1], quality=92)
+            ids, kind = await _send_album(bot, chat_id, cards, post, "#фильмвечера", links)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "pt:ev", what="Фильм вечера готов")
+
+
+async def make_battle_post(bot: Bot, chat_id: int) -> None:
+    """«⚔️ Битва фильмов»: два известных фильма одного жанра, карточка с VS и опрос «Какой лучше?»."""
+    hist = await _posts_history()
+    films = [f for f in await _popular_films(15) if shorts_daily._poster_url(f)]
+    pairs = [(a, b) for i, a in enumerate(films) for b in films[i + 1:]
+             if set(shorts_daily._genres(a)) & set(shorts_daily._genres(b))
+             and f"{min(a['id'], b['id'])}:{max(a['id'], b['id'])}" not in hist["battle"]]
+    if not pairs:
+        raise RuntimeError("не нашлось пары фильмов — попробуй ещё раз")
+    a, b = random.choice(pairs[:10])
+    work = SHORTS_DIR / f"battle_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        pa = await _image(shorts_daily._poster_url(a), work, "a")
+        pb = await _image(shorts_daily._poster_url(b), work, "b")
+        if not pa or not pb:
+            raise RuntimeError("не скачались постеры — попробуй ещё раз")
+        card = work / "battle.jpg"
+        (await asyncio.to_thread(shorts_postcard.make_battle_card, pa, pb, shorts_daily._title(a),
+                                 shorts_daily._title(b))).save(card, quality=92)
+        post = "\n".join([
+            f"⚔️ БИТВА ФИЛЬМОВ: {_label(a)} или {_label(b)}?", "",
+            f"🅰️ {_label(a)} — " + (str(a.get("shortDescription") or "").strip() or "классика жанра"),
+            f"🅱️ {_label(b)} — " + (str(b.get("shortDescription") or "").strip() or "классика жанра"), "",
+            "Голосуй в опросе ниже и защищай свой выбор в комментариях 👇", "",
+            "📤 Перешли другу — узнай, на чьей он стороне"])
+        ids, kind = await _send_album(bot, chat_id, [card], post, "#битвафильмов")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    hist["battle"] = (hist["battle"] + [f"{min(a['id'], b['id'])}:{max(a['id'], b['id'])}"])[-200:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await offer_post(bot, chat_id, ids, kind, "pt:bt", [shorts_daily._title(a), shorts_daily._title(b)],
+                     "Битва фильмов готова", "Какой фильм лучше? ⚔️")
+
+
+async def make_vote_post(bot: Bot, chat_id: int) -> None:
+    """«🗳 Выбор подписчиков»: 4 фильма и опрос «О каком фильме рассказать факты?»; в пятницу — итог."""
+    films = [f for f in await _popular_films(20) if shorts_daily._poster_url(f)][:4]
+    if len(films) < 4:
+        raise RuntimeError("мало фильмов — попробуй ещё раз")
+    titles = [shorts_daily._title(f)[:100] for f in films]
+    post = "\n".join([
+        "🗳 ВЫБОР ПОДПИСЧИКОВ!", "", "О каком фильме рассказать интересные факты в пятницу? Решаете вы 👇", "",
+        *[f"{n} {_label(f)}" for n, f in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣"], films)], "",
+        "Голосуй в опросе — в пятницу пост о победителе 🔥"])
+    work = SHORTS_DIR / f"vote_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        cards = await _list_cards(work, [(shorts_daily._title(f), shorts_daily._poster_url(f), f) for f in films])
+        ids, kind = await _send_album(bot, chat_id, cards, post, "#выборподписчиков")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "pt:vt", what="Голосование готово. После публикации под ним будет "
+                     f"опрос «{VOTE_QUESTION}», в пятницу бот подведёт итог",
+                     extra={"vote": {"ids": [int(f["id"]) for f in films], "titles": titles}})
+
+
+async def make_vote_result_post(bot: Bot, chat_id: int) -> None:
+    """Итог «Выбора подписчиков»: закрываем опрос в канале и делаем факты о победителе."""
+    vote = await _json_setting("vote_poll", {})
+    if not vote:
+        raise NothingToday("в канале нет опроса «Выбор подписчиков» — сначала опубликуй голосование")
+    await set_shorts_setting("vote_poll", None)
+    try:
+        poll = await bot.stop_poll(POST_CHANNEL, vote["message_id"])
+        counts = [o.voter_count for o in poll.options]
+    except Exception as exc:  # noqa: BLE001 — опрос уже закрыт или удалён — берём первый вариант
+        logging.info("Vote poll stop failed: %s", exc)
+        counts = [0] * len(vote["ids"])
+    winner = vote["ids"][max(range(len(counts)), key=lambda i: counts[i])] if counts else vote["ids"][0]
+    await make_facts_post(bot, chat_id, film_id=winner, voted=True)
+
+
+async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
+    """«🎭 Ляпы в кино»: известный фильм с 3+ ляпами Кинопоиска, пересказ своими словами, кадры со знаком."""
+    hist = await _posts_history()
+    used = {int(x) for x in hist["bloopers"]}
+    film, bloopers = None, []
+    for pick in [f for f in await _popular_films(15) if f["id"] not in used][:8]:
+        full = await kp._get(f"/movie/{pick['id']}")
+        bloopers = [shorts_daily._clean_fact(f.get("value")) for f in full.get("facts") or []
+                    if isinstance(f, dict) and str(f.get("type") or "").upper() == "BLOOPER" and not f.get("spoiler")]
+        bloopers = [b for b in bloopers if 30 <= len(b) <= 400]
+        if len(bloopers) >= 3:
+            film = full
+            break
+    if not film:
+        raise RuntimeError("не нашлось фильма с ляпами — попробуй ещё раз")
+    title = shorts_daily._title(film)
+    task = (f"Напиши пост «🎭 Ляпы в «{title}» ({film.get('year') or ''}), которые вы не замечали»: заголовок "
+            "КАПСОМ с эмодзи, 3–5 ляпов из материала строками «1️⃣ …» — своими словами, коротко и с юмором; в конце "
+            "вопрос «А вы замечали?» и строка реакций.")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, _film_line(film) + "\n\nЛяпы:\n" + "\n".join(
+        f"— {b}" for b in bloopers[:8]), search=False) or "\n".join(
+        [f"🎭 ЛЯПЫ В {_label(film).upper()}", ""] + [f"{n} {b}" for n, b in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"],
+                                                                               bloopers)]
+        + ["", "А вы замечали? 👇", "", "🔥 — замечал ❤️ — теперь пересмотрю"])
+    hist["bloopers"] = (hist["bloopers"] + [str(film["id"])])[-200:]
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    work = SHORTS_DIR / f"bloopers_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        cards: list[Path] = []
+        poster = await _image(shorts_daily._poster_url(film), work, "poster")
+        if poster:
+            rating, label = shorts_daily._best_rating(film)
+            cards.append(work / "card.jpg")
+            (await asyncio.to_thread(shorts_postcard.make_post_card, poster, title, pill=("ЛЯПЫ", ""),
+                                     meta=" · ".join(x for x in [str(film.get("year") or ""),
+                                                                 ", ".join(shorts_daily._genres(film)[:2])] if x),
+                                     extra=(f"{label} {rating:.1f}" if rating else None))).save(cards[-1], quality=92)
+        for k, frame in enumerate(await _frames(film, work, 2, "fr")):
+            cards.append(work / f"frame{k}.jpg")
+            (await asyncio.to_thread(shorts_postcard.watermark, frame)).save(cards[-1], quality=92)
+        ids, kind = await _send_album(bot, chat_id, cards, post, "#ляпы")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "pt:bl", what="Пост с ляпами готов")
+
+
+async def _bot_link(bot: Bot) -> str:
+    me = await bot.get_me()
+    return f"https://t.me/{me.username}"
+
+
+async def _card_post(bot: Bot, chat_id: int, tagline: str, link: str, post: str, rubric: str = "") -> list[int]:
+    """Пост с рекламной картинкой канала (логотип, свежие постеры) и своей строкой-призывом."""
+    today = datetime.now(MSK).date()
+    films = await shorts_daily.pick_films(kp._get, shorts_daily.theme_for("online", today), today, set())
+    if len(films) < 4:
+        films += await _popular_films(3)
+    work = SHORTS_DIR / f"card_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        posters = [img for img in [await _image(shorts_daily._poster_url(f), work, f"p{k}_")
+                                   for k, f in enumerate(films[:4])] if img]
+        card = work / "promo.jpg"
+        (await asyncio.to_thread(shorts_postcard.make_promo_card, posters, tagline, link)).save(card, quality=92)
+        sent = await bot.send_photo(chat_id, FSInputFile(card), caption=post_caption(post, rubric))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return [sent.message_id]
+
+
+async def make_bot_post(bot: Bot, chat_id: int) -> None:
+    """«🤖 Подбери фильм в нашем боте»: пост с кнопкой-ссылкой на бота VKino."""
+    url = await _bot_link(bot)
+    post = "\n".join([
+        "🤖 НЕ ЗНАЕШЬ, ЧТО ПОСМОТРЕТЬ? СПРОСИ НАШЕГО БОТА!", "",
+        "В боте KinoMir360 за пару секунд:", "🔎 найдёшь любой фильм или сериал", "🆕 посмотришь новинки и "
+        "что скоро выйдет", "🎲 получишь случайный фильм на вечер", "⭐ сохранишь фильмы в избранное", "",
+        "Жми кнопку под постом 👇", "", "📤 Перешли другу, который вечно не знает, что посмотреть"])
+    ids = await _card_post(bot, chat_id, "Бот подберёт фильм на вечер", url.replace("https://", ""), post)
+    await offer_post(bot, chat_id, ids, "caption", "pt:ab", what="Пост про бота готов (в канале под ним будет "
+                     "кнопка «🎬 Подобрать фильм»)", extra={"button": {"text": "🎬 Подобрать фильм", "url": url}})
+
+
+async def make_boost_post(bot: Bot, chat_id: int) -> None:
+    """«⚡ Буст канала»: просьба подписчиков забустить канал — откроются истории и новые реакции."""
+    own = POST_CHANNEL.lstrip("@")
+    url = f"https://t.me/boost/{own}"
+    post = "\n".join([
+        "⚡ ПОДДЕРЖИ KINOMIR360 БУСТОМ!", "",
+        "Если у тебя Telegram Premium — у тебя есть бесплатные бусты. Отдай один нашему каналу: так мы откроем "
+        "истории с трейлерами и новые реакции 🔥", "", "Это бесплатно и займёт 2 секунды — кнопка под постом 👇", "",
+        "❤️ Спасибо, что вы с нами!"])
+    ids = await _card_post(bot, chat_id, "Поддержи канал бустом", f"t.me/boost/{own}", post)
+    await offer_post(bot, chat_id, ids, "caption", what="Пост про буст готов (в канале под ним будет кнопка "
+                     "«⚡ Забустить»)", extra={"button": {"text": "⚡ Забустить канал", "url": url}})
+
+
+async def make_navigator_post(bot: Bot, chat_id: int) -> None:
+    """«📌 Закреп-навигатор»: что есть в канале — рубрики-хэштеги, бот, YouTube и MAX; закрепить в канале."""
+    url = await _bot_link(bot)
+    post = "\n".join([
+        "📌 ДОБРО ПОЖАЛОВАТЬ В KINOMIR360!", "", "Всё о кино каждый день. Жми на хэштег — увидишь все посты рубрики:",
+        "", *[f"{name} — {tag}" for tag, name in RUBRICS.items()], "",
+        f"🤖 Подобрать фильм: {url.replace('https://', '')}", f"📺 YouTube: {shorts_daily.YOUTUBE_URL.replace('https://', '')}",
+        f"💬 Мы в MAX: {MAX_URL.replace('https://', '')}"])
+    ids = await _card_post(bot, chat_id, "Всё о кино каждый день", f"t.me/{POST_CHANNEL.lstrip('@')}", post)
+    await offer_post(bot, chat_id, ids, "caption", what="Навигатор готов. После публикации закрепи его в канале "
+                     "(долгий тап по посту → Закрепить)", extra={"button": {"text": "🎬 Подобрать фильм", "url": url}})
+
+
+async def make_giveaway_post(bot: Bot, chat_id: int) -> None:
+    """«🎁 Розыгрыш»: шаблон совместного конкурса с каналами-партнёрами; приз и партнёров автор вписывает
+    кнопкой «✏️ Поправить текст»."""
+    own = POST_CHANNEL.lstrip("@")
+    post = "\n".join([
+        "🎁 РОЗЫГРЫШ! [ПРИЗ — например, 3 подписки на онлайн-кинотеатр на месяц]", "",
+        "Условия простые:", f"1️⃣ Подпишись на KinoMir360 — t.me/{own}", "2️⃣ Подпишись на каналы-партнёры:",
+        "[@канал1, @канал2, @канал3]", "3️⃣ Нажми «Участвую» под постом (или поставь ❤️)", "",
+        "📅 Итоги — [ДАТА] в [ВРЕМЯ] по МСК. Победителей выберем случайно 🍀", "",
+        "📤 Перешли другу — вдруг повезёт именно ему!"])
+    ids = await _card_post(bot, chat_id, "РОЗЫГРЫШ для подписчиков", f"t.me/{own}", post)
+    await offer_post(bot, chat_id, ids, "caption", what=(
+        "Шаблон розыгрыша готов. Нажми «✏️ Поправить текст» и впиши приз, каналы-партнёры и дату. Победителей "
+        "удобно выбрать встроенным розыгрышем Telegram или ботом @GiveShareBot — он проверит подписку на все "
+        "каналы"))
+
+
+async def make_article(bot: Bot, chat_id: int) -> None:
+    """«📰 Статья для Дзен/VK»: длинная подборка (3–4,5 тыс. знаков) файлом и текстом + карточки-постеры."""
+    today = datetime.now(MSK).date()
+    key = random.choice(["fresh", "online", "topfilms", "topseries", *[f"genre:{g}" for g in SHORTS_GENRES]])
+    theme = shorts_daily.theme_for(key, today)
+    kp_films = await shorts_daily.pick_films(kp._get, theme, today, set())
+    res = await shorts_ai.long_article(GEMINI_API_KEY, theme.hook, [_film_line(f) for f in kp_films],
+                                       f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    if not res:
+        raise RuntimeError(shorts_ai.last_error or "ИИ не написал статью")
+    text = f"{res['title']}\n\n{res['text']}\n\nПодписывайтесь на KinoMir360 в Telegram: t.me/{POST_CHANNEL.lstrip('@')}"
+    await bot.send_document(chat_id, BufferedInputFile(text.encode("utf-8"), filename="statya_kinomir360.txt"),
+                            caption="📰 Статья для Дзена и VK — файл целиком. Ниже текст частями и картинки к ней.")
+    for k in range(0, len(text), 3800):
+        await bot.send_message(chat_id, escape(text[k:k + 3800]), disable_web_page_preview=True)
+    work = SHORTS_DIR / f"article_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        found = [await _list_poster(f, kp_films, []) for f in res["films"]]
+        cards = await _list_cards(work, [(f["ru"] or f["en"], url, film) for f, (url, film) in zip(res["films"], found)])
+        if len(cards) >= 2:
+            await bot.send_media_group(chat_id, [InputMediaPhoto(media=FSInputFile(p)) for p in cards[:10]])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await bot.send_message(chat_id, "👆 Статья готова: скопируй текст в Дзен (dzen.ru → Создать → Статья) или "
+                           "VK (Статьи), картинки — к разделам о фильмах. Яндекс приводит из поиска читателей месяцами.",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔄 Другая статья", "pt:ar")]]))
 
 
 async def make_promo_post(bot: Bot, chat_id: int) -> None:
@@ -9185,7 +9510,7 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     work = SHORTS_DIR / f"list_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
-        ids, kind = await _send_album(bot, chat_id, await _list_cards(work, items), post)
+        ids, kind = await _send_album(bot, chat_id, await _list_cards(work, items), post, "#подборка")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", names, "Подборка готова")
@@ -9304,14 +9629,26 @@ POST_MAKERS.update({
     "bo": ("💰 ИИ ищет в Google сборы прошедшего уикенда…", make_box_office_post),
     "wk": ("🗞 Читаю каналы за неделю, ИИ собирает главное…", make_week_post),
     "pr": ("📣 Готовлю рекламный пост канала для взаимного пиара…", make_promo_post),
+    "ev": ("🎬 Выбираю фильм вечера, ищу трейлер со звуком и где посмотреть…", make_evening_post),
+    "bt": ("⚔️ Подбираю пару фильмов для битвы…", make_battle_post),
+    "vt": ("🗳 Готовлю голосование «Выбор подписчиков»…", make_vote_post),
+    "vr": ("🗳 Подвожу итог голосования и готовлю факты о победителе…", make_vote_result_post),
+    "bl": ("🎭 Ищу фильм с ляпами…", make_bloopers_post),
+    "ab": ("🤖 Готовлю пост про бота…", make_bot_post),
+    "bs": ("⚡ Готовлю пост про буст канала…", make_boost_post),
+    "nv": ("📌 Готовлю закреп-навигатор…", make_navigator_post),
+    "gv": ("🎁 Готовлю шаблон розыгрыша…", make_giveaway_post),
+    "ar": ("📰 ИИ пишет статью для Дзена и VK, обычно 1–2 минуты…", make_article),
 })
 PLAN_HELP = (
     "🗓 <b>Автоплан постов включён.</b> Бот сам готовит посты и присылает тебе — публикуешь кнопкой "
     "(можно «⏰ Позже»):\n"
     "• каждый день 9:00 — 🎂 день рождения звезды\n• каждый день 13:00 — 📅 этот день в кино (если есть "
-    "круглая дата)\n• каждый день 19:00 — 🧩 угадай фильм по кадру\n• пн 12:00 — 💰 сборы уикенда\n"
-    "• ср 15:00 — 💬 цитата дня\n• чт 11:00 — 🍿 премьеры недели в кино\n• пт 11:00 — 🆕 что посмотреть "
-    "на выходных\n• вс 18:00 — 🗞 итоги недели\n\nВремя московское. Выключить — та же кнопка.")
+    "круглая дата)\n• каждый день 19:00 — 🧩 угадай фильм по кадру\n• каждый день 20:00 — 🎬 фильм вечера\n"
+    "• пн 12:00 — 💰 сборы уикенда\n• пн 16:00 — 🗳 выбор подписчиков (голосование)\n• вт 17:00 — ⚔️ битва "
+    "фильмов\n• ср 15:00 — 💬 цитата дня\n• чт 11:00 — 🍿 премьеры недели в кино\n• пт 11:00 — 🆕 что "
+    "посмотреть на выходных\n• пт 16:00 — 🗳 факты о фильме, который выбрали подписчики\n• сб 15:00 — 🎭 ляпы "
+    "в кино\n• вс 18:00 — 🗞 итоги недели\n\nВремя московское. Выключить — та же кнопка.")
 
 
 @router.callback_query(F.data.startswith("pt:"))
