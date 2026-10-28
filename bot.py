@@ -8473,7 +8473,8 @@ async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 POST_CHANNEL = os.getenv("POST_CHANNEL", "@KinoMir360")  # свой канал: из него новости не берём, в него публикуем
 POSTS_EVERY = 30 * 60
 POSTS_NIGHT = range(0, 8)  # часы МСК: ночью авто-посты не присылаем
-POST_SLOTS = (9, 12, 15, 18, 19, 20, 21)  # часы МСК для «⏰ Опубликовать позже»
+POST_TZ = timezone(timedelta(hours=int(os.getenv("POST_TZ_HOURS", "5"))))  # «⏰ Позже» — время автора (Екатеринбург)
+POST_TZ_NAME = os.getenv("POST_TZ_NAME", "Екб")
 # автоплан: (дни недели, 0 — пн; час МСК; что) — бот сам готовит пост и присылает автору на публикацию
 POSTS_PLAN = [
     (range(7), 9, "bd"),          # каждый день — день рождения звезды
@@ -9636,14 +9637,11 @@ def short_caption(result: Any) -> str:
     return f"🎬 {title}\n\n{question}\n\n" + " ".join(shorts_daily._hashtags(result)[:8])
 
 
-def _slots(now: datetime) -> list[datetime]:
-    out = []
-    for day in (0, 1):
-        for hour in POST_SLOTS:
-            at = (now + timedelta(days=day)).replace(hour=hour, minute=0, second=0, microsecond=0)
-            if at > now + timedelta(minutes=5):
-                out.append(at)
-    return out[:6]
+def _hour_slots(now: datetime) -> list[datetime]:
+    """Ближайшие 24 часа для «⏰ Позже»: начала часов, в которых ещё осталось куда поставить пост."""
+    start = now.replace(minute=0, second=0, microsecond=0)
+    hours = [start + timedelta(hours=k) for k in range(25)]
+    return [h for h in hours if h + timedelta(minutes=45) > now + timedelta(minutes=2)][:24]
 
 
 def _when(at: datetime, now: datetime) -> str:
@@ -9786,16 +9784,32 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             pass
         return
     await callback.answer()
-    if kind == "t" and arg.isdigit():  # выбрать время
-        now = datetime.now(MSK)
-        rows = [[_btn(_when(at, now).capitalize(), f"pt:s:{arg}:{int(at.timestamp()) // 60}")
-                 for at in _slots(now)[k:k + 2]] for k in range(0, 6, 2)]
+    if kind == "t" and arg.isdigit():  # «⏰ Позже»: сначала час (ближайшие 24 часа, время автора)
+        now = datetime.now(POST_TZ)
+        hours = _hour_slots(now)
+        buttons = [_btn(("" if h.date() == now.date() else "завтра ") + h.strftime("%H:00"),
+                        f"pt:h:{arg}:{int(h.timestamp()) // 3600}") for h in hours]
+        rows = [buttons[k:k + 4] for k in range(0, len(buttons), 4)]
         rows.append([_btn("⬅️ Назад", f"pt:b:{arg}")])
-        await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r]))
+        await message.edit_text(f"⏰ Выбери час публикации (время {POST_TZ_NAME}), потом — минуты.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    if kind == "h":  # потом минуты: :00, :15, :30, :45
+        first, _, hour = arg.partition(":")
+        if not first.isdigit() or not hour.isdigit():
+            return
+        start = int(hour) * 3600
+        now = time.time()
+        mins = [start + m * 60 for m in (0, 15, 30, 45) if start + m * 60 > now + 60]
+        label = datetime.fromtimestamp(start, POST_TZ).strftime("%H")
+        rows = [[_btn(f"{label}:{datetime.fromtimestamp(t, POST_TZ):%M}", f"pt:s:{first}:{t // 60}") for t in mins]]
+        rows.append([_btn("⬅️ Другой час", f"pt:t:{first}")])
+        await message.edit_text(f"⏰ Час выбран: {label}:00. Теперь минуты (время {POST_TZ_NAME}).",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r]))
         return
     if kind == "b" and arg.isdigit():
         meta = await _post_meta(chat_id, int(arg))
-        await message.edit_reply_markup(reply_markup=post_keyboard(int(arg), yt=bool(meta.get("yt"))))
+        await message.edit_text("👆 Пост готов.", reply_markup=post_keyboard(int(arg), yt=bool(meta.get("yt"))))
         return
     if kind == "s":  # поставить в очередь
         first, _, minute = arg.partition(":")
@@ -9805,8 +9819,8 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == int(first))]
         queue.append({"chat": chat_id, "first": int(first), "at": at})
         await set_shorts_setting("posts_queue", json.dumps(queue))
-        when = _when(datetime.fromtimestamp(at, MSK), datetime.now(MSK))
-        await message.edit_text(f"⏰ Пост выйдет в канале {when} (МСК).", reply_markup=InlineKeyboardMarkup(
+        when = _when(datetime.fromtimestamp(at, POST_TZ), datetime.now(POST_TZ))
+        await message.edit_text(f"⏰ Пост выйдет в канале {when} ({POST_TZ_NAME}).", reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[_btn("📢 Нет, опубликовать сейчас", f"pt:p:{first}")],
                              [_btn("❌ Отменить", f"pt:u:{first}")]]))
         return
