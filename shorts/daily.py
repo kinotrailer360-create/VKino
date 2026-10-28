@@ -1071,7 +1071,7 @@ async def synthesize(lines: list[str], work: Path,
         words = []
         if piper_ready():
             # весь ролик одним голосом: переозвучиваем все фразы запасным
-            tts_note = f"🗣 Основной голос не ответил ({reason[:220]}) — озвучено запасным голосом."
+            tts_note = f"🗣 Голос Microsoft тоже не ответил ({reason[:220]}) — озвучено запасным голосом Piper."
             try:
                 await _piper_batch(list(zip(speak, parts)))
                 words = [[] for _ in speak]
@@ -1085,8 +1085,10 @@ async def synthesize(lines: list[str], work: Path,
                 await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
                            "-t", f"{sec:.2f}", str(parts[i]))
     voiced = not failed
-    if lumean_note and not tts_note:
-        tts_note = lumean_note
+    if lumean_note:  # причину отказа Lumean показываем всегда — иначе не понять, почему не основной голос
+        tts_note = f"{lumean_note}\n{tts_note}" if tts_note else lumean_note
+    elif tts_note and not lumean.enabled():
+        tts_note += "\n🗣 Голос Lumean не подключён: бот не видит LUMEAN_API_KEY в .env."
     if dropped and not tts_note:
         tts_note = ("🗣 Основной голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
                     + "; ".join(f"«{d[:60]}»" for d in dropped[:3]))
