@@ -42,8 +42,18 @@ async def _resolve(session: aiohttp.ClientSession, key: str, item: dict[str, Any
     if item.get("year"):
         params["first_air_date_year" if kind == "tv" else "year"] = item["year"]
     data = await _get(session, key, f"/search/{kind}", **params)
-    results = data.get("results") or []
-    return (kind, int(results[0]["id"])) if results else None
+    # только точное совпадение названия: первый результат поиска бывает другим фильмом
+    # («Переводчик» — The Covenant, а первым TMDB отдавал The Blood Covenant)
+    names = {_norm(t) for t in (item.get("enName"), item.get("alternativeName"), item.get("name")) if t}
+    for r in data.get("results") or []:
+        found = {_norm(r.get(k)) for k in ("title", "original_title", "name", "original_name") if r.get(k)}
+        if names & found:
+            return kind, int(r["id"])
+    return None
+
+
+def _norm(text: Any) -> str:
+    return re.sub(r"[^\w]+", "", str(text or "").lower().replace("ё", "е"))
 
 
 async def images(key: str, item: dict[str, Any], limit: int = 8) -> tuple[list[str], list[str]]:

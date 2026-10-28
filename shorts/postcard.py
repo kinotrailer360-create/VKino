@@ -207,3 +207,63 @@ def make_quiz_card(img: Image.Image) -> Image.Image:
               font=_font("Montserrat.ttf", 36, "SemiBold"), fill="white", anchor="mm")
     _brand_pill(card, H - 118)
     return card.convert("RGB")
+
+
+def make_promo_card(posters: list[Image.Image], tagline: str = "Новинки · подборки · факты · трейлеры",
+                    link: str = "t.me/KinoMir360") -> Image.Image:
+    """Рекламная картинка канала для взаимного пиара: логотип, название, 4 свежих постера, ссылка."""
+    card = (_backdrop(posters[0], 0.7) if posters else Image.new("RGBA", (W, H), INK + (255,)))
+    draw = ImageDraw.Draw(card)
+    logo = Image.open(ASSETS / "logo.png").convert("RGBA")
+    logo.thumbnail((150, 150))
+    card.alpha_composite(logo, ((W - logo.width) // 2, 36))
+    y = 46 + logo.height
+    draw.text((W // 2, y), BRAND.upper(), font=_font("Oswald.ttf", 96, "Bold"), fill="white", anchor="mt",
+              stroke_width=2, stroke_fill=(0, 0, 0))
+    y += 120
+    draw.text((W // 2, y), tagline, font=_font("Montserrat.ttf", 34, "SemiBold"), fill=ACCENT, anchor="mt")
+    # 2×2 постера в рамках цвета канала
+    pw, ph, gap = 290, 390, 26
+    x0, y0 = (W - 2 * pw - gap) // 2, y + 70
+    for k, img in enumerate(posters[:4]):
+        x, yy = x0 + (k % 2) * (pw + gap), y0 + (k // 2) * (ph + gap)
+        draw.rounded_rectangle((x - 5, yy - 5, x + pw + 5, yy + ph + 5), radius=16, fill=ACCENT)
+        card.paste(_cover(img.convert("RGB"), pw, ph, 0.3), (x, yy))
+    rows = (min(len(posters), 4) + 1) // 2
+    link_y = y0 + rows * (ph + gap) + 20
+    draw = ImageDraw.Draw(card)
+    font = _font("Montserrat.ttf", 44, "Bold")
+    lw = draw.textlength(link, font=font)
+    draw.rounded_rectangle(((W - lw) // 2 - 40, link_y - 10, (W + lw) // 2 + 40, link_y + 70), radius=40, fill=ACCENT)
+    draw.text((W // 2, link_y + 30), link, font=font, fill=INK, anchor="mm")
+    return card.convert("RGB")
+
+
+def make_battle_card(left: Image.Image, right: Image.Image, left_title: str, right_title: str) -> Image.Image:
+    """«Битва фильмов»: два постера рядом, круг VS между ними, названия, знак канала."""
+    card = _backdrop(left, 0.7)
+    draw = ImageDraw.Draw(card)
+    draw.text((W // 2, 120), "БИТВА ФИЛЬМОВ", font=_font("Oswald.ttf", 104, "Bold"), fill="white", anchor="mm",
+              stroke_width=2, stroke_fill=(0, 0, 0))
+    draw.text((W // 2, 215), "Какой лучше? Голосуй в опросе", font=_font("Montserrat.ttf", 34, "SemiBold"),
+              fill=ACCENT, anchor="mm")
+    pw, ph, gap, top = 470, 700, 40, 290
+    for k, (img, title) in enumerate(((left, left_title), (right, right_title))):
+        x = (W - 2 * pw - gap) // 2 + k * (pw + gap)
+        draw.rounded_rectangle((x - 5, top - 5, x + pw + 5, top + ph + 5), radius=18, fill=ACCENT)
+        card.paste(_cover(img.convert("RGB"), pw, ph, 0.3), (x, top))
+        font, rows = None, []
+        for size in range(56, 30, -4):
+            font = _font("Oswald.ttf", size, "Bold")
+            rows = _wrap(draw, title.upper(), font, pw - 10, 2)
+            if "…" not in rows[-1]:
+                break
+        y = top + ph + 30
+        for row in rows:
+            draw.text((x + pw // 2, y), row, font=font, fill="white", anchor="mt")
+            y += round(font.size * 1.1)
+    cx, cy, r = W // 2, top + ph // 2, 78
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=ACCENT, outline=INK, width=6)
+    draw.text((cx, cy), "VS", font=_font("Oswald.ttf", 80, "Bold"), fill=INK, anchor="mm")
+    _brand_pill(card, H - 118)
+    return card.convert("RGB")
