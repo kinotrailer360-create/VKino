@@ -51,6 +51,8 @@ from shorts import ai as shorts_ai
 from shorts import tgsearch as shorts_tgsearch
 from shorts import postcard as shorts_postcard
 from shorts import clips as shorts_clips
+from shorts import youtube_upload as shorts_yt
+from shorts import linkfetch as shorts_linkfetch
 from shorts import news as shorts_news
 from shorts import lumean as shorts_lumean
 from shorts import pronounce as shorts_pronounce
@@ -6407,7 +6409,9 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         height=1920,
         supports_streaming=True,
     )
-    await offer_post(bot, chat_id, [video.message_id], "caption", what="Шортс готов и для Telegram-канала")
+    keep_for_upload(chat_id, video.message_id, result)
+    await offer_post(bot, chat_id, [video.message_id], "caption", what="Шортс готов и для Telegram-канала",
+                     extra={"yt": True})
     for label, key in (
         ("Название", "title"),
         ("Описание", "description"),
@@ -8496,6 +8500,7 @@ post_lock = asyncio.Lock()
 
 class PostState(StatesGroup):
     edit = State()
+    link = State()
 
 
 async def _posts_history() -> dict[str, list[str]]:
@@ -8565,9 +8570,11 @@ async def _post_meta(chat_id: int, first: int) -> dict[str, Any]:
                                                                                    "poll": []}
 
 
-def post_keyboard(first: int, more: str = "") -> InlineKeyboardMarkup:
+def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboardMarkup:
     rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
             [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")]]
+    if yt:  # шортс — загрузка на YouTube одной кнопкой
+        rows.insert(1, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
     if more:
         rows.append([_btn("🔄 Ещё такой же", more), _btn("📝 Другие посты", "pt:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -8579,7 +8586,7 @@ async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: st
     await save_post(chat_id, ids, kind, poll, question, quiz, extra)
     await bot.send_message(chat_id, f"👆 {what}"
                            + (f". После публикации в канале добавлю опрос «{escape(question)}»." if poll else "."),
-                           reply_markup=post_keyboard(ids[0], more))
+                           reply_markup=post_keyboard(ids[0], more, bool((extra or {}).get("yt"))))
 
 
 async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
@@ -8709,6 +8716,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
     rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
              for k in range(0, len(SHORTS_GENRES), 3)]
+    rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
     rows.append([_btn("🎂 День рождения звезды", "pt:bd"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
@@ -8982,7 +8990,8 @@ async def make_quiz_post(bot: Bot, chat_id: int) -> None:
     work = SHORTS_DIR / f"quiz_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
-        for film in [f for f in films if f["id"] not in used][:6]:
+        for pick in [f for f in films if f["id"] not in used][:6]:
+            film = await kp._get(f"/movie/{pick['id']}")  # полная карточка — с id TMDB/IMDb, кадр точно из него
             frames = await _frames(film, work, 1, "q")
             if frames:
                 break
@@ -9516,6 +9525,108 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", names, "Подборка готова")
 
 
+# ---------------------------------------------------------------- загрузка шортсов на YouTube
+
+YT_CLIENT_ID = os.getenv("YT_CLIENT_ID", "").strip()
+YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET", "").strip()
+READY_DIR = SHORTS_DIR / "ready"  # готовые шортсы ждут загрузки на YouTube 3 дня
+READY_DAYS = 3
+yt_lock = asyncio.Lock()
+
+YT_SETUP = (
+    "▶️ <b>Загрузка на YouTube ещё не настроена.</b> Один раз, ~10 минут, с телефона:\n\n"
+    "1. Открой console.cloud.google.com → проект <b>vkino2</b> → «APIs &amp; Services» → «Library» → найди "
+    "<b>YouTube Data API v3</b> → «Enable».\n"
+    "2. «OAuth consent screen» → тип <b>External</b> → название «KinoMir360 bot», твоя почта → сохрани. В «Test "
+    "users» добавь свою Gmail (ту, где YouTube-канал). Потом нажми «Publish app» — иначе вход слетает каждые 7 дней.\n"
+    "3. «Credentials» → «Create credentials» → «OAuth client ID» → тип <b>TVs and Limited Input devices</b> → "
+    "«Create». Скопируй Client ID и Client secret.\n"
+    "4. В Termius: <code>nano /opt/vkino/deploy/.env</code>, добавь две строки\n"
+    "<code>YT_CLIENT_ID=…</code>\n<code>YT_CLIENT_SECRET=…</code>\nсохрани и перезапусти бота: "
+    "<code>cd /opt/vkino/deploy &amp;&amp; docker compose up -d</code>\n"
+    "5. Нажми «▶️ Загрузить на YouTube» ещё раз — бот покажет код для входа.\n\n"
+    "⚠️ Пока Google не одобрит проект, ролики загружаются <b>приватными</b>. Чтобы загружались публичными, "
+    "подай бесплатную заявку «YouTube API Services — Audit and Quota Extension Form» "
+    "(support.google.com/youtube/contact/yt_api_form), рассмотрение — несколько недель.")
+
+
+def keep_for_upload(chat_id: int, message_id: int, result: Any) -> None:
+    """Сохранить готовый шортс и его SEO для кнопки «▶️ Загрузить на YouTube» (старше 3 дней — удаляем)."""
+    try:
+        READY_DIR.mkdir(parents=True, exist_ok=True)
+        for old in READY_DIR.iterdir():
+            if time.time() - old.stat().st_mtime > READY_DAYS * 86400:
+                old.unlink(missing_ok=True)
+        shutil.copy(result.video, READY_DIR / f"{chat_id}_{message_id}.mp4")
+        (READY_DIR / f"{chat_id}_{message_id}.json").write_text(json.dumps(result.seo, ensure_ascii=False))
+    except Exception:  # noqa: BLE001 — без копии просто не будет загрузки на YouTube
+        logging.exception("Keep short for upload failed")
+
+
+async def _yt_login(message: Message) -> str:
+    """Вход по коду: показываем код, ждём подтверждения на google.com/device; refresh-токен — в базу."""
+    device = await shorts_yt.device_start(YT_CLIENT_ID)
+    await message.answer(
+        "🔐 <b>Вход в YouTube</b>\n\n1. Открой <b>google.com/device</b> (или "
+        f"{escape(str(device.get('verification_url') or 'https://www.google.com/device'))})\n"
+        f"2. Введи код: <code>{escape(str(device['user_code']))}</code>\n"
+        "3. Выбери аккаунт и YouTube-канал KinoMir360, нажми «Разрешить».\n\n"
+        "Google покажет «приложение не проверено» — это твоё же приложение: «Дополнительно» → «Перейти». "
+        "Жду подтверждения до 30 минут, потом загружу ролик сам.")
+    refresh = await shorts_yt.device_wait(YT_CLIENT_ID, YT_CLIENT_SECRET, device)
+    await set_shorts_setting("yt_refresh", refresh)
+    await message.answer("✅ YouTube подключён — дальше загрузка одной кнопкой, без кода.")
+    return refresh
+
+
+@router.callback_query(F.data.startswith("yt:"))
+async def youtube_button(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message = callback.message
+    first = (callback.data or "")[3:]
+    if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
+        await message.answer(YT_SETUP, disable_web_page_preview=True)
+        return
+    video = READY_DIR / f"{message.chat.id}_{first}.mp4"
+    seo_file = video.with_suffix(".json")
+    if not video.exists() or not seo_file.exists():
+        await message.answer(f"Файла этого шортса уже нет на сервере (храню {READY_DAYS} дня). Собери ролик заново.")
+        return
+    if yt_lock.locked():
+        await message.answer("⏳ Уже идёт загрузка на YouTube — подожди минуту.")
+        return
+
+    async def job() -> None:
+        async with yt_lock:
+            try:
+                refresh = await shorts_setting("yt_refresh") or await _yt_login(message)
+                try:
+                    token = await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, refresh)
+                except shorts_yt.LoginExpired:
+                    await set_shorts_setting("yt_refresh", None)
+                    await message.answer("Вход в YouTube устарел — войдём заново.")
+                    token = await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, await _yt_login(message))
+                wait = await message.answer("▶️ Загружаю шортс на YouTube…")
+                res = await shorts_yt.upload(token, video, json.loads(seo_file.read_text()))
+                link = f"https://youtube.com/shorts/{res['id']}"
+                if res["privacy"] == "public":
+                    await wait.edit_text(f"✅ Шортс на YouTube: {link}")
+                else:
+                    await wait.edit_text(
+                        f"✅ Шортс загружен, но YouTube сделал его <b>приватным</b>: {link}\n\nТак Google поступает "
+                        "с роликами из непроверенных проектов. Открой YouTube Studio → ролик → «Доступ» → "
+                        "«Открытый доступ», а чтобы дальше загружались сразу открытыми — подай заявку на аудит "
+                        "(support.google.com/youtube/contact/yt_api_form).")
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("YouTube upload failed")
+                await message.answer(f"❌ YouTube: <code>{escape(str(exc)[:300])}</code>")
+
+    _run_job(job)
+
+
 def short_caption(result: Any) -> str:
     """Подпись шортса для Telegram-канала: название, вопрос зрителям, хэштеги, подпись канала."""
     seo = result.seo
@@ -9683,7 +9794,8 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r]))
         return
     if kind == "b" and arg.isdigit():
-        await message.edit_reply_markup(reply_markup=post_keyboard(int(arg)))
+        meta = await _post_meta(chat_id, int(arg))
+        await message.edit_reply_markup(reply_markup=post_keyboard(int(arg), yt=bool(meta.get("yt"))))
         return
     if kind == "s":  # поставить в очередь
         first, _, minute = arg.partition(":")
@@ -9701,7 +9813,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if kind == "u" and arg.isdigit():
         queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == int(arg))]
         await set_shorts_setting("posts_queue", json.dumps(queue))
-        await message.edit_text("Отложенная публикация отменена.", reply_markup=post_keyboard(int(arg)))
+        meta = await _post_meta(chat_id, int(arg))
+        await message.edit_text("Отложенная публикация отменена.",
+                                reply_markup=post_keyboard(int(arg), yt=bool(meta.get("yt"))))
         return
     if kind == "e" and arg.isdigit():  # поправить текст
         await state.set_state(PostState.edit)
@@ -9712,6 +9826,14 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if action == "menu":
         await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
                              "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
+        return
+    if action == "lk":
+        await state.set_state(PostState.link)
+        await message.answer(
+            "🔗 Пришли ссылку на новость — или несколько ссылок в одном сообщении (сайты, посты Telegram-каналов). "
+            "Можно просто переслать пост из канала или вставить текст. ИИ перескажет своими словами в стиле "
+            "канала, добавит эмодзи и хэштеги; фото или видео возьму из источника.\n\n"
+            "После ссылок можно дописать пожелание, например: «с юмором», «коротко».\n\n<i>Передумал — /cancel</i>")
         return
     if action == "plan":
         on = await shorts_setting("posts_plan") == "off"
@@ -9784,6 +9906,97 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         _run_job(job)
 
 
+URL_RE = re.compile(r"https?://\S+|(?<!\w)t\.me/\S+")
+
+
+@router.message(PostState.link, ~F.text.startswith("/"))
+async def post_from_link(message: Message, state: FSMContext) -> None:
+    """«🔗 Пост по ссылке»: ссылки (сайты, посты каналов), пересланный пост или текст → пост в стиле канала."""
+    await state.clear()
+    raw = message.text or message.caption or ""
+    urls = list(dict.fromkeys(
+        [u.rstrip(").,»\"'") for u in URL_RE.findall(raw)]
+        + [e.url for e in (message.entities or message.caption_entities or []) if e.type == "text_link" and e.url]))[:5]
+    note = URL_RE.sub("", raw).strip() if urls else ""
+    own_media = None  # пересланный пост с фото/видео — берём его же файл
+    if message.photo:
+        own_media = ("photo", message.photo[-1].file_id)
+    elif message.video:
+        own_media = ("video", message.video.file_id)
+    if not urls and len(raw) < 60:
+        await message.answer("Не вижу ссылки или текста новости. Нажми «🔗 Пост по ссылке» и пришли ещё раз.")
+        return
+    wait = await message.answer("🔗 Читаю " + (f"ссылки ({len(urls)})" if len(urls) > 1 else "ссылку" if urls
+                                              else "текст") + ", ИИ пишет пост…")
+
+    async def job() -> None:
+        try:
+            async with post_lock:
+                await _make_link_post(message, urls, note, raw if not urls else "", own_media)
+            await wait.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Link post failed")
+            await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+    _run_job(job)
+
+
+async def _make_link_post(message: Message, urls: list[str], note: str, text: str,
+                          own_media: tuple[str, str] | None) -> None:
+    bot, chat_id = message.bot, message.chat.id
+    sources, failed = [], []
+    for url in urls:
+        try:
+            sources.append(await shorts_linkfetch.fetch(url))
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{url[:60]} — {str(exc)[:80]}")
+    if text:
+        sources.append({"url": "", "title": "", "text": text, "image": None, "video": None, "thumb": None})
+    if not sources:
+        raise RuntimeError("ни одна ссылка не открылась:\n" + "\n".join(failed))
+    material = "\n\n".join(f"[{s['url'] or 'текст автора'}]\n{s['title']}\n{s['text']}" for s in sources)
+    res = await shorts_ai.rewrite_post(GEMINI_API_KEY, material, note)
+    if not res:
+        raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+    caption = post_caption(res["post"], "#новости")
+    work = SHORTS_DIR / f"link_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        if own_media:
+            send = bot.send_photo if own_media[0] == "photo" else bot.send_video
+            sent = await send(chat_id, own_media[1], caption=caption)
+            kind = "caption"
+        else:
+            # видео источника → трейлер с Rutube (новость о трейлере) → фото источника → кадр Кинопоиска → превью видео
+            files = await shorts_tgsearch.download_media(
+                [{"video": s["video"]} for s in sources if s.get("video")], work, limit=1, prefix="link")
+            if not files and res["trailer"] and res["film"]:
+                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work)
+                files = [trailer] if trailer else []
+            if not files:
+                files = await shorts_tgsearch.download_media(
+                    [{"image": s["image"]} for s in sources if s.get("image")], work, limit=1, prefix="img")
+            if not files and res["film"]:
+                film = await shorts_daily.find_film(kp._get, res["film"])
+                url = shorts_daily._image_url(film) if film else None
+                files = await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix="kp") if url else []
+            if not files:
+                files = await shorts_tgsearch.download_media(
+                    [{"image": s["thumb"]} for s in sources if s.get("thumb")], work, limit=1, prefix="thumb")
+            if files and files[0].suffix == ".mp4":
+                sent = await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption, supports_streaming=True)
+            elif files:
+                sent = await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)
+            else:
+                sent = await bot.send_message(chat_id, caption, disable_web_page_preview=True)
+            kind = "caption" if files else "text"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if failed:
+        await bot.send_message(chat_id, "⚠️ Не открылись:\n" + escape("\n".join(failed)))
+    await offer_post(bot, chat_id, [sent.message_id], kind, "pt:lk", what="Пост по ссылке готов")
+
+
 @router.message(PostState.edit, F.text, ~F.text.startswith("/"))
 async def post_edit_text(message: Message, state: FSMContext) -> None:
     first = (await state.get_data()).get("post_first")
@@ -9801,7 +10014,7 @@ async def post_edit_text(message: Message, state: FSMContext) -> None:
     except TelegramBadRequest as exc:
         await message.answer(f"❌ Не получилось поправить: <code>{escape(str(exc)[:200])}</code>")
         return
-    await message.answer("✅ Текст поста обновлён.", reply_markup=post_keyboard(first))
+    await message.answer("✅ Текст поста обновлён.", reply_markup=post_keyboard(first, yt=bool(meta.get("yt"))))
 
 
 # ---------------------------------------------------------------- история персонажа (лор)
