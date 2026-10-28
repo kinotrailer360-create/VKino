@@ -8533,8 +8533,13 @@ def post_caption(text: str, rubric: str = "", links: list[tuple[str, str]] | Non
     text = re.sub(r"\s*🎬 KinoMir360 \| YouTube( \| KinoMir360 в MAX)?\s*$", "", text.strip())  # подпись добавим сами
     tail, tail_len = "", SIGN_LEN
     if rubric and rubric.lower() not in text.lower():
-        tail += f"\n{rubric}"
-        tail_len += len(rubric) + 1
+        lines = text.rstrip().split("\n")
+        if lines and lines[-1].lstrip().startswith("#"):  # дописываем в строку хэштегов, а не отдельной строкой
+            lines[-1] = f"{lines[-1].rstrip()} {rubric}"
+            text = "\n".join(lines)
+        else:
+            tail += f"\n{rubric}"
+            tail_len += len(rubric) + 1
     if links:
         shown = links[:4]
         tail += "\n\n📺 Где смотреть: " + " · ".join(f'<a href="{escape(url)}">{escape(name)}</a>' for name, url in shown)
@@ -8717,6 +8722,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
     rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
              for k in range(0, len(SHORTS_GENRES), 3)]
+    rows.append([_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")])
     rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
     rows.append([_btn("🎂 День рождения звезды", "pt:bd"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
@@ -9483,17 +9489,79 @@ async def make_promo_post(bot: Bot, chat_id: int) -> None:
                                                            [_btn("📝 Другие посты", "pt:menu")]]))
 
 
+# подборки по стилю: код → (кнопка, тема поста, кандидаты Кинопоиска). Фильмы выбирает ИИ по теме — из
+# кандидатов, своих знаний и поиска Google; Кинопоиск даёт постеры и рейтинги.
+STYLE_LISTS: dict[str, tuple[str, str, dict[str, str]]] = {
+    "lbh": ("💀 Малобюджетные хорроры", "Малобюджетные хорроры, которые напугали весь мир",
+            {"genres.name": "ужасы", "rating.kp": "6.3-10", "votes.kp": "15000-100000000"}),
+    "hor": ("🩸 Хорроры", "Хорроры, после которых не уснёшь",
+            {"genres.name": "ужасы", "rating.kp": "6.8-10", "votes.kp": "30000-100000000"}),
+    "lbf": ("💎 Малобюджетные хиты", "Малобюджетные фильмы, от которых зрители без ума",
+            {"rating.kp": "7.3-10", "votes.kp": "20000-100000000"}),
+    "twi": ("🤯 Неожиданная концовка", "Фильмы с концовкой, которую никто не ожидал",
+            {"genres.name": "триллер", "rating.kp": "7.3-10", "votes.kp": "50000-100000000"}),
+    "und": ("🕵️ Недооценённые", "Недооценённые фильмы, которые вы могли пропустить",
+            {"rating.kp": "7.2-10", "votes.kp": "5000-60000"}),
+    "tru": ("📜 По реальным событиям", "Фильмы, основанные на реальных событиях",
+            {"genres.name": "биография", "rating.kp": "7.2-10", "votes.kp": "20000-100000000"}),
+    "brn": ("🧠 Взрыв мозга", "Фильмы, которые взрывают мозг",
+            {"genres.name": "фантастика", "rating.kp": "7.5-10", "votes.kp": "50000-100000000"}),
+    "psy": ("🔪 Психологические триллеры", "Психологические триллеры, которые держат до последней минуты",
+            {"genres.name": "триллер", "rating.kp": "7-10", "votes.kp": "30000-100000000"}),
+    "com": ("😂 Комедии на вечер", "Комедии, которые точно поднимут настроение",
+            {"genres.name": "комедия", "rating.kp": "7-10", "votes.kp": "50000-100000000"}),
+    "asi": ("🏯 Азиатские хорроры", "Азиатские хорроры, от которых стынет кровь",
+            {"genres.name": "ужасы", "countries.name": "Южная Корея", "rating.kp": "6.3-10"}),
+    "kor": ("🇰🇷 Корейское кино", "Корейские фильмы, которые стоит посмотреть каждому",
+            {"countries.name": "Южная Корея", "rating.kp": "7.2-10", "votes.kp": "10000-100000000"}),
+    "min": ("📺 Мини-сериалы на выходные", "Мини-сериалы, которые можно посмотреть за выходные",
+            {"isSeries": "true", "rating.kp": "7.5-10", "votes.kp": "20000-100000000"}),
+    "fam": ("👨‍👩‍👧 Для всей семьи", "Фильмы для всей семьи",
+            {"genres.name": "семейный", "rating.kp": "7-10", "votes.kp": "30000-100000000"}),
+    "ani": ("🎌 Аниме", "Аниме, которое стоит посмотреть даже тем, кто не смотрит аниме",
+            {"type": "anime", "rating.kp": "7.5-10", "votes.kp": "10000-100000000"}),
+    "s90": ("📼 Культовое кино 90-х", "Культовые фильмы 90-х, которые пора пересмотреть",
+            {"year": "1990-1999", "rating.kp": "7.5-10", "votes.kp": "100000-100000000"}),
+    "spc": ("🚀 Про космос", "Лучшие фильмы про космос",
+            {"genres.name": "фантастика", "rating.kp": "7-10", "votes.kp": "50000-100000000"}),
+    "sur": ("🏝 Про выживание", "Фильмы про выживание, от которых не оторваться",
+            {"genres.name": "приключения", "rating.kp": "7-10", "votes.kp": "50000-100000000"}),
+    "one": ("🏠 Одна локация", "Фильмы, снятые почти в одной локации, но держащие в напряжении",
+            {"rating.kp": "7-10", "votes.kp": "20000-100000000"}),
+}
+
+
+def style_menu() -> InlineKeyboardMarkup:
+    keys = list(STYLE_LISTS)
+    rows = [[_btn(STYLE_LISTS[k][0], f"pt:l:x:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
+    rows.append([_btn("⬅️ Назад", "pt:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _style_candidates(params: dict[str, str], exclude: set[int]) -> list[dict[str, Any]]:
+    docs = await shorts_daily._query(kp._get, page=random.randint(1, 3), sortField="votes.kp", sortType="-1",
+                                     notNullFields="name", **params)
+    random.shuffle(docs)
+    return [d for d in docs if d.get("id") and d["id"] not in exclude and shorts_daily._poster_url(d)][:10]
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
     """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
     кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
     первому; ниже — кнопки публикации. Фильмы не повторяются подряд."""
     today = datetime.now(MSK).date()
-    theme = shorts_daily.theme_for(key, today)
-    title = title or theme.hook
     hist = await _posts_history()
-    kp_films = await shorts_daily.pick_films(kp._get, theme, today, {int(x) for x in hist["films"]})
-    if len(kp_films) < 3:
-        kp_films = await shorts_daily.pick_films(kp._get, theme, today, set())
+    if key.startswith("x:") and key[2:] in STYLE_LISTS:  # подборка по стилю
+        _, style_title, params = STYLE_LISTS[key[2:]]
+        title = title or style_title
+        kp_films = await _style_candidates(params, {int(x) for x in hist["films"]}) or \
+            await _style_candidates(params, set())
+    else:
+        theme = shorts_daily.theme_for(key, today)
+        title = title or theme.hook
+        kp_films = await shorts_daily.pick_films(kp._get, theme, today, {int(x) for x in hist["films"]})
+        if len(kp_films) < 3:
+            kp_films = await shorts_daily.pick_films(kp._get, theme, today, set())
     own = POST_CHANNEL.lstrip("@").lower()
     try:  # свежие посты каналов — что вышло и что обсуждают
         posts = await asyncio.wait_for(shorts_tgsearch.latest(
@@ -9837,6 +9905,10 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("✏️ Пришли новый текст поста целиком (можно скопировать старый и поправить). "
                              "Подпись канала внизу добавлю сам.\n\n<i>Передумал — /cancel</i>")
         return
+    if action == "styles":
+        await message.answer("🎨 <b>Подборки по стилю</b> — ИИ подберёт фильмы по теме (Кинопоиск, интернет), "
+                             "постеры — фирменными карточками.", reply_markup=style_menu())
+        return
     if action == "menu":
         await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
                              "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
@@ -9874,7 +9946,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if kind == "l":
         key = arg
-        if key not in LIST_POSTS and not key.startswith("genre:"):
+        if key not in LIST_POSTS and not key.startswith("genre:") and not (key.startswith("x:") and key[2:] in STYLE_LISTS):
             return
         if post_lock.locked():
             await message.answer("⏳ Пост уже пишется — подожди минуту.")
