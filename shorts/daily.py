@@ -20,6 +20,7 @@ import aiohttp
 from PIL import Image
 
 from . import ai, clips, lumean, news, pronounce, tgsearch, tmdb, wiki
+from . import music as musiclib
 from .cards import card_overlay, make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -1480,7 +1481,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         "intro": cover_path.name,
         "logo": str(ASSETS / "logo.png"),
         "voice": voice.name,
-        "music": str(music or ASSETS / "music.mp3"),
+        "music": str(music or musiclib.pick(header, tag, " ".join(lines)) or ASSETS / "music.mp3"),
         "music_db": -16 if voiced else -6,
         "tail": 1.2,
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},

@@ -22,6 +22,7 @@ import aiohttp
 from PIL import Image
 
 from . import ai, daily
+from . import music as musiclib
 from .cards import make_cover
 from .daily import (
     ASSETS,
@@ -186,7 +187,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     cfg = {
         "output": "short.mp4",
         "voice": voice.name,
-        "music": str(music or ASSETS / "music.mp3"),
+        "music": str(music or musiclib.pick(" ".join(script.get("lines") or [])) or ASSETS / "music.mp3"),
         "music_db": -17 if voiced else -6,
         "logo": str(ASSETS / "logo.png"),
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},

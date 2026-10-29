@@ -217,16 +217,14 @@ async def clone_status(clone_id: str, service: str = "fishaudio") -> dict[str, A
     raise LumeanError("клон не найден")
 
 
-async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT,
-                       service: str | None = None, voice: str | None = None) -> Path:
-    order = await _call(session, "POST", "/orders", json={
-        "template_id": await _template_id(session, service, voice), "input_text": text, "name": "KinoMir360 short"})
+async def _wait_files(session: aiohttp.ClientSession, order: dict[str, Any], wait: float = WAIT) -> list[str]:
+    """Дождаться готовности заказа; пути файлов результата."""
     oid = order["id"]
     status, waited = order.get("status"), 0.0
     while status not in DONE:
         if status in FAILED or status == "partially_completed":
             reason = (order.get("result") or {}).get("user_message") or status
-            raise LumeanError(f"заказ не озвучен: {reason}")
+            raise LumeanError(f"заказ не выполнен: {reason}")
         if waited >= wait:
             raise LumeanError(f"заказ не готов за {wait:.0f} с (статус {status})")
         await asyncio.sleep(3)
@@ -236,11 +234,36 @@ async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wai
     files = (order.get("result") or {}).get("files") or []
     if not files:
         raise LumeanError("заказ готов, но файла нет")
-    link = await _call(session, "POST", "/storage/url", json={"path": files[0]})
+    return [str(f) for f in files]
+
+
+async def _download(session: aiohttp.ClientSession, path: str, out: Path) -> Path:
+    link = await _call(session, "POST", "/storage/url", json={"path": path})
     async with session.get(link["url"]) as resp:
         resp.raise_for_status()
         out.write_bytes(await resp.read())
     return out
+
+
+async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT,
+                       service: str | None = None, voice: str | None = None) -> Path:
+    order = await _call(session, "POST", "/orders", json={
+        "template_id": await _template_id(session, service, voice), "input_text": text, "name": "KinoMir360 short"})
+    return await _download(session, (await _wait_files(session, order, wait))[0], out)
+
+
+async def make_music(prompt: str, out_dir: Path, name: str, variants: int = 2, wait: float = 420) -> list[Path]:
+    """Инструментальный трек по описанию (музыка Lumean, без шаблона): variants файлов по 30 с.
+    Цена — за каждый вариант, от длины не зависит."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timeout = aiohttp.ClientTimeout(total=wait + 120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        order = await _call(session, "POST", "/orders", json={"task_type": "music", "name": f"KinoMir360 {name}",
+                                                             "task_data": {"prompt": prompt, "n_variants": variants,
+                                                                           "force_instrumental": True,
+                                                                           "music_length_ms": 30000}})
+        files = await _wait_files(session, order, wait)
+        return [await _download(session, f, out_dir / f"{name}_{i}.mp3") for i, f in enumerate(files)]
 
 
 async def _run(*cmd: str) -> str:
