@@ -22,6 +22,8 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
+from . import websearch
+
 API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODELS = "https://generativelanguage.googleapis.com/v1beta/models"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
@@ -53,11 +55,76 @@ BEAT_URL = os.getenv("BEAT_API_URL", "https://api.beatapi.io/v1").rstrip("/")
 BEAT_MODEL = os.getenv("BEAT_API_MODEL", "").strip()  # пусто — бесплатная модель, предпочтительно DeepSeek
 BEAT_HEADERS = {"User-Agent": "KinoMir360-bot/1.0"}  # без своего User-Agent их защита отвечает 403
 FONT = os.path.join(os.path.dirname(__file__), "assets", "Oswald.ttf")
+# главный автор текстов — сильная модель (Claude/GPT) через ИИ-шлюз Lumean: тот же ключ, что у озвучки,
+# оплата с баланса Lumean. LLM_PRIMARY=gemini — вернуть бесплатный Gemini главным.
+LUMEAN_LLM_KEY = _env_key("LUMEAN_API_KEY")
+LUMEAN_LLM_URL = os.getenv("LUMEAN_LLM_URL", "https://api.lumean.app/v1").rstrip("/")
+LUMEAN_LLM_MODEL = os.getenv("LUMEAN_LLM_MODEL", "").strip()  # пусто — бот выберет сам из /v1/models
+LLM_PRIMARY = os.getenv("LLM_PRIMARY", "lumean").strip().lower()
+# какие модели брать, если LUMEAN_LLM_MODEL не задан: по порядку, первая доступная
+LUMEAN_PREFER = ("claude-sonnet", "claude-opus", "gpt-5", "gpt-4.1", "claude", "gpt-4o", "gemini-2.5-pro", "gemini")
 
 
 def available(key: str) -> bool:
     """Есть ли хоть один ИИ: ключ Gemini или резервный."""
-    return bool(key or RESERVE_KEY or BEAT_KEY)
+    return bool(key or RESERVE_KEY or BEAT_KEY or LUMEAN_LLM_KEY)
+
+
+def lumean_llm_on() -> bool:
+    return bool(LUMEAN_LLM_KEY) and LLM_PRIMARY != "gemini"
+
+
+_lumean_model = ""
+
+
+async def _lumean_pick_model(session: aiohttp.ClientSession) -> str:
+    """Модель шлюза: из LUMEAN_LLM_MODEL, иначе лучшая по LUMEAN_PREFER из GET /v1/models."""
+    global _lumean_model
+    if LUMEAN_LLM_MODEL:
+        return LUMEAN_LLM_MODEL
+    if _lumean_model:
+        return _lumean_model
+    async with session.get(f"{LUMEAN_LLM_URL}/models", headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise AIError(f"Lumean ИИ: список моделей HTTP {resp.status}: {str(data)[:200]}")
+    ids = [str(m.get("id")) for m in data.get("data") or [] if m.get("kind", "chat") == "chat" and m.get("id")]
+    for want in LUMEAN_PREFER:
+        match = sorted((i for i in ids if want in i.lower() and "mini" not in i.lower() and "image" not in i.lower()),
+                       key=lambda i: _version(i), reverse=True)
+        if match:
+            _lumean_model = match[0]
+            log.info("shorts: Lumean LLM model %s", _lumean_model)
+            return _lumean_model
+    raise AIError(f"Lumean ИИ: не нашёл подходящую модель среди {ids[:10]}")
+
+
+async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens: int = 4000) -> Any:
+    """Запрос к сильной модели через ИИ-шлюз Lumean (OpenAI Chat Completions), ответ — JSON."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image is not None:
+        small = image.copy()
+        small.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        small.convert("RGB").save(buf, "JPEG", quality=82)
+        content.append({"type": "image_url", "image_url": {
+            "url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}})
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=150)) as session:
+        model = await _lumean_pick_model(session)
+        body = {"model": model, "temperature": 0.3, "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": "Отвечай только валидным JSON, без пояснений."},
+                             {"role": "user", "content": content}]}
+        async with session.post(f"{LUMEAN_LLM_URL}/chat/completions", json=body,
+                                headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
+            data = await resp.json(content_type=None)
+            status = resp.status
+    if status != 200:
+        err = (data.get("error") or {}) if isinstance(data, dict) else {}
+        raise AIError(f"Lumean ИИ HTTP {status} ({model}): {str(err.get('message') or err.get('code') or data)[:200]}")
+    try:
+        return _json_from(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise AIError(f"Lumean ИИ: неожиданный ответ ({exc})") from exc
 
 
 class AIError(RuntimeError):
@@ -352,8 +419,19 @@ RESERVE_BUDGET = 90  # с на ответ резервного ИИ
 
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
                         image: Image.Image | None = None) -> Any:
-    """Сначала Gemini; не вышло — резервный ИИ. Ошибка — с причинами обоих."""
+    """Сначала сильная модель через Lumean (если подключена), потом Gemini, потом резервные ИИ.
+    Ошибка — с причинами всех."""
     errors = []
+    # картинки в запросе, а листа для резервных моделей нет — сильной модели нечего показать, сразу Gemini
+    blind = image is None and any("inline_data" in p for p in gemini_parts)
+    if lumean_llm_on() and not blind:
+        try:
+            result = await asyncio.wait_for(_ask_lumean(prompt, image), RESERVE_BUDGET + 60)
+            log.info("shorts: Lumean LLM answered")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc) or "Lumean ИИ не ответил")
+            log.warning("shorts: Lumean LLM failed: %s", exc)
     if key:
         try:
             return await _ask(key, gemini_parts)
@@ -437,6 +515,10 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
                   lambda r: f"нашёл «{r.get('film', '?')}», источников: {len(r.get('_sources') or [])}")
     if RESERVE_KEY:
         await run("Groq", _ask_reserve(ask), lambda r: "отвечает")
+    if LUMEAN_LLM_KEY:
+        await run("ИИ Lumean (главный автор текстов)" + ("" if lumean_llm_on() else " — выключен: LLM_PRIMARY=gemini"),
+                  _ask_lumean(ask, max_tokens=50), lambda r: f"отвечает, модель {LUMEAN_LLM_MODEL or _lumean_model}")
+    out += await websearch.probe()
     return out
 
 
@@ -794,22 +876,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         '"trailer": true, если новость — вышел трейлер или тизер, иначе false, '
         '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
     )
-    data = None
-    if key:
-        try:
-            data = await _ask(key, [{"text": rules + "\n\nПОСТЫ:\n" + listing}], search=True)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: tg post with search failed: %s", exc)
-    if data is None:
-        prompt = rules + "\n\nПОСТЫ:\n" + listing
-        try:
-            data = await _with_reserve(key, [{"text": prompt}], prompt)
-        except Exception as exc:  # noqa: BLE001
-            global last_error
-            last_error = str(exc)[:300]
-            log.warning("shorts: tg post failed: %s", exc)
-            return None
-    if not isinstance(data, dict):
+    data = await _post_json(key, rules + "\n\nПОСТЫ:\n" + listing)  # Google → сильная модель → фактчекер
+    if not data:
         return None
     post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip()
     if len(post) < 80:
@@ -854,21 +922,8 @@ async def write_list_post(key: str, title: str, films: list[str], posts: str = "
         + '\n\nОтветь только JSON: {"post": "текст поста", "films": [{"ru": "название по-русски", '
         '"en": "оригинальное", "year": 2026}, ...] — в том же порядке, что в посте}'
     )
-    data = None
-    if key:
-        try:
-            data = await _ask(key, [{"text": rules}], search=True)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: list post with search failed: %s", exc)
-    if data is None:
-        try:
-            data = await _with_reserve(key, [{"text": rules}], rules)
-        except Exception as exc:  # noqa: BLE001
-            global last_error
-            last_error = str(exc)[:300]
-            log.warning("shorts: list post failed: %s", exc)
-            return None
-    if not isinstance(data, dict):
+    data = await _post_json(key, rules, query=f"{title} {today} Кинопоиск")
+    if not data:
         return None
     post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip()
     picked = []
@@ -894,46 +949,78 @@ async def write_styled_post(key: str, task: str, material: str, search: bool = T
         "не выдумывай." + GRAMMAR + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
         + "\n\nМАТЕРИАЛ:\n" + material[:9000] + '\n\nОтветь только JSON: {"post": "текст поста"}'
     )
-    data = None
-    if key and search:
-        try:
-            data = await _ask(key, [{"text": "Уточни детали поиском в Google. " + prompt}], search=True)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: styled post with search failed: %s", exc)
-    if data is None:
-        try:
-            data = await _with_reserve(key, [{"text": prompt}], prompt)
-        except Exception as exc:  # noqa: BLE001
-            global last_error
-            last_error = str(exc)[:300]
-            log.warning("shorts: styled post failed: %s", exc)
-            return None
+    data = await _post_json(key, prompt, search=search)
     post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip() if isinstance(data, dict) else ""
     return post[:1020] if len(post) >= 80 else None
 
 
-async def _post_json(key: str, prompt: str, search: bool = True, need_search: bool = False) -> dict[str, Any] | None:
-    """JSON-ответ для поста: сначала Gemini с поиском Google; need_search — без поиска не отвечаем (свежие
-    цифры, которых модель знать не может), иначе — резервный ИИ."""
+async def _post_json(key: str, prompt: str, search: bool = True, need_search: bool = False,
+                     query: str = "", verify: bool = True) -> dict[str, Any] | None:
+    """JSON-ответ для поста. query — сначала свой поиск (Tavily/Яндекс), результаты идут в задание; потом
+    Gemini с поиском Google, иначе — сильная модель Lumean и резервные ИИ. need_search — без свежих
+    данных из интернета не отвечаем (цифры, которых модель знать не может). verify — второй проход:
+    фактчекер сверяет текст поста с материалами."""
     if not available(key):
         return None
     global last_error
+    web = ""
+    if query:
+        try:
+            web = websearch.as_text(await asyncio.wait_for(websearch.search(query), 45))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: web search failed: %s", exc)
+    if web:
+        prompt += "\n\nСВЕЖИЕ РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ (опирайся на них, это точнее твоей памяти):\n" + web
+    data = None
     if key and search:
         try:
             data = await _ask(key, [{"text": "Поищи в Google. " + prompt}], search=True)
-            return data if isinstance(data, dict) else None
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)[:300]
             log.warning("shorts: post with search failed: %s", exc)
-            if need_search:
-                return None
+    if data is None:
+        if need_search and not web:
+            return None
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)[:300]
+            log.warning("shorts: post failed: %s", exc)
+            return None
+    if not isinstance(data, dict):
+        return None
+    if verify and data.get("post"):
+        data["post"] = await verify_post(key, prompt, str(data["post"]))
+    return data
+
+
+async def verify_post(key: str, task: str, post: str) -> str:
+    """Второй проход — строгий фактчекер: сверяет каждое утверждение поста с материалами задания и убирает
+    или помечает неподтверждённое. Не вышло — возвращаем пост как был."""
+    if not post.strip() or not available(key):
+        return post
+    prompt = (
+        "Ты строгий редактор-фактчекер Telegram-канала о кино. Ниже ЗАДАНИЕ (с материалами и результатами "
+        "поиска) и ЧЕРНОВИК поста. Проверь КАЖДОЕ утверждение черновика:\n"
+        "— оставь только то, что подтверждается материалами задания или точно и общеизвестно верно;\n"
+        "— неподтверждённое убери, а слух — пометь («по слухам», «по данным инсайдеров»);\n"
+        "— особенно проверь: «снова/опять/вернётся» (играл ли актёр эту роль раньше), даты выхода (в "
+        "премьерах — только свежие фильмы), годы, имена, цифры, названия (как в материале/прокате);\n"
+        "— исправь падежи и опечатки.\n"
+        "Сохрани стиль, эмодзи, структуру, хэштеги и длину (до 950 символов). Если всё верно — верни черновик "
+        "без изменений." + GRAMMAR
+        + '\n\nОтветь только JSON: {"post": "проверенный текст поста", "fixes": ["что исправил", ...]}'
+        + "\n\nЗАДАНИЕ:\n" + _fit(task, 12000) + "\n\nЧЕРНОВИК:\n" + post)
     try:
         data = await _with_reserve(key, [{"text": prompt}], prompt)
     except Exception as exc:  # noqa: BLE001
-        last_error = str(exc)[:300]
-        log.warning("shorts: post failed: %s", exc)
-        return None
-    return data if isinstance(data, dict) else None
+        log.warning("shorts: fact-check failed: %s", exc)
+        return post
+    checked = str((data or {}).get("post") or "").strip() if isinstance(data, dict) else ""
+    fixes = (data or {}).get("fixes") if isinstance(data, dict) else None
+    if fixes:
+        log.info("shorts: fact-check fixes: %s", "; ".join(map(str, fixes))[:500])
+    return checked[:1020] if len(checked) >= 80 else post
 
 
 def _films_from(data: dict[str, Any], extra: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -970,7 +1057,8 @@ async def box_office_post(key: str, today: str) -> dict[str, Any] | None:
               "удивил, кто провалился. " + _style_rules()
               + '\n\nОтветь только JSON: {"post": "текст поста", "films": [{"ru": "название по-русски", '
               '"en": "оригинальное", "year": 2026, "gross": "$45 млн"}] — в порядке поста}')
-    data = await _post_json(key, prompt, need_search=True)
+    data = await _post_json(key, prompt, need_search=True,
+                            query=f"кассовые сборы уикенда {today} box office weekend Россия мир")
     post = _clean_post(data)
     films = _films_from(data or {}, ("gross",))
     return {"post": post, "films": films[:8]} if post and len(films) >= 3 else None
@@ -1001,7 +1089,7 @@ async def quote_post(key: str, film: str) -> dict[str, Any] | None:
               "сцене без спойлеров, вопрос подписчикам «А какая ваша любимая цитата из фильма?». " + _style_rules()
               + '\n\nОтветь только JSON: {"quote": "цитата без кавычек", "character": "персонаж", '
               '"post": "текст поста"}')
-    data = await _post_json(key, prompt)
+    data = await _post_json(key, prompt, query=f"{film} известные цитаты из фильма")
     quote = str((data or {}).get("quote") or "").strip(" «»\"")
     post = _clean_post(data)
     if not quote or not post:
@@ -1030,7 +1118,7 @@ async def long_article(key: str, title: str, films: list[str], today: str) -> di
               + "\n\nКАНДИДАТЫ (можно взять другие, если лучше подходят):\n" + "\n".join(f"— {f}" for f in films)
               + '\n\nОтветь только JSON: {"title": "заголовок", "text": "текст статьи без заголовка, абзацы через '
               'пустую строку", "films": [{"ru": "...", "en": "...", "year": 2026}]}')
-    data = await _post_json(key, prompt)
+    data = await _post_json(key, prompt, query=f"{title} фильмы")
     text = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str((data or {}).get("text") or "")).strip()
     if len(text) < 1000:
         return None
@@ -1104,7 +1192,8 @@ async def rewrite_post(key: str, sources: str, note: str = "") -> dict[str, Any]
         + "\n\nМАТЕРИАЛ:\n" + sources[:9000]
         + '\n\nОтветь только JSON: {"post": "текст поста", "film": "фильм или сериал по-русски или пусто", '
         '"film_en": "оригинальное название или пусто", "trailer": true, если новость — вышел трейлер или тизер}')
-    data = await _post_json(key, prompt)  # с поиском Google — сверить факты и не выдумать лишнего
+    lead = re.sub(r"\[[^\]]*\]|https?://\S+", " ", sources)
+    data = await _post_json(key, prompt, query=re.sub(r"\s+", " ", lead).strip()[:200])  # поиск, Google, фактчекер
     post = _clean_post(data)
     if not post:
         return None
