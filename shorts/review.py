@@ -21,6 +21,7 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFilter
 
 from . import ai, clips, daily, tmdb
+from . import music as musiclib
 from .daily import (
     ASSETS,
     ROOT,
@@ -520,7 +521,7 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
     cfg = {
         "output": "review.mp4",
         "voice": voice.name,
-        "music": str(music or ASSETS / "music.mp3"),
+        "music": str(music or musiclib.pick(", ".join(_genres(film)), t) or ASSETS / "music.mp3"),
         "music_db": -20 if voiced else -8,
         "logo": str(ASSETS / "logo.png"),
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},

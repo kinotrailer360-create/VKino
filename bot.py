@@ -55,6 +55,7 @@ from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
 from shorts import news as shorts_news
 from shorts import lumean as shorts_lumean
+from shorts import music as shorts_music
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
@@ -6304,6 +6305,8 @@ async def broadcast(
 MSK = timezone(timedelta(hours=3))
 SHORTS_HOUR = int(os.getenv("SHORTS_HOUR", "8"))
 SHORTS_DIR = Path(os.getenv("SHORTS_DIR", "/tmp/kinomir_shorts"))
+if not os.getenv("MUSIC_DIR"):
+    shorts_music.DIR = SHORTS_DIR / "music"  # копии треков библиотеки; сами треки хранятся в Telegram
 SHORT_THEMES = {
     "online": "онлайн-премьеры",
     "cinema": "сейчас в кино",
@@ -6475,15 +6478,7 @@ async def run_short(
         work = SHORTS_DIR / now.strftime("%Y%m%d_%H%M%S")
         work.mkdir(parents=True, exist_ok=True)
         try:
-            music = None
-            file_id = await shorts_setting("music_file_id")
-            if file_id:
-                music = work / "music_custom"
-                try:
-                    await bot.download(file_id, destination=music)
-                except Exception:
-                    logging.exception("Shorts: custom music download failed")
-                    music = None
+            music = await custom_music(bot, work)
 
             # если бот перезапустится посреди сборки (обновление), после старта скажем об этом
             await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": theme_key or ""}))
@@ -7129,6 +7124,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
+        [_btn("🎼 Музыка Lumean под настроение ▸", "sh:mlib")],
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
         [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
@@ -7326,6 +7322,10 @@ async def shorts_panel(
         await message.answer(f"✅ Вернул стандартный список: {len(shorts_tgsearch.DEFAULT_CHANNELS)} каналов.")
     elif data == "sh:ai":
         await ai_status_action(message)
+    elif data == "sh:mlib":
+        await show(*await music_library_menu())
+    elif data.startswith("sh:mlib:"):
+        await music_make_action(message, data[len("sh:mlib:"):])
     elif data == "sh:clone":
         await show(*await shorts_clone_menu())
     elif data == "sh:clone_off":
@@ -7433,8 +7433,133 @@ async def shorts_clone_audio(message: Message, state: FSMContext) -> None:
 REVIEW_TIMEOUT = 30 * 60
 
 
+MUSIC_VARIANTS = 2  # треков на настроение; Lumean берёт плату за каждый
+music_jobs: set[asyncio.Task] = set()
+music_lock = asyncio.Lock()
+
+
+async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
+    lib = await music_library()
+    rows = [f"{label}: {len(lib.get(m) or [])} тр." for m, (label, _, _) in shorts_music.MOODS.items()]
+    missing = [m for m in shorts_music.MOODS if not lib.get(m)]
+    custom = await shorts_setting("music_file_id")
+    text = (
+        "🎼 <b>Музыка Lumean под настроение</b>\n"
+        "Бот один раз заказывает треки у Lumean и дальше сам подбирает их к ролику: хоррор — мрачная, "
+        "комедия — весёлая, новости — бодрая. Трек 30 с плавно склеен до ~2 минут.\n\n"
+        + "\n".join(rows)
+        + f"\n\n💰 Каждый трек оплачивается в Lumean отдельно (по {MUSIC_VARIANTS} трека на настроение)."
+        + ("\n⚠️ Сейчас стоит своя музыка — она важнее библиотеки. Чтобы играла библиотека, нажми "
+           "«↩️ Стандартная» в настройках." if custom else "")
+    )
+    buttons = []
+    if missing:
+        buttons.append([_btn(f"🎼 Заказать недостающие ({len(missing) * MUSIC_VARIANTS} тр.)", "sh:mlib:all")])
+    moods = list(shorts_music.MOODS.items())
+    for k in range(0, len(moods), 2):
+        buttons.append([_btn(f"🔄 {label}", f"sh:mlib:{m}") for m, (label, _, _) in moods[k:k + 2]])
+    buttons.append([_btn("⬅️ Назад", "sh:settings")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def music_make_action(message: Message, which: str) -> None:
+    """Заказать треки у Lumean: «all» — для настроений без треков, иначе — заново для одного настроения."""
+    if not shorts_lumean.enabled():
+        await message.answer("❌ Нет ключа Lumean (LUMEAN_API_KEY) — музыку заказать негде.")
+        return
+    if music_jobs:
+        await message.answer("⏳ Музыка уже заказывается — дождись, пришлю треки сюда.")
+        return
+    lib = await music_library()
+    moods = [m for m in shorts_music.MOODS if not lib.get(m)] if which == "all" else \
+        [which] if which in shorts_music.MOODS else []
+    if not moods:
+        await message.answer("✅ Треки есть для всех настроений. Заменить — кнопка 🔄 у нужного.")
+        return
+    status = await message.answer(f"🎼 Заказываю у Lumean {len(moods) * MUSIC_VARIANTS} тр. "
+                                  f"({len(moods)} настр.) — займёт несколько минут, треки пришлю сюда.")
+    task = asyncio.create_task(music_make_job(message, status, moods))
+    music_jobs.add(task)
+    task.add_done_callback(music_jobs.discard)
+
+
+async def music_make_job(message: Message, status: Message, moods: list[str]) -> None:
+    gate = asyncio.Semaphore(3)  # по три заказа сразу
+    done: list[str] = []
+    failed: list[str] = []
+
+    async def one(mood: str) -> None:
+        label = shorts_music.MOODS[mood][0]
+        work = SHORTS_DIR / "music_new" / mood
+        try:
+            async with gate:
+                raw = await shorts_lumean.make_music(shorts_music.prompt(mood), work, mood, MUSIC_VARIANTS)
+            ids = []
+            for i, path in enumerate(raw, 1):
+                long = await shorts_music.make_long(path, path.with_name(f"{path.stem}_long.mp3"))
+                sent = await message.answer_audio(
+                    FSInputFile(long, filename=f"kinomir360_{mood}_{i}.mp3"),
+                    caption=f"🎼 {label} — вариант {i}", title=f"KinoMir360 {label} {i}", performer="Lumean")
+                if sent.audio:
+                    ids.append(sent.audio.file_id)
+            if not ids:
+                raise RuntimeError("Lumean не прислал файлов")
+            async with music_lock:
+                lib = await music_library()
+                lib[mood] = ids
+                await set_shorts_setting("music_lib", json.dumps(lib))
+            done.append(label)
+        except Exception as exc:
+            logging.exception("Shorts: music for %s failed", mood)
+            failed.append(f"{label}: {escape(str(exc)[:200])}")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    await asyncio.gather(*(one(m) for m in moods))
+    report = []
+    if done:
+        report.append(f"✅ Готово: {', '.join(done)}. Со следующего ролика музыка подбирается под настроение.")
+    if failed:
+        report.append("❌ Не вышло:\n" + "\n".join(failed))
+    try:
+        await status.reply("\n\n".join(report) or "Ничего не заказано.")
+    except Exception:
+        await message.answer("\n\n".join(report) or "Ничего не заказано.")
+
+
+async def music_library() -> dict[str, list[str]]:
+    """Треки Lumean по настроениям: {настроение: [file_id в Telegram]}."""
+    try:
+        lib = json.loads(await shorts_setting("music_lib") or "{}")
+    except ValueError:
+        return {}
+    return {m: [str(f) for f in ids] for m, ids in lib.items() if m in shorts_music.MOODS and isinstance(ids, list)}
+
+
+async def sync_music_library(bot: Bot) -> None:
+    """Скачать треки библиотеки, которых ещё нет на диске (после перезапуска диск пустой), и убрать лишние."""
+    for mood, ids in (await music_library()).items():
+        folder = shorts_music.DIR / mood
+        folder.mkdir(parents=True, exist_ok=True)
+        wanted = {f"{i}_{fid[-16:]}.mp3": fid for i, fid in enumerate(ids)}
+        for old in folder.glob("*.mp3"):
+            if old.name not in wanted:
+                old.unlink(missing_ok=True)
+        for name, fid in wanted.items():
+            if not (folder / name).exists():
+                try:
+                    await bot.download(fid, destination=folder / name)
+                except Exception:
+                    logging.exception("Shorts: music library download failed (%s)", mood)
+
+
 async def custom_music(bot: Bot, work: Path) -> Path | None:
-    """Своя фоновая музыка (кнопка «Сменить музыку»), если задана."""
+    """Своя фоновая музыка (кнопка «Сменить музыку»), если задана. Иначе ролик сам возьмёт трек
+    библиотеки Lumean под настроение — здесь только докачиваем её на диск."""
+    try:
+        await sync_music_library(bot)
+    except Exception:
+        logging.exception("Shorts: music library sync failed")
     file_id = await shorts_setting("music_file_id")
     if not file_id:
         return None
