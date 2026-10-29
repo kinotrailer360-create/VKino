@@ -1,5 +1,6 @@
 """Свой поиск в интернете для ИИ — не зависит от лимитов Gemini.
 
+DuckDuckGo — бесплатно и без ключа (выключить: DDG_SEARCH=off).
 Tavily (TAVILY_API_KEY, бесплатно до 1000 запросов в месяц, tavily.com) — тексты статей со ссылками.
 Поиск Яндекса (YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID, Yandex Cloud → Search API) — лучше всех находит
 российские источники: Кинопоиск, СМИ, даты проката в России. Нет ключей — пустой результат, бот работает как раньше.
@@ -14,7 +15,10 @@ import logging
 import os
 import re
 import xml.etree.ElementTree as ET
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
@@ -25,10 +29,15 @@ YANDEX_KEY = os.getenv("YANDEX_SEARCH_API_KEY", "").strip()
 YANDEX_FOLDER = os.getenv("YANDEX_FOLDER_ID", "").strip()
 TAVILY_URL = "https://api.tavily.com/search"
 YANDEX_URL = "https://searchapi.api.cloud.yandex.net/v2/web/search"
+# DuckDuckGo — бесплатно и без ключа (html-версия поиска); DDG_SEARCH=off — выключить
+DDG_ON = os.getenv("DDG_SEARCH", "on").strip().lower() not in ("off", "0", "no", "false")
+DDG_URL = "https://html.duckduckgo.com/html/"
+BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/124.0 Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
 
 
 def available() -> bool:
-    return bool(TAVILY_KEY or (YANDEX_KEY and YANDEX_FOLDER))
+    return bool(TAVILY_KEY or (YANDEX_KEY and YANDEX_FOLDER) or DDG_ON)
 
 
 HINTS = {401: "ключ не подходит — проверь, что скопирован целиком", 403: "доступ запрещён — сервис, похоже, "
@@ -79,13 +88,85 @@ async def yandex(query: str, n: int = 6) -> list[dict[str, str]]:
     return out[:n]
 
 
+class _DDG(HTMLParser):
+    """Результаты html-версии DuckDuckGo: ссылка, заголовок, сниппет."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items: list[dict[str, str]] = []
+        self.field = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        a = dict(attrs)
+        cls = a.get("class") or ""
+        if tag == "a" and "result__a" in cls:
+            self.items.append({"url": _ddg_url(a.get("href") or ""), "title": "", "text": ""})
+            self.field = "title"
+        elif "result__snippet" in cls and self.items:
+            self.field = "text"
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("a", "td", "div"):
+            self.field = ""
+
+    def handle_data(self, data: str) -> None:
+        if self.field and self.items:
+            self.items[-1][self.field] += data
+
+
+def _ddg_url(href: str) -> str:
+    """Ссылки DuckDuckGo идут через редирект //duckduckgo.com/l/?uddg=<настоящий адрес>."""
+    q = parse_qs(urlparse(href if href.startswith("http") else "https:" + href).query)
+    return unquote(q["uddg"][0]) if q.get("uddg") else href
+
+
+async def duckduckgo(query: str, n: int = 6) -> list[dict[str, str]]:
+    if not DDG_ON:
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25), headers=BROWSER) as session:
+        async with session.post(DDG_URL, data={"q": query[:400], "kl": "ru-ru"}) as resp:
+            text = await resp.text(errors="ignore")
+            if resp.status != 200:
+                hint = HINTS.get(resp.status, "")
+                raise RuntimeError(f"DuckDuckGo HTTP {resp.status}" + (f" — {hint}" if hint else ""))
+    if "anomaly" in text.lower() and "result__a" not in text:
+        raise RuntimeError("DuckDuckGo просит капчу — с этого сервера он запросы не принимает")
+    parser = _DDG()
+    parser.feed(text)
+    out = []
+    for r in parser.items:
+        if r["url"].startswith("http") and "duckduckgo.com/y.js" not in r["url"]:  # без рекламы
+            out.append({"url": r["url"], "title": re.sub(r"\s+", " ", r["title"]).strip(),
+                        "text": re.sub(r"\s+", " ", r["text"]).strip()[:600]})
+    for r in out[:2]:  # у двух первых — текст самой страницы: сниппета для проверки фактов мало
+        try:
+            page = await asyncio.wait_for(_page_text(r["url"]), 15)
+            if page:
+                r["text"] = (r["text"] + " … " + page)[:1500]
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: page %s not read: %s", r["url"][:60], exc)
+    return out[:n]
+
+
+async def _page_text(url: str) -> str:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), headers=BROWSER) as session:
+        async with session.get(url) as resp:
+            if resp.status != 200 or "html" not in resp.headers.get("Content-Type", ""):
+                return ""
+            html = await resp.text(errors="ignore")
+    paras = [re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", p))).strip()
+             for p in re.findall(r"<p[^>]*>(.*?)</p>", html, re.S | re.I)]
+    return " ".join(p for p in paras if len(p) >= 40)[:1200]
+
+
 async def search(query: str, n: int = 6) -> list[dict[str, str]]:
     """Результаты обоих поисковиков (что подключено), без повторов ссылок; ошибки — в лог, не наверх."""
     if not query.strip() or not available():
         return []
     found: list[dict[str, str]] = []
-    for name, res in zip(("Tavily", "Яндекс"), await asyncio.gather(tavily(query, n), yandex(query, n),
-                                                                    return_exceptions=True)):
+    for name, res in zip(("Tavily", "Яндекс", "DuckDuckGo"),
+                         await asyncio.gather(tavily(query, n), yandex(query, n), duckduckgo(query, n),
+                                              return_exceptions=True)):
         if isinstance(res, Exception):
             log.warning("shorts: web search %s failed: %s", name, res)
             continue
@@ -113,7 +194,8 @@ async def probe() -> list[tuple[str, bool, str]]:
     """Для «Проверить ИИ»: работает ли каждый подключённый поисковик."""
     out = []
     for name, fn, on in (("Поиск Tavily", tavily, bool(TAVILY_KEY)),
-                         ("Поиск Яндекса", yandex, bool(YANDEX_KEY and YANDEX_FOLDER))):
+                         ("Поиск Яндекса", yandex, bool(YANDEX_KEY and YANDEX_FOLDER)),
+                         ("Поиск DuckDuckGo (бесплатный)", duckduckgo, DDG_ON)):
         if not on:
             continue
         try:
