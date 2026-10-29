@@ -956,8 +956,8 @@ async def write_styled_post(key: str, task: str, material: str, search: bool = T
 
 async def _post_json(key: str, prompt: str, search: bool = True, need_search: bool = False,
                      query: str = "", verify: bool = True) -> dict[str, Any] | None:
-    """JSON-ответ для поста. query — сначала свой поиск (Tavily/Яндекс), результаты идут в задание; потом
-    Gemini с поиском Google, иначе — сильная модель Lumean и резервные ИИ. need_search — без свежих
+    """JSON-ответ для поста. query — сначала свой поиск (Groq Compound/DuckDuckGo/Tavily/Яндекс), результаты
+    идут в задание; потом Gemini с поиском Google, иначе — сильная модель Lumean и резервные ИИ. need_search — без свежих
     данных из интернета не отвечаем (цифры, которых модель знать не может). verify — второй проход:
     фактчекер сверяет текст поста с материалами."""
     if not available(key):
