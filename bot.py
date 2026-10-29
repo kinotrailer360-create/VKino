@@ -8765,8 +8765,21 @@ def posts_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+RATING_MIN_VOTES = 1000  # меньше оценок — рейтинг случайный (у новинок в первые дни бывает 8+), не показываем
+
+
+def _trusted_rating(f: dict[str, Any]) -> tuple[float, str]:
+    """Рейтинг, если за ним достаточно оценок; иначе (0, "")."""
+    votes = f.get("votes") or {}
+    try:
+        enough = max(int(votes.get("kp") or 0), int(votes.get("imdb") or 0)) >= RATING_MIN_VOTES
+    except (TypeError, ValueError):
+        enough = False
+    return shorts_daily._best_rating(f) if enough else (0.0, "")
+
+
 def _film_line(f: dict[str, Any]) -> str:
-    rating, label = shorts_daily._best_rating(f)
+    rating, label = _trusted_rating(f)
     about = re.sub(r"\s+", " ", str(f.get("shortDescription") or f.get("description") or "")).strip()[:260]
     parts = [f"«{shorts_daily._title(f)}» ({f.get('year') or '?'})", *shorts_daily._genres(f)[:3]]
     if rating:
@@ -8796,7 +8809,7 @@ def _list_fallback(title: str, films: list[dict[str, Any]]) -> str:
     nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
     rows = [f"🍿 {title.upper()}!", BRAND, ""]
     for n, f in zip(nums, films):
-        rating, _ = shorts_daily._best_rating(f)
+        rating, _ = _trusted_rating(f)
         about = str(f.get("shortDescription") or "").strip()
         rows.append(f"{n} «{shorts_daily._title(f)}» ({f.get('year') or '?'})" + (f" ⭐ {rating:.1f}" if rating else ""))
         if about:
@@ -8847,7 +8860,7 @@ async def _list_cards(work: Path, items: list[tuple[str, str | None, dict[str, A
         if not got:
             continue
         try:
-            rating, label = shorts_daily._best_rating(film) if film else (0.0, "")
+            rating, label = _trusted_rating(film) if film else (0.0, "")
             card = await asyncio.to_thread(
                 shorts_postcard.make_post_card, Image.open(got[0]), name, k, len(items), rating or None, label,
                 (film or {}).get("year"), shorts_daily._genres(film)[:2] if film else None,
