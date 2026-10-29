@@ -35,8 +35,10 @@ DDG_ON = os.getenv("DDG_SEARCH", "on").strip().lower() not in ("off", "0", "no",
 DDG_URL = "https://html.duckduckgo.com/html/"
 # Groq Compound: модель со встроенным поиском в интернете, ищет на серверах Groq — с российского сервера работает
 GROQ_SEARCH_ON = os.getenv("GROQ_SEARCH", "on").strip().lower() not in ("off", "0", "no", "false")
-GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "groq/compound-mini").strip()
+GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "").strip()  # пусто — бот сам находит модель Compound у Groq
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+_groq_model = ""
 BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/124.0 Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
 
@@ -174,6 +176,22 @@ async def _page_text(url: str) -> str:
     return " ".join(p for p in paras if len(p) >= 40)[:1200]
 
 
+async def _pick_groq_model(session: aiohttp.ClientSession, key: str) -> str:
+    """Модель Compound из списка моделей ключа: названия у Groq меняются, поэтому не зашиваем."""
+    global _groq_model
+    if GROQ_SEARCH_MODEL:
+        return GROQ_SEARCH_MODEL
+    if not _groq_model:
+        async with session.get(GROQ_MODELS_URL, headers={"Authorization": f"Bearer {key}"}) as resp:
+            data = await _json_or_error("Groq Compound (список моделей)", resp)
+        ids = [str(m.get("id")) for m in data.get("data") or [] if isinstance(m, dict) and m.get("id")]
+        found = sorted((i for i in ids if "compound" in i.lower()), key=lambda i: ("mini" in i.lower(), len(i)))
+        if not found:
+            raise RuntimeError("у ключа Groq нет моделей Compound с поиском; доступны: " + ", ".join(ids[:8]))
+        _groq_model = found[0]
+    return _groq_model
+
+
 async def groq_compound(query: str, n: int = 6) -> list[dict[str, str]]:
     """Groq Compound ищет в интернете сам: сводка фактов со ссылками + найденные страницы."""
     key = groq_key()
@@ -182,10 +200,14 @@ async def groq_compound(query: str, n: int = 6) -> list[dict[str, str]]:
     ask = (f"Найди в интернете свежие проверенные факты по запросу: «{query[:400]}». Ответь по-русски коротким "
            "списком фактов: у каждого — дата, если есть, и ссылка на источник. Ничего не додумывай: не нашёл — "
            "так и напиши.")
-    body = {"model": GROQ_SEARCH_MODEL, "temperature": 0.1, "messages": [{"role": "user", "content": ask}]}
+    global _groq_model
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=38)) as session:
+        model = await _pick_groq_model(session, key)
+        body = {"model": model, "temperature": 0.1, "messages": [{"role": "user", "content": ask}]}
         async with session.post(GROQ_URL, json=body, headers={"Authorization": f"Bearer {key}"}) as resp:
-            data = await _json_or_error("Groq Compound", resp)
+            if resp.status == 404:
+                _groq_model = ""  # модель убрали — в следующий раз выберем заново
+            data = await _json_or_error(f"Groq Compound ({model})", resp)
     msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
     answer = re.sub(r"<think>.*?</think>", "", str(msg.get("content") or ""), flags=re.S).strip()
     out = [{"title": "Сводка поиска Groq Compound", "url": "groq-compound", "text": answer[:2500]}] if answer else []
