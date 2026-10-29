@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -30,15 +31,32 @@ def available() -> bool:
     return bool(TAVILY_KEY or (YANDEX_KEY and YANDEX_FOLDER))
 
 
+HINTS = {401: "ключ не подходит — проверь, что скопирован целиком", 403: "доступ запрещён — сервис, похоже, "
+         "не пускает запросы с этого сервера (например, из России)", 429: "кончился лимит запросов",
+         432: "кончился бесплатный лимит месяца"}
+
+
+async def _json_or_error(name: str, resp: aiohttp.ClientResponse) -> dict[str, Any]:
+    """JSON ответа или понятная ошибка: код, подсказка и начало ответа (а не «Expecting value…»)."""
+    text = await resp.text(errors="ignore")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if resp.status != 200 or not isinstance(data, dict):
+        snippet = re.sub(r"<[^>]+>|\s+", " ", text).strip()[:150]
+        hint = HINTS.get(resp.status, "")
+        raise RuntimeError(f"{name} HTTP {resp.status}" + (f" — {hint}" if hint else "") + (f": {snippet}" if snippet else ""))
+    return data
+
+
 async def tavily(query: str, n: int = 6) -> list[dict[str, str]]:
     if not TAVILY_KEY:
         return []
     body = {"query": query[:400], "max_results": n, "search_depth": "advanced", "include_answer": False}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.post(TAVILY_URL, json=body, headers={"Authorization": f"Bearer {TAVILY_KEY}"}) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status != 200:
-                raise RuntimeError(f"Tavily HTTP {resp.status}: {str(data)[:200]}")
+            data = await _json_or_error("Tavily", resp)
     return [{"title": str(r.get("title") or ""), "url": str(r.get("url") or ""),
              "text": re.sub(r"\s+", " ", str(r.get("content") or ""))[:900]} for r in data.get("results") or []]
 
@@ -50,9 +68,7 @@ async def yandex(query: str, n: int = 6) -> list[dict[str, str]]:
             "responseFormat": "FORMAT_XML", "groupSpec": {"groupsOnPage": str(n)}}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.post(YANDEX_URL, json=body, headers={"Authorization": f"Api-Key {YANDEX_KEY}"}) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status != 200:
-                raise RuntimeError(f"Яндекс HTTP {resp.status}: {str(data)[:200]}")
+            data = await _json_or_error("Яндекс", resp)
     root = ET.fromstring(base64.b64decode(data.get("rawData") or ""))
     out = []
     for doc in root.iter("doc"):
