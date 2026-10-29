@@ -264,6 +264,9 @@ def theme_for(key: str | None, today: date) -> Theme:
                      f"{n} самых ожидаемых премьер ⏳ Скоро в кино",
                      ["скоро в кино", "ожидаемые фильмы", "премьеры", "новинки кино", "афиша"],
                      upcoming=True)
+    if key == "week":  # для постов: премьеры этой недели в кино
+        return Theme("week", "ПРЕМЬЕРЫ", "ПРЕМЬЕРЫ НЕДЕЛИ", "Премьеры недели в кино", "Премьеры недели в кино 🍿",
+                     ["премьеры недели", "новинки кино", "что посмотреть в кино", "афиша кино", "кинопрокат"])
     if key == "fresh":  # для постов: только что вышло онлайн
         return Theme("fresh", "ТОЛЬКО ВЫШЛО", "ТОЛЬКО ВЫШЛО ОНЛАЙН",
                      "Только что вышло онлайн: что посмотреть", "Только что вышло онлайн 🔥",
@@ -294,9 +297,13 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         docs += await _query(fetch, isSeries="true",
                              **{"premiere.world": _range(today - timedelta(days=10), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
-    elif theme.key == "cinema":
-        docs = await _query(fetch, isSeries="false",
+    elif theme.key == "cinema":  # год — отсекаем повторный прокат старых фильмов
+        docs = await _query(fetch, isSeries="false", year=f"{today.year - 1}-{today.year + 1}",
                             **{"premiere.russia": _range(today - timedelta(days=35), today)}, **common)
+    elif theme.key == "week":  # премьеры этой недели: вышли за последние дни или выходят в ближайшие
+        docs = await _query(fetch, isSeries="false", year=f"{today.year - 1}-{today.year + 1}",
+                            **{"premiere.russia": _range(today - timedelta(days=4), today + timedelta(days=4))},
+                            **common)
     elif theme.key == "series":
         docs = await _query(fetch, isSeries="true",
                             **{"premiere.world": _range(today - timedelta(days=60), today)}, **common)

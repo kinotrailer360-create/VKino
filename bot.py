@@ -8488,11 +8488,11 @@ POSTS_PLAN = [
     ((5,), 15, "bl"),             # суббота — ляпы в кино
     ((0,), 12, "bo"),             # понедельник — сборы уикенда
     ((2,), 15, "qt"),             # среда — цитата дня
-    ((3,), 11, "l:cinema"),       # четверг — премьеры недели в кино
+    ((3,), 11, "l:week"),         # четверг — премьеры недели в кино
     ((4,), 11, "l:online"),       # пятница — что посмотреть на выходных
     ((6,), 18, "wk"),             # воскресенье — итоги недели
 ]
-PLAN_TITLES = {"l:cinema": "Премьеры недели в кино", "l:online": "Что посмотреть на выходных"}
+PLAN_TITLES = {"l:week": "Премьеры недели в кино", "l:online": "Что посмотреть на выходных"}
 MAX_URL = os.getenv("MAX_URL", "https://max.ru/se14155241_biz")  # канал KinoMir360 в мессенджере MAX
 SIGNATURE = (f'\n\n🎬 <a href="https://t.me/{POST_CHANNEL.lstrip("@")}">KinoMir360</a> | '
              f'<a href="{shorts_daily.YOUTUBE_URL}">YouTube</a> | <a href="{MAX_URL}">KinoMir360 в MAX</a>')
@@ -8545,7 +8545,25 @@ def post_caption(text: str, rubric: str = "", links: list[tuple[str, str]] | Non
         shown = links[:4]
         tail += "\n\n📺 Где смотреть: " + " · ".join(f'<a href="{escape(url)}">{escape(name)}</a>' for name, url in shown)
         tail_len += len("\n\n📺 Где смотреть: ") + sum(len(name) + 3 for name, _ in shown)
-    return escape(text[: 1020 - tail_len].rstrip()) + tail + SIGNATURE
+    return escape(_fit_text(text, 1020 - tail_len)) + tail + SIGNATURE
+
+
+def _fit_text(text: str, limit: int) -> str:
+    """Укоротить пост до limit символов, не обрывая хэштеги и слова: строка хэштегов остаётся целой,
+    а текст над ней режется по последней целой строке (или слову)."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    lines = text.split("\n")
+    tags = lines.pop() if lines and lines[-1].lstrip().startswith("#") else ""
+    words = tags.split()
+    words = words[:5] + words[-1:] if len(words) > 6 else words  # последний — хэштег рубрики, его оставляем
+    tags = " ".join(words)[: max(0, limit // 4)]
+    room = limit - (len(tags) + 2 if tags else 0)
+    body = "\n".join(lines).rstrip()[:room]
+    cut = body.rfind("\n")
+    body = body[:cut] if cut > room * 0.6 else body[: body.rfind(" ")] + "…" if " " in body else body
+    return body.rstrip() + (f"\n\n{tags}" if tags else "")
 
 
 async def _json_setting(key: str, default: Any) -> Any:
@@ -8712,7 +8730,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
 
 
 LIST_POSTS = {  # подборки для поста: ключ темы шортсов → кнопка
-    "fresh": "🔥 Только вышло онлайн", "online": "🆕 Новинки онлайн", "cinema": "🍿 Сейчас в кино", "series": "📺 Новые сериалы",
+    "week": "🎟 Премьеры недели в кино", "fresh": "🔥 Только вышло онлайн", "online": "🆕 Новинки онлайн",
+    "cinema": "🍿 Сейчас в кино", "series": "📺 Новые сериалы",
     "upcoming": "⏳ Скоро в кино", "topfilms": "🏆 Топ фильмов", "topseries": "🏆 Топ сериалов",
 }
 
@@ -8746,6 +8765,13 @@ def _film_line(f: dict[str, Any]) -> str:
     parts = [f"«{shorts_daily._title(f)}» ({f.get('year') or '?'})", *shorts_daily._genres(f)[:3]]
     if rating:
         parts.append(f"{label} {rating:.1f}")
+    premiere = f.get("premiere") or {}
+    for key, where in (("russia", "в кино в России с"), ("digital", "онлайн с"), ("world", "мировая премьера")):
+        day = str(premiere.get(key) or "")[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):  # дата выхода — ИИ не возьмёт старое в «премьеры недели»
+            y, m, d = map(int, day.split("-"))
+            parts.append(f"{where} {d} {shorts_daily.MONTHS[m - 1]} {y}")
+            break
     return ", ".join(parts) + (f". {about}" if about else "")
 
 
