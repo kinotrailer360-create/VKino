@@ -6922,13 +6922,13 @@ async def ai_status_action(message: Message) -> None:
     from shorts import websearch as shorts_websearch
     rows = [
         "🤖 <b>ИИ бота</b>",
-        "Посты: свой поиск (Groq Compound/DuckDuckGo/Tavily/Яндекс) → Gemini с поиском Google → пишет сильная модель Lumean → "
+        "Посты: свой поиск (Groq/DuckDuckGo/Tavily/Яндекс) → Gemini с поиском Google → пишет сильная модель Lumean → "
         "второй проход-фактчекер.",
         f"0. Lumean ИИ (Claude/GPT): {'включён ✅' if shorts_ai.lumean_llm_on() else 'выключен ❌ (нужен LUMEAN_API_KEY)'}"
         f"; поиск: Tavily {'✅' if shorts_websearch.TAVILY_KEY else '— нет TAVILY_API_KEY'}, Яндекс "
         f"{'✅' if shorts_websearch.YANDEX_KEY and shorts_websearch.YANDEX_FOLDER else '— нет YANDEX_SEARCH_API_KEY/YANDEX_FOLDER_ID'}"
         f", DuckDuckGo {'✅' if shorts_websearch.DDG_ON else '— выключен'}"
-        f", Groq Compound {'✅' if shorts_websearch.groq_key() else '— нет ключа Groq или GROQ_SEARCH=off'}",
+        f", Groq-поиск {'✅' if shorts_websearch.groq_key() else '— нет ключа Groq или GROQ_SEARCH=off'}",
         f"1. Gemini: {f'ключей: {len(shorts_ai.gemini_keys(GEMINI_API_KEY))} ✅' if GEMINI_API_KEY else 'нет GEMINI_API_KEY ❌'}"
         f" ({escape(shorts_ai.MODEL)})",
         f"2. Groq: {'ключ есть ✅' if shorts_ai.RESERVE_KEY else 'нет RESERVE_AI_KEY ❌'} ({escape(shorts_ai.RESERVE_MODEL)})",
