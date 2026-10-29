@@ -1,7 +1,8 @@
 """Свой поиск в интернете для ИИ — не зависит от лимитов Gemini.
 
 DuckDuckGo — бесплатно и без ключа (выключить: DDG_SEARCH=off).
-Groq Compound — ИИ Groq сам ищет в интернете (ключ тот же, что у Groq; выключить: GROQ_SEARCH=off).
+Groq Compound — ИИ Groq сам ищет в интернете (ключ тот же, что у Groq; выключить: GROQ_SEARCH=off). Нет Compound
+у ключа — модель GPT-OSS с встроенным поиском browser_search.
 Tavily (TAVILY_API_KEY, бесплатно до 1000 запросов в месяц, tavily.com) — тексты статей со ссылками.
 Поиск Яндекса (YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID, Yandex Cloud → Search API) — лучше всех находит
 российские источники: Кинопоиск, СМИ, даты проката в России. Нет ключей — пустой результат, бот работает как раньше.
@@ -183,11 +184,14 @@ async def _pick_groq_model(session: aiohttp.ClientSession, key: str) -> str:
         return GROQ_SEARCH_MODEL
     if not _groq_model:
         async with session.get(GROQ_MODELS_URL, headers={"Authorization": f"Bearer {key}"}) as resp:
-            data = await _json_or_error("Groq Compound (список моделей)", resp)
+            data = await _json_or_error("Поиск Groq (список моделей)", resp)
         ids = [str(m.get("id")) for m in data.get("data") or [] if isinstance(m, dict) and m.get("id")]
         found = sorted((i for i in ids if "compound" in i.lower()), key=lambda i: ("mini" in i.lower(), len(i)))
+        # нет Compound — модели GPT-OSS у Groq ищут в интернете встроенным инструментом browser_search
+        found += sorted((i for i in ids if "gpt-oss" in i.lower() and "safeguard" not in i.lower()),
+                        key=lambda i: ("120b" not in i, i))
         if not found:
-            raise RuntimeError("у ключа Groq нет моделей Compound с поиском; доступны: " + ", ".join(ids[:8]))
+            raise RuntimeError("у ключа Groq нет моделей с поиском (Compound, GPT-OSS); доступны: " + ", ".join(ids[:8]))
         _groq_model = found[0]
     return _groq_model
 
@@ -203,11 +207,13 @@ async def groq_compound(query: str, n: int = 6) -> list[dict[str, str]]:
     global _groq_model
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=38)) as session:
         model = await _pick_groq_model(session, key)
-        body = {"model": model, "temperature": 0.1, "messages": [{"role": "user", "content": ask}]}
+        body: dict[str, Any] = {"model": model, "temperature": 0.1, "messages": [{"role": "user", "content": ask}]}
+        if "compound" not in model.lower():
+            body.update(tools=[{"type": "browser_search"}], tool_choice="required")
         async with session.post(GROQ_URL, json=body, headers={"Authorization": f"Bearer {key}"}) as resp:
             if resp.status == 404:
                 _groq_model = ""  # модель убрали — в следующий раз выберем заново
-            data = await _json_or_error(f"Groq Compound ({model})", resp)
+            data = await _json_or_error(f"Поиск Groq ({model})", resp)
     msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
     answer = re.sub(r"<think>.*?</think>", "", str(msg.get("content") or ""), flags=re.S).strip()
     out = [{"title": "Сводка поиска Groq Compound", "url": "groq-compound", "text": answer[:2500]}] if answer else []
@@ -257,7 +263,7 @@ async def probe() -> list[tuple[str, bool, str]]:
     for name, fn, on in (("Поиск Tavily", tavily, bool(TAVILY_KEY)),
                          ("Поиск Яндекса", yandex, bool(YANDEX_KEY and YANDEX_FOLDER)),
                          ("Поиск DuckDuckGo (бесплатный)", duckduckgo, DDG_ON),
-                         ("Поиск Groq Compound (ИИ ищет сам)", groq_compound, bool(groq_key()))):
+                         ("Поиск Groq (ИИ ищет сам)", groq_compound, bool(groq_key()))):
         if not on:
             continue
         try:
