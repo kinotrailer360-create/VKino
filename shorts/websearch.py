@@ -1,6 +1,7 @@
 """Свой поиск в интернете для ИИ — не зависит от лимитов Gemini.
 
 DuckDuckGo — бесплатно и без ключа (выключить: DDG_SEARCH=off).
+Groq Compound — ИИ Groq сам ищет в интернете (ключ тот же, что у Groq; выключить: GROQ_SEARCH=off).
 Tavily (TAVILY_API_KEY, бесплатно до 1000 запросов в месяц, tavily.com) — тексты статей со ссылками.
 Поиск Яндекса (YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID, Yandex Cloud → Search API) — лучше всех находит
 российские источники: Кинопоиск, СМИ, даты проката в России. Нет ключей — пустой результат, бот работает как раньше.
@@ -32,12 +33,26 @@ YANDEX_URL = "https://searchapi.api.cloud.yandex.net/v2/web/search"
 # DuckDuckGo — бесплатно и без ключа (html-версия поиска); DDG_SEARCH=off — выключить
 DDG_ON = os.getenv("DDG_SEARCH", "on").strip().lower() not in ("off", "0", "no", "false")
 DDG_URL = "https://html.duckduckgo.com/html/"
+# Groq Compound: модель со встроенным поиском в интернете, ищет на серверах Groq — с российского сервера работает
+GROQ_SEARCH_ON = os.getenv("GROQ_SEARCH", "on").strip().lower() not in ("off", "0", "no", "false")
+GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "groq/compound-mini").strip()
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/124.0 Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
 
 
+def groq_key() -> str:
+    """Ключ Groq — тот же, что у резервного ИИ (если он Groq), или GROQ_API_KEY."""
+    if not GROQ_SEARCH_ON:
+        return ""
+    from . import ai  # здесь, а не наверху: ai сам импортирует этот модуль
+    if ai.RESERVE_KEY and "groq.com" in ai.RESERVE_URL:
+        return ai.RESERVE_KEY
+    return os.getenv("GROQ_API_KEY", "").strip().strip("\"'")
+
+
 def available() -> bool:
-    return bool(TAVILY_KEY or (YANDEX_KEY and YANDEX_FOLDER) or DDG_ON)
+    return bool(TAVILY_KEY or (YANDEX_KEY and YANDEX_FOLDER) or DDG_ON or groq_key())
 
 
 HINTS = {401: "ключ не подходит — проверь, что скопирован целиком", 403: "доступ запрещён — сервис, похоже, "
@@ -159,14 +174,38 @@ async def _page_text(url: str) -> str:
     return " ".join(p for p in paras if len(p) >= 40)[:1200]
 
 
+async def groq_compound(query: str, n: int = 6) -> list[dict[str, str]]:
+    """Groq Compound ищет в интернете сам: сводка фактов со ссылками + найденные страницы."""
+    key = groq_key()
+    if not key:
+        return []
+    ask = (f"Найди в интернете свежие проверенные факты по запросу: «{query[:400]}». Ответь по-русски коротким "
+           "списком фактов: у каждого — дата, если есть, и ссылка на источник. Ничего не додумывай: не нашёл — "
+           "так и напиши.")
+    body = {"model": GROQ_SEARCH_MODEL, "temperature": 0.1, "messages": [{"role": "user", "content": ask}]}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=38)) as session:
+        async with session.post(GROQ_URL, json=body, headers={"Authorization": f"Bearer {key}"}) as resp:
+            data = await _json_or_error("Groq Compound", resp)
+    msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+    answer = re.sub(r"<think>.*?</think>", "", str(msg.get("content") or ""), flags=re.S).strip()
+    out = [{"title": "Сводка поиска Groq Compound", "url": "groq-compound", "text": answer[:2500]}] if answer else []
+    for tool in msg.get("executed_tools") or []:
+        results = (tool.get("search_results") or {}).get("results") if isinstance(tool, dict) else None
+        for r in results or []:
+            if isinstance(r, dict) and r.get("url"):
+                out.append({"title": str(r.get("title") or ""), "url": str(r["url"]),
+                            "text": re.sub(r"\s+", " ", str(r.get("content") or ""))[:900]})
+    return out[: n + 1]
+
+
 async def search(query: str, n: int = 6) -> list[dict[str, str]]:
-    """Результаты обоих поисковиков (что подключено), без повторов ссылок; ошибки — в лог, не наверх."""
+    """Результаты всех поисковиков (что подключено), без повторов ссылок; ошибки — в лог, не наверх."""
     if not query.strip() or not available():
         return []
     found: list[dict[str, str]] = []
-    for name, res in zip(("Tavily", "Яндекс", "DuckDuckGo"),
-                         await asyncio.gather(tavily(query, n), yandex(query, n), duckduckgo(query, n),
-                                              return_exceptions=True)):
+    for name, res in zip(("Groq Compound", "Tavily", "Яндекс", "DuckDuckGo"),
+                         await asyncio.gather(groq_compound(query, n), tavily(query, n), yandex(query, n),
+                                              duckduckgo(query, n), return_exceptions=True)):
         if isinstance(res, Exception):
             log.warning("shorts: web search %s failed: %s", name, res)
             continue
@@ -195,7 +234,8 @@ async def probe() -> list[tuple[str, bool, str]]:
     out = []
     for name, fn, on in (("Поиск Tavily", tavily, bool(TAVILY_KEY)),
                          ("Поиск Яндекса", yandex, bool(YANDEX_KEY and YANDEX_FOLDER)),
-                         ("Поиск DuckDuckGo (бесплатный)", duckduckgo, DDG_ON)):
+                         ("Поиск DuckDuckGo (бесплатный)", duckduckgo, DDG_ON),
+                         ("Поиск Groq Compound (ИИ ищет сам)", groq_compound, bool(groq_key()))):
         if not on:
             continue
         try:
