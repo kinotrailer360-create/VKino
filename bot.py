@@ -10133,6 +10133,9 @@ async def _style_candidates(params: dict[str, str], exclude: set[int]) -> list[d
     return [d for d in docs if d.get("id") and d["id"] not in exclude and shorts_daily._poster_url(d)][:10]
 
 
+FRESH_LISTS = {"week", "fresh", "online", "cinema", "films", "series", "weekfilms", "weekseries", "upcoming"}
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
     """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
     кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
@@ -10147,8 +10150,11 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     else:
         theme = shorts_daily.theme_for(key, today)
         title = title or theme.hook
-        kp_films = await shorts_daily.pick_films(kp._get, theme, today, {int(x) for x in hist["films"]})
-        if len(kp_films) < 3:
+        # подборки «что вышло сейчас» историю не учитывают: неудачная или неопубликованная попытка не должна
+        # отнимать фильмы у следующей; повторы отсекаем только у «вечных» подборок (жанры, топы)
+        exclude = set() if key in FRESH_LISTS else {int(x) for x in hist["films"]}
+        kp_films = await shorts_daily.pick_films(kp._get, theme, today, exclude)
+        if len(kp_films) < 3 and exclude:
             kp_films = await shorts_daily.pick_films(kp._get, theme, today, set())
     own = POST_CHANNEL.lstrip("@").lower()
     try:  # свежие посты каналов — что вышло и что обсуждают
@@ -10159,7 +10165,8 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
         posts = []
     res = await shorts_ai.write_list_post(
         GEMINI_API_KEY, title, [_film_line(f) for f in kp_films], shorts_tgsearch.as_text(posts, 7000),
-        hist["list_titles"], f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+        [] if key in FRESH_LISTS else hist["list_titles"],
+        f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
     if res:
         # в альбом — только то, что есть в тексте поста: ИИ иногда перечисляет в films больше, чем написал
         flat = re.sub(r"[^\w]+", "", res["post"].lower().replace("ё", "е"))
