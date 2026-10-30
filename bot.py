@@ -9085,14 +9085,35 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
     for d in kp_films:
         if any(_same_title(n, t) for n in names for t in (shorts_daily._title(d), str(d.get("enName") or ""))):
             return shorts_daily._poster_url(d), d
+    # поиск на Кинопоиске — только точное совпадение названия: первый результат поиска бывает чужим
+    # («Американская история ужасов» → «Американская история X», «Тёмная материя» → «Тёмные начала»)
+    def titles(d: dict[str, Any]) -> list[str]:
+        out = [shorts_daily._title(d), str(d.get("alternativeName") or ""), str(d.get("enName") or "")]
+        return out + [str(x.get("name") or "") for x in d.get("names") or [] if isinstance(x, dict)]
+
     for q in names:
         try:
-            d = await shorts_daily.find_film(kp._get, f"{q} {f['year']}" if f["year"] else q)
+            data = await kp._get("/movie/search", query=q, page=1, limit=10)
         except Exception as exc:  # noqa: BLE001
             logging.info("List post: kinopoisk lookup %r failed: %s", q, exc)
             continue
-        if d and shorts_daily._poster_url(d):
-            return shorts_daily._poster_url(d), d
+        same = [d for d in data.get("docs") or [] if isinstance(d, dict) and d.get("id")
+                and any(_same_title(n, t) for n in names for t in titles(d))]
+        same.sort(key=lambda d: (abs(int(d.get("year") or 0) - f["year"]) > 1 if f["year"] else False,
+                                 -int((d.get("votes") or {}).get("kp") or 0)))
+        for d in same[:2]:
+            try:
+                full = await kp._get(f"/movie/{d['id']}")
+            except Exception:  # noqa: BLE001
+                full = d
+            if shorts_daily._poster_url(full):
+                return shorts_daily._poster_url(full), full
+    try:  # нет на Кинопоиске (бывает у свежих сериалов) — постер с TMDB, тоже по точному названию
+        url = await shorts_daily.tmdb.poster_by_title(TMDB_API_KEY, names)
+        if url:
+            return url, None
+    except Exception as exc:  # noqa: BLE001
+        logging.info("List post: TMDB poster %r failed: %s", names, exc)
     for p in posts:
         if p.get("image") and shorts_tgsearch._mentions(p["text"], names):
             return p["image"], None
