@@ -321,9 +321,9 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         docs += await _query(fetch, isSeries="false", year=years,
                              **{"premiere.russia": _range(today - timedelta(days=45), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
-    elif theme.key in ("weekfilms", "weekseries"):  # вышло онлайн за последние 7 дней
+    elif theme.key in ("weekfilms", "weekseries"):  # вышло онлайн за последние 10 дней
         series = theme.key == "weekseries"
-        week = _range(today - timedelta(days=7), today)
+        week = _range(today - timedelta(days=10), today)
         docs = []
         for field in (("digital", "world", "russia") if series else ("digital",)):
             docs += await _query(fetch, isSeries=str(series).lower(), year=f"{today.year - 1}-{today.year}",
