@@ -3666,6 +3666,9 @@ async def cmd_start(
 ) -> None:
     await state.clear()
     await remember(message)
+    if (message.text or "").partition(" ")[2].strip() == "pick":  # кнопка из поста «Рекомендация: что посмотреть»
+        await message.answer(*rq_screen("-", "-", "-", "-"))
+        return
 
     name = escape(
         message.from_user.first_name
@@ -4969,6 +4972,119 @@ async def popular(
         await message.answer(
             "Не удалось загрузить популярное."
         )
+
+
+# ---------------------------------------------------------------- «Рекомендация: что посмотреть» (опрос в боте)
+
+RQ_TYPES = {"f": "🎬 Фильм", "s": "📺 Сериал", "a": "🤷 Неважно"}
+RQ_GENRES = ["комедия", "ужасы", "триллер", "фантастика", "боевик", "драма", "детектив", "мелодрама",
+             "приключения", "фэнтези", "мультфильм", "криминал"]
+RQ_COUNTRIES = {"ru": "🇷🇺 Наше", "us": "🇺🇸 США", "a": "🌍 Неважно"}
+RQ_ERAS = {"n": "🆕 Новое (2020+)", "m": "📀 2000–2019", "o": "📼 Классика (до 2000)", "a": "🤷 Неважно"}
+rq_seen: dict[int, list[int]] = {}  # что уже советовали человеку — чтобы «ещё вариант» не повторялся
+
+
+def rq_screen(t: str, g: str, c: str, e: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Следующий вопрос опроса (ответы — в callback_data: тип:жанр:страна:эпоха, «-» — ещё не отвечено)."""
+    def btn(text: str, data: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=data)
+
+    if t == "-":
+        return ("🎯 <b>Подберу, что посмотреть!</b>\nОтветь на 4 коротких вопроса.\n\n1/4. Фильм или сериал?",
+                InlineKeyboardMarkup(inline_keyboard=[[btn(v, f"rq:{k}:-:-:-") for k, v in RQ_TYPES.items()]]))
+    if g == "-":
+        rows = [[btn(RQ_GENRES[i + j].capitalize(), f"rq:{t}:{i + j}:-:-") for j in range(3) if i + j < len(RQ_GENRES)]
+                for i in range(0, len(RQ_GENRES), 3)]
+        rows.append([btn("🎲 Любой жанр", f"rq:{t}:a:-:-")])
+        return "2/4. Какой жанр любишь?", InlineKeyboardMarkup(inline_keyboard=rows)
+    if c == "-":
+        return ("3/4. Наше или зарубежное?",
+                InlineKeyboardMarkup(inline_keyboard=[[btn(v, f"rq:{t}:{g}:{k}:-") for k, v in RQ_COUNTRIES.items()]]))
+    return ("4/4. Новое или постарше?", InlineKeyboardMarkup(inline_keyboard=[
+        [btn(v, f"rq:{t}:{g}:{c}:{k}") for k, v in list(RQ_ERAS.items())[:2]],
+        [btn(v, f"rq:{t}:{g}:{c}:{k}") for k, v in list(RQ_ERAS.items())[2:]]]))
+
+
+async def rq_pick(t: str, g: str, c: str, e: str, seen: list[int]) -> dict[str, Any] | None:
+    """Случайный хороший фильм/сериал Кинопоиска под ответы; не из уже показанных."""
+    year_now = datetime.now(MSK).year
+    params: dict[str, Any] = {"notNullFields": "poster.url"}
+    if t in ("f", "s"):
+        params["isSeries"] = "true" if t == "s" else "false"
+    if g.isdigit() and int(g) < len(RQ_GENRES):
+        params["genres.name"] = RQ_GENRES[int(g)]
+    if c == "ru":
+        params["countries.name"] = "СССР" if e == "o" else "Россия"
+    elif c == "us":
+        params["countries.name"] = "США"
+    params["year"] = {"n": f"2020-{year_now}", "m": "2000-2019", "o": "1950-1999"}.get(e, f"1970-{year_now}")
+    # российские и старые набирают меньше оценок — порог ниже
+    strict = {"rating.kp": "6.3-10" if c == "ru" else "6.8-10",
+              "votes.kp": f"{1500 if c == 'ru' or t == 's' else 8000}-100000000"}
+    for extra in (strict, {"rating.kp": "6-10", "votes.kp": "300-100000000"}):
+        query = {**params, **extra}
+        for _ in range(3):  # /movie/random — сразу случайный под фильтры
+            try:
+                item = await kp._get("/movie/random", **query)
+            except Exception:  # noqa: BLE001
+                break
+            if item.get("id") and int(item["id"]) not in seen:
+                return kp.normalize(item)
+        try:  # запасной путь: страница списка и случайный из неё
+            data = await kp._get("/movie", page=random.randint(1, 3), limit=50, sortField="votes.kp",
+                                 sortType="-1", **query)
+        except Exception:  # noqa: BLE001
+            continue
+        docs = [d for d in data.get("docs") or [] if d.get("id") and int(d["id"]) not in seen]
+        if docs:
+            return kp.normalize(random.choice(docs))
+    return None
+
+
+@router.callback_query(F.data.startswith("rq:"))
+async def rq_buttons(callback: CallbackQuery) -> None:
+    await callback.answer()
+    message = callback.message
+    if not message:
+        return
+    parts = (callback.data or "").split(":")
+    if parts[1] == "start" or len(parts) != 5:
+        await message.answer(*rq_screen("-", "-", "-", "-"))
+        return
+    t, g, c, e = parts[1:]
+    if "-" in (t, g, c, e):
+        text, markup = rq_screen(t, g, c, e)
+        try:
+            await message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await message.answer(text, reply_markup=markup)
+        return
+    user_id = callback.from_user.id
+    seen = rq_seen.setdefault(user_id, [])
+    try:
+        item = await rq_pick(t, g, c, e, seen)
+    except Exception:  # noqa: BLE001
+        logging.exception("Recommendation pick failed")
+        item = None
+    if not item:
+        await message.answer("😔 Под такие ответы ничего не нашлось. Попробуй другой жанр или «Неважно».",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [InlineKeyboardButton(text="🧩 Ответить заново", callback_data="rq:start")]]))
+        return
+    seen.append(int(item["id"]))
+    del seen[:-50]
+    answers = " · ".join(x for x in [RQ_TYPES[t].split(" ", 1)[1] if t != "a" else "",
+                                     RQ_GENRES[int(g)] if g.isdigit() else "",
+                                     RQ_COUNTRIES[c].split(" ", 1)[1] if c != "a" else "",
+                                     RQ_ERAS[e].split(" ", 1)[1] if e != "a" else ""] if x)
+    try:
+        await message.edit_text(f"🎯 Подбираю: {escape(answers or 'что угодно хорошее')}")
+    except TelegramBadRequest:
+        pass
+    await send_card(message, item, user_id)
+    await message.answer("Не то? Жми ещё 👇", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Ещё вариант", callback_data=f"rq:{t}:{g}:{c}:{e}")],
+        [InlineKeyboardButton(text="🧩 Ответить заново", callback_data="rq:start")]]))
 
 
 @router.message(F.text == "🎲 Что посмотреть?")
@@ -8893,6 +9009,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("🗳 Выбор подписчиков", "pt:vt"), _btn("🎭 Ляпы в кино", "pt:bl")])
     rows.append([_btn("🗳 Итог голосования → факты", "pt:vr")])
     rows.append([_btn("📣 Пост для взаимного пиара", "pt:pr"), _btn("🤖 Пост про бота", "pt:ab")])
+    rows.append([_btn("🎯 Рекомендация: что посмотреть (опрос в боте)", "pt:rq")])
     rows.append([_btn("📌 Закреп-навигатор", "pt:nv"), _btn("⚡ Буст канала", "pt:bs")])
     rows.append([_btn("🎁 Розыгрыш", "pt:gv"), _btn("📰 Статья для Дзен/VK", "pt:ar")])
     rows.append([_btn("🗓 Автоплан постов (вкл/выкл)", "pt:plan")])
@@ -9685,6 +9802,23 @@ async def make_bot_post(bot: Bot, chat_id: int) -> None:
                      "кнопка «🎬 Подобрать фильм»)", extra={"button": {"text": "🎬 Подобрать фильм", "url": url}})
 
 
+async def make_pick_post(bot: Bot, chat_id: int) -> None:
+    """«🎯 Рекомендация: что посмотреть»: пост с кнопкой — бот задаёт 4 вопроса и советует фильм или сериал."""
+    url = f"{await _bot_link(bot)}?start=pick"
+    post = "\n".join([
+        "🎯 РЕКОМЕНДАЦИЯ: ЧТО ПОСМОТРЕТЬ?", "",
+        "Не знаешь, что включить вечером? Ответь боту на 4 вопроса:", "",
+        "🎬 Фильм или сериал?", "🎭 Какой жанр любишь?", "🌍 Наше или зарубежное?", "🆕 Новинка или классика?", "",
+        "…и получи персональную рекомендацию с рейтингом и описанием. Не зашло — жми «Ещё вариант» 🔄", "",
+        "Жми кнопку под постом 👇", "",
+        "📤 Перешли другу, который вечно выбирает фильм дольше, чем смотрит",
+        "", "#чтопосмотреть #рекомендация #кино"])
+    ids = await _card_post(bot, chat_id, "4 вопроса — и бот подберёт фильм", url.replace("https://", "").split("?")[0], post)
+    await offer_post(bot, chat_id, ids, "caption", "pt:rq", what="Пост «Рекомендация: что посмотреть» готов (в "
+                     "канале под ним будет кнопка «🎯 Подобрать мне фильм»)",
+                     extra={"button": {"text": "🎯 Подобрать мне фильм", "url": url}})
+
+
 async def make_boost_post(bot: Bot, chat_id: int) -> None:
     """«⚡ Буст канала»: просьба подписчиков забустить канал — откроются истории и новые реакции."""
     own = POST_CHANNEL.lstrip("@")
@@ -10122,6 +10256,7 @@ POST_MAKERS.update({
     "bo": ("💰 ИИ ищет в Google сборы прошедшего уикенда…", make_box_office_post),
     "wk": ("🗞 Читаю каналы за неделю, ИИ собирает главное…", make_week_post),
     "pr": ("📣 Готовлю рекламный пост канала для взаимного пиара…", make_promo_post),
+    "rq": ("🎯 Готовлю пост «Рекомендация: что посмотреть» с кнопкой опроса…", make_pick_post),
     "ev": ("🎬 Выбираю фильм вечера, ищу трейлер со звуком и где посмотреть…", make_evening_post),
     "bt": ("⚔️ Подбираю пару фильмов для битвы…", make_battle_post),
     "vt": ("🗳 Готовлю голосование «Выбор подписчиков»…", make_vote_post),
