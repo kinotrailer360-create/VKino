@@ -167,6 +167,22 @@ async def company_logo(key: str, name: str) -> str | None:
     return f"{IMG}w780{hits[0]['logo_path']}" if hits else None
 
 
+async def poster_by_title(key: str, names: list[str]) -> str | None:
+    """Постер фильма/сериала по точному названию (русскому или оригинальному) — когда Кинопоиск не нашёл."""
+    if not key:
+        return None
+    wanted = {_norm(n) for n in names if _norm(n)}
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for name in names:
+            data = await _get(session, key, "/search/multi", query=name, language="ru-RU")
+            for r in data.get("results") or []:
+                found = {_norm(r.get(k)) for k in ("title", "original_title", "name", "original_name") if r.get(k)}
+                if r.get("poster_path") and wanted & found:
+                    return f"{IMG}w780{r['poster_path']}"
+    return None
+
+
 def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
     """Самые известные фильмы человека: роли (или режиссура), без документалок и камео «в роли себя»."""
     credits = info.get("movie_credits") or {}
