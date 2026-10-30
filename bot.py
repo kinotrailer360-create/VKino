@@ -4977,10 +4977,16 @@ async def popular(
 
 # ---------------------------------------------------------------- «Рекомендация: что посмотреть» (опрос в боте)
 
-RQ_TYPES = {"f": "🎬 Фильм", "s": "📺 Сериал", "a": "🤷 Неважно"}
+# тип — поле type Кинопоиска: «Фильм» и «Сериал» без мультфильмов, анимация — отдельными пунктами
+RQ_TYPES = {"f": "🎬 Фильм", "s": "📺 Сериал", "c": "🧸 Мультфильм", "m": "📺 Мультсериал", "j": "🍥 Аниме",
+            "a": "🤷 Неважно"}
+RQ_KP_TYPE = {"f": "movie", "s": "tv-series", "c": "cartoon", "m": "animated-series", "j": "anime"}
 RQ_GENRES = ["комедия", "ужасы", "триллер", "фантастика", "боевик", "драма", "детектив", "мелодрама",
-             "приключения", "фэнтези", "мультфильм", "криминал"]
-RQ_COUNTRIES = {"ru": "🇷🇺 Наше", "us": "🇺🇸 США", "a": "🌍 Неважно"}
+             "приключения", "фэнтези", "семейный", "криминал"]
+RQ_COUNTRIES = {"ru": "🇷🇺 Россия", "us": "🇺🇸 США", "gb": "🇬🇧 Англия", "kr": "🇰🇷 Корея", "fr": "🇫🇷 Франция",
+                "jp": "🇯🇵 Япония", "es": "🇪🇸 Испания", "tr": "🇹🇷 Турция", "de": "🇩🇪 Германия", "a": "🌍 Неважно"}
+RQ_KP_COUNTRY = {"ru": "Россия", "us": "США", "gb": "Великобритания", "kr": "Корея Южная", "fr": "Франция",
+                 "jp": "Япония", "es": "Испания", "tr": "Турция", "de": "Германия"}
 RQ_ERAS = {"n": "🆕 Новое (2020+)", "m": "📀 2000–2019", "o": "📼 Классика (до 2000)", "a": "🤷 Неважно"}
 rq_seen: dict[int, list[int]] = {}  # что уже советовали человеку — чтобы «ещё вариант» не повторялся
 
@@ -4991,16 +4997,20 @@ def rq_screen(t: str, g: str, c: str, e: str) -> tuple[str, InlineKeyboardMarkup
         return InlineKeyboardButton(text=text, callback_data=data)
 
     if t == "-":
-        return ("🎯 <b>Подберу, что посмотреть!</b>\nОтветь на 4 коротких вопроса.\n\n1/4. Фильм или сериал?",
-                InlineKeyboardMarkup(inline_keyboard=[[btn(v, f"rq:{k}:-:-:-") for k, v in RQ_TYPES.items()]]))
+        types = list(RQ_TYPES.items())
+        return ("🎯 <b>Подберу, что посмотреть!</b>\nОтветь на 4 коротких вопроса.\n\n1/4. Что будем смотреть?",
+                InlineKeyboardMarkup(inline_keyboard=[[btn(v, f"rq:{k}:-:-:-") for k, v in types[i:i + 3]]
+                                                      for i in range(0, len(types), 3)]))
     if g == "-":
         rows = [[btn(RQ_GENRES[i + j].capitalize(), f"rq:{t}:{i + j}:-:-") for j in range(3) if i + j < len(RQ_GENRES)]
                 for i in range(0, len(RQ_GENRES), 3)]
         rows.append([btn("🎲 Любой жанр", f"rq:{t}:a:-:-")])
         return "2/4. Какой жанр любишь?", InlineKeyboardMarkup(inline_keyboard=rows)
     if c == "-":
-        return ("3/4. Наше или зарубежное?",
-                InlineKeyboardMarkup(inline_keyboard=[[btn(v, f"rq:{t}:{g}:{k}:-") for k, v in RQ_COUNTRIES.items()]]))
+        countries = list(RQ_COUNTRIES.items())
+        return ("3/4. Какая страна?",
+                InlineKeyboardMarkup(inline_keyboard=[[btn(v, f"rq:{t}:{g}:{k}:-") for k, v in countries[i:i + 3]]
+                                                      for i in range(0, len(countries), 3)]))
     return ("4/4. Новое или постарше?", InlineKeyboardMarkup(inline_keyboard=[
         [btn(v, f"rq:{t}:{g}:{c}:{k}") for k, v in list(RQ_ERAS.items())[:2]],
         [btn(v, f"rq:{t}:{g}:{c}:{k}") for k, v in list(RQ_ERAS.items())[2:]]]))
@@ -5010,18 +5020,18 @@ async def rq_pick(t: str, g: str, c: str, e: str, seen: list[int]) -> dict[str, 
     """Случайный хороший фильм/сериал Кинопоиска под ответы; не из уже показанных."""
     year_now = datetime.now(MSK).year
     params: dict[str, Any] = {"notNullFields": "poster.url"}
-    if t in ("f", "s"):
-        params["isSeries"] = "true" if t == "s" else "false"
+    if t in RQ_KP_TYPE:
+        params["type"] = RQ_KP_TYPE[t]
     if g.isdigit() and int(g) < len(RQ_GENRES):
         params["genres.name"] = RQ_GENRES[int(g)]
-    if c == "ru":
-        params["countries.name"] = "СССР" if e == "o" else "Россия"
-    elif c == "us":
-        params["countries.name"] = "США"
+    if c == "ru" and e == "o":
+        params["countries.name"] = "СССР"
+    elif c in RQ_KP_COUNTRY:
+        params["countries.name"] = RQ_KP_COUNTRY[c]
     params["year"] = {"n": f"2020-{year_now}", "m": "2000-2019", "o": "1950-1999"}.get(e, f"1970-{year_now}")
-    # российские и старые набирают меньше оценок — порог ниже
+    # у американских фильмов оценок много — порог выше; у остальных стран, сериалов и анимации — ниже
     strict = {"rating.kp": "6.3-10" if c == "ru" else "6.8-10",
-              "votes.kp": f"{1500 if c == 'ru' or t == 's' else 8000}-100000000"}
+              "votes.kp": f"{8000 if t == 'f' and c in ('us', 'a') else 1000}-100000000"}
     for extra in (strict, {"rating.kp": "6-10", "votes.kp": "300-100000000"}):
         query = {**params, **extra}
         for _ in range(3):  # /movie/random — сразу случайный под фильтры
@@ -8784,6 +8794,9 @@ RUBRICS = {
 }
 
 
+BOT_URL = os.getenv("BOT_URL", "https://t.me/VKino_360bot")  # бот в строке «Где смотреть» постов
+
+
 def post_caption(text: str, rubric: str = "", links: list[tuple[str, str]] | None = None) -> str:
     """Текст поста → подпись в HTML: рубрика-хэштег, «Где смотреть» (ссылки на онлайн-кинотеатры) и подпись
     канала внизу — всё в пределах 1024 символов Telegram."""
@@ -8798,7 +8811,7 @@ def post_caption(text: str, rubric: str = "", links: list[tuple[str, str]] | Non
             tail += f"\n{rubric}"
             tail_len += len(rubric) + 1
     if links:
-        shown = links[:4]
+        shown = links[:3] + [("🤖 VKino бот", BOT_URL)]
         tail += "\n\n📺 Где смотреть: " + " · ".join(f'<a href="{escape(url)}">{escape(name)}</a>' for name, url in shown)
         tail_len += len("\n\n📺 Где смотреть: ") + sum(len(name) + 3 for name, _ in shown)
     return escape(_fit_text(text, 1020 - tail_len)) + tail + SIGNATURE
@@ -9831,7 +9844,8 @@ async def make_pick_post(bot: Bot, chat_id: int) -> None:
     post = "\n".join([
         "🎯 РЕКОМЕНДАЦИЯ: ЧТО ПОСМОТРЕТЬ?", "",
         "Не знаешь, что включить вечером? Ответь боту на 4 вопроса:", "",
-        "🎬 Фильм или сериал?", "🎭 Какой жанр любишь?", "🌍 Наше или зарубежное?", "🆕 Новинка или классика?", "",
+        "🎬 Фильм, сериал, мультфильм или аниме?", "🎭 Какой жанр любишь?",
+        "🌍 Какая страна: Россия, США, Корея, Англия, Франция…?", "🆕 Новинка или классика?", "",
         "…и получи персональную рекомендацию с рейтингом и описанием. Не зашло — жми «Ещё вариант» 🔄", "",
         "Жми кнопку под постом 👇", "",
         "📤 Перешли другу, который вечно выбирает фильм дольше, чем смотрит",
