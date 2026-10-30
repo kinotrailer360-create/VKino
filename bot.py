@@ -5104,40 +5104,115 @@ def rq_screen(t: str, g: str, c: str, e: str) -> tuple[str, InlineKeyboardMarkup
         [btn(v, f"rq:{t}:{g}:{c}:{k}") for k, v in list(RQ_ERAS.items())[2:]]]))
 
 
+rq_error = ""  # почему не нашлось (видно админу)
+RQ_ANIMATED = {"cartoon", "animated-series", "anime"}
+# жанры для TMDB (фильм, сериал); у сериалов TMDB свои объединённые жанры
+RQ_TMDB_GENRES = {"комедия": (35, 35), "ужасы": (27, 9648), "триллер": (53, 80), "фантастика": (878, 10765),
+                  "боевик": (28, 10759), "драма": (18, 18), "детектив": (9648, 9648), "мелодрама": (10749, 18),
+                  "приключения": (12, 10759), "фэнтези": (14, 10765), "семейный": (10751, 10751),
+                  "криминал": (80, 80)}
+RQ_TMDB_COUNTRY = {"ru": "RU", "us": "US", "gb": "GB", "kr": "KR", "fr": "FR", "jp": "JP", "es": "ES", "tr": "TR",
+                   "de": "DE"}
+
+
+def rq_type_ok(t: str, item: dict[str, Any]) -> bool:
+    """Тип с Кинопоиска совпал с ответом: «Фильм»/«Сериал» — без анимации, анимация — своего вида."""
+    kind = str(item.get("type") or "")
+    if t not in RQ_KP_TYPE or not kind:
+        return True
+    return kind == RQ_KP_TYPE[t] or (t == "f" and kind == "movie") or (t == "s" and kind == "tv-series")
+
+
 async def rq_pick(t: str, g: str, c: str, e: str, seen: list[int]) -> dict[str, Any] | None:
-    """Случайный хороший фильм/сериал Кинопоиска под ответы; не из уже показанных."""
+    """Случайный хороший фильм/сериал под ответы, не из уже показанных: Кинопоиск, а если он не ответил или
+    ничего не нашёл — TMDB."""
+    global rq_error
+    rq_error = ""
     year_now = datetime.now(MSK).year
-    params: dict[str, Any] = {"notNullFields": "poster.url"}
-    if t in RQ_KP_TYPE:
-        params["type"] = RQ_KP_TYPE[t]
+    base: dict[str, Any] = {"notNullFields": "poster.url"}
     if g.isdigit() and int(g) < len(RQ_GENRES):
-        params["genres.name"] = RQ_GENRES[int(g)]
+        base["genres.name"] = RQ_GENRES[int(g)]
     if c == "ru" and e == "o":
-        params["countries.name"] = "СССР"
+        base["countries.name"] = "СССР"
     elif c in RQ_KP_COUNTRY:
-        params["countries.name"] = RQ_KP_COUNTRY[c]
-    params["year"] = {"n": f"2020-{year_now}", "m": "2000-2019", "o": "1950-1999"}.get(e, f"1970-{year_now}")
+        base["countries.name"] = RQ_KP_COUNTRY[c]
+    base["year"] = {"n": f"2020-{year_now}", "m": "2000-2019", "o": "1950-1999"}.get(e, f"1970-{year_now}")
+    # тип: сначала полем type, если API его не примет — isSeries и проверка типа у найденного
+    kinds: list[dict[str, Any]] = [{}]
+    if t in RQ_KP_TYPE:
+        kinds = [{"type": RQ_KP_TYPE[t]}, {"isSeries": "true" if t in ("s", "m", "j") else "false"}]
     # у американских фильмов оценок много — порог выше; у остальных стран, сериалов и анимации — ниже
     strict = {"rating.kp": "6.3-10" if c == "ru" else "6.8-10",
               "votes.kp": f"{8000 if t == 'f' and c in ('us', 'a') else 1000}-100000000"}
-    for extra in (strict, {"rating.kp": "6-10", "votes.kp": "300-100000000"}):
-        query = {**params, **extra}
-        for _ in range(3):  # /movie/random — сразу случайный под фильтры
+    soft = {"rating.kp": "6-10", "votes.kp": "300-100000000"}
+    for extra in (strict, soft):
+        for kind in kinds:
+            query = {**base, **kind, **extra}
             try:
-                item = await kp._get("/movie/random", **query)
-            except Exception:  # noqa: BLE001
-                break
-            if item.get("id") and int(item["id"]) not in seen:
-                return kp.normalize(item)
-        try:  # запасной путь: страница списка и случайный из неё
-            data = await kp._get("/movie", page=random.randint(1, 3), limit=50, sortField="votes.kp",
-                                 sortType="-1", **query)
-        except Exception:  # noqa: BLE001
-            continue
-        docs = [d for d in data.get("docs") or [] if d.get("id") and int(d["id"]) not in seen]
-        if docs:
-            return kp.normalize(random.choice(docs))
-    return None
+                for _ in range(3):  # /movie/random — сразу случайный под фильтры
+                    item = await kp._get("/movie/random", **query)
+                    if item.get("id") and int(item["id"]) not in seen and rq_type_ok(t, item):
+                        return kp.normalize(item)
+            except Exception as exc:  # noqa: BLE001
+                rq_error = f"Кинопоиск /movie/random: {exc}"
+                logging.warning("Recommendation random failed %s: %s", query, exc)
+            try:  # запасной путь: случайная страница списка (только из существующих) и случайный из неё
+                data = await kp._get("/movie", page=1, limit=50, sortField="votes.kp", sortType="-1", **query)
+                pages = int(data.get("pages") or 1)
+                if pages > 1:
+                    data = await kp._get("/movie", page=random.randint(1, min(pages, 5)), limit=50,
+                                         sortField="votes.kp", sortType="-1", **query)
+            except Exception as exc:  # noqa: BLE001
+                rq_error = f"Кинопоиск /movie: {exc}"
+                logging.warning("Recommendation list failed %s: %s", query, exc)
+                continue
+            docs = [d for d in data.get("docs") or []
+                    if d.get("id") and int(d["id"]) not in seen and rq_type_ok(t, d)]
+            if docs:
+                return kp.normalize(random.choice(docs))
+    try:
+        return await rq_pick_tmdb(t, g, c, e, seen)
+    except Exception as exc:  # noqa: BLE001
+        rq_error += f"; TMDB: {exc}"
+        logging.warning("Recommendation TMDB failed: %s", exc)
+        return None
+
+
+async def rq_pick_tmdb(t: str, g: str, c: str, e: str, seen: list[int]) -> dict[str, Any] | None:
+    """Запасной подбор с TMDB: {"tmdb": True, "id", "title", "year", "rating", "overview", "poster", "tv"}."""
+    tv = t in ("s", "m", "j") or (t == "a" and random.random() < 0.4)
+    year_now = datetime.now(MSK).year
+    lo, hi = {"n": (2020, year_now), "m": (2000, 2019), "o": (1950, 1999)}.get(e, (1970, year_now))
+    date_key = "first_air_date" if tv else "primary_release_date"
+    params: dict[str, Any] = {"language": "ru-RU", "sort_by": "popularity.desc", "vote_average.gte": 6.5,
+                              "vote_count.gte": 300 if c in ("us", "a") else 80,
+                              f"{date_key}.gte": f"{lo}-01-01", f"{date_key}.lte": f"{hi}-12-31"}
+    genres = []
+    if g.isdigit() and int(g) < len(RQ_GENRES):
+        genres.append(RQ_TMDB_GENRES[RQ_GENRES[int(g)]][1 if tv else 0])
+    if t in ("c", "m", "j"):
+        genres.append(16)
+    elif t in ("f", "s"):
+        params["without_genres"] = "16"
+    if genres:
+        params["with_genres"] = ",".join(map(str, genres))
+    country = RQ_TMDB_COUNTRY.get(c) or ("JP" if t == "j" else "")
+    if country:
+        params["with_origin_country"] = "SU" if (c == "ru" and e == "o") else country
+    kind = "tv" if tv else "movie"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        first = await shorts_daily.tmdb._get(session, TMDB_API_KEY, f"/discover/{kind}", page=1, **params)
+        pages = min(int(first.get("total_pages") or 1), 5)
+        data = first if pages <= 1 else await shorts_daily.tmdb._get(
+            session, TMDB_API_KEY, f"/discover/{kind}", page=random.randint(1, pages), **params)
+    pool = [r for r in data.get("results") or [] if r.get("poster_path") and -int(r["id"]) not in seen]
+    if not pool:
+        return None
+    r = random.choice(pool)
+    return {"tmdb": True, "id": -int(r["id"]), "tv": tv, "title": r.get("name") or r.get("title") or "",
+            "year": str(r.get("first_air_date") or r.get("release_date") or "")[:4],
+            "rating": float(r.get("vote_average") or 0), "overview": str(r.get("overview") or ""),
+            "poster": f"{shorts_daily.tmdb.IMG}w780{r['poster_path']}"}
 
 
 @router.callback_query(F.data.startswith("rq:"))
@@ -5167,7 +5242,8 @@ async def rq_buttons(callback: CallbackQuery) -> None:
         logging.exception("Recommendation pick failed")
         item = None
     if not item:
-        await message.answer("😔 Под такие ответы ничего не нашлось. Попробуй другой жанр или «Неважно».",
+        why = f"\n\n<i>Для админа: {escape(rq_error[:300])}</i>" if rq_error and user_id in ADMIN_IDS else ""
+        await message.answer("😔 Под такие ответы ничего не нашлось. Попробуй другой жанр или «Неважно»." + why,
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [InlineKeyboardButton(text="🧩 Ответить заново", callback_data="rq:start")]]))
         return
@@ -5182,7 +5258,16 @@ async def rq_buttons(callback: CallbackQuery) -> None:
         await message.edit_text(f"🎯 Подбираю: {escape(answers or 'что угодно хорошее')}")
     except TelegramBadRequest:
         pass
-    await send_card(message, item, user_id)
+    if item.get("tmdb"):  # нашлось на TMDB — короткая карточка, а полная — через поиск бота
+        caption = (f"🎬 <b>{escape(item['title'])}</b> ({item['year'] or '?'}, {'сериал' if item['tv'] else 'фильм'})"
+                   + (f"\n⭐ TMDB: {item['rating']:.1f}" if item["rating"] else "")
+                   + (f"\n\n{escape(item['overview'][:700])}" if item["overview"] else ""))
+        try:
+            await message.answer_photo(item["poster"], caption=caption[:1024])
+        except Exception:  # noqa: BLE001
+            await message.answer(caption)
+    else:
+        await send_card(message, item, user_id)
     await message.answer("Не то? Жми ещё 👇", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Ещё вариант", callback_data=f"rq:{t}:{g}:{c}:{e}")],
         [InlineKeyboardButton(text="🧩 Ответить заново", callback_data="rq:start")]]))
