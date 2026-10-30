@@ -272,6 +272,15 @@ def theme_for(key: str | None, today: date) -> Theme:
         return Theme("fresh", "ТОЛЬКО ВЫШЛО", "ТОЛЬКО ВЫШЛО ОНЛАЙН",
                      "Только что вышло онлайн: что посмотреть", "Только что вышло онлайн 🔥",
                      ["новинки онлайн", "только вышло", "что посмотреть", "новые фильмы", "новые сериалы"])
+    if key == "films":  # для постов: новые фильмы (вышли онлайн или в кино за полтора месяца)
+        return Theme("films", "НОВИНКИ", "НОВЫЕ ФИЛЬМЫ", f"{n} новых фильмов, которые стоит посмотреть",
+                     f"{n} новых фильмов 🎬 Что посмотреть",
+                     ["новые фильмы", "новинки кино", "что посмотреть", "фильмы 2026", "фильм на вечер"])
+    if key in ("weekfilms", "weekseries"):  # для постов: что вышло онлайн за эту неделю
+        what = "сериалы" if key == "weekseries" else "фильмы"
+        return Theme(key, "ЗА НЕДЕЛЮ", f"ВЫШЛО ОНЛАЙН ЗА НЕДЕЛЮ: {what.upper()}",
+                     f"Вышло онлайн за неделю: {what}", f"Что посмотреть: {what}, вышедшие онлайн за неделю 🆕",
+                     [f"новые {what}", "новинки онлайн", "что посмотреть", "вышло на этой неделе", "онлайн премьеры"])
     if key in ("topfilms", "topseries"):  # для постов: лучшее за последние годы
         what = "сериалов" if key == "topseries" else "фильмов"
         return Theme(key, "ТОП", f"ТОП {what.upper()}", f"{n} лучших {what} последних лет",
@@ -305,6 +314,21 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         docs = await _query(fetch, isSeries="false", year=f"{today.year - 1}-{today.year + 1}",
                             **{"premiere.russia": _range(today - timedelta(days=4), today + timedelta(days=4))},
                             **common)
+    elif theme.key == "films":
+        years = f"{today.year - 1}-{today.year}"
+        docs = await _query(fetch, isSeries="false", year=years,
+                            **{"premiere.digital": _range(today - timedelta(days=45), today)}, **common)
+        docs += await _query(fetch, isSeries="false", year=years,
+                             **{"premiere.russia": _range(today - timedelta(days=45), today)}, **common)
+        docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
+    elif theme.key in ("weekfilms", "weekseries"):  # вышло онлайн за последние 7 дней
+        series = theme.key == "weekseries"
+        week = _range(today - timedelta(days=7), today)
+        docs = []
+        for field in (("digital", "world", "russia") if series else ("digital",)):
+            docs += await _query(fetch, isSeries=str(series).lower(), year=f"{today.year - 1}-{today.year}",
+                                 **{f"premiere.{field}": week}, **common)
+        docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
     elif theme.key == "series":
         docs = await _query(fetch, isSeries="true",
                             **{"premiere.world": _range(today - timedelta(days=60), today)}, **common)
