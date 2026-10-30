@@ -129,6 +129,31 @@ async def person(key: str, imdb: str) -> dict[str, Any] | None:
                           append_to_response="movie_credits,images")
 
 
+async def person_by_name(key: str, name: str) -> dict[str, Any] | None:
+    """Человек по имени (лучше английскому): профиль на русском с фильмографией и фото, или None."""
+    if not key or not name.strip():
+        return None
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        found = await _get(session, key, "/search/person", query=name.strip())
+        people = [p for p in found.get("results") or [] if p.get("profile_path")]
+        if not people:
+            return None
+        return await _get(session, key, f"/person/{people[0]['id']}", language="ru-RU",
+                          append_to_response="movie_credits,tv_credits,images")
+
+
+async def backdrops(key: str, kind: str, tmdb_id: int, n: int = 2) -> list[str]:
+    """Лучшие кадры фильма/сериала без надписей по его id на TMDB."""
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _get(session, key, f"/{kind}/{tmdb_id}/images", include_image_language="null,ru,en")
+    shots = sorted((b for b in data.get("backdrops") or [] if not b.get("iso_639_1") and b.get("file_path")),
+                   key=lambda b: float(b.get("vote_average") or 0) * 100 + float(b.get("vote_count") or 0),
+                   reverse=True)
+    return [f"{IMG}w1280{b['file_path']}" for b in shots[:n]]
+
+
 def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
     """Самые известные фильмы человека: роли (или режиссура), без документалок и камео «в роли себя»."""
     credits = info.get("movie_credits") or {}

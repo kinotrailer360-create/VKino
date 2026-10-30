@@ -21,7 +21,7 @@ from typing import Any
 import aiohttp
 from PIL import Image
 
-from . import ai, daily
+from . import ai, daily, tmdb
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -89,6 +89,87 @@ async def write_script(name: str, hook: str, key: str) -> dict[str, Any]:
     return script
 
 
+async def news_images(tmdb_key: str, person: str, person_en: str, films: list[str]) -> list[str]:
+    """Фото к новости: портреты человека и кадры фильмов из текста (TMDB), иначе — картинки Википедии."""
+    urls: list[str] = []
+    try:
+        info = await tmdb.person_by_name(tmdb_key, person_en or person)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: TMDB person %s failed: %s", person_en or person, exc)
+        info = None
+    if info:
+        urls += tmdb.profile_urls(info)
+        works = [("movie", c) for c in (info.get("movie_credits") or {}).get("cast") or []] + \
+                [("tv", c) for c in (info.get("tv_credits") or {}).get("cast") or []]
+        wanted = [tmdb._norm(f) for f in films if tmdb._norm(f)]
+
+        def mentioned(c: dict[str, Any]) -> bool:
+            names = {tmdb._norm(c.get(k)) for k in ("title", "original_title", "name", "original_name")}
+            return any(w and any(w in n or (n and n in w) for n in names if n) for w in wanted)
+
+        picked = [(k, c) for k, c in works if mentioned(c)]
+        picked += [("movie", c) for c in tmdb.best_movies(info, 6) if all(c.get("id") != p.get("id") for _, p in picked)]
+        seen: set[tuple[str, int]] = set()
+        for kind, c in picked:
+            if not c.get("id") or (kind, int(c["id"])) in seen or len(seen) >= 8:
+                continue
+            seen.add((kind, int(c["id"])))
+            try:
+                urls += await tmdb.backdrops(tmdb_key, kind, int(c["id"]), 2)
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: TMDB backdrops %s failed: %s", c.get("id"), exc)
+    if len(urls) < 8 and person:
+        try:
+            urls += (await find_article(person))["images"]
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: wiki images for %s failed: %s", person, exc)
+    out: list[str] = []
+    for u in urls:
+        if u not in out:
+            out.append(u)
+    return out[:MAX_IMAGES]
+
+
+async def write_news(text: str, key: str, tmdb_key: str) -> dict[str, Any]:
+    """Шортс «своя новость»: текст автора → закадровый текст, фото человека и кадры фильмов из новости."""
+    story = await ai.write_news_story(key, text)
+    name = story["person"] or story["title"] or "Новость"
+    images = await news_images(tmdb_key, story["person"], story["person_en"], story["films"])
+    return {"kind": "news", "name": name, "en": story["person_en"], "title": story["title"],
+            "lines": story["lines"], "hashtags": story["hashtags"], "films": story["films"],
+            "article": "текст автора", "url": "", "images": images}
+
+
+def is_mourning(script: dict[str, Any]) -> bool:
+    from .music import MOURNING
+    text = " ".join([script.get("title") or ""] + list(script.get("lines") or [])).lower()
+    return any(w in text for w in MOURNING)
+
+
+def build_news_seo(script: dict[str, Any]) -> dict[str, str]:
+    title = script.get("title") or script["name"]
+    title = (title if len(title) <= 88 else title[:85] + "…") + " #shorts"
+    mourning = is_mourning(script)
+    tags_line = " ".join(script.get("hashtags") or [])
+    desc = [" ".join(script["lines"][:3])[:400], ""]
+    if tags_line:
+        desc += [tags_line, ""]
+    desc += ["Светлая память. Какая роль запомнилась вам больше всего? Пишите в комментариях 👇" if mourning
+             else "Что думаешь? Пиши в комментариях 👇", "",
+             f"📺 YouTube: {YOUTUBE_URL}",
+             f"✈️ Telegram: {TELEGRAM_URL} — новости кино каждый день"]
+    tags: list[str] = []
+    name, en = script["name"], script.get("en") or ""
+    for t in [name.lower(), en.lower(), *[t.lstrip("#").lower() for t in script.get("hashtags") or []],
+              *[f.lower() for f in script.get("films") or []], "новости кино", "кино новости",
+              "KinoMir360", "киномир360"]:
+        if t and t not in tags and len(", ".join(tags + [t])) <= 480:
+            tags.append(t)
+    pinned = (f"Светлая память 🕯 Какая роль для вас главная?\nВсе новости — в Telegram {TELEGRAM_URL}"
+              if mourning else f"Что думаешь об этой новости? 👇\nВсе новости — в Telegram {TELEGRAM_URL}")
+    return {"title": title, "description": "\n".join(desc), "tags": ", ".join(tags), "pinned": pinned}
+
+
 def script_text(script: dict[str, Any]) -> str:
     return "\n".join(f"{i}. {line}" for i, line in enumerate(script["lines"], 1))
 
@@ -131,8 +212,11 @@ def _frame_ready(img: Image.Image, limit: int = 2400) -> Image.Image:
 async def make_lore(work: Path, script: dict[str, Any], music: Path | None = None,
                     user_media: list[Path] | None = None, gemini_key: str = "") -> ShortResult:
     lines = script["lines"]
+    news = script.get("kind") == "news"
+    mourning = news and is_mourning(script)
     await _progress(5, "Озвучка")
-    spoken = lines[:-1] + [f"{lines[-1]} {SAVE_AND_SUBSCRIBE}"]
+    # в прощальном ролике «подписывайся» в конце неуместно
+    spoken = lines if mourning else lines[:-1] + [f"{lines[-1]} {SAVE_AND_SUBSCRIBE}"]
     voice, starts, voiced, spans = await daily.synthesize(spoken, work)
     await _progress(30, "Субтитры по слову")
     words = await daily.word_timeline(voice, starts, spans) if voiced else []
@@ -187,14 +271,16 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     cfg = {
         "output": "short.mp4",
         "voice": voice.name,
-        "music": str(music or musiclib.pick(" ".join(script.get("lines") or [])) or ASSETS / "music.mp3"),
+        "music": str(music or musiclib.pick(script.get("title") or "", " ".join(script.get("lines") or []))
+                     or ASSETS / "music.mp3"),
         "music_db": -17 if voiced else -6,
         "logo": str(ASSETS / "logo.png"),
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
         "slides": slides,
         "words": words,
         "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
-        "outro": {"question": "ПРО КОГО\nРАССКАЗАТЬ\nДАЛЬШЕ?", "channel": "KinoMir360", "youtube": "@kinomir360",
+        "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
+                  else "ПРО КОГО\nРАССКАЗАТЬ\nДАЛЬШЕ?", "channel": "KinoMir360", "youtube": "@kinomir360",
                   "telegram": "@KinoMir360", "note": "ссылки в описании"},
     }
     cfg_path = work / "lore.json"
@@ -218,15 +304,25 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         raise RuntimeError(f"монтаж упал: {err.decode(errors='ignore')[-800:]}")
 
     cover_src = Image.open(work / pool[order[0]][0]).convert("RGB")
-    cover = await asyncio.to_thread(make_cover, cover_src, "ИСТОРИЯ", f"Кто такой {script['name']}?")
+    if news:
+        tag = "ПАМЯТИ" if mourning else "НОВОСТИ"
+        cover = await asyncio.to_thread(make_cover, cover_src, tag, script.get("title") or script["name"])
+        theme = Theme("news_own", tag, script["name"].upper(), script.get("title") or script["name"],
+                      script.get("title") or script["name"], [])
+        seo = build_news_seo(script)
+    else:
+        cover = await asyncio.to_thread(make_cover, cover_src, "ИСТОРИЯ", f"Кто такой {script['name']}?")
+        theme = Theme("lore", "ИСТОРИЯ", script["name"].upper(), f"История: {script['name']}",
+                      f"История: {script['name']}", [])
+        seo = build_lore_seo(script)
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
-    theme = Theme("lore", "ИСТОРИЯ", script["name"].upper(), f"История: {script['name']}",
-                  f"История: {script['name']}", [])
     film = {"name": script["name"], "en": script.get("en") or ""}
-    result = ShortResult(work / "short.mp4", cover_path, theme, [film], build_lore_seo(script))
+    result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
     notes = []
-    if own == 0:
+    if own == 0 and news:
+        notes.append("🖼 Фото подобраны автоматически (TMDB, Википедия). Хочешь свои — кнопка «📎 Свои картинки».")
+    elif own == 0:
         notes.append("🖼 Картинки взяты из статьи Википедии. Со своими страницами комиксов и кадрами "
                      "ролик выйдет ярче — кнопка «📎 Свои картинки».")
     if not voiced or daily.tts_note:

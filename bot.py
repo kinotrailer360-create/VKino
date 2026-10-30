@@ -220,6 +220,7 @@ class CustomState(StatesGroup):
 
 
 class LoreState(StatesGroup):
+    news = State()
     name = State()
     hook = State()
     edit = State()
@@ -7102,6 +7103,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
         [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
+        [_btn("📰 Своя новость: вставлю текст", "lo:news")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
@@ -10300,8 +10302,40 @@ async def lore_ask_hook(message: Message, state: FSMContext, name: str) -> None:
                                                            [_btn("❌ Отмена", "lo:cancel")]]))
 
 
+async def news_ask_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(LoreState.news)
+    await message.answer(
+        "📰 <b>Своя новость</b>\n\nВставь текст новости целиком — как есть, хоть с цитатами и хэштегами. "
+        "ИИ сократит его до ролика на минуту (ничего не добавляя от себя), сам подберёт фото человека "
+        "и кадры фильмов из новости. Дальше можно поправить текст и добавить свои фото.\n\n"
+        "<i>Передумал — /cancel</i>")
+
+
+async def news_generate(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    wait = await message.answer("✍️ Сокращаю текст и подбираю фото, обычно до минуты…")
+    try:
+        script = await shorts_lore.write_news(data.get("news_text") or "", GEMINI_API_KEY, TMDB_API_KEY)
+    except Exception as exc:
+        logging.exception("News script failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("🔄 Ещё раз", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]]))
+        return
+    await wait.delete()
+    await state.update_data(lore_name=script["name"], lore_script=script)
+    await show_lore(message, state)
+    if len(script.get("images") or []) < 6:
+        await message.answer(f"🖼 Нашёл только {len(script.get('images') or [])} фото — добавь свои кнопкой "
+                             "«📎 Добавить свои картинки», иначе картинки будут повторяться.")
+
+
 async def lore_generate(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
+    if data.get("lore_kind") == "news":
+        await news_generate(message, state)
+        return
     wait = await message.answer("✍️ Читаю Википедию и пишу сценарий, обычно до минуты…")
     try:
         script = await shorts_lore.write_script(data["lore_name"], data.get("lore_hook") or "", GEMINI_API_KEY)
@@ -10321,9 +10355,11 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
     script = data["lore_script"]
     media = data.get("lore_media") or []
     chars = sum(len(x) for x in script["lines"])
+    source = (f"<a href=\"{escape(script['url'])}\">{escape(script.get('article') or 'Википедия')}</a>"
+              if script.get("url") else escape(script.get("article") or "—"))
+    photos = f" • фото найдено: {len(script.get('images') or [])}" if script.get("kind") == "news" else ""
     head = (f"📝 <b>{escape(script.get('title') or data['lore_name'])}</b>\n"
-            f"{chars} символов ≈ {round(chars / 15)} с • источник: "
-            f"<a href=\"{escape(script.get('url') or '')}\">{escape(script.get('article') or 'Википедия')}</a>\n"
+            f"{chars} символов ≈ {round(chars / 15)} с • источник: {source}{photos}\n"
             "Каждая строка — отдельная картинка в ролике.")
     body = "" if brief else "\n\n" + escape(shorts_lore.script_text(script))
     markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -10377,6 +10413,18 @@ async def lore_command(message: Message, state: FSMContext) -> None:
         await lore_ask_hook(message, state, name)
     else:
         await lore_ask_name(message, state)
+
+
+@router.message(LoreState.news, F.text, ~F.text.startswith("/"))
+async def news_text(message: Message, state: FSMContext) -> None:
+    text = message.text or ""
+    if len(text.strip()) < 40:
+        await message.answer("Маловато — пришли текст новости целиком (хотя бы пару предложений).")
+        return
+    await state.set_state(None)
+    await state.update_data(news_text=text, lore_kind="news", lore_name="Новость", lore_hook="",
+                            lore_script=None, lore_media=[])
+    await news_generate(message, state)
 
 
 @router.message(LoreState.name, F.text, ~F.text.startswith("/"))
@@ -10438,6 +10486,9 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     if action == "start":
         await lore_ask_name(message, state)
+        return
+    if action == "news":
+        await news_ask_text(message, state)
         return
     if action == "cancel":
         await state.clear()

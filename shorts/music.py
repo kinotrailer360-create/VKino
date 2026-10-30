@@ -39,6 +39,9 @@ MOODS: dict[str, tuple[str, str, tuple[str, ...]]] = {
              ()),
 }
 DEFAULT = "epic"
+# прощальный ролик — всегда спокойная драма, даже если в тексте «Marvel» или «боевик»
+MOURNING = ("умер", "скончал", "ушёл из жизни", "ушел из жизни", "не стало", "светлая память", "прощаемся",
+            "памяти ", "соболезн", "некролог")
 LOOP_COPIES = 4  # 30-секундный трек → ~1 мин 50 с с плавными стыками
 CROSSFADE = 3.0
 
@@ -49,6 +52,8 @@ def prompt(mood: str) -> str:
 
 def mood_for(*texts: str) -> str:
     """Настроение по текстам ролика — от главного (заголовок) к второстепенному (реплики)."""
+    if any(w in (t or "").lower() for t in texts for w in MOURNING):
+        return "drama"
     for text in texts:
         low = (text or "").lower()
         for mood, (_, _, words) in MOODS.items():
