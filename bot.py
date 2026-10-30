@@ -10358,6 +10358,10 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
     source = (f"<a href=\"{escape(script['url'])}\">{escape(script.get('article') or 'Википедия')}</a>"
               if script.get("url") else escape(script.get("article") or "—"))
     photos = f" • фото найдено: {len(script.get('images') or [])}" if script.get("kind") == "news" else ""
+    pinned = shorts_lore.fixed_lines(script, script["lines"])
+    if pinned:
+        photos += "\n📌 " + ", ".join(f"{i + 1} — {escape(str(item.get('who') or ''))}"
+                                     for i, item in sorted(pinned.items()))
     head = (f"📝 <b>{escape(script.get('title') or data['lore_name'])}</b>\n"
             f"{chars} символов ≈ {round(chars / 15)} с • источник: {source}{photos}\n"
             "Каждая строка — отдельная картинка в ролике.")

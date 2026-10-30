@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
-from . import ai, daily, tmdb
+from . import ai, daily, pronounce, tmdb
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -89,16 +89,19 @@ async def write_script(name: str, hook: str, key: str) -> dict[str, Any]:
     return script
 
 
-async def news_images(tmdb_key: str, person: str, person_en: str, films: list[str]) -> list[str]:
-    """Фото к новости: портреты человека и кадры фильмов из текста (TMDB), иначе — картинки Википедии."""
+async def news_images(tmdb_key: str, person: str, person_en: str, films: list[str]) -> tuple[list[str], list[str]]:
+    """Фото к новости: портреты человека и кадры фильмов из текста (TMDB), иначе — картинки Википедии.
+    Возвращает (все картинки, портреты главного человека)."""
     urls: list[str] = []
+    portraits: list[str] = []
     try:
         info = await tmdb.person_by_name(tmdb_key, person_en or person)
     except Exception as exc:  # noqa: BLE001
         log.info("shorts: TMDB person %s failed: %s", person_en or person, exc)
         info = None
     if info:
-        urls += tmdb.profile_urls(info)
+        portraits = tmdb.profile_urls(info)
+        urls += portraits
         works = [("movie", c) for c in (info.get("movie_credits") or {}).get("cast") or []] + \
                 [("tv", c) for c in (info.get("tv_credits") or {}).get("cast") or []]
         wanted = [tmdb._norm(f) for f in films if tmdb._norm(f)]
@@ -127,15 +130,44 @@ async def news_images(tmdb_key: str, person: str, person_en: str, films: list[st
     for u in urls:
         if u not in out:
             out.append(u)
-    return out[:MAX_IMAGES]
+    return out[:MAX_IMAGES], portraits
+
+
+async def news_fixed(tmdb_key: str, story: dict[str, Any], portraits: list[str]) -> list[dict[str, Any]]:
+    """Картинки, привязанные к фразам: фото того, кого цитируют; логотип студии к её заявлению;
+    в прощальном ролике — чёрно-белый портрет на «Светлая память»."""
+    fixed: list[dict[str, Any]] = []
+    for v in story.get("visuals") or []:
+        try:
+            if v.get("brand"):
+                url = await tmdb.company_logo(tmdb_key, v["brand"])
+                first = v["brand"].split()[0]
+                keys = [v["brand"].lower(), first.lower(), pronounce.DEFAULT.get(first, "").lower()]
+                mode = "logo"
+            else:
+                info = await tmdb.person_by_name(tmdb_key, v.get("person_en") or v.get("person_ru") or "")
+                url = (tmdb.profile_urls(info) or [None])[0] if info else None
+                keys = [w.lower() for w in (v.get("person_ru") or "").split()[-1:] + (v.get("person_en") or "").split()[-1:]]
+                mode = "photo"
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: news visual %s failed: %s", v, exc)
+            continue
+        if url:
+            fixed.append({"line": v["line"], "keys": [k for k in keys if len(k) >= 3], "url": url, "mode": mode,
+                          "who": v.get("brand") or v.get("person_ru") or v.get("person_en")})
+    if portraits and is_mourning({"title": story.get("title"), "lines": story["lines"][-1:]}):
+        fixed.append({"line": len(story["lines"]), "keys": ["светлая память"], "url": portraits[min(1, len(portraits) - 1)],
+                      "mode": "bw", "who": f"{story.get('person') or 'актёр'}, чёрно-белое фото"})
+    return fixed
 
 
 async def write_news(text: str, key: str, tmdb_key: str) -> dict[str, Any]:
     """Шортс «своя новость»: текст автора → закадровый текст, фото человека и кадры фильмов из новости."""
     story = await ai.write_news_story(key, text)
     name = story["person"] or story["title"] or "Новость"
-    images = await news_images(tmdb_key, story["person"], story["person_en"], story["films"])
-    return {"kind": "news", "name": name, "en": story["person_en"], "title": story["title"],
+    images, portraits = await news_images(tmdb_key, story["person"], story["person_en"], story["films"])
+    fixed = await news_fixed(tmdb_key, story, portraits)
+    return {"kind": "news", "fixed": fixed, "name": name, "en": story["person_en"], "title": story["title"],
             "lines": story["lines"], "hashtags": story["hashtags"], "films": story["films"],
             "article": "текст автора", "url": "", "images": images}
 
@@ -201,6 +233,34 @@ def build_lore_seo(script: dict[str, Any]) -> dict[str, str]:
     return {"title": title, "description": "\n".join(desc), "tags": ", ".join(tags), "pinned": pinned}
 
 
+def _logo_card(logo: Image.Image) -> Image.Image:
+    """Логотип (PNG с прозрачностью) по центру тёмного кадра."""
+    card = Image.new("RGB", (1080, 1350), (16, 16, 20))
+    logo = logo.convert("RGBA")
+    logo.thumbnail((820, 520))
+    card.paste(logo, ((1080 - logo.width) // 2, (1350 - logo.height) // 2), logo)
+    return card
+
+
+def _black_white(img: Image.Image) -> Image.Image:
+    return ImageEnhance.Contrast(ImageOps.grayscale(img).convert("RGB")).enhance(1.15)
+
+
+def fixed_lines(script: dict[str, Any], lines: list[str]) -> dict[int, dict[str, Any]]:
+    """К какой фразе какая привязанная картинка: по имени/названию в тексте фразы, иначе по номеру
+    (автор мог поправить текст — номера тогда сдвигаются, а имена остаются)."""
+    out: dict[int, dict[str, Any]] = {}
+    for item in script.get("fixed") or []:
+        low = [ln.lower() for ln in lines]
+        hit = next((i for i, ln in enumerate(low) if i not in out and any(k in ln for k in item.get("keys") or [])), None)
+        if hit is None:
+            n = int(item.get("line") or 0) - 1
+            hit = n if 0 <= n < len(lines) and n not in out else None
+        if hit is not None:
+            out[hit] = item
+    return out
+
+
 def _frame_ready(img: Image.Image, limit: int = 2400) -> Image.Image:
     """Уменьшить огромные сканы (рендеру хватит ~2400 px по длинной стороне)."""
     img = img.convert("RGB")
@@ -250,19 +310,53 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 img.save(out, quality=90)
                 img.thumbnail((480, 480))
                 pool.append((out.name, img))
+    general = len(pool)
+    pinned: dict[int, int] = {}  # фраза -> картинка, привязанная к ней (кто говорит, логотип, памятный портрет)
+    fixed = fixed_lines(script, lines)
+    if fixed:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
+            for i, item in fixed.items():
+                try:
+                    async with session.get(item["url"]) as resp:
+                        resp.raise_for_status()
+                        raw = Image.open(io.BytesIO(await resp.read()))
+                        raw.load()
+                except Exception as exc:  # noqa: BLE001
+                    log.info("shorts: fixed image %s failed: %s", item["url"], exc)
+                    continue
+                img = _logo_card(raw) if item["mode"] == "logo" else _frame_ready(raw)
+                if item["mode"] == "bw":
+                    img = _black_white(img)
+                out = work / f"lfix{i}.jpg"
+                img.save(out, quality=92)
+                img.thumbnail((480, 480))
+                pinned[i] = len(pool)
+                pool.append((out.name, img))
     if not pool:
         raise RuntimeError("нет ни одной картинки: пришли свои (страницы комиксов, кадры) кнопкой «📎»")
 
-    # какую картинку на какую фразу: ИИ по смыслу; остальное — по порядку, без повторов подряд
-    choices = await ai.match_images(gemini_key, lines, [im for _, im in pool]) if gemini_key else None
-    used: set[int] = set()
+    # какую картинку на какую фразу: привязанные — как есть; остальные ИИ по смыслу, иначе по порядку
+    free_lines = [i for i in range(len(lines)) if i not in pinned]
+    picked = await ai.match_images(gemini_key, [lines[i] for i in free_lines],
+                                   [im for _, im in pool[:general]]) if gemini_key and general else None
+    choices = [-1] * len(lines)
+    for k, i in enumerate(free_lines):
+        if picked and k < len(picked):
+            choices[i] = picked[k]
+    for i, c in pinned.items():
+        choices[i] = c
+    used: set[int] = set(pinned.values())
     order: list[int] = []
     nxt = 0
     for i in range(len(lines)):
+        if i in pinned:
+            order.append(pinned[i])
+            continue
         c = choices[i] if choices and i < len(choices) else -1
         if c < 0 or c in used:
             free = [j for j in range(len(pool)) if j not in used]
-            c = free[0] if free else nxt % len(pool)
+            c = free[0] if free else nxt % (general or len(pool))
             nxt += 1
         used.add(c)
         order.append(c)

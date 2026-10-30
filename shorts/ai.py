@@ -1444,8 +1444,12 @@ async def write_news_story(key: str, text: str) -> dict[str, Any]:
         "Ещё определи: главного человека новости (по-русски и по-английски; пусто, если его нет), фильмы и "
         "сериалы из текста (по-русски, как в тексте), название ролика до 70 символов (как в тексте автора, "
         "если там есть заголовок) и 3–6 хэштегов (хэштеги автора — первыми).\n"
+        "И для фраз, где говорит или упоминается ДРУГОЙ человек или студия/компания (цитата, заявление), — "
+        "кого показать на картинке: visuals — список {\"line\": номер фразы с 1, \"person_ru\": \"имя по-русски\", "
+        "\"person_en\": \"имя по-английски\"} для человека или {\"line\": номер, \"brand\": \"Marvel Studios\"} для "
+        "студии. Главного человека новости сюда не включай.\n"
         'Ответь только JSON: {"title": "", "person": "", "person_en": "", "films": [""], '
-        '"hashtags": ["#..."], "lines": ["фраза", ...]}.\n\nТЕКСТ АВТОРА:\n' + text[:6000]
+        '"hashtags": ["#..."], "lines": ["фраза", ...], "visuals": []}.\n\nТЕКСТ АВТОРА:\n' + text[:6000]
     )
     data = await _with_reserve(key, [{"text": prompt}], prompt)
     if not isinstance(data, dict):
@@ -1458,7 +1462,18 @@ async def write_news_story(key: str, text: str) -> dict[str, Any]:
         return [str(x).strip() for x in data.get(key_) or [] if str(x).strip()][:n]
 
     tags = [t if t.startswith("#") else "#" + t for t in strs("hashtags", 6)]
-    return {"title": str(data.get("title") or "").strip()[:90], "person": str(data.get("person") or "").strip()[:80],
+    visuals = []
+    for v in data.get("visuals") or []:
+        if not isinstance(v, dict):
+            continue
+        try:
+            line = int(v.get("line") or 0)
+        except (TypeError, ValueError):
+            continue
+        item = {k: str(v.get(k) or "").strip()[:80] for k in ("person_ru", "person_en", "brand")}
+        if 1 <= line <= len(lines) and (item["person_en"] or item["person_ru"] or item["brand"]):
+            visuals.append({"line": line, **item})
+    return {"visuals": visuals[:8], "title": str(data.get("title") or "").strip()[:90], "person": str(data.get("person") or "").strip()[:80],
             "person_en": str(data.get("person_en") or "").strip()[:80], "films": strs("films", 8),
             "hashtags": [re.sub(r"\s+", "", t) for t in tags], "lines": lines[:14]}
 
