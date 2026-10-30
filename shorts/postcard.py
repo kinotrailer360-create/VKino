@@ -42,7 +42,7 @@ def _title_font(draw: ImageDraw.ImageDraw, title: str) -> tuple[ImageFont.FreeTy
 def make_post_card(img: Image.Image, title: str, place: int = 0, total: int = 0, rating: float | None = None,
                    rating_label: str = "", year: int | str | None = None, genres: list[str] | None = None,
                    actors: list[str] | None = None, pill: tuple[str, str] | None = None,
-                   meta: str | None = None, extra: str | None = None) -> Image.Image:
+                   meta: str | None = None, extra: str | None = None, episode: str | None = None) -> Image.Image:
     """Карточка фильма для подборки; без данных (фильм не с Кинопоиска) — только название и знак канала.
     pill — своя плашка вместо рейтинга (например («🎂», «51»)); meta и extra — свои строки вместо
     «год · жанр» и «В ролях: …» (например «Роль: Нео»)."""
@@ -84,6 +84,12 @@ def make_post_card(img: Image.Image, title: str, place: int = 0, total: int = 0,
         y -= 50
     if meta:
         y -= 50
+    if episode:  # свежий сезон/серия сериала — крупно над названием
+        ep_font = _font("Oswald.ttf", 60, "Bold")
+        y -= 80
+        draw.text((W // 2, y), episode.upper(), font=ep_font, fill=ACCENT, anchor="mt", stroke_width=3,
+                  stroke_fill=(0, 0, 0))
+        y += 80
     for row in rows:
         draw.text((W // 2, y), row, font=font, fill="white", anchor="mt", stroke_width=2, stroke_fill=(0, 0, 0))
         y += line_h

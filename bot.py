@@ -9242,7 +9242,8 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
 
 
 async def _list_cards(work: Path, items: list[tuple[str, str | None, dict[str, Any] | None]],
-                      extras: list[str] | None = None) -> list[Path]:
+                      extras: list[str] | None = None,
+                      episodes: list[tuple[str, str] | None] | None = None) -> list[Path]:
     """Фирменные карточки KinoMir360 для альбома подборки: (название, картинка, карточка Кинопоиска);
     extras — своя нижняя строка у каждой карточки (например «Сборы: $45 млн»)."""
     out = []
@@ -9255,10 +9256,11 @@ async def _list_cards(work: Path, items: list[tuple[str, str | None, dict[str, A
             continue
         try:
             rating, label = _trusted_rating(film) if film else (0.0, "")
+            ep = (episodes or [])[k - 1] if episodes and k <= len(episodes) else None
             card = await asyncio.to_thread(
                 shorts_postcard.make_post_card, Image.open(got[0]), name, k, len(items), rating or None, label,
-                (film or {}).get("year"), shorts_daily._genres(film)[:2] if film else None,
-                shorts_daily._actors(film, 3) if film else None, extra=extra)
+                ep[1] if ep else (film or {}).get("year"), shorts_daily._genres(film)[:2] if film else None,
+                shorts_daily._actors(film, 3) if film else None, extra=extra, episode=ep[0] if ep else None)
             path = work / f"card{k}.jpg"
             card.save(path, quality=92)
             out.append(path)
@@ -10141,7 +10143,7 @@ async def _style_candidates(params: dict[str, str], exclude: set[int]) -> list[d
 FRESH_LISTS = {"week", "fresh", "online", "cinema", "films", "series", "weekfilms", "weekseries", "upcoming"}
 
 
-async def _tmdb_week_lines(series: bool, today: date) -> list[str]:
+async def _tmdb_week_lines(series: bool, today: date) -> tuple[list[str], dict[str, tuple[str, str]]]:
     """Кандидаты «за неделю» с TMDB, от самых популярных: у сериалов — какая серия какого сезона и когда вышла
     (на Кинопоиске есть только дата первого сезона, свежих серий идущих сериалов там не видно)."""
     since, until = (today - timedelta(days=10)).isoformat(), today.isoformat()
@@ -10150,10 +10152,18 @@ async def _tmdb_week_lines(series: bool, today: date) -> list[str]:
             TMDB_API_KEY, since, until)
     except Exception as exc:  # noqa: BLE001
         logging.info("TMDB week list failed: %s", exc)
-        return []
-    out = []
+        return [], {}
+    out: list[str] = []
+    seasons: dict[str, tuple[str, str]] = {}  # название → («38 сезон · 4 серия», год сезона) для карточек
     for t in found:
-        parts = [f"«{t['name']}» ({t['year'] or '?'})"]
+        if series and t.get("season") and t.get("episode"):
+            label = f"{t['season']} сезон · {t['episode']} серия"
+            for n in (t["name"], t["original"]):
+                if n:
+                    seasons[_norm_title(n)] = (label, t["aired"][:4])
+            parts = [f"«{t['name']}» — {t['season']}-й сезон ({t['aired'][:4]}), сериал идёт с {t['year'] or '?'}"]
+        else:
+            parts = [f"«{t['name']}» ({t['year'] or '?'})"]
         if t["original"] and t["original"] != t["name"]:
             parts.append(f"ориг. {t['original']}")
         parts += t.get("genres", [])[:2]
@@ -10164,7 +10174,11 @@ async def _tmdb_week_lines(series: bool, today: date) -> list[str]:
             parts.append(f"вышла {t['episode']}-я серия {t['season']}-го сезона {d.day} "
                          f"{shorts_daily.MONTHS[d.month - 1]}")
         out.append(", ".join(parts) + (f". {t['overview'][:220]}" if t["overview"] else ""))
-    return out
+    return out, seasons
+
+
+def _norm_title(text: str) -> str:
+    return re.sub(r"[^\w]+", "", str(text or "").lower().replace("ё", "е"))
 
 
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
@@ -10195,8 +10209,10 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
         logging.info("List post: tg channels skipped: %s", exc)
         posts = []
     lines = [_film_line(f) for f in kp_films]
+    seasons: dict[str, tuple[str, str]] = {}
     if key in ("weekseries", "weekfilms"):  # первыми — популярное с TMDB: свежие серии идущих сериалов, релизы онлайн
-        lines = await _tmdb_week_lines(key == "weekseries", today) + lines
+        tm_lines, seasons = await _tmdb_week_lines(key == "weekseries", today)
+        lines = tm_lines + lines
     res = await shorts_ai.write_list_post(
         GEMINI_API_KEY, title, lines, shorts_tgsearch.as_text(posts, 7000),
         [] if key in FRESH_LISTS else hist["list_titles"],
@@ -10211,9 +10227,12 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
         post, names = res["post"], [f["ru"] or f["en"] for f in res["films"]]
         found = [await _list_poster(f, kp_films, posts) for f in res["films"]]
         items = [(name, url, film) for name, (url, film) in zip(names, found)]
+        episodes = [next((seasons[_norm_title(n)] for n in (f["ru"], f["en"]) if n and _norm_title(n) in seasons), None)
+                    for f in res["films"]]
     elif len(kp_films) >= 3:  # ИИ не ответил — подборка только с Кинопоиска по шаблону
         post, names = _list_fallback(title, kp_films), [shorts_daily._title(f) for f in kp_films]
         items = [(shorts_daily._title(f), shorts_daily._poster_url(f), f) for f in kp_films]
+        episodes = []
     else:
         raise RuntimeError("ни ИИ, ни Кинопоиск не дали фильмов для этой подборки — попробуй другую")
     post = _brand(post)
@@ -10223,7 +10242,8 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     work = SHORTS_DIR / f"list_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
-        ids, kind = await _send_album(bot, chat_id, await _list_cards(work, items), post, "#подборка")
+        ids, kind = await _send_album(bot, chat_id, await _list_cards(work, items, episodes=episodes), post,
+                                      "#подборка")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, f"pt:l:{key}", names, "Подборка готова")
