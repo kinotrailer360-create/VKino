@@ -8868,6 +8868,7 @@ class PostState(StatesGroup):
     link = State()
     actor = State()
     digest = State()
+    listlink = State()
 
 
 async def _posts_history() -> dict[str, list[str]]:
@@ -9114,6 +9115,7 @@ def posts_menu() -> InlineKeyboardMarkup:
              for k in range(0, len(SHORTS_GENRES), 3)]
     rows.append([_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")])
     rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
+    rows.append([_btn("🔗 Подборка по ссылке или тексту", "pt:ll")])
     rows.append([_btn("🧩 Сводка по теме из всех каналов", "pt:dg")])
     rows.append([_btn("🎂 День рождения звезды", "pt:bd"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
@@ -10136,6 +10138,32 @@ async def _style_candidates(params: dict[str, str], exclude: set[int]) -> list[d
 FRESH_LISTS = {"week", "fresh", "online", "cinema", "films", "series", "weekfilms", "weekseries", "upcoming"}
 
 
+async def _tmdb_week_lines(series: bool, today: date) -> list[str]:
+    """Кандидаты «за неделю» с TMDB, от самых популярных: у сериалов — какая серия какого сезона и когда вышла
+    (на Кинопоиске есть только дата первого сезона, свежих серий идущих сериалов там не видно)."""
+    since, until = (today - timedelta(days=10)).isoformat(), today.isoformat()
+    try:
+        found = await (shorts_daily.tmdb.tv_aired if series else shorts_daily.tmdb.movies_digital)(
+            TMDB_API_KEY, since, until)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("TMDB week list failed: %s", exc)
+        return []
+    out = []
+    for t in found:
+        parts = [f"«{t['name']}» ({t['year'] or '?'})"]
+        if t["original"] and t["original"] != t["name"]:
+            parts.append(f"ориг. {t['original']}")
+        parts += t.get("genres", [])[:2]
+        if t["votes"] >= 50 and t["rating"]:
+            parts.append(f"TMDB {t['rating']:.1f}")
+        if series and t.get("episode"):
+            d = date.fromisoformat(t["aired"])
+            parts.append(f"вышла {t['episode']}-я серия {t['season']}-го сезона {d.day} "
+                         f"{shorts_daily.MONTHS[d.month - 1]}")
+        out.append(", ".join(parts) + (f". {t['overview'][:220]}" if t["overview"] else ""))
+    return out
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
     """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
     кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
@@ -10163,10 +10191,14 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     except Exception as exc:  # noqa: BLE001
         logging.info("List post: tg channels skipped: %s", exc)
         posts = []
+    lines = [_film_line(f) for f in kp_films]
+    if key in ("weekseries", "weekfilms"):  # первыми — популярное с TMDB: свежие серии идущих сериалов, релизы онлайн
+        lines = await _tmdb_week_lines(key == "weekseries", today) + lines
     res = await shorts_ai.write_list_post(
-        GEMINI_API_KEY, title, [_film_line(f) for f in kp_films], shorts_tgsearch.as_text(posts, 7000),
+        GEMINI_API_KEY, title, lines, shorts_tgsearch.as_text(posts, 7000),
         [] if key in FRESH_LISTS else hist["list_titles"],
-        f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+        f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
+        n=6 if key in ("weekseries", "weekfilms") else 5)
     if res:
         # в альбом — только то, что есть в тексте поста: ИИ иногда перечисляет в films больше, чем написал
         flat = re.sub(r"[^\w]+", "", res["post"].lower().replace("ё", "е"))
@@ -10514,6 +10546,13 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
                              "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
         return
+    if action == "ll":
+        await state.set_state(PostState.listlink)
+        await message.answer(
+            "🔗 Пришли ссылку на подборку (статья, пост Telegram-канала) или вставь сам список фильмов — можно с "
+            "описаниями. Бот возьмёт фильмы ровно оттуда, в том же порядке, перескажет в стиле канала и сделает "
+            "фирменные карточки с постерами.\n\n<i>Передумал — /cancel</i>")
+        return
     if action == "dg":
         await state.set_state(PostState.digest)
         await message.answer(
@@ -10646,6 +10685,76 @@ async def make_digest_post(bot: Bot, chat_id: int, topic: str) -> None:
     used = sorted({p["channel"] for p in posts})
     await offer_post(bot, chat_id, ids, kind, "pt:dg",
                      what=f"Сводка готова: {len(posts)} постов из {len(used)} каналов")
+
+
+async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str]) -> None:
+    """«🔗 Подборка по ссылке или тексту»: фильмы ровно из источника автора → пост-подборка с карточками."""
+    texts = []
+    for url in urls:
+        try:
+            src = await shorts_linkfetch.fetch(url)
+            texts.append(f"{src['title']}\n{src['text']}")
+        except Exception as exc:  # noqa: BLE001
+            logging.info("List link %s failed: %s", url, exc)
+    rest = URL_RE.sub("", raw).strip()
+    if rest:
+        texts.append(rest)
+    material = "\n\n".join(t for t in texts if t.strip())
+    if len(material) < 20:
+        raise RuntimeError("не получилось прочитать ссылку — вставь список фильмов текстом")
+    plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
+    films = plan.get("films") or []
+    if len(films) < 2:
+        raise RuntimeError("в источнике не нашлось списка фильмов")
+    lines = [f"«{f['ru'] or f['en']}» ({f.get('year') or '?'})" + (f", ориг. {f['en']}" if f.get("en") else "")
+             + (f". {f['note']}" if f.get("note") else "") for f in films]
+    today = datetime.now(MSK).date()
+    res = await shorts_ai.write_list_post(GEMINI_API_KEY, plan.get("title") or "Подборка", lines, "", [],
+                                          f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
+                                          n=len(films), only=True)
+    picked = (res or {}).get("films") or [{"ru": f["ru"], "en": f["en"],
+                                           "year": int(f["year"]) if str(f.get("year") or "").isdigit() else None}
+                                          for f in films]
+    post = _brand(res["post"] if res else "\n".join(
+        [f"🍿 {str(plan.get('title') or 'ПОДБОРКА').upper()}", ""] + [f"{k}. {ln}" for k, ln in enumerate(lines, 1)]))
+    names = [f["ru"] or f["en"] for f in picked]
+    found = [await _list_poster(f, [], []) for f in picked]
+    work = SHORTS_DIR / f"llist_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        ids, kind = await _send_album(
+            bot, chat_id, await _list_cards(work, [(n, u, fl) for n, (u, fl) in zip(names, found)]), post, "#подборка")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "pt:ll", names[:10], "Подборка по ссылке готова")
+
+
+@router.message(PostState.listlink, ~F.text.startswith("/"))
+async def post_list_link(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    raw = message.text or message.caption or ""
+    urls = list(dict.fromkeys(
+        [u.rstrip(").,»\"'") for u in URL_RE.findall(raw)]
+        + [e.url for e in (message.entities or message.caption_entities or []) if e.type == "text_link" and e.url]))[:3]
+    if not urls and len(raw) < 20:
+        await message.answer("Не вижу ни ссылки, ни списка. Нажми «🔗 Подборка по ссылке» и пришли ещё раз.")
+        return
+    if post_lock.locked():
+        await message.answer("⏳ Пост уже пишется — подожди минуту и пришли ещё раз.")
+        return
+    wait = await message.answer("🔗 Читаю источник, ИИ собирает подборку и ищет постеры…")
+    chat_id = message.chat.id
+
+    async def job() -> None:
+        try:
+            async with post_lock:
+                await make_link_list_post(message.bot, chat_id, raw, urls)
+            await wait.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("List-by-link post failed")
+            await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(str(exc)[:300])}</code>")
+
+    _run_job(job)
 
 
 @router.message(PostState.digest, F.text, ~F.text.startswith("/"))
