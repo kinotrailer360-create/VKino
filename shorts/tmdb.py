@@ -167,20 +167,81 @@ async def company_logo(key: str, name: str) -> str | None:
     return f"{IMG}w780{hits[0]['logo_path']}" if hits else None
 
 
-async def poster_by_title(key: str, names: list[str]) -> str | None:
-    """Постер фильма/сериала по точному названию (русскому или оригинальному) — когда Кинопоиск не нашёл."""
+def similar(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    a, b = _norm(a), _norm(b)
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+async def poster_by_title(key: str, names: list[str], year: int | None = None) -> str | None:
+    """Постер фильма/сериала по названию (русскому или оригинальному) — когда Кинопоиск не нашёл.
+    Точное совпадение; иначе очень похожее (≥ 0.85) и того же года (±1) — чужой постер хуже, чем никакого."""
     if not key:
         return None
     wanted = {_norm(n) for n in names if _norm(n)}
     timeout = aiohttp.ClientTimeout(total=20)
+    close: str | None = None
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for name in names:
             data = await _get(session, key, "/search/multi", query=name, language="ru-RU")
             for r in data.get("results") or []:
-                found = {_norm(r.get(k)) for k in ("title", "original_title", "name", "original_name") if r.get(k)}
-                if r.get("poster_path") and wanted & found:
+                if not r.get("poster_path"):
+                    continue
+                titles = [r.get(k) for k in ("title", "original_title", "name", "original_name") if r.get(k)]
+                if wanted & {_norm(t) for t in titles}:
                     return f"{IMG}w780{r['poster_path']}"
-    return None
+                r_year = int(str(r.get("release_date") or r.get("first_air_date") or "0")[:4] or 0)
+                if (not close and year and r_year and abs(r_year - year) <= 1
+                        and max(similar(n, t) for n in names for t in titles) >= 0.85):
+                    close = f"{IMG}w780{r['poster_path']}"
+    return close
+
+
+async def tv_aired(key: str, since: str, until: str, n: int = 12) -> list[dict[str, Any]]:
+    """Популярные сериалы, у которых в период вышли серии: название (ru), описание, последняя вышедшая серия.
+    [{"name", "original", "year", "overview", "rating", "votes", "season", "episode", "aired", "poster"}]"""
+    if not key:
+        return []
+    timeout = aiohttp.ClientTimeout(total=40)
+    out: list[dict[str, Any]] = []
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _get(session, key, "/discover/tv", language="ru-RU", sort_by="popularity.desc",
+                          **{"air_date.gte": since, "air_date.lte": until, "vote_count.gte": 30,
+                             "without_genres": "10763,10764,10767"})  # без новостей, реалити и ток-шоу
+        for r in (data.get("results") or [])[: n + 4]:
+            try:
+                tv = await _get(session, key, f"/tv/{r['id']}", language="ru-RU")
+            except Exception:  # noqa: BLE001
+                continue
+            last = tv.get("last_episode_to_air") or {}
+            aired = str(last.get("air_date") or "")
+            if not (since <= aired <= until):
+                continue
+            out.append({"name": tv.get("name") or r.get("name"), "original": tv.get("original_name") or "",
+                        "year": str(tv.get("first_air_date") or "")[:4], "overview": str(tv.get("overview") or ""),
+                        "rating": float(tv.get("vote_average") or 0), "votes": int(tv.get("vote_count") or 0),
+                        "season": last.get("season_number"), "episode": last.get("episode_number"), "aired": aired,
+                        "genres": [g.get("name") for g in tv.get("genres") or [] if g.get("name")],
+                        "poster": f"{IMG}w780{tv['poster_path']}" if tv.get("poster_path") else None})
+            if len(out) >= n:
+                break
+    return out
+
+
+async def movies_digital(key: str, since: str, until: str, n: int = 12) -> list[dict[str, Any]]:
+    """Популярные фильмы, вышедшие в цифре (онлайн) за период — по данным TMDB (релизы США)."""
+    if not key:
+        return []
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _get(session, key, "/discover/movie", language="ru-RU", sort_by="popularity.desc",
+                          region="US", with_release_type="4",
+                          **{"release_date.gte": since, "release_date.lte": until, "vote_count.gte": 10})
+    return [{"name": r.get("title"), "original": r.get("original_title") or "",
+             "year": str(r.get("release_date") or "")[:4], "overview": str(r.get("overview") or ""),
+             "rating": float(r.get("vote_average") or 0), "votes": int(r.get("vote_count") or 0),
+             "poster": f"{IMG}w780{r['poster_path']}" if r.get("poster_path") else None}
+            for r in (data.get("results") or [])[:n] if r.get("title")]
 
 
 def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
