@@ -9215,8 +9215,11 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
         except Exception as exc:  # noqa: BLE001
             logging.info("List post: kinopoisk lookup %r failed: %s", q, exc)
             continue
-        same = [d for d in data.get("docs") or [] if isinstance(d, dict) and d.get("id")
-                and any(_same_title(n, t) for n in names for t in titles(d))]
+        docs = [d for d in data.get("docs") or [] if isinstance(d, dict) and d.get("id")]
+        same = [d for d in docs if any(_same_title(n, t) for n in names for t in titles(d))]
+        if not same and f["year"]:  # чуть другое написание («Шериф поневоле» / «Шериф-поневоле») — того же года
+            same = [d for d in docs if abs(int(d.get("year") or 0) - f["year"]) <= 1 and max(
+                (shorts_daily.tmdb.similar(n, t) for n in names for t in titles(d) if t), default=0) >= 0.85]
         same.sort(key=lambda d: (abs(int(d.get("year") or 0) - f["year"]) > 1 if f["year"] else False,
                                  -int((d.get("votes") or {}).get("kp") or 0)))
         for d in same[:2]:
@@ -9227,7 +9230,7 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
             if shorts_daily._poster_url(full):
                 return shorts_daily._poster_url(full), full
     try:  # нет на Кинопоиске (бывает у свежих сериалов) — постер с TMDB, тоже по точному названию
-        url = await shorts_daily.tmdb.poster_by_title(TMDB_API_KEY, names)
+        url = await shorts_daily.tmdb.poster_by_title(TMDB_API_KEY, names, f["year"])
         if url:
             return url, None
     except Exception as exc:  # noqa: BLE001

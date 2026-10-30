@@ -167,20 +167,34 @@ async def company_logo(key: str, name: str) -> str | None:
     return f"{IMG}w780{hits[0]['logo_path']}" if hits else None
 
 
-async def poster_by_title(key: str, names: list[str]) -> str | None:
-    """Постер фильма/сериала по точному названию (русскому или оригинальному) — когда Кинопоиск не нашёл."""
+def similar(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    a, b = _norm(a), _norm(b)
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+async def poster_by_title(key: str, names: list[str], year: int | None = None) -> str | None:
+    """Постер фильма/сериала по названию (русскому или оригинальному) — когда Кинопоиск не нашёл.
+    Точное совпадение; иначе очень похожее (≥ 0.85) и того же года (±1) — чужой постер хуже, чем никакого."""
     if not key:
         return None
     wanted = {_norm(n) for n in names if _norm(n)}
     timeout = aiohttp.ClientTimeout(total=20)
+    close: str | None = None
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for name in names:
             data = await _get(session, key, "/search/multi", query=name, language="ru-RU")
             for r in data.get("results") or []:
-                found = {_norm(r.get(k)) for k in ("title", "original_title", "name", "original_name") if r.get(k)}
-                if r.get("poster_path") and wanted & found:
+                if not r.get("poster_path"):
+                    continue
+                titles = [r.get(k) for k in ("title", "original_title", "name", "original_name") if r.get(k)]
+                if wanted & {_norm(t) for t in titles}:
                     return f"{IMG}w780{r['poster_path']}"
-    return None
+                r_year = int(str(r.get("release_date") or r.get("first_air_date") or "0")[:4] or 0)
+                if (not close and year and r_year and abs(r_year - year) <= 1
+                        and max(similar(n, t) for n in names for t in titles) >= 0.85):
+                    close = f"{IMG}w780{r['poster_path']}"
+    return close
 
 
 async def tv_aired(key: str, since: str, until: str, n: int = 12) -> list[dict[str, Any]]:
