@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote_plus, urlencode
 
 import aiohttp
 import asyncpg
@@ -5258,14 +5258,38 @@ async def rq_buttons(callback: CallbackQuery) -> None:
         await message.edit_text(f"🎯 Подбираю: {escape(answers or 'что угодно хорошее')}")
     except TelegramBadRequest:
         pass
-    if item.get("tmdb"):  # нашлось на TMDB — короткая карточка, а полная — через поиск бота
+    if item.get("tmdb"):  # нашлось на TMDB — ищем тот же фильм на Кинопоиске, чтобы была полная карточка
+        try:
+            for d in await kp.search(item["title"], limit=8):
+                if _same_title(kp.title(d), item["title"]) and (
+                        not item["year"] or abs(int(d.get("year") or 0) - int(item["year"])) <= 1):
+                    item = await kp.details(int(d["id"]))
+                    break
+        except Exception as exc:  # noqa: BLE001 — Кинопоиск не отвечает — покажем карточку TMDB
+            logging.info("Recommendation KP lookup failed: %s", exc)
+    if item.get("tmdb"):
+        title_q = quote_plus(item["title"])
         caption = (f"🎬 <b>{escape(item['title'])}</b> ({item['year'] or '?'}, {'сериал' if item['tv'] else 'фильм'})"
                    + (f"\n⭐ TMDB: {item['rating']:.1f}" if item["rating"] else "")
-                   + (f"\n\n{escape(item['overview'][:700])}" if item["overview"] else ""))
-        try:
-            await message.answer_photo(item["poster"], caption=caption[:1024])
+                   + (f"\n\n{escape(item['overview'][:600])}" if item["overview"] else "")
+                   + (f"\n\n<i>Для админа: Кинопоиск не ответил — {escape(rq_error[:150])}</i>"
+                      if rq_error and user_id in ADMIN_IDS else ""))
+        bot_name = BOT_URL.rstrip("/").rsplit("/", 1)[-1]
+        buttons = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🤖 Смотреть в @{bot_name}", url=BOT_URL)],
+            [InlineKeyboardButton(text="▶️ Где смотреть", url=f"https://www.kinopoisk.ru/index.php?kp_query={title_q}")],
+            [InlineKeyboardButton(text="🎞 Трейлер",
+                                  url=f"https://www.youtube.com/results?search_query={title_q}+трейлер")],
+            [InlineKeyboardButton(text="👍 Понравилось", callback_data=f"rate:{item['id']}:1"),
+             InlineKeyboardButton(text="👎 Не моё", callback_data=f"rate:{item['id']}:-1")]])
+        try:  # название для «Топа подписчиков»: оценка берёт его из истории просмотров
+            await record_history(user_id, "series" if item["tv"] else "movie", int(item["id"]), item["title"])
         except Exception:  # noqa: BLE001
-            await message.answer(caption)
+            pass
+        try:
+            await message.answer_photo(item["poster"], caption=caption[:1024], reply_markup=buttons)
+        except Exception:  # noqa: BLE001
+            await message.answer(caption, reply_markup=buttons)
     else:
         await send_card(message, item, user_id)
     await message.answer("Не то? Жми ещё 👇", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
