@@ -5274,10 +5274,18 @@ async def rq_buttons(callback: CallbackQuery) -> None:
                    + (f"\n\n{escape(item['overview'][:600])}" if item["overview"] else "")
                    + (f"\n\n<i>Для админа: Кинопоиск не ответил — {escape(rq_error[:150])}</i>"
                       if rq_error and user_id in ADMIN_IDS else ""))
+        bot_name = BOT_URL.rstrip("/").rsplit("/", 1)[-1]
         buttons = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🤖 Смотреть в @{bot_name}", url=BOT_URL)],
             [InlineKeyboardButton(text="▶️ Где смотреть", url=f"https://www.kinopoisk.ru/index.php?kp_query={title_q}")],
             [InlineKeyboardButton(text="🎞 Трейлер",
-                                  url=f"https://www.youtube.com/results?search_query={title_q}+трейлер")]])
+                                  url=f"https://www.youtube.com/results?search_query={title_q}+трейлер")],
+            [InlineKeyboardButton(text="👍 Понравилось", callback_data=f"rate:{item['id']}:1"),
+             InlineKeyboardButton(text="👎 Не моё", callback_data=f"rate:{item['id']}:-1")]])
+        try:  # название для «Топа подписчиков»: оценка берёт его из истории просмотров
+            await record_history(user_id, "series" if item["tv"] else "movie", int(item["id"]), item["title"])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             await message.answer_photo(item["poster"], caption=caption[:1024], reply_markup=buttons)
         except Exception:  # noqa: BLE001
