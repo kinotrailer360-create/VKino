@@ -4554,15 +4554,11 @@ async def watch(
     except Exception:
         links = []
 
-    if not links:
-        await callback.message.answer(
-            "Для этого фильма площадки "
-            "просмотра пока не указаны."
-        )
-        return
-
+    # свой бот — всегда первым, даже если Кинопоиск площадок не знает
+    bot_name = BOT_URL.rstrip("/").rsplit("/", 1)[-1]
     text = (
         "▶️ <b>Где посмотреть:</b>\n"
+        f'• 🤖 <a href="{escape(BOT_URL)}">@{escape(bot_name)}</a> — наш бот\n'
         + "\n".join(
             f'• <a href="{escape(url)}">'
             f"{escape(name)}</a>"
@@ -7251,7 +7247,9 @@ def shorts_genres_menu() -> InlineKeyboardMarkup:
 
 async def shorts_settings_menu() -> InlineKeyboardMarkup:
     clips_on = await shorts_setting("clips") != "off"
+    mode = await shorts_setting("sub_mode") or "soft"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"🔒 Подписка на канал: {SUB_MODES.get(mode, mode)}", "sh:sub")],
         [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
         [_btn("🎼 Музыка Lumean под настроение ▸", "sh:mlib")],
@@ -7433,6 +7431,15 @@ async def shorts_panel(
         target, prompt = SHORTS_ASKS[data[len("sh:ask:"):]]
         await state.set_state(target)
         await message.answer(prompt + "\n\n<i>Передумал — /cancel</i>")
+    elif data == "sh:sub":  # по кругу: мягкая → строгая → выключена
+        modes = list(SUB_MODES)
+        cur = await shorts_setting("sub_mode") or "soft"
+        new = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "soft"
+        await set_shorts_setting("sub_mode", new)
+        global _sub_mode
+        _sub_mode = (0.0, new)
+        await show("⚙️ <b>Настройки шортсов</b>\n\n🔒 Обязательная подписка на канал: "
+                   f"<b>{SUB_MODES[new]}</b>", await shorts_settings_menu())
     elif data == "sh:clips":
         off = await shorts_setting("clips") == "off"
         await set_shorts_setting("clips", None if off else "off")
@@ -11187,6 +11194,90 @@ async def inline_title_search(query: InlineQuery) -> None:
     await query.answer(results, cache_time=30, is_personal=True)
 
 
+# ---------------------------------------------------------------- обязательная подписка на канал
+
+SUB_MODES = {"soft": "мягкая (3 запроса бесплатно)", "strict": "строгая (сразу)", "off": "выключена"}
+SUB_FREE = 3  # мягкий режим: столько запросов без подписки
+SUB_OK_TTL = 1800  # подписку проверяем раз в 30 минут
+sub_used: dict[int, int] = {}  # запросы без подписки (мягкий режим; после перезапуска счёт с нуля)
+sub_ok: dict[int, float] = {}  # кто подписан → когда проверяли
+_sub_mode: tuple[float, str] = (0.0, "soft")
+
+
+async def sub_mode() -> str:
+    global _sub_mode
+    if time.time() - _sub_mode[0] > 60:
+        try:
+            _sub_mode = (time.time(), await shorts_setting("sub_mode") or "soft")
+        except Exception:  # noqa: BLE001 — нет базы — не мешаем пользоваться
+            _sub_mode = (time.time(), "off")
+    return _sub_mode[1]
+
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    if time.time() - sub_ok.get(user_id, 0) < SUB_OK_TTL:
+        return True
+    try:
+        member = await bot.get_chat_member(POST_CHANNEL, user_id)
+    except Exception as exc:  # noqa: BLE001 — бот не админ канала или Telegram не ответил: пускаем
+        logging.warning("Subscription check failed: %s", exc)
+        return True
+    status = str(getattr(member.status, "value", member.status))
+    ok = status in ("creator", "administrator", "member") or (status == "restricted" and
+                                                              bool(getattr(member, "is_member", False)))
+    if ok:
+        sub_ok[user_id] = time.time()
+    return ok
+
+
+def sub_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📢 Подписаться на {POST_CHANNEL}",
+                              url=f"https://t.me/{POST_CHANNEL.lstrip('@')}")],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="sub:check")]])
+
+
+async def subscription_gate(handler: Any, event: Any, data: dict[str, Any]) -> Any:
+    """Перед каждым сообщением и кнопкой в личке: подписан ли человек на канал (кроме админов)."""
+    user = getattr(event, "from_user", None)
+    chat = event.chat if isinstance(event, Message) else (event.message.chat if getattr(event, "message", None) else None)
+    if (not user or user.id in ADMIN_IDS or not chat or chat.type != "private"
+            or (isinstance(event, CallbackQuery) and event.data == "sub:check")):
+        return await handler(event, data)
+    mode = await sub_mode()
+    if mode == "off":
+        return await handler(event, data)
+    bot = data["bot"]
+    if await is_subscribed(bot, user.id):
+        return await handler(event, data)
+    if mode == "soft" and sub_used.get(user.id, 0) < SUB_FREE:
+        sub_used[user.id] = sub_used.get(user.id, 0) + 1
+        return await handler(event, data)
+    text = (f"🔒 Чтобы пользоваться ботом дальше, подпишись на наш канал {escape(POST_CHANNEL)} — там новинки, "
+            "подборки и трейлеры каждый день 🎬\n\nПодписался — жми «✅ Я подписался».")
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        if event.message:
+            await event.message.answer(text, reply_markup=sub_markup())
+    else:
+        await event.answer(text, reply_markup=sub_markup())
+    return None
+
+
+@router.callback_query(F.data == "sub:check")
+async def sub_check(callback: CallbackQuery) -> None:
+    sub_ok.pop(callback.from_user.id, None)
+    if await is_subscribed(callback.bot, callback.from_user.id):
+        await callback.answer("✅ Спасибо за подписку!")
+        if callback.message:
+            try:
+                await callback.message.edit_text("✅ Спасибо за подписку! Пользуйся ботом — повтори свой запрос 🎬")
+            except TelegramBadRequest:
+                pass
+    else:
+        await callback.answer("Подписка пока не видна — подпишись и нажми ещё раз.", show_alert=True)
+
+
 async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
@@ -11249,6 +11340,8 @@ async def main() -> None:
     posts_task = asyncio.create_task(posts_auto_loop(bot))
 
     dp = Dispatcher()
+    dp.message.outer_middleware(subscription_gate)
+    dp.callback_query.outer_middleware(subscription_gate)
     dp.include_router(router)
     commands_task = asyncio.create_task(set_admin_commands(bot))  # не задерживает запуск
 
