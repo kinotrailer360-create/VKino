@@ -154,6 +154,19 @@ async def backdrops(key: str, kind: str, tmdb_id: int, n: int = 2) -> list[str]:
     return [f"{IMG}w1280{b['file_path']}" for b in shots[:n]]
 
 
+async def company_logo(key: str, name: str) -> str | None:
+    """Логотип студии/компании (PNG с прозрачным фоном) по названию."""
+    if not key or not name.strip():
+        return None
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        found = await _get(session, key, "/search/company", query=name.strip())
+    want = _norm(name)
+    hits = [c for c in found.get("results") or [] if c.get("logo_path")]
+    hits.sort(key=lambda c: _norm(c.get("name")) != want)  # точное совпадение названия — первым
+    return f"{IMG}w780{hits[0]['logo_path']}" if hits else None
+
+
 def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
     """Самые известные фильмы человека: роли (или режиссура), без документалок и камео «в роли себя»."""
     credits = info.get("movie_credits") or {}
