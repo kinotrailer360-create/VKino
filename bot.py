@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import io
@@ -242,19 +243,151 @@ class AdminSourceState(StatesGroup):
     url = State()
 
 
-class PoiskKino:
-    BASE_URL = "https://api.poiskkino.dev/v1.5"
+class KinopoiskUnavailable(RuntimeError):
+    pass
 
-    def __init__(self, token: str) -> None:
-        self.token = token
 
-    async def _get(self, path: str, **params: Any) -> dict[str, Any]:
-        headers = {"X-API-KEY": self.token, "accept": "application/json"}
+class Unofficial:
+    """Запасной Кинопоиск: kinopoiskapiunofficial.tech. Отдаёт поиск и карточку фильма в формате poiskkino
+    (те же id Кинопоиска) — этого хватает поиску, карточкам и постерам, пока основные ключи на лимите."""
+
+    URL = "https://kinopoiskapiunofficial.tech/api"
+    TYPES = {"FILM": "movie", "VIDEO": "movie", "TV_SERIES": "tv-series", "MINI_SERIES": "tv-series",
+             "TV_SHOW": "tv-show"}
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+    async def _fetch(self, path: str, **params: Any) -> dict[str, Any]:
         timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-            async with session.get(f"{self.BASE_URL}{path}", params=params) as resp:
+        async with aiohttp.ClientSession(headers={"X-API-KEY": self.key, "accept": "application/json"},
+                                         timeout=timeout) as session:
+            async with session.get(f"{self.URL}{path}", params=params) as resp:
                 resp.raise_for_status()
                 return await resp.json()
+
+    @classmethod
+    def convert(cls, f: dict[str, Any]) -> dict[str, Any]:
+        """Фильм kinopoiskapiunofficial → документ в формате poiskkino."""
+        def num(x: Any) -> float:
+            try:
+                return float(str(x).replace("%", ""))
+            except (TypeError, ValueError):
+                return 0.0
+
+        kind = cls.TYPES.get(str(f.get("type") or ""), "movie")
+        age = str(f.get("ratingAgeLimits") or "").replace("age", "")
+        return {
+            "id": int(f.get("kinopoiskId") or f.get("filmId") or 0),
+            "name": f.get("nameRu") or f.get("nameEn") or f.get("nameOriginal"),
+            "enName": f.get("nameEn"), "alternativeName": f.get("nameOriginal") or f.get("nameEn"),
+            "year": int(str(f.get("year") or "0")[:4] or 0) or None,
+            "description": f.get("description"), "shortDescription": f.get("shortDescription"),
+            "type": kind, "isSeries": kind != "movie" or bool(f.get("serial")),
+            "rating": {"kp": num(f.get("ratingKinopoisk") or f.get("rating")), "imdb": num(f.get("ratingImdb"))},
+            "votes": {"kp": int(num(f.get("ratingKinopoiskVoteCount") or f.get("ratingVoteCount"))),
+                      "imdb": int(num(f.get("ratingImdbVoteCount")))},
+            "poster": {"url": f.get("posterUrl"), "previewUrl": f.get("posterUrlPreview")},
+            "genres": [{"name": g.get("genre")} for g in f.get("genres") or [] if g.get("genre")],
+            "countries": [{"name": c.get("country")} for c in f.get("countries") or [] if c.get("country")],
+            "movieLength": f.get("filmLength") if isinstance(f.get("filmLength"), int) else None,
+            "ageRating": int(age) if age.isdigit() else None,
+            "externalId": {"imdb": f.get("imdbId")},
+        }
+
+    async def get(self, path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        """Ответ в формате poiskkino или None — такой запрос запасной API не умеет."""
+        if path == "/movie/search" and params.get("query"):
+            data = await self._fetch("/v2.1/films/search-by-keyword", keyword=params["query"], page=1)
+            docs = [self.convert(f) for f in data.get("films") or [] if f.get("filmId")]
+            return {"docs": docs[: int(params.get("limit") or 10)], "pages": 1, "total": len(docs)}
+        m = re.fullmatch(r"/movie/(\d+)", path)
+        if m:
+            return self.convert(await self._fetch(f"/v2.2/films/{m.group(1)}"))
+        return None
+
+
+class PoiskKino:
+    """Кинопоиск через poiskkino.dev. Несколько ключей (KINOPOISK_TOKEN, KINOPOISK_TOKEN_2, … или через
+    запятую): упёрся в лимит (401/403/429) — следующий ключ, исчерпанный отдыхает до конца суток (UTC).
+    Ответы запоминаем на несколько часов — лимит тратится втрое медленнее. Все ключи исчерпаны — поиск
+    и карточка фильма через запасной kinopoiskapiunofficial.tech (KP_UNOFFICIAL_KEY), если он задан."""
+
+    BASE_URL = "https://api.poiskkino.dev/v1.5"
+    CACHE_TTL = 6 * 3600
+    CACHE_MAX = 3000
+    NO_CACHE = ("/movie/random",)
+
+    def __init__(self, tokens: list[str], unofficial_key: str = "") -> None:
+        self.tokens = [t for t in tokens if t]
+        self.token = self.tokens[0] if self.tokens else ""
+        self.unofficial = Unofficial(unofficial_key) if unofficial_key else None
+        self.resting: dict[str, float] = {}  # ключ → до какого времени не трогаем
+        self.calls: dict[str, int] = {}  # ключ → запросов сегодня (для статистики)
+        self.calls_day = ""
+        self.cache: dict[str, tuple[float, Any]] = {}
+        self.hits = self.misses = self.fallbacks = 0
+        self.last_error = ""
+
+    def _count(self, token: str) -> None:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if today != self.calls_day:
+            self.calls_day, self.calls = today, {}
+        self.calls[token] = self.calls.get(token, 0) + 1
+
+    async def _get(self, path: str, **params: Any) -> dict[str, Any]:
+        key = path + "?" + urlencode(sorted((k, str(v)) for k, v in params.items()))
+        cached = self.cache.get(key)
+        if cached and time.time() - cached[0] < self.CACHE_TTL and not path.startswith(self.NO_CACHE):
+            self.hits += 1
+            return copy.deepcopy(cached[1])  # копия: вызывающий код может менять ответ
+        self.misses += 1
+        errors = []
+        for token in self.tokens:
+            if self.resting.get(token, 0) > time.time():
+                continue
+            headers = {"X-API-KEY": token, "accept": "application/json"}
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(f"{self.BASE_URL}{path}", params=params) as resp:
+                    self._count(token)
+                    if resp.status in (401, 403, 429):  # лимит ключа — отдыхает до конца суток UTC
+                        tomorrow = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0) + timedelta(days=1)
+                        self.resting[token] = tomorrow.timestamp()
+                        self.last_error = f"ключ …{token[-4:]}: HTTP {resp.status} ({datetime.now(MSK):%d.%m %H:%M})"
+                        errors.append(self.last_error)
+                        logging.warning("Kinopoisk key …%s rejected (%s), switching", token[-4:], resp.status)
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json()
+            if not path.startswith(self.NO_CACHE):
+                if len(self.cache) >= self.CACHE_MAX:
+                    for k in sorted(self.cache, key=lambda x: self.cache[x][0])[: self.CACHE_MAX // 5]:
+                        self.cache.pop(k, None)
+                self.cache[key] = (time.time(), data)
+            return data
+        if self.unofficial:
+            try:
+                data = await self.unofficial.get(path, params)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"запасной API: {exc}")
+            else:
+                if data is not None:
+                    self.fallbacks += 1
+                    self.cache[key] = (time.time(), data)
+                    return data
+        raise KinopoiskUnavailable("Кинопоиск недоступен: " + ("; ".join(errors) or "все ключи на сегодня исчерпаны"))
+
+    def status(self) -> str:
+        now = time.time()
+        keys = ", ".join(f"…{t[-4:]} {'⛔ лимит' if self.resting.get(t, 0) > now else '✅'} ({self.calls.get(t, 0)} запр.)"
+                         for t in self.tokens)
+        total = self.hits + self.misses
+        return (f"🎬 Кинопоиск: ключи {keys}"
+                + (f" · из памяти {round(100 * self.hits / total)}%" if total else "")
+                + (f" · запасной API: {'есть' if self.unofficial else 'нет'}"
+                   + (f", выручил {self.fallbacks} раз" if self.fallbacks else ""))
+                + (f"\n⚠️ Последний отказ: {self.last_error}" if self.last_error else ""))
 
     @staticmethod
     def media_type(item: dict[str, Any]) -> str:
@@ -462,7 +595,10 @@ class PoiskKino:
         return result
 
 
-kp = PoiskKino(KINOPOISK_TOKEN)
+kp = PoiskKino(
+    [t.strip() for t in ",".join([KINOPOISK_TOKEN] + [os.getenv(f"KINOPOISK_TOKEN_{i}", "") for i in range(2, 6)]).split(",")],
+    os.getenv("KP_UNOFFICIAL_KEY", "").strip(),
+)
 
 
 def db() -> asyncpg.Pool:
@@ -11608,7 +11744,8 @@ async def bot_stats_text() -> str:
         "📈 <b>Статистика бота</b>", "",
         f"👥 Пользователей всего: <b>{users}</b>",
         f"🆕 Новых: сегодня <b>{new[0]}</b> · 7 дн <b>{new[1]}</b> · 30 дн <b>{new[2]}</b>",
-        f"🟢 Заходили: сегодня <b>{active[0]}</b> · 7 дн <b>{active[1]}</b> · 30 дн <b>{active[2]}</b>", "",
+        f"🟢 Заходили: сегодня <b>{active[0]}</b> · 7 дн <b>{active[1]}</b> · 30 дн <b>{active[2]}</b>",
+        escape(kp.status()), "",
         f"🔎 Поисков за 7 дн: <b>{searches}</b> · 🎬 открыто карточек: <b>{opens}</b>",
         f"🎯 Подборов «что посмотреть» за 7 дн: <b>{await q(ev, 'rq', week)}</b>",
         f"❤️ В избранном: <b>{favs}</b> (у {fav_users} чел.) · 🔔 ждут премьеры: <b>{reminders}</b>",
