@@ -4554,15 +4554,11 @@ async def watch(
     except Exception:
         links = []
 
-    if not links:
-        await callback.message.answer(
-            "Для этого фильма площадки "
-            "просмотра пока не указаны."
-        )
-        return
-
+    # свой бот — всегда первым, даже если Кинопоиск площадок не знает
+    bot_name = BOT_URL.rstrip("/").rsplit("/", 1)[-1]
     text = (
         "▶️ <b>Где посмотреть:</b>\n"
+        f'• 🤖 <a href="{escape(BOT_URL)}">@{escape(bot_name)}</a> — наш бот\n'
         + "\n".join(
             f'• <a href="{escape(url)}">'
             f"{escape(name)}</a>"
