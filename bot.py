@@ -8639,6 +8639,7 @@ class PostState(StatesGroup):
     edit = State()
     link = State()
     actor = State()
+    digest = State()
 
 
 async def _posts_history() -> dict[str, list[str]]:
@@ -8881,6 +8882,7 @@ def posts_menu() -> InlineKeyboardMarkup:
              for k in range(0, len(SHORTS_GENRES), 3)]
     rows.append([_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")])
     rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
+    rows.append([_btn("🧩 Сводка по теме из всех каналов", "pt:dg")])
     rows.append([_btn("🎂 День рождения звезды", "pt:bd"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
@@ -10226,6 +10228,14 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
                              "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
         return
+    if action == "dg":
+        await state.set_state(PostState.digest)
+        await message.answer(
+            "🧩 Напиши тему — имя, фильм или событие: <code>Патрик Стюарт</code>, <code>Мстители: Судный день</code>. "
+            "Можно с английским вариантом через «/»: <code>Патрик Стюарт / Patrick Stewart</code>.\n"
+            "Бот найдёт посты об этом во всех каналах из списка за последние 3 дня, ИИ соберёт их в один пост "
+            "без повторов (главное, подробности, кто что сказал), фото возьму из постов.\n\n<i>Передумал — /cancel</i>")
+        return
     if action == "ac":
         await state.set_state(PostState.actor)
         await message.answer(
@@ -10314,6 +10324,64 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 URL_RE = re.compile(r"https?://\S+|(?<!\w)t\.me/\S+")
+
+
+DIGEST_HOURS = 72
+DIGEST_NOTE = ("Это СВОДКА: материалов несколько, все об одной теме из разных каналов. Собери их в ОДИН пост: "
+               "главное событие, затем важные подробности и реакции (кто что сказал — коротко, своими словами или "
+               "одной фразой цитаты), без повторов одного и того же. Если в материалах есть противоречия в цифрах "
+               "или датах — бери то, что подтверждает поиск, или не указывай. До 1000 символов.")
+
+
+async def make_digest_post(bot: Bot, chat_id: int, topic: str) -> None:
+    """«🧩 Сводка по теме»: посты всех каналов из списка о теме за 3 дня → один пост в стиле канала + фото."""
+    names = [n.strip() for n in re.split(r"[/|]", topic) if n.strip()][:3]
+    own = POST_CHANNEL.lstrip("@").lower()
+    channels = [c for c in await fact_channels() if c.lower() != own]
+    since = time.time() - DIGEST_HOURS * 3600
+    posts = [p for p in await shorts_tgsearch.search(channels, names, per_channel=3)
+             if not p.get("time") or p["time"] >= since]
+    if not posts:
+        raise RuntimeError(f"в каналах ({len(channels)}) за {DIGEST_HOURS // 24} дня нет постов про «{topic}». "
+                           "Проверь написание или добавь английский вариант через «/»")
+    posts.sort(key=lambda p: -(p.get("time") or 0))
+    material = shorts_tgsearch.as_text(posts, 9000)
+    res = await shorts_ai.rewrite_post(GEMINI_API_KEY, material, DIGEST_NOTE)
+    if not res:
+        raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+    work = SHORTS_DIR / f"digest_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        photos = await shorts_tgsearch.download_media(
+            [{"image": p["image"]} for p in posts if p.get("image")], work, limit=4, prefix="dg")
+        ids, kind = await _send_album(bot, chat_id, photos, res["post"], "#новости")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    used = sorted({p["channel"] for p in posts})
+    await offer_post(bot, chat_id, ids, kind, "pt:dg",
+                     what=f"Сводка готова: {len(posts)} постов из {len(used)} каналов")
+
+
+@router.message(PostState.digest, F.text, ~F.text.startswith("/"))
+async def post_digest(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    topic = (message.text or "").strip()[:120]
+    if post_lock.locked():
+        await message.answer("⏳ Пост уже пишется — подожди минуту и нажми кнопку ещё раз.")
+        return
+    wait = await message.answer(f"🧩 Ищу «{escape(topic)}» во всех каналах, ИИ собирает сводку… (1–2 минуты)")
+    chat_id = message.chat.id
+
+    async def digest_job() -> None:
+        try:
+            async with post_lock:
+                await make_digest_post(message.bot, chat_id, topic)
+            await wait.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Digest post failed")
+            await wait.edit_text(f"❌ Сводка не получилась: <code>{escape(str(exc)[:300])}</code>")
+
+    _run_job(digest_job)
 
 
 @router.message(PostState.actor, F.text, ~F.text.startswith("/"))

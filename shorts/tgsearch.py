@@ -158,7 +158,7 @@ async def search(channels: list[str], names: list[str], per_channel: int = POSTS
                 url, text = post["url"], post["text"]
                 if len(text) >= 60 and _mentions(text, names) and url not in found:
                     found[url] = {"channel": channel, "url": url, "text": text[:POST_MAX],
-                                  "image": post["image"], "video": post["video"]}
+                                  "image": post["image"], "video": post["video"], "time": post["time"]}
             if len(found) >= per_channel:
                 break
         return list(found.values())[:per_channel]
