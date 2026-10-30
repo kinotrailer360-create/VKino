@@ -3667,7 +3667,8 @@ async def cmd_start(
     await state.clear()
     await remember(message)
     if (message.text or "").partition(" ")[2].strip() == "pick":  # кнопка из поста «Рекомендация: что посмотреть»
-        await message.answer(*rq_screen("-", "-", "-", "-"))
+        text, markup = rq_screen("-", "-", "-", "-")
+        await message.answer(text, reply_markup=markup)
         return
 
     name = escape(
@@ -5049,7 +5050,8 @@ async def rq_buttons(callback: CallbackQuery) -> None:
         return
     parts = (callback.data or "").split(":")
     if parts[1] == "start" or len(parts) != 5:
-        await message.answer(*rq_screen("-", "-", "-", "-"))
+        text, markup = rq_screen("-", "-", "-", "-")
+        await message.answer(text, reply_markup=markup)
         return
     t, g, c, e = parts[1:]
     if "-" in (t, g, c, e):
