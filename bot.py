@@ -45,7 +45,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageOps
 
 from shorts import ai as shorts_ai
 from shorts import tgsearch as shorts_tgsearch
@@ -8638,6 +8638,7 @@ post_lock = asyncio.Lock()
 class PostState(StatesGroup):
     edit = State()
     link = State()
+    actor = State()
 
 
 async def _posts_history() -> dict[str, list[str]]:
@@ -8660,6 +8661,7 @@ RUBRICS = {
     "#битвафильмов": "⚔️ Битва фильмов", "#деньрождения": "🎂 Дни рождения звёзд", "#цитата": "💬 Цитата дня",
     "#этотденьвкино": "📅 Этот день в кино", "#ляпы": "🎭 Ляпы в кино", "#сборы": "💰 Сборы уикенда",
     "#итогинедели": "🗞 Итоги недели", "#выборподписчиков": "🗳 Выбор подписчиков",
+    "#сактёром": "🎭 Фильмы и сериалы с актёром",
 }
 
 
@@ -8880,6 +8882,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")])
     rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
     rows.append([_btn("🎂 День рождения звезды", "pt:bd"), _btn("📅 Этот день в кино", "pt:an")])
+    rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
     rows.append([_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")])
@@ -9092,6 +9095,141 @@ async def make_birthday_post(bot: Bot, chat_id: int) -> None:
         shutil.rmtree(work, ignore_errors=True)
     await offer_post(bot, chat_id, ids, kind, "pt:bd", [f["title"] for f in films], "Пост ко дню рождения готов",
                      f"Какой фильм с {'ней' if female else 'ним'} ваш любимый? 🎬")
+
+
+ACTOR_SKIP_GENRES = {99, 10763, 10764, 10767}  # документальные, новости, реалити, ток-шоу
+
+
+async def find_actor(query: str) -> dict[str, Any] | None:
+    """Человек на TMDB (профиль на русском, фильмы, сериалы, фото): по имени как написано, иначе по
+    английскому имени с Кинопоиска («Патрик Стюарт» → «Patrick Stewart»)."""
+    info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, query)
+    if info:
+        return info
+    try:
+        data = await kp._get("/person/search", query=query, page=1, limit=5)
+    except Exception:  # noqa: BLE001
+        logging.exception("KP person search failed")
+        return None
+    for doc in data.get("docs") or []:
+        if doc.get("enName"):
+            return await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, str(doc["enName"]))
+    return None
+
+
+def actor_works(info: dict[str, Any], films: int = 5, series: int = 3) -> list[dict[str, Any]]:
+    """Самые известные фильмы и сериалы с человеком: без камео «в роли себя», документалок и ток-шоу;
+    у сериалов — только заметные роли (от 3 эпизодов)."""
+    self_role = re.compile(r"\b(self|himself|herself|себя|камео)\b", re.I)
+
+    def ok(c: dict[str, Any]) -> bool:
+        return (bool(c.get("id")) and not self_role.search(str(c.get("character") or ""))
+                and not ACTOR_SKIP_GENRES & set(c.get("genre_ids") or []))
+
+    movies: dict[int, dict[str, Any]] = {}
+    for c in (info.get("movie_credits") or {}).get("cast") or []:
+        if ok(c) and c.get("release_date") and (c.get("vote_count") or 0) >= 50:
+            movies.setdefault(int(c["id"]), {**c, "tv": False})
+    shows: dict[int, dict[str, Any]] = {}
+    for c in (info.get("tv_credits") or {}).get("cast") or []:
+        if ok(c) and c.get("first_air_date") and (c.get("vote_count") or 0) >= 30 and (c.get("episode_count") or 0) >= 3:
+            shows.setdefault(int(c["id"]), {**c, "tv": True})
+    top_m = sorted(movies.values(), key=lambda c: c.get("vote_count") or 0, reverse=True)[:films]
+    top_s = sorted(shows.values(), key=lambda c: c.get("vote_count") or 0, reverse=True)[:series]
+    if len(top_s) < series:  # мало сериалов — добираем фильмами
+        top_m = sorted(movies.values(), key=lambda c: c.get("vote_count") or 0, reverse=True)[:films + series - len(top_s)]
+    return top_m + top_s
+
+
+async def make_actor_post(bot: Bot, chat_id: int, query: str) -> None:
+    """«🎭 Фильмы и сериалы с актёром»: портрет и лучшие фильмы и сериалы с ролями, опрос «какой любимый».
+    Если человека нет в живых (или автор написал «память») — пост «Светлая память» с чёрно-белым портретом."""
+    memorial = bool(re.search(r"\bпамят", query, re.I))
+    name_q = re.sub(r"\b(светлая\s+)?памят\w*\b", "", query, flags=re.I).strip(" ,.-—")
+    info = await find_actor(name_q)
+    if not info:
+        raise RuntimeError(f"не нашёл «{name_q}» — проверь имя (можно по-английски)")
+    name = str(info.get("name") or name_q)
+    if shorts_daily._latin(name):  # на TMDB нет русского имени — берём как написал автор
+        name = name_q
+    female = info.get("gender") == 1
+    born, died = str(info.get("birthday") or "")[:4], str(info.get("deathday") or "")[:4]
+    memorial = memorial or bool(died)
+    works = actor_works(info)
+    if not works:
+        raise RuntimeError(f"у «{name}» на TMDB не нашлось известных фильмов и сериалов")
+    who = {"name": name, "en": str(info.get("original_name") or "") if not shorts_daily._latin(name_q) else name_q}
+    items = []
+    for w in works:
+        title = str(w.get("name") or w.get("original_name") if w["tv"] else w.get("title") or w.get("original_title") or "")
+        when = str((w.get("first_air_date") if w["tv"] else w.get("release_date")) or "")[:4]
+        role = await shorts_daily._kp_role(kp._get, {"title": title, "release_date": when}, who)
+        if not role and not shorts_daily._latin(str(w.get("character") or "")):
+            role = str(w.get("character") or "").strip()
+        items.append({"title": title, "year": when, "tv": w["tv"], "rating": float(w.get("vote_average") or 0),
+                      "role": role, "poster": w.get("poster_path") or w.get("backdrop_path"),
+                      "episodes": int(w.get("episode_count") or 0)})
+    life = f"{born}–{died}" if born and died else (born and f"род. {born}") or ""
+    material = (f"{name} ({who['en'] or '—'}), {'актриса' if female else 'актёр'}" + (f", {life}" if life else "")
+                + ".\nФильмы и сериалы:\n" + "\n".join(
+                    f"— {'сериал' if i['tv'] else 'фильм'} «{i['title']}» ({i['year']})"
+                    + (f", роль: {i['role']}" if i["role"] else "") for i in items)
+                + "\n\nБиография:\n" + str(info.get("biography") or "—")[:2500])
+    if memorial:
+        task = (f"Напиши пост памяти: {name} ({life}). Заголовок «🕯 СВЕТЛАЯ ПАМЯТЬ: {name.upper()}»; 2–3 сдержанных "
+                f"предложения о том, чем {'она запомнилась' if female else 'он запомнился'} зрителям; затем лучшие роли "
+                "из материала строками «🎬 «Название» (год) — роль» (у сериалов пометь «сериал»); в конце — "
+                "«Какая роль запомнилась вам больше всего?» и хэштеги. Без шуток и восклицаний, факты — только "
+                "из материала.")
+    else:
+        task = (f"Напиши пост-подборку «Фильмы и сериалы с {name}»: заголовок с эмодзи 🎭; 1–2 предложения, чем "
+                f"{'она интересна' if female else 'он интересен'}; затем фильмы и сериалы из материала строками "
+                "«1️⃣ «Название» (год) — роль» (у сериалов пометь «сериал»); в конце вопрос подписчикам и хэштеги. "
+                "Факты — только из материала.")
+    num = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material) or "\n".join(
+        [f"🕯 СВЕТЛАЯ ПАМЯТЬ: {name.upper()}" if memorial else f"🎭 ФИЛЬМЫ И СЕРИАЛЫ С {name.upper()}", ""]
+        + [f"{'🎬' if memorial else num[k]} «{i['title']}» ({i['year']})" + (" — сериал" if i["tv"] else "")
+           + (f" — {i['role']}" if i["role"] else "") for k, i in enumerate(items)]
+        + ["", "Какая роль запомнилась вам больше всего?" if memorial else "Что из этого вы смотрели? 👇", "",
+           "#Кино #KinoMir360"])
+    work = SHORTS_DIR / f"actor_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        cards: list[Path] = []
+        known = ", ".join(f"«{i['title']}»" for i in items[:2])
+        for url in shorts_daily.tmdb.profile_urls(info)[:2]:
+            photo = await _image(url, work, "face")
+            if photo:
+                if memorial:
+                    photo = ImageOps.grayscale(photo).convert("RGB")
+                card = await asyncio.to_thread(
+                    shorts_postcard.make_post_card, photo, name,
+                    pill=("СВЕТЛАЯ ПАМЯТЬ", "") if memorial else ("ФИЛЬМЫ И СЕРИАЛЫ", ""),
+                    meta=life or None, extra=f"{'Известна' if female else 'Известен'} по: {known}")
+                cards.append(work / "face.jpg")
+                card.save(cards[-1], quality=92)
+                break
+        for k, i in enumerate(items, 1):
+            img = await _image(f"{shorts_daily.tmdb.IMG}w780{i['poster']}" if i["poster"] else None, work, f"w{k}_")
+            if not img:
+                continue
+            rating = i["rating"] if i["rating"] >= shorts_daily.MIN_RATING else None
+            role = f"Роль: {i['role']}" if i["role"] else None
+            if i["tv"]:
+                role = "Сериал" + (f" · {i['role']}" if i["role"] else "")
+            card = await asyncio.to_thread(shorts_postcard.make_post_card, img, i["title"], k, len(items), rating,
+                                           "TMDB", i["year"], None, None, extra=role)
+            cards.append(work / f"work{k}.jpg")
+            card.save(cards[-1], quality=92)
+        ids, kind = await _send_album(bot, chat_id, cards[:10], post, "#сактёром")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    him = "ней" if female else "ним"
+    await offer_post(bot, chat_id, ids, kind, "pt:ac", [i["title"] for i in items][:10],
+                     "Пост памяти готов" if memorial else "Подборка с актёром готова",
+                     "Какая роль запомнилась вам больше всего? 🕯" if memorial
+                     else f"Какой фильм или сериал с {him} ваш любимый? 🎬")
 
 
 async def make_facts_post(bot: Bot, chat_id: int, era: str = "", film_id: int = 0, voted: bool = False) -> None:
@@ -10088,6 +10226,14 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
                              "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
         return
+    if action == "ac":
+        await state.set_state(PostState.actor)
+        await message.answer(
+            "🎭 Напиши имя актёра или актрисы — например <code>Патрик Стюарт</code> или <code>Cillian Murphy</code>. "
+            "Бот возьмёт лучшие фильмы и сериалы с ролями, портрет и сделает пост с опросом.\n"
+            "Если человека нет в живых — выйдет пост «Светлая память» с чёрно-белым портретом "
+            "(или допиши слово «память»).\n\n<i>Передумал — /cancel</i>")
+        return
     if action == "lk":
         await state.set_state(PostState.link)
         await message.answer(
@@ -10168,6 +10314,28 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 URL_RE = re.compile(r"https?://\S+|(?<!\w)t\.me/\S+")
+
+
+@router.message(PostState.actor, F.text, ~F.text.startswith("/"))
+async def post_actor(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    query = (message.text or "").strip()[:100]
+    if post_lock.locked():
+        await message.answer("⏳ Пост уже пишется — подожди минуту и нажми кнопку ещё раз.")
+        return
+    wait = await message.answer(f"🎭 Ищу «{escape(query)}»: фильмы, сериалы, роли и портрет…")
+    chat_id = message.chat.id
+
+    async def actor_job() -> None:
+        try:
+            async with post_lock:
+                await make_actor_post(message.bot, chat_id, query)
+            await wait.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Actor post failed")
+            await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+    _run_job(actor_job)
 
 
 @router.message(PostState.link, ~F.text.startswith("/"))
