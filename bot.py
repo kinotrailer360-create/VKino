@@ -10161,6 +10161,11 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
         GEMINI_API_KEY, title, [_film_line(f) for f in kp_films], shorts_tgsearch.as_text(posts, 7000),
         hist["list_titles"], f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
     if res:
+        # в альбом — только то, что есть в тексте поста: ИИ иногда перечисляет в films больше, чем написал
+        flat = re.sub(r"[^\w]+", "", res["post"].lower().replace("ё", "е"))
+        in_post = [f for f in res["films"] if any(
+            n and re.sub(r"[^\w]+", "", n.lower().replace("ё", "е")) in flat for n in (f["ru"], f["en"]))]
+        res["films"] = in_post or res["films"]
         post, names = res["post"], [f["ru"] or f["en"] for f in res["films"]]
         found = [await _list_poster(f, kp_films, posts) for f in res["films"]]
         items = [(name, url, film) for name, (url, film) in zip(names, found)]
