@@ -185,6 +185,7 @@ MAIN_MENU_LABELS = {
     "🧩 Викторина дня",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
+    "✉️ Написать админу",
 }
 
 
@@ -841,6 +842,14 @@ async def init_db() -> None:
                 referrer_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 subscribed BOOLEAN NOT NULL DEFAULT FALSE
+            );
+
+            CREATE TABLE IF NOT EXISTS contact_msgs (
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (chat_id, message_id)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3346,6 +3355,7 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
+            [KeyboardButton(text="✉️ Написать админу")],
             [
                 KeyboardButton(text="🎬 Подборки"),
                 KeyboardButton(text="❤️ Избранное"),
@@ -3953,6 +3963,9 @@ async def do_search(
             await message.answer(
                 "Напиши название фильма или сериала 👇"
             )
+            return
+        if query == "✉️ Написать админу":
+            await contact_ask(message, state)
             return
         if query == "💡 Предложить идею":
             await idea_ask(message, state)
@@ -11847,6 +11860,100 @@ class IdeaState(StatesGroup):
     text = State()
 
 
+class ContactState(StatesGroup):
+    text = State()
+
+
+# --- «✉️ Написать админу»: сообщение человека приходит админам, ответ админа (Reply) — человеку
+
+CONTACT_BUTTON = "✉️ Написать админу"
+
+
+async def contact_ask(message: Message, state: FSMContext) -> None:
+    await state.set_state(ContactState.text)
+    await message.answer("✉️ Напиши сообщение одним сообщением — текст, фото, видео или голосовое. "
+                         "Я передам его администратору KinoMir360, ответ придёт сюда же 🙌\n\n"
+                         "<i>Передумал — /cancel</i>")
+
+
+@router.message(F.text == CONTACT_BUTTON)
+async def contact_button(message: Message, state: FSMContext) -> None:
+    await contact_ask(message, state)
+
+
+async def _contact_link(chat_id: int, message_id: int, user_id: int) -> None:
+    await db().execute("INSERT INTO contact_msgs(chat_id, message_id, user_id) VALUES($1, $2, $3) "
+                       "ON CONFLICT DO NOTHING", chat_id, message_id, user_id)
+
+
+async def contact_to_admins(message: Message) -> int:
+    """Сообщение человека — каждому админу: шапка «от кого» и копия сообщения (любой тип). Сколько дошло."""
+    user = message.from_user
+    who = (f"@{user.username}" if user.username else escape(user.first_name or "без имени")) + f" (id {user.id})"
+    sent = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            head = await message.bot.send_message(
+                admin_id, f"✉️ <b>Сообщение от {who}</b>\nОтветь на это или следующее сообщение (свайп → «Ответить») — "
+                          "ответ уйдёт человеку.")
+            copy = await message.bot.copy_message(admin_id, message.chat.id, message.message_id)
+            await _contact_link(admin_id, head.message_id, user.id)
+            await _contact_link(admin_id, copy.message_id, user.id)
+            sent += 1
+        except Exception:  # noqa: BLE001
+            logging.exception("Contact: forward to admin %s failed", admin_id)
+    await track(user.id, "contact")
+    return sent
+
+
+@router.message(ContactState.text, ~F.text.startswith("/"))
+async def contact_message(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if message.text == CONTACT_BUTTON:
+        await contact_ask(message, state)
+        return
+    if await contact_to_admins(message):
+        await message.answer("✅ Отправил администратору. Ответ придёт сюда — обычно в течение дня.")
+    else:
+        await message.answer("😔 Не получилось отправить — попробуй чуть позже.")
+
+
+async def _contact_thread(message: Message) -> int | None:
+    """Ответ (Reply) на сообщение переписки «написать админу» — id человека в этой переписке."""
+    reply = message.reply_to_message
+    if not reply or not message.from_user:
+        return None
+    try:
+        user_id = await db().fetchval("SELECT user_id FROM contact_msgs WHERE chat_id=$1 AND message_id=$2",
+                                      message.chat.id, reply.message_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return int(user_id) if user_id else None
+
+
+async def is_contact_reply(message: Message) -> bool:
+    return await _contact_thread(message) is not None
+
+
+@router.message(is_contact_reply)
+async def contact_reply(message: Message) -> None:
+    user_id = await _contact_thread(message)
+    if message.from_user.id in ADMIN_IDS and message.chat.id != user_id:  # админ отвечает человеку
+        try:
+            head = await message.bot.send_message(user_id, "💬 <b>Ответ от KinoMir360:</b>")
+            copy = await message.bot.copy_message(user_id, message.chat.id, message.message_id)
+            await _contact_link(user_id, head.message_id, user_id)
+            await _contact_link(user_id, copy.message_id, user_id)
+            await message.reply("✅ Ответ отправлен.")
+        except TelegramForbiddenError:
+            await message.reply("❌ Человек заблокировал бота — ответ не дойдёт.")
+        except Exception as exc:  # noqa: BLE001
+            await message.reply(f"❌ Не отправилось: <code>{escape(str(exc)[:200])}</code>")
+    else:  # человек отвечает на ответ админа — снова админам
+        await contact_to_admins(message)
+        await message.answer("✅ Передал администратору.")
+
+
 _seen_users: dict[int, float] = {}  # кому уже обновили last_seen (раз в 5 минут, а не на каждое нажатие)
 
 
@@ -11923,6 +12030,7 @@ async def bot_stats_text() -> str:
         f" (подписались {await q('SELECT COUNT(*) FROM referrals WHERE subscribed')})",
         f"🔒 Подписка: замок показан за 7 дн <b>{await q(ev, 'sub_lock', week)}</b>"
         f" · подписались после замка <b>{await q(ev, 'sub_ok', week)}</b>",
+        f"✉️ Написали админу за 7 дн: <b>{await q(ev, 'contact', week)}</b>",
         f"💡 Идей от подписчиков: <b>{await q('SELECT COUNT(*) FROM ideas')}</b>"
         f" (за 7 дн {await q(IDEAS_WEEK)})",
     ]
@@ -12478,7 +12586,11 @@ async def subscription_gate(handler: Any, event: Any, data: dict[str, Any]) -> A
     user = getattr(event, "from_user", None)
     chat = event.chat if isinstance(event, Message) else (event.message.chat if getattr(event, "message", None) else None)
     if (not user or user.id in ADMIN_IDS or not chat or chat.type != "private"
-            or (isinstance(event, CallbackQuery) and event.data == "sub:check")):
+            or (isinstance(event, CallbackQuery) and event.data == "sub:check")
+            # написать админу можно всегда, даже без подписки
+            or (isinstance(event, Message) and (event.text == "✉️ Написать админу"
+                                                or data.get("raw_state") == ContactState.text.state
+                                                or await _contact_thread(event) is not None))):
         return await handler(event, data)
     mode = await sub_mode()
     if mode == "off":
