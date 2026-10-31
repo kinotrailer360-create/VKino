@@ -99,6 +99,13 @@ async def rutube_trailer(titles: list[str], year: int | None = None) -> dict | N
         title, dur = _norm(v.get("title")), float(v.get("duration") or 0)
         if not 30 <= dur <= 400 or not any(n in title for n in names):
             continue
+        # короткое название («Кошелёк или жизнь», «Хэллоуин») встречается и в чужих роликах («Скуби-Ду: Кошелёк
+        # или жизнь») — тогда в названии ролика должен быть год или второе (оригинальное) название фильма
+        hits = [n for n in names if n in title]
+        if all(len(n.split()) <= 3 for n in hits) and not (year and str(year) in title) and len(set(hits)) < 2:
+            before = title.split(hits[0], 1)[0].strip()
+            if before and not any(w in before for w in TRAILER_WORDS):
+                continue  # перед названием что-то ещё — скорее всего это другой фильм или мультфильм
         if not any(w in title for w in TRAILER_WORDS):
             continue
         score = 1.0
