@@ -8903,8 +8903,25 @@ async def holiday_short(message: Message, state: FSMContext, key: str) -> None:
                                               f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
                                               n=5, hint=hint)
         ids: list[int] = []
+
+        async def by_title(name: str, year: int | None) -> dict[str, Any] | None:
+            try:
+                film = await shorts_daily.find_film(kp._get, f"{name} {year}" if year else name)
+            except Exception:  # noqa: BLE001
+                return None
+            return film if film and _same_title(shorts_daily._title(film), name) else None
+
         for f in (res or {}).get("films") or []:
             _, film = await _list_poster(f, kp_films, [])
+            if not film:  # постер нашёлся не на Кинопоиске — фильм всё равно нужен ролику
+                film = await by_title(f["ru"] or f["en"], f.get("year"))
+            if film and film.get("id") and int(film["id"]) not in ids:
+                ids.append(int(film["id"]))
+        for seed in HOLIDAY_SEEDS.get(key, []):  # мало — добираем фильмами точно про праздник
+            if len(ids) >= 5:
+                break
+            m = re.match(r"«([^»]+)»\s*\((?:[^)]*?)(\d{4})", seed)
+            film = await by_title(m.group(1), int(m.group(2))) if m else None
             if film and film.get("id") and int(film["id"]) not in ids:
                 ids.append(int(film["id"]))
         # ИИ не ответил или нашёл мало — добираем кандидатами Кинопоиска (не для «тематических» праздников:
