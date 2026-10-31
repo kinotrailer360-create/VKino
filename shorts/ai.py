@@ -896,7 +896,7 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
 
 
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
-                          today: str = "", n: int = 5, only: bool = False) -> dict[str, Any] | None:
+                          today: str = "", n: int = 5, only: bool = False, hint: str = "") -> dict[str, Any] | None:
     """Пост-подборка для Telegram-канала в стиле POST_STYLE. ИИ сам выбирает n фильмов из всех источников:
     кандидаты Кинопоиска (films — строки с данными), посты Telegram-каналов (posts) и поиск Google.
     {"post": текст до 1020 символов, "films": [{"ru", "en", "year"}] в порядке поста} или None."""
@@ -917,6 +917,7 @@ async def write_list_post(key: str, title: str, films: list[str], posts: str = "
         "(2026) ⭐ 8.0, а не «Симпсоны» (1989). "
         "Не бери то, что было недавно:\n"
         + ("\n".join(f"— {t}" for t in (recent or [])[-40:]) or "—")
+        + (f"\n\nО ЧЁМ ПОДБОРКА: {hint}" if hint else "")
         + ("\n\nВАЖНО: это подборка автора — бери ТОЛЬКО фильмы и сериалы из списка кандидатов, все и в том же "
            "порядке, ничего не добавляй и не убирай." if only else
            "\n\nКандидаты идут от самых популярных и обсуждаемых — их бери в первую очередь; у каждого из них в "

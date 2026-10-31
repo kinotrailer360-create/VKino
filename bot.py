@@ -7561,7 +7561,9 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("📝 Пост для ТГ: новость или подборка ▸", "pt:menu")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
+        *[[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")] for k in holidays_now(datetime.now(MSK).date())],
         [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
+        [_btn("🎉 Шортс к празднику ▸", "sh:hol")],
         [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
         [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
@@ -7759,6 +7761,10 @@ async def shorts_panel(
     if data == "sh:menu":
         await state.clear()
         await show(SHORTS_MENU_TEXT, shorts_menu())
+    elif data == "sh:hol":
+        await show("🎉 <b>Шортс к празднику</b> — выбери праздник:", holidays_menu("sh:hol:", "sh:menu"))
+    elif data.startswith("sh:hol:") and data[7:] in HOLIDAYS:
+        await holiday_short(message, state, data[7:])
     elif data == "sh:genres":
         await show("🎭 <b>Топ какого жанра собрать?</b>", shorts_genres_menu())
     elif data == "sh:settings":
@@ -8882,6 +8888,40 @@ async def _fill_notes(wait: Message, films: list[dict[str, Any]], items: list[di
             films[k]["note"] = note
 
 
+async def holiday_short(message: Message, state: FSMContext, key: str) -> None:
+    """Шортс к празднику: ИИ выбирает 5 фильмов (Кинопоиск, интернет, подсказка о празднике) — дальше как
+    «Своя подборка»."""
+    if shorts_lock.locked():
+        await message.answer("⏳ Сейчас собирается другой ролик — попробуй через пару минут.")
+        return
+    wait = await message.answer(f"{HOLIDAYS[key][0]}: ИИ подбирает фильмы к празднику…")
+    try:
+        title, kp_films, hint = await holiday_pick(key)
+        today = datetime.now(MSK).date()
+        res = await shorts_ai.write_list_post(GEMINI_API_KEY, title, [_film_line(f) for f in kp_films], "", [],
+                                              f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
+                                              n=5, hint=hint)
+        ids: list[int] = []
+        for f in (res or {}).get("films") or []:
+            _, film = await _list_poster(f, kp_films, [])
+            if film and film.get("id") and int(film["id"]) not in ids:
+                ids.append(int(film["id"]))
+        for f in kp_films:  # ИИ не ответил или нашёл мало — добираем кандидатами Кинопоиска
+            if len(ids) >= 5:
+                break
+            if f.get("id") and int(f["id"]) not in ids:
+                ids.append(int(f["id"]))
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Holiday short pick failed")
+        await wait.edit_text(f"❌ Не получилось подобрать фильмы: <code>{escape(str(exc)[:300])}</code>")
+        return
+    await wait.delete()
+    if len(ids) < shorts_daily.CUSTOM_MIN:
+        await message.answer("😔 Мало фильмов для ролика — попробуй ещё раз позже.")
+        return
+    await start_custom(message, state, re.sub(r"\s*[\U0001F300-\U0001FAFF]\s*$", "", title), ids[:5])
+
+
 async def start_custom(message: Message, state: FSMContext, title: str, ids: list[int],
                        notes: list[str] | None = None) -> None:
     media = (await state.get_data()).get("cs_media") or []
@@ -9354,11 +9394,14 @@ LIST_POSTS = {  # подборки для поста: ключ темы шорт
 
 def posts_menu() -> InlineKeyboardMarkup:
     keys = list(LIST_POSTS)
-    rows = [[_btn("📰 Свежая новость из каналов", "pt:make")]]
+    rows = [[_btn(f"{HOLIDAYS[k][0]}: подборка к празднику", f"pt:l:h:{k}")]
+            for k in holidays_now(datetime.now(MSK).date())]
+    rows += [[_btn("📰 Свежая новость из каналов", "pt:make")]]
     rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
     rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
              for k in range(0, len(SHORTS_GENRES), 3)]
     rows.append([_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")])
+    rows.append([_btn("🎉 Подборки к праздникам ▸", "pt:hol")])
     rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
     rows.append([_btn("🔗 Подборка по ссылке или тексту", "pt:ll")])
     rows.append([_btn("🧩 Сводка по теме из всех каналов", "pt:dg")])
@@ -10378,6 +10421,72 @@ def style_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# праздники: ключ → (кнопка, месяц, день, дней до, дней после, заголовок, фильтр Кинопоиска, подсказка ИИ)
+HOLIDAYS: dict[str, tuple[str, int, int, int, int, str, dict[str, str], str]] = {
+    "halloween": ("🎃 Хэллоуин", 10, 31, 10, 1, "Фильмы на Хэллоуин 🎃",
+                  {"genres.name": "ужасы", "rating.kp": "6.8-10", "votes.kp": "50000-100000000"},
+                  "атмосферное кино на Хэллоуин: ведьмы, тыквы, призраки, маньяки в масках, классика хоррора и "
+                  "семейные страшилки («Хэллоуин», «Битлджус», «Кошмар перед Рождеством», «Фокус-покус»)"),
+    "newyear": ("🎄 Новый год", 12, 31, 21, 8, "Новогодние фильмы, которые создают настроение 🎄",
+                {"genres.name": "комедия", "rating.kp": "7-10", "votes.kp": "50000-100000000"},
+                "новогодние и рождественские фильмы: и зарубежная классика («Один дома», «Реальная любовь», "
+                "«Гринч»), и наша («Ирония судьбы», «Чародеи», «Ёлки»)"),
+    "valentine": ("💘 День святого Валентина", 2, 14, 7, 0, "Фильмы о любви ко Дню святого Валентина 💘",
+                  {"genres.name": "мелодрама", "rating.kp": "7-10", "votes.kp": "50000-100000000"},
+                  "романтичные фильмы о любви для вечера вдвоём"),
+    "feb23": ("🎖 23 февраля", 2, 23, 5, 0, "Фильмы к 23 февраля 🎖",
+              {"genres.name": "военный", "rating.kp": "7.3-10", "votes.kp": "50000-100000000"},
+              "мужское кино ко Дню защитника Отечества: военные фильмы и боевики о героях"),
+    "march8": ("🌷 8 Марта", 3, 8, 5, 0, "Фильмы к 8 Марта 🌷",
+               {"genres.name": "мелодрама", "rating.kp": "7-10", "votes.kp": "40000-100000000"},
+               "фильмы к Международному женскому дню: о сильных женщинах, романтические комедии, кино для девичника"),
+    "april1": ("🤡 1 апреля", 4, 1, 3, 0, "Самые смешные комедии ко Дню смеха 🤡",
+               {"genres.name": "комедия", "rating.kp": "7.2-10", "votes.kp": "80000-100000000"},
+               "самые смешные комедии ко Дню смеха"),
+    "space": ("🚀 День космонавтики", 4, 12, 3, 0, "Фильмы о космосе ко Дню космонавтики 🚀",
+              {"genres.name": "фантастика", "rating.kp": "7.2-10", "votes.kp": "50000-100000000"},
+              "фильмы о космосе и космонавтах: «Время первых», «Салют-7», «Интерстеллар», «Марсианин», «Аполлон-13»"),
+    "may9": ("🎗 9 Мая", 5, 9, 7, 0, "Фильмы о Великой Отечественной войне ко Дню Победы 🎗",
+             {"genres.name": "военный", "countries.name": "СССР", "rating.kp": "7.5-10", "votes.kp": "10000-100000000"},
+             "лучшие фильмы о Великой Отечественной войне ко Дню Победы — советская классика и новые фильмы"),
+    "kids": ("🧸 День защиты детей", 6, 1, 3, 0, "Фильмы и мультфильмы для всей семьи ко Дню защиты детей 🧸",
+             {"genres.name": "семейный", "rating.kp": "7.2-10", "votes.kp": "50000-100000000"},
+             "добрые семейные фильмы и мультфильмы для детей и родителей"),
+    "school": ("🎒 1 сентября", 9, 1, 5, 0, "Фильмы про школу к 1 сентября 🎒",
+               {"genres.name": "драма", "rating.kp": "7.2-10", "votes.kp": "30000-100000000"},
+               "фильмы про школу, учителей и школьную жизнь: «Общество мёртвых поэтов», «Чучело», «Школа рока»"),
+}
+
+
+def holidays_now(today: date) -> list[str]:
+    """Праздники, к которым сейчас уместна подборка (за несколько дней до и в сам день)."""
+    out = []
+    for key, (_, month, day, before, after, *_rest) in HOLIDAYS.items():
+        for year in (today.year - 1, today.year, today.year + 1):
+            try:
+                d = date(year, month, day)
+            except ValueError:
+                continue
+            if d - timedelta(days=before) <= today <= d + timedelta(days=after):
+                out.append(key)
+                break
+    return out
+
+
+def holidays_menu(prefix: str, back: str) -> InlineKeyboardMarkup:
+    keys = list(HOLIDAYS)
+    rows = [[_btn(HOLIDAYS[k][0], f"{prefix}{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
+    rows.append([_btn("⬅️ Назад", back)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def holiday_pick(key: str) -> tuple[str, list[dict[str, Any]], str]:
+    """Заголовок, кандидаты Кинопоиска и подсказка для подборки к празднику."""
+    _, _, _, _, _, title, params, hint = HOLIDAYS[key]
+    kp_films = await _style_candidates(params, set())
+    return title, kp_films, hint
+
+
 async def _style_candidates(params: dict[str, str], exclude: set[int]) -> list[dict[str, Any]]:
     docs = await shorts_daily._query(kp._get, page=random.randint(1, 3), sortField="votes.kp", sortType="-1",
                                      notNullFields="name", **params)
@@ -10432,7 +10541,11 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     первому; ниже — кнопки публикации. Фильмы не повторяются подряд."""
     today = datetime.now(MSK).date()
     hist = await _posts_history()
-    if key.startswith("x:") and key[2:] in STYLE_LISTS:  # подборка по стилю
+    hint = ""
+    if key.startswith("h:") and key[2:] in HOLIDAYS:  # подборка к празднику
+        hol_title, kp_films, hint = await holiday_pick(key[2:])
+        title = title or hol_title
+    elif key.startswith("x:") and key[2:] in STYLE_LISTS:  # подборка по стилю
         _, style_title, params = STYLE_LISTS[key[2:]]
         title = title or style_title
         kp_films = await _style_candidates(params, {int(x) for x in hist["films"]}) or \
@@ -10460,9 +10573,9 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
         lines = tm_lines + lines
     res = await shorts_ai.write_list_post(
         GEMINI_API_KEY, title, lines, shorts_tgsearch.as_text(posts, 7000),
-        [] if key in FRESH_LISTS else hist["list_titles"],
+        [] if key in FRESH_LISTS or key.startswith("h:") else hist["list_titles"],
         f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
-        n=6 if key in ("weekseries", "weekfilms") else 5)
+        n=6 if key in ("weekseries", "weekfilms") else 5, hint=hint)
     if res:
         # в альбом — только то, что есть в тексте поста: ИИ иногда перечисляет в films больше, чем написал
         flat = re.sub(r"[^\w]+", "", res["post"].lower().replace("ё", "е"))
@@ -10806,6 +10919,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("✏️ Пришли новый текст поста целиком (можно скопировать старый и поправить). "
                              "Подпись канала внизу добавлю сам.\n\n<i>Передумал — /cancel</i>")
         return
+    if action == "hol":
+        await message.answer("🎉 <b>Подборка к празднику</b> — выбери праздник:", reply_markup=holidays_menu("pt:l:h:", "pt:menu"))
+        return
     if action == "styles":
         await message.answer("🎨 <b>Подборки по стилю</b> — ИИ подберёт фильмы по теме (Кинопоиск, интернет), "
                              "постеры — фирменными карточками.", reply_markup=style_menu())
@@ -10870,7 +10986,8 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if kind == "l":
         key = arg
-        if key not in LIST_POSTS and not key.startswith("genre:") and not (key.startswith("x:") and key[2:] in STYLE_LISTS):
+        if key not in LIST_POSTS and not key.startswith("genre:") and not (key.startswith("x:") and key[2:] in STYLE_LISTS) \
+                and not (key.startswith("h:") and key[2:] in HOLIDAYS):
             return
         if post_lock.locked():
             await message.answer("⏳ Пост уже пишется — подожди минуту.")
