@@ -166,6 +166,7 @@ if not DATABASE_URL:
 
 pool: asyncpg.Pool | None = None
 router = Router()
+contact_router = Router()  # ответы в переписке «написать админу» — раньше всех остальных обработчиков
 
 MAIN_MENU_LABELS = {
     "🔎 Найти фильм или сериал",
@@ -11942,7 +11943,11 @@ async def _contact_thread(message: Message) -> int | None:
         user_id = await db().fetchval("SELECT user_id FROM contact_msgs WHERE chat_id=$1 AND message_id=$2",
                                       message.chat.id, reply.message_id)
     except Exception:  # noqa: BLE001
-        return None
+        logging.exception("Contact: thread lookup failed")
+        user_id = None
+    if not user_id and reply.from_user and reply.from_user.is_bot:  # запасной путь: id человека в шапке
+        m = re.search(r"Сообщение от .*\(id (\d+)\)", reply.text or reply.caption or "")
+        user_id = int(m.group(1)) if m else None
     return int(user_id) if user_id else None
 
 
@@ -11950,10 +11955,11 @@ async def is_contact_reply(message: Message) -> bool:
     return await _contact_thread(message) is not None
 
 
-@router.message(is_contact_reply)
-async def contact_reply(message: Message) -> None:
+@contact_router.message(is_contact_reply)
+async def contact_reply(message: Message, state: FSMContext) -> None:
     user_id = await _contact_thread(message)
-    if message.from_user.id in ADMIN_IDS and message.chat.id != user_id:  # админ отвечает человеку
+    if message.from_user.id in ADMIN_IDS:  # админ отвечает человеку (и себе, если проверял сам)
+        await state.clear()  # ответ мог прийти посреди другого режима (ввод текста поста и т. п.)
         try:
             head = await message.bot.send_message(user_id, "💬 <b>Ответ от KinoMir360:</b>")
             copy = await message.bot.copy_message(user_id, message.chat.id, message.message_id)
@@ -12710,6 +12716,7 @@ async def main() -> None:
     dp.callback_query.outer_middleware(activity_tracker)
     dp.message.outer_middleware(subscription_gate)
     dp.callback_query.outer_middleware(subscription_gate)
+    dp.include_router(contact_router)
     dp.include_router(router)
     commands_task = asyncio.create_task(set_admin_commands(bot))  # не задерживает запуск
 
