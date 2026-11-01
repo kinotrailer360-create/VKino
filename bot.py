@@ -3897,6 +3897,9 @@ async def cmd_start(
         text, markup = rq_screen("-", "-", "-", "-")
         await message.answer(text, reply_markup=markup)
         return
+    if arg == "contact":  # ссылка «связь с админом» (?start=contact) — например, из закрепа канала
+        await contact_ask(message, state)
+        return
     if arg == "quiz":  # кнопка из поста «Знатоки месяца»
         await message.answer("🧩 Викторина дня — жми кнопку в меню или держи кадр 👇",
                              reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
@@ -10306,7 +10309,8 @@ async def make_navigator_post(bot: Bot, chat_id: int) -> None:
         "📌 ДОБРО ПОЖАЛОВАТЬ В KINOMIR360!", "", "Всё о кино каждый день. Жми на хэштег — увидишь все посты рубрики:",
         "", *[f"{name} — {tag}" for tag, name in RUBRICS.items()], "",
         f"🤖 Подобрать фильм: {url.replace('https://', '')}", f"📺 YouTube: {shorts_daily.YOUTUBE_URL.replace('https://', '')}",
-        f"💬 Мы в MAX: {MAX_URL.replace('https://', '')}"])
+        f"💬 Мы в MAX: {MAX_URL.replace('https://', '')}",
+        f"✉️ Связь с админом: {url.replace('https://', '')}?start=contact"])
     ids = await _card_post(bot, chat_id, "Всё о кино каждый день", f"t.me/{POST_CHANNEL.lstrip('@')}", post)
     await offer_post(bot, chat_id, ids, "caption", what="Навигатор готов. После публикации закрепи его в канале "
                      "(долгий тап по посту → Закрепить)", extra={"button": {"text": "🎬 Подобрать фильм", "url": url}})
@@ -11874,6 +11878,17 @@ async def contact_ask(message: Message, state: FSMContext) -> None:
     await message.answer("✉️ Напиши сообщение одним сообщением — текст, фото, видео или голосовое. "
                          "Я передам его администратору KinoMir360, ответ придёт сюда же 🙌\n\n"
                          "<i>Передумал — /cancel</i>")
+
+
+@router.message(Command("contact"))
+async def contact_command(message: Message, state: FSMContext) -> None:
+    """/contact — для админа ссылка «связь с админом», для остальных — сразу написать."""
+    if message.from_user and message.from_user.id in ADMIN_IDS:
+        link = f"{await _bot_link(message.bot)}?start=contact"
+        await message.answer(f"✉️ Ссылка «связь с админом» — для закрепа, описания канала, постов:\n<code>{link}</code>\n\n"
+                             "По ней человек сразу попадает в «Написать админу», его сообщение придёт тебе сюда.")
+        return
+    await contact_ask(message, state)
 
 
 @router.message(F.text == CONTACT_BUTTON)
