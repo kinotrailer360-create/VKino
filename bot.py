@@ -9614,9 +9614,10 @@ async def _send_media(bot: Bot, chat_id: int, files: list[Path], caption: str) -
     просто текст."""
     files = files[:10]
     if len(files) >= 2:
-        media = [(InputMediaVideo(media=FSInputFile(f), supports_streaming=True) if f.suffix == ".mp4"
-                  else InputMediaPhoto(media=FSInputFile(f))) for f in files]
-        media[0].caption = caption
+        # подпись — сразу в первом элементе: объекты aiogram неизменяемые, потом её не добавить
+        media = [(InputMediaVideo(media=FSInputFile(f), supports_streaming=True, caption=caption if k == 0 else None)
+                  if f.suffix == ".mp4" else InputMediaPhoto(media=FSInputFile(f), caption=caption if k == 0 else None))
+                 for k, f in enumerate(files)]
         sent = await bot.send_media_group(chat_id, media)
         return [m.message_id for m in sent], "caption"
     if files and files[0].suffix == ".mp4":
