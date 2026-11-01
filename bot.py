@@ -196,6 +196,7 @@ class SearchState(StatesGroup):
 
 
 class ShortsState(StatesGroup):
+    download_url = State()
     facts_title = State()
     say_entry = State()
     voice_text = State()
@@ -7589,6 +7590,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
         [_btn("📰 Своя новость: вставлю текст", "lo:news")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
+        [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
         [_btn("✍️ Факты: ввести название", "sh:ask:facts"), _btn("🔎 Факты: интернет или свой текст", "fx:start")],
@@ -7735,6 +7737,8 @@ SHORTS_ASKS = {
     "trailer": (ShortsState.trailer_query,
                 "🎬 Напиши название фильма или пришли ссылку на видео (VK, Rutube) — проверю, качается ли трейлер."),
     "feed": (ShortsState.feed_url, "📡 Пришли ссылку на RSS-ленту новостей кино."),
+    "dl": (ShortsState.download_url, "⬇️ Пришли ссылку на видео — Rutube, VK, YouTube, Дзен и др. Скачаю со звуком "
+                                     "(до 720p) и пришлю сюда; длинное — частями до 50 МБ."),
     "clone": (ShortsState.clone_audio,
               "🎤 Запишите и пришлите сюда голосовое сообщение на 30–60 секунд — сделаю из него ваш голос."),
     "tgch": (ShortsState.fact_channels,
@@ -7913,6 +7917,58 @@ async def shorts_fact_channels(message: Message, state: FSMContext) -> None:
     head = f"✅ Добавил {len(added)}, всего {len(result)} каналов." if adding else f"✅ Сохранил {len(result)} каналов."
     await message.answer(head + note)
     await channels_action(message)
+
+
+dl_lock = asyncio.Lock()
+
+
+async def download_action(message: Message, url: str) -> None:
+    """⬇️ Скачать видео по ссылке: yt-dlp со звуком, до 720p; больше 50 МБ — частями."""
+    if dl_lock.locked():
+        await message.answer("⏳ Уже качаю другое видео — пришли ссылку через пару минут.")
+        return
+    wait = await message.answer("⬇️ Качаю видео… Длинное может занять несколько минут.")
+    work = SHORTS_DIR / f"dl_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+
+    async def job() -> None:
+        try:
+            async with dl_lock:
+                video = await shorts_clips.download_video(url, work)
+                parts = await shorts_clips.split_for_telegram(video)
+                for k, part in enumerate(parts, 1):
+                    caption = f"⬇️ Часть {k} из {len(parts)}" if len(parts) > 1 else "⬇️ Готово"
+                    await message.bot.send_video(message.chat.id, FSInputFile(part, filename=f"video_{k}.mp4"),
+                                                 caption=caption, supports_streaming=True, request_timeout=600)
+            await wait.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Video download failed: %s", url)
+            await wait.edit_text(f"❌ Не скачалось: <code>{escape(str(exc)[-400:])}</code>")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    _run_job(job)
+
+
+@router.message(ShortsState.download_url, F.text, ~F.text.startswith("/"))
+async def download_url_message(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    urls = URL_RE.findall(message.text or "")
+    if not urls:
+        await message.answer("Не вижу ссылки. Нажми «⬇️ Скачать видео» и пришли ссылку ещё раз.")
+        return
+    await download_action(message, urls[0].rstrip(").,»\"'"))
+
+
+@router.message(Command("dl"))
+async def download_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    urls = URL_RE.findall(message.text or "")
+    if not urls:
+        await message.answer("⬇️ Пришли так: <code>/dl https://rutube.ru/video/…</code>")
+        return
+    await download_action(message, urls[0].rstrip(").,»\"'"))
 
 
 @router.message(ShortsState.music_file, F.audio | F.document | F.voice)
