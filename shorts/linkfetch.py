@@ -70,7 +70,7 @@ async def fetch(url: str) -> dict[str, Any]:
             if not post:
                 raise RuntimeError("пост не открылся (канал закрытый или пост удалён)")
             return {"url": url, "title": "", "text": post["text"][:TEXT_MAX], "image": post["image"],
-                    "video": post["video"], "thumb": post.get("thumb")}
+                    "video": post["video"], "thumb": post.get("thumb"), "media": post.get("media") or []}
         async with session.get(url) as resp:
             resp.raise_for_status()
             html = await resp.text(errors="ignore")

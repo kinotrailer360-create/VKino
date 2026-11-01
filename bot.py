@@ -40,6 +40,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    InputMediaVideo,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -9380,6 +9381,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
+            # 0) альбом поста-источника целиком (несколько фото/видео) — все медиа, а не одно
+            album = next((p["media"] for p in same if len(p.get("media") or []) >= 2), None)
             # 1) видео из постов об этой же новости
             with_media = [p for p in same if p.get("video")]
             # 2) новость о трейлере — сам трейлер со звуком с Rutube
@@ -9406,18 +9409,14 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
                     logging.info("Tg post: kinopoisk image skipped: %s", exc)
             # последнее — маленькая обложка видео из самой новости
             with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
-            files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
-                     await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
+            files = await shorts_tgsearch.download_media(album, work, limit=10, prefix="alb") if album else []
+            if len(files) < 2:
+                files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
+                         await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
             caption = post_caption(res["post"], "#новости")
             for chat_id in chat_ids:
-                if files and files[0].suffix == ".mp4":
-                    sent = await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption,
-                                                supports_streaming=True)
-                elif files:
-                    sent = await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)
-                else:
-                    sent = await bot.send_message(chat_id, caption, disable_web_page_preview=True)
-                await offer_post(bot, chat_id, [sent.message_id], "caption" if files else "text", "pt:make")
+                ids, kind = await _send_media(bot, chat_id, files, caption)
+                await offer_post(bot, chat_id, ids, kind, "pt:make")
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return res["topic"] or "пост"
@@ -9444,7 +9443,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
     rows.append([_btn("🔗 Подборка по ссылке или тексту", "pt:ll")])
     rows.append([_btn("🧩 Сводка по теме из всех каналов", "pt:dg")])
-    rows.append([_btn("🎂 День рождения звезды", "pt:bd"), _btn("📅 Этот день в кино", "pt:an")])
+    rows.append([_btn("🎂 День рождения звезды", "bd:list"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
@@ -9610,6 +9609,24 @@ async def _send_album(bot: Bot, chat_id: int, files: list[Path], post: str, rubr
     return [(await bot.send_message(chat_id, caption, disable_web_page_preview=True)).message_id], "text"
 
 
+async def _send_media(bot: Bot, chat_id: int, files: list[Path], caption: str) -> tuple[list[int], str]:
+    """Фото и видео поста (весь альбом источника, до 10) с подписью к первому; одно — фото или видео; нет —
+    просто текст."""
+    files = files[:10]
+    if len(files) >= 2:
+        media = [(InputMediaVideo(media=FSInputFile(f), supports_streaming=True) if f.suffix == ".mp4"
+                  else InputMediaPhoto(media=FSInputFile(f))) for f in files]
+        media[0].caption = caption
+        sent = await bot.send_media_group(chat_id, media)
+        return [m.message_id for m in sent], "caption"
+    if files and files[0].suffix == ".mp4":
+        return [(await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption,
+                                      supports_streaming=True)).message_id], "caption"
+    if files:
+        return [(await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)).message_id], "caption"
+    return [(await bot.send_message(chat_id, caption, disable_web_page_preview=True)).message_id], "text"
+
+
 async def _image(url: str | None, work: Path, prefix: str) -> Image.Image | None:
     if not url:
         return None
@@ -9620,12 +9637,20 @@ async def _image(url: str | None, work: Path, prefix: str) -> Image.Image | None
         return None
 
 
-async def make_birthday_post(bot: Bot, chat_id: int) -> None:
+async def make_birthday_post(bot: Bot, chat_id: int, chosen: dict[str, Any] | None = None) -> None:
     """День рождения звезды кино: пара фраз о человеке, его лучшие фильмы с ролями и лёгкое поздравление.
-    Альбом: портрет «С днём рождения» и карточки фильмов; в канале — опрос «Какой фильм любимый?»."""
+    Альбом: портрет «С днём рождения» и карточки фильмов; в канале — опрос «Какой фильм любимый?».
+    chosen — именинник, которого выбрал автор из списка (иначе — самый известный, кого ещё не было)."""
     today = datetime.now(MSK).date()
     hist = await _posts_history()
-    who, info, top = await shorts_daily.pick_birthday(today, {int(x) for x in hist["people"]}, TMDB_API_KEY)
+    if chosen:
+        who = chosen
+        info = await shorts_daily.tmdb.person(TMDB_API_KEY, who["imdb"])
+        top = shorts_daily.tmdb.best_movies(info, shorts_daily.BIRTHDAY_FILMS) if info else []
+        if not top:
+            raise RuntimeError(f"у «{who['name']}» на TMDB не нашлось фильмов — выбери другого")
+    else:
+        who, info, top = await shorts_daily.pick_birthday(today, {int(x) for x in hist["people"]}, TMDB_API_KEY)
     name, female = who["name"], who["female"]
     age = today.year - date.fromisoformat(who["born"]).year
     years = shorts_daily._years(age)
@@ -9821,6 +9846,129 @@ async def make_actor_post(bot: Bot, chat_id: int, query: str) -> None:
                      "Пост памяти готов" if memorial else "Подборка с актёром готова",
                      "Какая роль запомнилась вам больше всего? 🕯" if memorial
                      else f"Какой фильм или сериал с {him} ваш любимый? 🎬")
+
+
+bd_lists: dict[int, dict[str, Any]] = {}  # чат → {"people": именинники дня, "sel": выбранные номера}
+
+
+def birthday_menu(chat_id: int) -> InlineKeyboardMarkup:
+    data = bd_lists.get(chat_id) or {"people": [], "sel": set()}
+    today = datetime.now(MSK).date()
+    rows = []
+    for i, p in enumerate(data["people"]):
+        age = today.year - int(p["born"][:4])
+        rows.append([_btn(f"{'✅' if i in data['sel'] else '▫️'} {p['name']}, {age}", f"bd:t:{i}")])
+    n = len(data["sel"])
+    rows.append([_btn(f"🎂 Сделать пост ({n})" if n else "🎂 Выбери хотя бы одного", "bd:go")])
+    rows.append([_btn("🎲 Самый известный (автоматически)", "pt:bd")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("bd:"))
+async def birthday_buttons(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    message, action = callback.message, (callback.data or "")[3:]
+    chat_id = message.chat.id
+    if action == "list":
+        await callback.answer()
+        wait = await message.answer("🎂 Ищу, у кого из кино сегодня день рождения…")
+        today = datetime.now(MSK).date()
+        try:
+            people = await shorts_daily.wiki.birthdays(today.month, today.day, limit=20)
+        except Exception as exc:  # noqa: BLE001
+            await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:300])}</code>")
+            return
+        if not people:
+            await wait.edit_text("Сегодня в Википедии нет именинников из кино 🤷")
+            return
+        bd_lists[chat_id] = {"people": people, "sel": set()}
+        await wait.edit_text("🎂 <b>Сегодня дни рождения</b> — от самых известных. Отметь одного или нескольких "
+                             "(актёры, режиссёры, продюсеры) и нажми «Сделать пост». Несколько — один общий пост.",
+                             reply_markup=birthday_menu(chat_id))
+        return
+    data = bd_lists.get(chat_id)
+    if not data:
+        await callback.answer("Список устарел — нажми «🎂 День рождения» ещё раз", show_alert=True)
+        return
+    if action.startswith("t:"):
+        i = int(action[2:])
+        data["sel"].symmetric_difference_update({i})
+        await callback.answer()
+        try:
+            await message.edit_reply_markup(reply_markup=birthday_menu(chat_id))
+        except TelegramBadRequest:
+            pass
+        return
+    if action == "go":
+        chosen = [data["people"][i] for i in sorted(data["sel"])]
+        if not chosen:
+            await callback.answer("Отметь хотя бы одного человека", show_alert=True)
+            return
+        await callback.answer()
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту.")
+            return
+        wait = await message.answer(f"🎂 Готовлю пост: {escape(', '.join(p['name'] for p in chosen))}…")
+
+        async def job() -> None:
+            try:
+                async with post_lock:
+                    if len(chosen) == 1:
+                        await make_birthday_post(message.bot, chat_id, chosen[0])
+                    else:
+                        await make_birthdays_post(message.bot, chat_id, chosen)
+                await wait.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Birthday post failed")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+        _run_job(job)
+
+
+async def make_birthdays_post(bot: Bot, chat_id: int, people: list[dict[str, Any]]) -> None:
+    """Общий пост «Сегодня дни рождения»: несколько звёзд, у каждого возраст и 2–3 главных фильма, портреты."""
+    today = datetime.now(MSK).date()
+    rows, cards_data = [], []
+    for who in people[:6]:
+        try:
+            info = await shorts_daily.tmdb.person(TMDB_API_KEY, who["imdb"])
+        except Exception:  # noqa: BLE001
+            info = None
+        films = shorts_daily.tmdb.best_movies(info, 3) if info else []
+        age = today.year - int(who["born"][:4])
+        titles = [str(f.get("title") or f.get("original_title") or "") for f in films]
+        rows.append(f"{who['name']} ({who['en'] or '—'}), {age} {shorts_daily._years(age)}"
+                    + (f"; известен по: {', '.join(titles)}" if titles else ""))
+        cards_data.append((who, info, age, titles))
+    task = ("Сегодня дни рождения у нескольких звёзд кино. Напиши пост: заголовок «🎂 СЕГОДНЯ ДНИ РОЖДЕНИЯ "
+            "ОТМЕЧАЮТ»; для каждого — строка с эмодзи: имя, сколько лет и 2–3 главных фильма в «ёлочках»; тёплое "
+            "поздравление одной фразой и строка реакций. Только факты из материала.")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, "\n".join(rows)) or "\n".join(
+        ["🎂 СЕГОДНЯ ДНИ РОЖДЕНИЯ ОТМЕЧАЮТ", ""] + [f"🎉 {r}" for r in rows]
+        + ["", "Поздравляем! 🥳 Кого из них любите больше всего?", "", "#ДеньРождения #Кино #KinoMir360"])
+    work = SHORTS_DIR / f"bdays_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        cards: list[Path] = []
+        for k, (who, info, age, titles) in enumerate(cards_data):
+            url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
+            photo = await _image(url, work, f"face{k}_")
+            if not photo:
+                continue
+            card = await asyncio.to_thread(
+                shorts_postcard.make_post_card, photo, who["name"], pill=("С ДНЁМ РОЖДЕНИЯ", ""),
+                meta=f"{age} {shorts_daily._years(age)}",
+                extra=("Известен по: " if not who.get("female") else "Известна по: ") + ", ".join(f"«{t}»" for t in titles[:2])
+                if titles else None)
+            cards.append(work / f"face{k}.jpg")
+            card.save(cards[-1], quality=92)
+        ids, kind = await _send_album(bot, chat_id, cards, post, "#деньрождения")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "bd:list", [p["name"] for p in people[:6]] if len(people) >= 2 else None,
+                     "Пост с днями рождения готов", "Кого из именинников любите больше всего? 🎉")
 
 
 async def make_facts_post(bot: Bot, chat_id: int, era: str = "", film_id: int = 0, voted: bool = False) -> None:
@@ -11307,12 +11455,15 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
     try:
         if own_media:
             send = bot.send_photo if own_media[0] == "photo" else bot.send_video
-            sent = await send(chat_id, own_media[1], caption=caption)
-            kind = "caption"
+            ids, kind = [(await send(chat_id, own_media[1], caption=caption)).message_id], "caption"
         else:
-            # видео источника → трейлер с Rutube (новость о трейлере) → фото источника → кадр Кинопоиска → превью видео
+            # все фото и видео источника (альбом поста) → видео источника → трейлер с Rutube (новость о трейлере)
+            # → фото источника → кадр Кинопоиска → превью видео
             files = await shorts_tgsearch.download_media(
-                [{"video": s["video"]} for s in sources if s.get("video")], work, limit=1, prefix="link")
+                [m for s in sources for m in s.get("media") or []], work, limit=10, prefix="alb")
+            if len(files) < 2:
+                files = await shorts_tgsearch.download_media(
+                    [{"video": s["video"]} for s in sources if s.get("video")], work, limit=1, prefix="link")
             if not files and res["trailer"] and res["film"]:
                 trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work)
                 files = [trailer] if trailer else []
@@ -11326,18 +11477,12 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
             if not files:
                 files = await shorts_tgsearch.download_media(
                     [{"image": s["thumb"]} for s in sources if s.get("thumb")], work, limit=1, prefix="thumb")
-            if files and files[0].suffix == ".mp4":
-                sent = await bot.send_video(chat_id, FSInputFile(files[0]), caption=caption, supports_streaming=True)
-            elif files:
-                sent = await bot.send_photo(chat_id, FSInputFile(files[0]), caption=caption)
-            else:
-                sent = await bot.send_message(chat_id, caption, disable_web_page_preview=True)
-            kind = "caption" if files else "text"
+            ids, kind = await _send_media(bot, chat_id, files, caption)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if failed:
         await bot.send_message(chat_id, "⚠️ Не открылись:\n" + escape("\n".join(failed)))
-    await offer_post(bot, chat_id, [sent.message_id], kind, "pt:lk", what="Пост по ссылке готов")
+    await offer_post(bot, chat_id, ids, kind, "pt:lk", what="Пост по ссылке готов")
 
 
 @router.message(PostState.edit, F.text, ~F.text.startswith("/"))

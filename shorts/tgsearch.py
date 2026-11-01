@@ -67,7 +67,7 @@ class _Posts(HTMLParser):
         cls = a.get("class") or ""
         if a.get("data-post") and "tgme_widget_message" in cls:
             self.all.append({"url": f"https://t.me/{a['data-post']}", "text": "", "time": 0.0, "image": None,
-                             "video": None})
+                             "video": None, "media": []})  # media — все фото и видео поста (альбом), по порядку
         cur = self.all[-1] if self.all else None
         if tag == "div":
             if self.depth:
@@ -81,15 +81,18 @@ class _Posts(HTMLParser):
                 cur["time"] = datetime.fromisoformat(str(a["datetime"])).timestamp()
             except ValueError:
                 pass
-        elif tag == "a" and "tgme_widget_message_photo_wrap" in cls and cur is not None and not cur["image"]:
+        elif tag == "a" and "tgme_widget_message_photo_wrap" in cls and cur is not None:
             m = re.search(r"background-image:url\(['\"]?([^'\")]+)", a.get("style") or "")
-            cur["image"] = m.group(1) if m else None
+            if m:
+                cur["media"].append({"image": m.group(1)})
+                cur["image"] = cur["image"] or m.group(1)
         elif tag == "i" and "tgme_widget_message_video_thumb" in cls and cur is not None and not cur.get("thumb"):
             # большое видео веб-версия не отдаёт — только его маленькую обложку (запасная картинка)
             m = re.search(r"background-image:url\(['\"]?([^'\")]+)", a.get("style") or "")
             cur["thumb"] = m.group(1) if m else None
-        elif tag == "video" and cur is not None and not cur["video"] and str(a.get("src") or "").startswith("http"):
-            cur["video"] = a["src"]
+        elif tag == "video" and cur is not None and str(a.get("src") or "").startswith("http"):
+            cur["media"].append({"video": a["src"]})
+            cur["video"] = cur["video"] or a["src"]
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "div" and self.depth:
@@ -158,7 +161,8 @@ async def search(channels: list[str], names: list[str], per_channel: int = POSTS
                 url, text = post["url"], post["text"]
                 if len(text) >= 60 and _mentions(text, names) and url not in found:
                     found[url] = {"channel": channel, "url": url, "text": text[:POST_MAX],
-                                  "image": post["image"], "video": post["video"], "time": post["time"]}
+                                  "image": post["image"], "video": post["video"], "time": post["time"],
+                                  "media": post.get("media") or []}
             if len(found) >= per_channel:
                 break
         return list(found.values())[:per_channel]
