@@ -34,6 +34,41 @@ async def _yt_dlp(url: str, outtmpl: str, extra: list[str], timeout: float, fmt:
     return Path(lines[-1].strip())
 
 
+async def download_video(url: str, out_dir: Path, timeout: float = 1200) -> Path:
+    """Видео со звуком целиком (до 720p, mp4) — для кнопки «⬇️ Скачать видео»."""
+    return await _yt_dlp(url, str(out_dir / "video.%(ext)s"),
+                         ["--merge-output-format", "mp4", "--max-filesize", "1500M"], timeout,
+                         fmt="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b")
+
+
+async def split_for_telegram(src: Path, limit: int = 48 * 1024 * 1024) -> list[Path]:
+    """Видео больше лимита Telegram (50 МБ у ботов) — на части без перекодирования (быстро, без потери
+    качества); каждая часть меньше лимита."""
+    size = src.stat().st_size
+    if size <= limit:
+        return [src]
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(src),
+        stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    duration = float(out.decode().strip() or 0)
+    if duration <= 0:
+        raise RuntimeError("не удалось узнать длину видео")
+    parts = int(size / (limit * 0.85)) + 1  # запас: части режутся по ключевым кадрам и выходят неровными
+    pattern = src.with_name(src.stem + "_part%02d.mp4")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-v", "error", "-y", "-i", str(src), "-c", "copy", "-map", "0", "-f", "segment",
+        "-segment_time", f"{duration / parts:.1f}", "-reset_timestamps", "1", str(pattern),
+        stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode:
+        raise RuntimeError(f"ffmpeg: {err.decode(errors='ignore')[-300:]}")
+    files = sorted(src.parent.glob(src.stem + "_part*.mp4"))
+    if any(f.stat().st_size > limit for f in files):
+        raise RuntimeError("видео слишком плотное — части всё равно больше 50 МБ")
+    return files
+
+
 async def download_clip(url: str, out: Path, start: float = 20.0, length: float = 4.0,
                         timeout: float = 120) -> Path:
     """Скачать отрезок [start, start+length] видео в out (mp4, 720p, без звука)."""
