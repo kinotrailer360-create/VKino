@@ -966,7 +966,8 @@ async def write_styled_post(key: str, task: str, material: str, search: bool = T
 
 
 async def _post_json(key: str, prompt: str, search: bool = True, need_search: bool = False,
-                     query: str = "", verify: bool = True) -> dict[str, Any] | None:
+                     query: str = "", verify: bool = True,
+                     images: list[Image.Image] | None = None) -> dict[str, Any] | None:
     """JSON-ответ для поста. query — сначала свой поиск (Groq Compound/DuckDuckGo/Tavily/Яндекс), результаты
     идут в задание; потом Gemini с поиском Google, иначе — сильная модель Lumean и резервные ИИ. need_search — без свежих
     данных из интернета не отвечаем (цифры, которых модель знать не может). verify — второй проход:
@@ -983,9 +984,10 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
     if web:
         prompt += "\n\nСВЕЖИЕ РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ (опирайся на них, это точнее твоей памяти):\n" + web
     data = None
+    pics = [_thumb(im, 1024) for im in (images or [])[:4]]  # картинки поста: на них бывает сам список/текст
     if key and search:
         try:
-            data = await _ask(key, [{"text": "Поищи в Google. " + prompt}], search=True)
+            data = await _ask(key, [{"text": "Поищи в Google. " + prompt}, *pics], search=True)
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)[:300]
             log.warning("shorts: post with search failed: %s", exc)
@@ -993,7 +995,7 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
         if need_search and not web:
             return None
         try:
-            data = await _with_reserve(key, [{"text": prompt}], prompt)
+            data = await _with_reserve(key, [{"text": prompt}, *pics], prompt, (images or [None])[0])
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)[:300]
             log.warning("shorts: post failed: %s", exc)
@@ -1017,6 +1019,8 @@ async def verify_post(key: str, task: str, post: str) -> str:
         "— неподтверждённое убери, а слух — пометь («по слухам», «по данным инсайдеров»);\n"
         "— особенно проверь: «снова/опять/вернётся» (играл ли актёр эту роль раньше), даты выхода (в "
         "премьерах — только свежие фильмы), годы, имена, цифры, названия (как в материале/прокате);\n"
+        "— МАТЕРИАЛ главнее поиска: если черновик взял из поиска другой год, другой список или другую новость "
+        "вместо материала — верни то, что в материале;\n"
         "— исправь падежи и опечатки.\n"
         "Сохрани стиль, эмодзи, структуру, хэштеги и длину (до 950 символов). Если всё верно — верни черновик "
         "без изменений." + GRAMMAR
@@ -1178,7 +1182,8 @@ NEWS_RULES = (
     + " Образцы удачных постов:\n" + NEWS_STYLE)
 
 
-async def rewrite_post(key: str, sources: str, note: str = "") -> dict[str, Any] | None:
+async def rewrite_post(key: str, sources: str, note: str = "",
+                       images: list[Image.Image] | None = None) -> dict[str, Any] | None:
     """«🔗 Пост по ссылке»: переработать материал (одна или несколько ссылок, пересланный пост) в новостной пост
     для кино-канала: смысл тот же, свои слова, немного эмодзи и хэштегов, где уместно — юмор.
     {"post", "film", "film_en"} или None."""
@@ -1197,6 +1202,10 @@ async def rewrite_post(key: str, sources: str, note: str = "") -> dict[str, Any]
         "сам не переводи (VisionQuest — «Вижнквест», а не «Квест Вижна»).\n"
         "— Оформление как в образцах: короткие абзацы с эмодзи, строка реакций «❤️ — … 🔥 — … 📤 Перешли "
         "другу…», в конце 4–6 хэштегов одной строкой. До 900 символов. Ничего не выдумывай сверх материала.\n"
+        "— МАТЕРИАЛ — главный источник: год, список, названия и цифры бери ИЗ НЕГО (и с картинок поста, если они "
+        "приложены: на них часто сам список фильмов). Поиск — только чтобы проверить отдельный факт. Если поиск "
+        "рассказывает о другом годе или другом списке (например, топ прошлых лет) — это другая новость, её НЕ бери "
+        "и материал ею не заменяй. Названий нет ни в тексте, ни на картинке — не выдумывай и не бери из поиска.\n"
         "—" + FACT_CHECK + GRAMMAR
         + (f"\n\nПОЖЕЛАНИЕ АВТОРА: {note[:500]}" if note else "")
         + "\n\nОБРАЗЦЫ ОФОРМЛЕНИЯ (факты из них не бери):\n" + NEWS_STYLE
@@ -1204,7 +1213,8 @@ async def rewrite_post(key: str, sources: str, note: str = "") -> dict[str, Any]
         + '\n\nОтветь только JSON: {"post": "текст поста", "film": "фильм или сериал по-русски или пусто", '
         '"film_en": "оригинальное название или пусто", "trailer": true, если новость — вышел трейлер или тизер}')
     lead = re.sub(r"\[[^\]]*\]|https?://\S+", " ", sources)
-    data = await _post_json(key, prompt, query=re.sub(r"\s+", " ", lead).strip()[:200])  # поиск, Google, фактчекер
+    data = await _post_json(key, prompt, query=re.sub(r"\s+", " ", lead).strip()[:200],
+                            images=images)  # поиск, Google, фактчекер
     post = _clean_post(data)
     if not post:
         return None

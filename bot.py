@@ -11503,7 +11503,20 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
     if not sources:
         raise RuntimeError("ни одна ссылка не открылась:\n" + "\n".join(failed))
     material = "\n\n".join(f"[{s['url'] or 'текст автора'}]\n{s['title']}\n{s['text']}" for s in sources)
-    res = await shorts_ai.rewrite_post(GEMINI_API_KEY, material, note)
+    pics: list[Image.Image] = []  # картинки источника — ИИ видит, что на них (часто там сам список фильмов)
+    pic_dir = SHORTS_DIR / f"linkpic_{time.time_ns()}"
+    pic_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        imgs = [m for s in sources for m in (s.get("media") or ([{"image": s["image"]}] if s.get("image") else []))
+                if m.get("image")]
+        for path in await shorts_tgsearch.download_media(imgs[:3], pic_dir, limit=3, prefix="v"):
+            try:
+                pics.append(Image.open(path).convert("RGB"))
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        shutil.rmtree(pic_dir, ignore_errors=True)
+    res = await shorts_ai.rewrite_post(GEMINI_API_KEY, material, note, images=pics)
     if not res:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
     caption = post_caption(res["post"], "#новости")
