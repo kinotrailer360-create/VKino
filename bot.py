@@ -3895,6 +3895,8 @@ async def cmd_start(
     if arg.startswith("ref_") and message.from_user:  # пришёл по ссылке друга
         await save_referral(message.from_user.id, arg)
     if arg == "pick":  # кнопка из поста «Рекомендация: что посмотреть»
+        await message.answer("🎬 Привет! Внизу — меню бота, а сейчас подберём фильм 👇",
+                             reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
         text, markup = rq_screen("-", "-", "-", "-")
         await message.answer(text, reply_markup=markup)
         return
@@ -11874,11 +11876,16 @@ class ContactState(StatesGroup):
 CONTACT_BUTTON = "✉️ Написать админу"
 
 
+def _user_menu(message: Message) -> ReplyKeyboardMarkup:
+    """Главное меню внизу экрана: у пришедших по ссылке (?start=…) его иначе нет."""
+    return main_menu(bool(message.chat and message.chat.id in ADMIN_IDS))
+
+
 async def contact_ask(message: Message, state: FSMContext) -> None:
     await state.set_state(ContactState.text)
     await message.answer("✉️ Напиши сообщение одним сообщением — текст, фото, видео или голосовое. "
                          "Я передам его администратору KinoMir360, ответ придёт сюда же 🙌\n\n"
-                         "<i>Передумал — /cancel</i>")
+                         "<i>Передумал — /cancel</i>", reply_markup=_user_menu(message))
 
 
 @router.message(Command("contact"))
@@ -11929,7 +11936,9 @@ async def contact_message(message: Message, state: FSMContext) -> None:
         await contact_ask(message, state)
         return
     if await contact_to_admins(message):
-        await message.answer("✅ Отправил администратору. Ответ придёт сюда — обычно в течение дня.")
+        await message.answer("✅ Отправил администратору. Ответ придёт сюда — обычно в течение дня.\n\n"
+                             "А пока — кнопки внизу: найти фильм, подобрать на вечер, викторина 🎬",
+                             reply_markup=_user_menu(message))
     else:
         await message.answer("😔 Не получилось отправить — попробуй чуть позже.")
 
@@ -12549,6 +12558,17 @@ async def idea_save(message: Message, state: FSMContext) -> None:
             pass
 
 
+@router.message(Command("pick"))
+async def pick_command(message: Message) -> None:
+    text, markup = rq_screen("-", "-", "-", "-")
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(Command("quiz"))
+async def quiz_command(message: Message) -> None:
+    await quiz_day_menu(message)
+
+
 @router.message(F.text == "🎯 Подобрать фильм")
 async def rq_menu(message: Message) -> None:
     text, markup = rq_screen("-", "-", "-", "-")
@@ -12609,7 +12629,7 @@ async def subscription_gate(handler: Any, event: Any, data: dict[str, Any]) -> A
     if (not user or user.id in ADMIN_IDS or not chat or chat.type != "private"
             or (isinstance(event, CallbackQuery) and event.data == "sub:check")
             # написать админу можно всегда, даже без подписки
-            or (isinstance(event, Message) and (event.text == "✉️ Написать админу"
+            or (isinstance(event, Message) and (event.text in ("✉️ Написать админу", "/contact", "/start contact")
                                                 or data.get("raw_state") == ContactState.text.state
                                                 or await _contact_thread(event) is not None))):
         return await handler(event, data)
@@ -12669,6 +12689,15 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="music", description="Сменить фоновую музыку"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ]
+    try:  # кнопка «Меню» у всех пользователей
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🎬 Главное меню"),
+            BotCommand(command="pick", description="🎯 Подобрать фильм на вечер"),
+            BotCommand(command="quiz", description="🧩 Викторина дня"),
+            BotCommand(command="contact", description="✉️ Написать админу"),
+        ])
+    except Exception:
+        logging.exception("Failed to set public commands")
     for admin_id in ADMIN_IDS:
         try:
             await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=admin_id))
