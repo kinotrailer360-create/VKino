@@ -7211,12 +7211,12 @@ async def fast_command(message: Message) -> None:
         return
     wait = await message.answer("⏳ Проверяю быстрые источники…")
     lines = ["⚡ <b>Быстрые источники</b> (Reddit, Deadline, инсайдеры, X) — новостей за сутки:"]
-    for i, (entry, res) in enumerate(await shorts_fast.check(feeds), 1):
+    for i, (entry, res, name) in enumerate(await shorts_fast.check(feeds), 1):
         mark = f"✅ {res}" if isinstance(res, int) and res else ("⚪ 0" if res == 0 else f"❌ {escape(str(res))}")
-        lines.append(f"{i}. {escape(shorts_fast.label(entry))} — {mark}\n<code>{escape(entry[:90])}</code>")
+        lines.append(f"{i}. {escape(name)} — {mark}\n<code>{escape(entry[:90])}</code>")
     lines.append(
         "\n<code>/fast add URL</code> — добавить RSS (в том числе X через rss.app)\n"
-        "<code>/fast add @Имя</code> — аккаунт X (нужен свой Nitter/RSSHub: NITTER_URL в .env)\n"
+        "<code>/fast add @Имя</code> — аккаунт X через свой RSSHub (COMPOSE_PROFILES=x в .env)\n"
         "<code>/fast del N</code> — удалить\n<code>/fast default</code> — стандартный список")
     await wait.edit_text("\n".join(lines), disable_web_page_preview=True)
 
