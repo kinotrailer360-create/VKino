@@ -9507,7 +9507,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("🎬 Фильм вечера", "pt:ev"), _btn("⚔️ Битва фильмов", "pt:bt")])
     rows.append([_btn("🗳 Выбор подписчиков", "pt:vt"), _btn("🎭 Ляпы в кино", "pt:bl")])
     rows.append([_btn("🗳 Итог голосования → факты", "pt:vr")])
-    rows.append([_btn("📣 Пост для взаимного пиара", "pt:pr"), _btn("🤖 Пост про бота", "pt:ab")])
+    rows.append([_btn("📣 Реклама канала (подпишись)", "pt:pr"), _btn("🤖 Пост про бота", "pt:ab")])
     rows.append([_btn("🎯 Рекомендация: что посмотреть (опрос в боте)", "pt:rq")])
     rows.append([_btn("🏆 Знатоки месяца (викторина)", "pt:qw"), _btn("⭐ Топ подписчиков", "pt:us")])
     rows.append([_btn("📌 Закреп-навигатор", "pt:nv"), _btn("⚡ Буст канала", "pt:bs")])
@@ -10602,7 +10602,8 @@ async def make_promo_post(bot: Bot, chat_id: int) -> None:
                                    for k, f in enumerate(films[:4])] if img]
         card = work / "promo.jpg"
         (await asyncio.to_thread(shorts_postcard.make_promo_card, posters, link=f"t.me/{own}")).save(card, quality=92)
-        await bot.send_photo(chat_id, FSInputFile(card), caption=post_caption(post))
+        await bot.send_photo(chat_id, FSInputFile(card), caption=post_caption(post), reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="✅ Подписаться на KinoMir360", url=f"https://t.me/{own}")]]))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     offer = (f"Здравствуйте! Я админ кино-канала KinoMir360 — t.me/{own}"
@@ -10610,7 +10611,7 @@ async def make_promo_post(bot: Bot, chat_id: int) -> None:
              "викторины о кино.\n\nПредлагаю взаимный пиар: ваш пост у нас и наш у вас, формат 1/24 (час в топе, "
              "сутки в ленте), время согласуем. Рекламный пост пришлю. Интересно?")
     await bot.send_message(
-        chat_id, "👆 Рекламный пост — перешли его админу канала-партнёра.\n\n✉️ Сообщение админу (нажми, чтобы "
+        chat_id, "👆 Рекламный пост с кнопкой «✅ Подписаться» — перешли его админу канала-партнёра (кнопка сохранится при пересылке).\n\n✉️ Сообщение админу (нажми, чтобы "
         f"скопировать):\n<code>{escape(offer)}</code>\n\n💡 Партнёров ищи в поиске Telegram и на tgstat.ru → "
         "«Кино»: каналы примерно твоего размера (±50% подписчиков), с живыми просмотрами.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔄 Другой вариант", "pt:pr")],
