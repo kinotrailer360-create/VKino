@@ -88,18 +88,33 @@ async def upload(token: str, video: Path, seo: dict[str, str], privacy: str = "p
                     "tags": _tags(seo.get("tags", "")), "categoryId": "1", "defaultLanguage": "ru"},
         "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }
-    data = video.read_bytes()
+    size = video.stat().st_size
     headers = {"Authorization": f"Bearer {token}", "X-Upload-Content-Type": "video/mp4",
-               "X-Upload-Content-Length": str(len(data)), "Content-Type": "application/json; charset=UTF-8"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as session:
+               "X-Upload-Content-Length": str(size), "Content-Type": "application/json; charset=UTF-8"}
+    # большой файл (выпуск на 8 минут — сотни МБ) отдаём потоком, время — по размеру (не меньше 1 МБ/с)
+    timeout = aiohttp.ClientTimeout(total=600 + size / 1_000_000)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(UPLOAD_URL, params={"uploadType": "resumable", "part": "snippet,status"},
                                 data=json.dumps(meta), headers=headers) as resp:
             if resp.status != 200 or not resp.headers.get("Location"):
                 raise YouTubeError(f"YouTube не принял загрузку: HTTP {resp.status} {(await resp.text())[:300]}")
             location = resp.headers["Location"]
-        async with session.put(location, data=data, headers={"Authorization": f"Bearer {token}",
-                                                             "Content-Type": "video/mp4"}) as resp:
-            body = await resp.json(content_type=None)
-            if resp.status not in (200, 201) or not body.get("id"):
-                raise YouTubeError(f"загрузка не удалась: HTTP {resp.status} {str(body)[:300]}")
+        with video.open("rb") as fh:
+            async with session.put(location, data=fh, headers={"Authorization": f"Bearer {token}",
+                                                               "Content-Type": "video/mp4",
+                                                               "Content-Length": str(size)}) as resp:
+                body = await resp.json(content_type=None)
+                if resp.status not in (200, 201) or not body.get("id"):
+                    raise YouTubeError(f"загрузка не удалась: HTTP {resp.status} {str(body)[:300]}")
     return {"id": body["id"], "privacy": (body.get("status") or {}).get("privacyStatus", privacy)}
+
+
+async def set_thumbnail(token: str, video_id: str, image: Path) -> None:
+    """Своя обложка ролика. YouTube разрешает её только подтверждённым каналам (подтверждение по телефону
+    в YouTube Studio) — иначе ошибка 403, обложку тогда ставят вручную."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+        async with session.post("https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+                                params={"videoId": video_id, "uploadType": "media"}, data=image.read_bytes(),
+                                headers={"Authorization": f"Bearer {token}", "Content-Type": "image/jpeg"}) as resp:
+            if resp.status not in (200, 201):
+                raise YouTubeError(f"обложка: HTTP {resp.status} {(await resp.text())[:200]}")

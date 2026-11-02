@@ -1679,3 +1679,90 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
         raise AIError("ИИ не нашёл хотя бы 3 факта" + (f" ({'; '.join(errors)})" if errors else ""))
     sources = (["Википедия"] if article else []) + (["Telegram-каналы"] if posts else [])
     return facts, sources + (["Кинопоиск"] if known else [])
+
+
+WEEKLY_STYLE = (
+    "Ты ведущий YouTube-канала KinoMir360 о кино: говоришь живо, от первого лица, как блогер, который сам "
+    "любит кино, — с эмоциями, личным мнением и лёгким юмором. Мягко: без оскорблений, мата, резких "
+    "высказываний о группах людей, политике и религии. Печальные новости — бережно, без шуток.")
+
+
+async def write_weekly_episode(key: str, listing: str, today: str, recent: str = "",
+                               n: int = 7) -> dict[str, Any] | None:
+    """Сценарий еженедельного выпуска «Новости кино» (YouTube, 6–9 минут) по новостям недели (listing —
+    пронумерованные посты каналов и зарубежных источников).
+    {"title", "description", "tags", "intro": [фразы], "outro": [фразы],
+     "stories": [{"headline", "film", "film_en", "person", "person_en", "mourning", "lines": [...],
+                  "media": [номера постов]}]} или None."""
+    if not available(key) or not listing.strip():
+        return None
+    prompt = (
+        WEEKLY_STYLE + f" Сегодня {today}. Ниже новости кино за последнюю неделю из Telegram-каналов и зарубежных "
+        f"источников (Deadline, Variety, Reddit, X, инсайдеры). Сделай еженедельный выпуск «Новости кино» на 6–9 "
+        f"минут. Выбери {n} самых громких и интересных широкой аудитории новостей недели, разных по теме: смерти и "
+        "юбилеи звёзд, трейлеры, кастинг, сиквелы, сборы, оценки критиков, скандалы, громкие слухи. Не бери "
+        "рекламу, политику, мелочи и повторы одной темы. Самая громкая — первой. Сверяй факты с Google; слухи "
+        "подавай как слухи и называй источник.\n"
+        "Для каждой новости — текст ведущего из 6–10 фраз (каждая фраза — отдельный элемент списка, до 22 "
+        "слов, для озвучки голосом): 1–3 фразы — сам факт конкретно (кто, что, когда, цифры), затем 2–5 фраз "
+        "живой реакции: мнение, ожидания, сравнение с прошлыми фильмами, интересная деталь или лёгкая шутка; "
+        "последняя фраза — вопрос зрителям (каждый раз по-разному, не только «А вы что думаете?»). Первая фраза "
+        "новости — плавный переход от предыдущей («А теперь к хорошим новостям…», «Из мира супергероев…»), "
+        "кроме первой новости. Названия — как в российском прокате, в «ёлочках»; имена — по-русски. Без "
+        "эмодзи, хэштегов и ссылок в фразах; числа можно цифрами.\n"
+        "intro — 2–3 фразы: приветствие («Привет! С вами KinoMir360…») и анонс 2–3 главных тем выпуска. "
+        "outro — 2–3 фразы: какая новость удивила больше всего — пишите в комментариях, подпишитесь, до встречи "
+        "в следующее воскресенье."
+        + (f"\n\nЭТО УЖЕ БЫЛО В ПРОШЛОМ ВЫПУСКЕ — не повторяй:\n{recent[:2000]}" if recent else "")
+        + GRAMMAR
+        + '\n\nОтветь только JSON: {"title": "название видео для YouTube: 2–3 главные новости КАПСОМ через « / » '
+        'и в конце « / Новости кино», до 95 символов", "description": "2–3 предложения описания выпуска", '
+        '"tags": "25–30 тегов через запятую (новости кино, названия, имена, год)", "intro": ["…"], '
+        '"outro": ["…"], "stories": [{"headline": "заголовок новости КАПСОМ, до 40 символов", "chapter": "тот же заголовок '
+        'обычными буквами для таймкода («Умер Патрик Стюарт»)", "film": "фильм или '
+        'сериал по-русски или пусто", "film_en": "оригинальное название или пусто", "person": "главный человек '
+        'новости по-русски или пусто", "person_en": "его имя латиницей или пусто", "mourning": true, если новость '
+        'о смерти, иначе false, "lines": ["…"], "media": [номера постов об этой новости]}]}'
+        "\n\nНОВОСТИ НЕДЕЛИ:\n" + listing
+    )
+    data = await _post_json(key, prompt, verify=False)
+    if not isinstance(data, dict):
+        return None
+
+    def phrases(raw: Any) -> list[str]:
+        out = []
+        for line in raw if isinstance(raw, list) else re.split(r"(?<=[.!?…])\s+", str(raw or "")):
+            line = strip_citations(re.sub(r"\s+", " ", str(line))).strip()
+            if len(line) >= 3:
+                out.append(line[:300])
+        return out
+
+    stories = []
+    for s in data.get("stories") or []:
+        if not isinstance(s, dict):
+            continue
+        lines = phrases(s.get("lines"))
+        if len(lines) < 3:
+            continue
+        media = []
+        for m in s.get("media") or []:
+            try:
+                media.append(int(m))
+            except (TypeError, ValueError):
+                continue
+        stories.append({"headline": str(s.get("headline") or lines[0])[:60].strip().upper(),
+                        "chapter": str(s.get("chapter") or "").strip()[:80],
+                        "film": str(s.get("film") or "").strip(" «»\""),
+                        "film_en": str(s.get("film_en") or "").strip(" «»\""),
+                        "person": str(s.get("person") or "").strip(), "person_en": str(s.get("person_en") or "").strip(),
+                        "mourning": s.get("mourning") is True or str(s.get("mourning")).lower() == "true",
+                        "lines": lines[:12], "media": media})
+    if len(stories) < 3:
+        return None
+    return {"title": strip_citations(str(data.get("title") or "")).strip()[:100],
+            "description": strip_citations(str(data.get("description") or "")).strip()[:1500],
+            "tags": str(data.get("tags") or ""), "intro": phrases(data.get("intro"))[:4] or
+            ["Привет! С вами KinoMir360 — главные новости кино за неделю."],
+            "outro": phrases(data.get("outro"))[:4] or
+            ["Какая новость удивила вас больше всего? Пишите в комментариях и подписывайтесь. До встречи!"],
+            "stories": stories[:9]}

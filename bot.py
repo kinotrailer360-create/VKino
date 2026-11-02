@@ -14,6 +14,7 @@ import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
 from html import escape
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote_plus, urlencode
@@ -58,6 +59,7 @@ from shorts import linkfetch as shorts_linkfetch
 from shorts import news as shorts_news
 from shorts import fastnews as shorts_fast
 from shorts import rt as shorts_rt
+from shorts import weekly as shorts_weekly
 from shorts import lumean as shorts_lumean
 from shorts import music as shorts_music
 from shorts import pronounce as shorts_pronounce
@@ -9609,6 +9611,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("🎂 День рождения звезды", "bd:list"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
     rows.append([_btn("🍅 Что пишут критики и зрители (Rotten Tomatoes)", "pt:rt")])
+    rows.append([_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
     rows.append([_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")])
@@ -11072,11 +11075,24 @@ async def youtube_button(callback: CallbackQuery) -> None:
                     await set_shorts_setting("yt_refresh", None)
                     await message.answer("Вход в YouTube устарел — войдём заново.")
                     token = await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, await _yt_login(message))
-                wait = await message.answer("▶️ Загружаю шортс на YouTube…")
-                res = await shorts_yt.upload(token, video, json.loads(seo_file.read_text()))
-                link = f"https://youtube.com/shorts/{res['id']}"
+                seo = json.loads(seo_file.read_text())
+                long = bool(seo.get("long"))
+                wait = await message.answer("▶️ Загружаю выпуск на YouTube (большой файл — до 10–15 минут)…"
+                                            if long else "▶️ Загружаю шортс на YouTube…")
+                res = await shorts_yt.upload(token, video, seo)
+                link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                thumb_note = ""
+                cover = video.with_suffix(".jpg")
+                if long and cover.exists():
+                    try:
+                        await shorts_yt.set_thumbnail(token, res["id"], cover)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.info("YouTube thumbnail failed: %s", exc)
+                        thumb_note = ("\n\n🖼 Обложку YouTube не принял (своя обложка доступна только подтверждённым "
+                                      "каналам: YouTube Studio → Настройки → Канал → Доступ к функциям). Поставь её "
+                                      "вручную — она выше в чате.")
                 if res["privacy"] == "public":
-                    await wait.edit_text(f"✅ Шортс на YouTube: {link}")
+                    await wait.edit_text(f"✅ {'Выпуск' if long else 'Шортс'} на YouTube: {link}{thumb_note}")
                 else:
                     await wait.edit_text(
                         f"✅ Шортс загружен, но YouTube сделал его <b>приватным</b>: {link}\n\nТак Google поступает "
@@ -11325,6 +11341,29 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "Можно с английским вариантом через «/»: <code>Патрик Стюарт / Patrick Stewart</code>.\n"
             "Бот найдёт посты об этом во всех каналах из списка за последние 3 дня, ИИ соберёт их в один пост "
             "без повторов (главное, подробности, кто что сказал), фото возьму из постов.\n\n<i>Передумал — /cancel</i>")
+        return
+    if action in ("wvon", "wvoff"):
+        await set_shorts_setting("weekly_video", None if action == "wvon" else "off")
+        await message.answer("🔔 Каждое воскресенье в 10:00 (Екатеринбург) соберу выпуск «Новости кино» и пришлю "
+                             "сюда." if action == "wvon" else "🔕 По воскресеньям выпуск больше не собираю. Вручную — "
+                             "📝 Посты → «🎞 Выпуск «Новости кино»».")
+        return
+    if action == "wv":
+        status = await message.answer("🎞 Собираю выпуск «Новости кино» за неделю: 6–8 новостей, голос, картинки, "
+                                      "заставки. Это 15–40 минут — пришлю, когда будет готово."
+                                      + ("\n⏳ Сейчас собирается другой ролик — начну сразу после него."
+                                         if shorts_lock.locked() else ""))
+        chat_id = message.chat.id
+
+        async def weekly_job() -> None:
+            try:
+                await make_weekly_video(message.bot, [chat_id], status)
+                await status.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Weekly video failed")
+                await status.edit_text(f"❌ Выпуск не собрался: <code>{escape(str(exc)[:300])}</code>")
+
+        _run_job(weekly_job)
         return
     if action == "rt":
         await message.answer("🍅 Ищу свежие и ближайшие премьеры…")
@@ -12917,6 +12956,122 @@ async def rt_title(message: Message, state: FSMContext) -> None:
         [_btn(text, f"rt:f:{key}")] for text, key in options]))
 
 
+# --- еженедельный выпуск «Новости кино» для YouTube (воскресенье, 10:00 по Екатеринбургу)
+
+WEEKLY_TIMEOUT = 80 * 60  # выпуск на 8 минут собирается дольше шортса
+WEEKLY_DAY, WEEKLY_HOUR = 6, 10  # воскресенье, 10:00 (время автора)
+
+
+async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
+    """Новости недели (Telegram-каналы и быстрые зарубежные источники) → сценарий ведущего → выпуск 16:9 с
+    голосом, картинками, заставками и таймкодами → превью в Telegram и кнопка загрузки на YouTube."""
+    async with shorts_lock:
+        await load_pronunciations()
+        await load_voice()
+        today = datetime.now(MSK).date()
+        start = today - timedelta(days=6)
+        months = shorts_daily.MONTHS
+        label = (f"{start.day}–{today.day} {months[today.month - 1]}" if start.month == today.month else
+                 f"{start.day} {months[start.month - 1]} — {today.day} {months[today.month - 1]}")
+        own = POST_CHANNEL.lstrip("@").lower()
+        channels = [c for c in await fact_channels() if c.lower() != own]
+        posts = await shorts_tgsearch.latest(channels, hours=168, per_channel=12)
+        try:
+            fast = await asyncio.wait_for(shorts_fast.latest(await fast_feeds(), hours=168, per_feed=25), 120)
+        except Exception as exc:  # noqa: BLE001
+            logging.info("Weekly video: fast sources failed: %s", exc)
+            fast = []
+        pool = posts[:80] + fast[:60]
+        if len(pool) < 10:
+            raise RuntimeError("за неделю почти нет новостей в источниках — проверь каналы (/channels) и /fast")
+        listing, size = [], 0
+        for i, p in enumerate(pool, 1):
+            text = re.sub(r"\s+", " ", p["text"])[:450]
+            row = f"{i}. [{p.get('label') or 't.me/' + p['channel']}] {text}"
+            if size + len(row) > 30000:
+                break
+            listing.append(row)
+            size += len(row)
+        if status:
+            await status.edit_text("🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
+        script = await shorts_ai.write_weekly_episode(
+            GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
+            await shorts_setting("weekly_last") or "")
+        if not script:
+            raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
+        work = SHORTS_DIR / f"weekly_{time.time_ns()}"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": "выпуск «Новости кино»"}))
+            shorts_daily.on_progress, shorts_daily.last_stage = progress_updater(status, "выпуск"), ""
+            try:
+                ep = await asyncio.wait_for(shorts_weekly.render(work, script, pool, TMDB_API_KEY, label),
+                                            timeout=WEEKLY_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"сборка шла дольше {WEEKLY_TIMEOUT // 60} минут и была прервана — застряла на "
+                                   f"этапе: {shorts_daily.last_stage or 'начало'}") from None
+            await set_shorts_setting("weekly_last", shorts_weekly.headlines(script))
+            for chat_id in chat_ids:
+                await send_episode(bot, chat_id, ep, script)
+        finally:
+            shorts_daily.on_progress = None
+            await clear_running()
+            shutil.rmtree(work, ignore_errors=True)
+
+
+async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) -> None:
+    seo = ep.seo
+    mins = f"{int(ep.duration) // 60}:{int(ep.duration) % 60:02d}"
+    await bot.send_photo(chat_id, FSInputFile(ep.cover), caption=f"🖼 Обложка для YouTube\n<b>{escape(seo['title'])}</b>")
+    if ep.preview:
+        msg = await bot.send_video(chat_id, FSInputFile(ep.preview, filename="kinomir360_novosti_preview.mp4"),
+                                   caption=f"🎞 Выпуск «Новости кино» ({mins})" + (
+                                       "." if ep.preview == ep.video else " — превью в низком качестве. На YouTube "
+                                       "уйдёт полный файл 1080p."), width=854, height=480,
+                                   supports_streaming=True, request_timeout=600)
+    else:
+        msg = await bot.send_message(chat_id, f"🎞 Выпуск «Новости кино» собран ({mins}). Превью для Telegram вышло "
+                                              "больше 50 МБ — посмотри ролик после загрузки на YouTube.")
+    keep_for_upload(chat_id, msg.message_id, SimpleNamespace(video=ep.video, seo=seo))
+    try:
+        shutil.copy(ep.cover, READY_DIR / f"{chat_id}_{msg.message_id}.jpg")
+    except Exception:  # noqa: BLE001
+        logging.exception("Weekly cover copy failed")
+    topics = "\n".join(f"{n}. {escape(s['headline'])}" for n, s in enumerate(script["stories"], 1))
+    on = await shorts_setting("weekly_video") != "off"
+    await bot.send_message(
+        chat_id, f"👆 Выпуск готов. Новости в нём:\n{topics}\n\nПосмотри превью и жми «▶️ Загрузить на YouTube» — "
+                 "загружу полное качество, название, описание с таймкодами, теги и обложку.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
+            [_btn("🔕 Не собирать по воскресеньям" if on else "🔔 Собирать по воскресеньям в 10:00",
+                  "pt:wvoff" if on else "pt:wvon")]]))
+    for name, key in (("Название", "title"), ("Описание", "description"), ("Теги", "tags"),
+                      ("Закреплённый комментарий", "pinned")):
+        await bot.send_message(chat_id, f"<b>{name}:</b>\n<pre>{escape(seo[key])}</pre>")
+    if seo.get("warning"):
+        await bot.send_message(chat_id, escape(seo["warning"]))
+
+
+async def weekly_video_job(bot: Bot) -> None:
+    """По расписанию: полоска сборки — первому админу, готовый выпуск — всем админам."""
+    admins = sorted(ADMIN_IDS)
+    status = None
+    try:
+        status = await bot.send_message(admins[0], "🎞 Воскресенье — собираю выпуск «Новости кино» для YouTube "
+                                                   "(15–40 минут)…")
+        await make_weekly_video(bot, admins, status)
+        await status.delete()
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Weekly video failed")
+        for admin_id in admins:
+            try:
+                await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(str(exc)[:300])}"
+                                                 "</code>\nПовторить — 📝 Посты → «🎞 Выпуск «Новости кино»».")
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def growth_loop(bot: Bot) -> None:
     """Раз в 10 минут: уведомления из избранного (раз в 3 часа), подборка недели (пятница, 18:00 Екб)."""
     last_alerts = last_rt = 0.0
@@ -12934,6 +13089,11 @@ async def growth_loop(bot: Bot) -> None:
                 await favorites_alerts(bot)
             now = datetime.now(POST_TZ)
             week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
+            if (now.weekday() == WEEKLY_DAY and now.hour >= WEEKLY_HOUR and ADMIN_IDS
+                    and await shorts_setting("weekly_video") != "off"
+                    and await shorts_setting("weekly_video_done") != week):
+                await set_shorts_setting("weekly_video_done", week)
+                _run_job(lambda: weekly_video_job(bot))
             if (now.weekday() == 4 and now.hour >= 18 and await shorts_setting("digest") != "off"
                     and await shorts_setting("digest_done") != week):
                 await set_shorts_setting("digest_done", week)
