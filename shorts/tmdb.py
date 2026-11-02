@@ -390,6 +390,9 @@ async def tv_seasons(key: str, since: str, until: str, n: int = 10) -> list[dict
         details = await asyncio.gather(*(tv_details(session, key, int(r["id"])) for r in shows),
                                        return_exceptions=True)
     out = []
+    failed = [d for d in details if isinstance(d, BaseException)]
+    if failed:
+        log.info("shorts: tmdb tv details: %d of %d failed (%s)", len(failed), len(details), type(failed[0]).__name__)
     for show in details:
         if isinstance(show, BaseException) or not show.get("id"):
             continue
@@ -399,7 +402,7 @@ async def tv_seasons(key: str, since: str, until: str, n: int = 10) -> list[dict
     return out[:n]
 
 
-async def tv_season(key: str, tv_id: int, season: int = 0) -> dict[str, Any] | None:
+async def tv_season(key: str, tv_id: int, season: int = 0, today: str = "") -> dict[str, Any] | None:
     """Сезон сериала; season=0 — текущий (скоро выходит или последний вышедший)."""
     if not key:
         return None
@@ -410,7 +413,7 @@ async def tv_season(key: str, tv_id: int, season: int = 0) -> dict[str, Any] | N
     if season:
         found = next((s for s in show.get("seasons") or [] if s.get("season_number") == season), None)
     else:
-        found = current_season(show, date.today().isoformat())
+        found = current_season(show, today or date.today().isoformat())
     return _season_row(show, found) if found else None
 
 
@@ -420,15 +423,22 @@ async def search_tv(key: str, query: str, n: int = 5) -> list[dict[str, Any]]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         data = await _get(session, key, "/search/tv", query=query.strip(), language="ru-RU")
     return [{"id": int(r["id"]), "title": str(r.get("name") or r.get("original_name") or ""),
-             "year": str(r.get("first_air_date") or "")[:4], "kind": "tv"}
+             "original": str(r.get("original_name") or ""), "year": str(r.get("first_air_date") or "")[:4],
+             "kind": "tv", "poster": f"{IMG}w780{r['poster_path']}" if r.get("poster_path") else None}
             for r in (data.get("results") or [])[:n] if r.get("id")
             and not set(r.get("genre_ids") or []) & TV_SKIP_GENRES]
 
 
+_EN_TITLES: dict[tuple[str, int], str] = {}
+
+
 async def english_title(key: str, kind: str, tmdb_id: int) -> str:
-    """Английское название фильма или сериала (для сайтов вроде Rotten Tomatoes)."""
+    """Английское название фильма или сериала (для сайтов вроде Rotten Tomatoes); запоминаем."""
     if not key:
         return ""
+    if (kind, tmdb_id) in _EN_TITLES:
+        return _EN_TITLES[(kind, tmdb_id)]
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
         data = await _get(session, key, f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}", language="en-US")
-    return str(data.get("name") or data.get("title") or "")
+    _EN_TITLES[(kind, tmdb_id)] = str(data.get("name") or data.get("title") or "")
+    return _EN_TITLES[(kind, tmdb_id)]

@@ -55,7 +55,10 @@ async def _run(*args: str) -> None:
         _, err = await proc.communicate()
     except asyncio.CancelledError:  # таймаут сборки — ffmpeg не должен работать дальше и писать в удалённую папку
         proc.kill()
-        await proc.wait()
+        try:  # дождаться, чтобы не остался зомби, даже если отмену повторят
+            await asyncio.shield(proc.wait())
+        except asyncio.CancelledError:
+            pass
         raise
     if proc.returncode:
         raise RuntimeError(f"{args[0]}: {err.decode(errors='ignore')[-500:]}")
@@ -115,30 +118,42 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
     async def film_urls() -> list[str]:
         if not name:
             return []
-        try:
-            found = await tmdb.search_movie(tmdb_key, name) or []
-            kind = "movie"
-            if not found:
-                found, kind = await tmdb.search_tv(tmdb_key, name) or [], "tv"
-            if not found:
+        try:  # фильм или сериал — что ближе по названию (одноимённый фильм не должен перебить сериал)
+            films, shows = await asyncio.gather(tmdb.search_movie(tmdb_key, name), tmdb.search_tv(tmdb_key, name),
+                                                return_exceptions=True)
+            cands = [(r, "movie") for r in (films if isinstance(films, list) else [])[:3]] + \
+                    [(r, "tv") for r in (shows if isinstance(shows, list) else [])[:3]]
+            if not cands:
                 return []
-            out = await tmdb.backdrops(tmdb_key, kind, int(found[0]["id"]), 3)
-            return out + ([found[0]["poster"]] if found[0].get("poster") else [])
+            names = [n for n in (story.get("film_en"), story.get("film")) if n]
+            best, kind = max(cands, key=lambda c: max(tmdb.similar(c[0]["title"], n) for n in names)
+                             + max(tmdb.similar(c[0].get("original") or "", n) for n in names) * 0.5)
+            out = await tmdb.backdrops(tmdb_key, kind, int(best["id"]), 3)
+            return out + ([best["poster"]] if best.get("poster") else [])
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: weekly film %s failed: %s", name, exc)
             return []
 
     people, films = await asyncio.gather(person_urls(), film_urls())
     urls: list[str] = people + films
+    keys = [_words(x) for x in (story.get("film"), story.get("film_en"), story.get("person"),
+                                 story.get("person_en")) if x]
     for i in story.get("media") or []:
         if 1 <= i <= len(posts):
             p = posts[i - 1]
+            text = _words(p.get("text") or "")
+            if keys and not any(k and all(w[:max(3, len(w) - 2)] in text for w in k.split()[:2]) for k in keys):
+                continue  # ИИ дал номер поста не об этой новости — его фото не берём
             urls += [m["image"] for m in p.get("media") or [] if m.get("image")][:3] or (
                 [p["image"]] if p.get("image") else [])
     wanted = list(dict.fromkeys(urls))[:limit + 3]  # с запасом на битые
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
         got = await asyncio.gather(*(_download(session, u, bool(story.get("mourning"))) for u in wanted))
     return [img for img in got if img][:limit]
+
+
+def _words(text: str) -> str:
+    return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
 
 
 def slide_image(img: Image.Image) -> Image.Image:

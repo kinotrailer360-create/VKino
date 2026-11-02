@@ -118,9 +118,14 @@ def _season_in(title: str, n: int) -> bool:
 
 
 def _age_days(v: dict) -> float | None:
+    """Сколько дней назад выложен ролик Rutube (дата бывает строкой ISO или числом секунд); None — не знаем."""
     from datetime import datetime, timezone
-    for key in ("publication_ts", "created_ts"):
-        raw = str(v.get(key) or "")
+    for key in ("publication_ts", "created_ts", "published_at", "created_at"):
+        raw = v.get(key)
+        if isinstance(raw, (int, float)) or (isinstance(raw, str) and raw.strip().isdigit()):
+            sec = float(raw) / (1000 if float(raw) > 1e11 else 1)  # бывает и в миллисекундах
+            return (datetime.now(timezone.utc).timestamp() - sec) / 86400
+        raw = str(raw or "")
         if raw:
             try:
                 ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -147,12 +152,21 @@ async def rutube_trailer(titles: list[str], year: int | None = None, season: int
     if not names:
         return None
     timeout = aiohttp.ClientTimeout(total=15)
-    query = f"{titles[0]} {season} сезон трейлер" if season and season > 1 else f"{titles[0]} трейлер"
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(RUTUBE_SEARCH, params={"query": query, "format": "json"},
-                               headers={"accept": "application/json"}) as resp:
-            data = await resp.json(content_type=None)
+    queries = [f"{t} {season} сезон трейлер" if season and season > 1 else f"{t} трейлер"
+               for t in dict.fromkeys(t for t in titles[:2] if t)]
+    for query in queries:  # по-русски не нашлось — пробуем оригинальное название
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(RUTUBE_SEARCH, params={"query": query, "format": "json"},
+                                   headers={"accept": "application/json"}) as resp:
+                data = await resp.json(content_type=None)
+        found = _best_trailer(data, names, year, season, fresh_days)
+        if found:
+            return found
+    return None
 
+
+def _best_trailer(data: dict, names: list[str], year: int | None, season: int | None,
+                  fresh_days: float | None) -> dict | None:
     best, best_score = None, 0.0
     for v in (data.get("results") or [])[:30]:
         if not isinstance(v, dict) or v.get("is_paid") or v.get("is_adult") or v.get("is_hidden"):
