@@ -74,6 +74,8 @@ def label(entry: str) -> str:
     if "reddit.com" in url.netloc and sub:
         return f"Reddit r/{sub.group(1)}"
     host = url.netloc.removeprefix("www.")
+    if host == "rss.app":  # имя ленты rss.app — из самой ленты (аккаунт X и т. п.)
+        return ""
     if "/twitter/user/" in url.path:
         return f"X @{url.path.rstrip('/').rsplit('/', 1)[1]}"
     if "nitter" in host or (nitter() and entry.startswith(nitter())):  # готовая ссылка Nitter: /Имя/rss
@@ -106,8 +108,18 @@ def _article(entry: Any) -> str:
     return html.unescape(found.group(1)) if found and "reddit.com" not in found.group(1) else ""
 
 
+def feed_name(feed: Any) -> str:
+    """Имя ленты по её заголовку: «X @DiscussingFilm» для аккаунтов X, иначе сам заголовок."""
+    title = _text((feed.get("feed") or {}).get("title"))
+    handle = re.search(r"@(\w{1,30})", title)
+    if handle or re.search(r"\b(?:twitter|x\.com)\b|/ X$", title, re.I):
+        return f"X @{handle.group(1)}" if handle else f"X {title[:40]}"
+    return title[:40] or "RSS"
+
+
 def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> list[dict[str, Any]]:
     feed = feedparser.parse(raw)
+    source = source or feed_name(feed)
     out = []
     for entry in feed.get("entries") or []:
         title = _text(entry.get("title"))
@@ -134,13 +146,33 @@ def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> li
     return out
 
 
+_reddit: asyncio.Lock | None = None
+
+
+async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        return await resp.read()
+
+
 async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_feed: int) -> list[dict[str, Any]]:
+    global _reddit
     url = feed_url(entry)
     if not url:
         return []
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        raw = await resp.read()
+    if "reddit.com" in url:  # Reddit режет частые запросы (429): по одному, с паузой и одним повтором
+        _reddit = _reddit or asyncio.Lock()
+        async with _reddit:
+            await asyncio.sleep(3)
+            try:
+                raw = await _download(session, url)
+            except aiohttp.ClientResponseError as exc:
+                if exc.status != 429:
+                    raise
+                await asyncio.sleep(10)
+                raw = await _download(session, url)
+    else:
+        raw = await _download(session, url)
     return await asyncio.to_thread(parse, raw, label(entry), since, per_feed)
 
 
@@ -151,8 +183,6 @@ async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEE
 
     async def one(session: aiohttp.ClientSession, entry: str) -> list[dict[str, Any]]:
         async with sem:
-            if "reddit.com" in entry:
-                await asyncio.sleep(1.5)  # Reddit отвечает 429 на частые запросы
             try:
                 return await _fetch(session, entry, since, per_feed)
             except Exception as exc:  # noqa: BLE001
@@ -164,26 +194,24 @@ async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEE
     return sorted((p for chunk in results for p in chunk), key=lambda p: -p["time"])
 
 
-async def check(feeds: list[str]) -> list[tuple[str, int | str]]:
-    """Для /fast: сколько новостей за сутки даёт каждый источник (или почему не читается). Все сразу,
-    Reddit — по очереди (частые запросы он режет)."""
+async def check(feeds: list[str]) -> list[tuple[str, int | str, str]]:
+    """Для /fast: (источник, сколько новостей за сутки или почему не читается, имя). Все сразу; Reddit —
+    по очереди (частые запросы он режет)."""
     since = time.time() - 24 * 3600
-    reddit = asyncio.Lock()
 
-    async def one(session: aiohttp.ClientSession, entry: str) -> tuple[str, int | str]:
+    async def one(session: aiohttp.ClientSession, entry: str) -> tuple[str, int | str, str]:
+        name = label(entry)
         if not feed_url(entry):
             return entry, ("X не подключён: нужен RSSHub (COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN в .env) "
-                           "или RSS-ссылка rss.app")
+                           "или RSS-ссылка rss.app"), name
         try:
-            if "reddit.com" in entry:
-                async with reddit:
-                    await asyncio.sleep(1.5)
-                    return entry, len(await _fetch(session, entry, since, 50))
-            return entry, len(await _fetch(session, entry, since, 50))
+            posts = await _fetch(session, entry, 0, 200)
+            fresh = [p for p in posts if p["time"] >= since]
+            return entry, len(fresh), name or (posts[0]["label"] if posts else "RSS")
         except Exception as exc:  # noqa: BLE001
             hint = (" — RSSHub не запущен или нет TWITTER_AUTH_TOKEN" if rsshub() and
                     str(feed_url(entry)).startswith(rsshub()) else "")
-            return entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}"
+            return entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}", name or "RSS"
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40), headers=HEADERS) as session:
         return list(await asyncio.gather(*(one(session, e) for e in feeds)))
