@@ -38,6 +38,7 @@ ADMIN_IDS=803444545
 ```env
 WEBAPP_URL=https://your-domain        # на Railway берётся из RAILWAY_PUBLIC_DOMAIN
 TMDB_API_KEY=...                      # трейлеры из TMDB
+NITTER_URL=https://nitter.example     # свой Nitter/RSSHub: аккаунты X (x:Имя) в /fast; без него — RSS-ссылки rss.app
 YOUTUBE_API_KEY=...                   # поиск трейлеров на YouTube
 VIDEO_PROVIDER_API_URL=https://legal-provider.example/api/catalog
 VIDEO_PROVIDER_API_TOKEN=...

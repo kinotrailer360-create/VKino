@@ -305,3 +305,39 @@ def profile_urls(info: dict[str, Any]) -> list[str]:
             if url not in urls:
                 urls.append(url)
     return urls
+
+
+def _movie_row(r: dict[str, Any]) -> dict[str, Any]:
+    return {"id": int(r["id"]), "title": str(r.get("title") or r.get("original_title") or ""),
+            "original": str(r.get("original_title") or r.get("title") or ""),
+            "date": str(r.get("release_date") or ""), "year": str(r.get("release_date") or "")[:4],
+            "poster": f"{IMG}w780{r['poster_path']}" if r.get("poster_path") else None,
+            "backdrop": f"{IMG}w1280{r['backdrop_path']}" if r.get("backdrop_path") else None,
+            "popularity": float(r.get("popularity") or 0)}
+
+
+async def releases(key: str, since: str, until: str, n: int = 15) -> list[dict[str, Any]]:
+    """Самые ожидаемые и популярные фильмы с премьерой в кино США между датами (для Rotten Tomatoes)."""
+    if not key:
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _get(session, key, "/discover/movie", language="ru-RU", region="US",
+                          sort_by="popularity.desc", with_release_type="2|3",
+                          **{"release_date.gte": since, "release_date.lte": until})
+    return [_movie_row(r) for r in (data.get("results") or [])[:n] if r.get("id")]
+
+
+async def movie(key: str, tmdb_id: int) -> dict[str, Any] | None:
+    if not key:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _get(session, key, f"/movie/{tmdb_id}", language="ru-RU")
+    return _movie_row(data) if data.get("id") else None
+
+
+async def search_movie(key: str, query: str, n: int = 5) -> list[dict[str, Any]]:
+    if not key or not query.strip():
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _get(session, key, "/search/movie", query=query.strip(), language="ru-RU")
+    return [_movie_row(r) for r in (data.get("results") or [])[:n] if r.get("id")]
