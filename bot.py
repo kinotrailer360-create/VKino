@@ -9721,7 +9721,9 @@ async def make_birthday_post(bot: Bot, chat_id: int, chosen: dict[str, Any] | No
                       "year": str(f.get("release_date") or "")[:4], "rating": float(f.get("vote_average") or 0),
                       "role": role, "poster": f.get("poster_path") or f.get("backdrop_path")})
     who_is = "режиссёр" if director else "актриса" if female else "актёр"
+    fame = shorts_daily.tmdb.known_for(info, 4)
     material = (f"{name}" + (f" ({who['en']})" if who["en"] else "") + f", {who_is}, сегодня {age} {years}.\n"
+                + (f"Чем известен зрителям прежде всего (фильмы и сериалы): {', '.join(fame)}\n" if fame else "")
                 + "Лучшие фильмы:\n" + "\n".join(
                     f"— «{f['title']}» ({f['year']})" + (f", роль: {f['role']}" if f["role"] else "")
                     for f in films)
@@ -9743,12 +9745,12 @@ async def make_birthday_post(bot: Bot, chat_id: int, chosen: dict[str, Any] | No
     work.mkdir(parents=True, exist_ok=True)
     try:
         cards: list[Path] = []
-        known = ", ".join(f"«{f['title']}»" for f in films[:2])
+        known = ", ".join(f"«{t}»" for t in (shorts_daily.tmdb.known_for(info, 2) or [f["title"] for f in films[:2]]))
         for url in shorts_daily.tmdb.profile_urls(info)[:2]:
             photo = await _image(url, work, "face")
             if photo:
                 card = await asyncio.to_thread(
-                    shorts_postcard.make_post_card, photo, name, pill=("С ДНЁМ РОЖДЕНИЯ", ""),
+                    shorts_postcard.make_post_card, photo, name, pill=("С ДНЁМ РОЖДЕНИЯ", ""), portrait=True,
                     meta=f"Сегодня {age} {years}", extra=f"{'Известна' if female else 'Известен'} по: {known}")
                 cards.append(work / "face.jpg")
                 card.save(cards[-1], quality=92)
@@ -9993,9 +9995,8 @@ async def make_birthdays_post(bot: Bot, chat_id: int, people: list[dict[str, Any
             info = await shorts_daily.tmdb.person(TMDB_API_KEY, who["imdb"])
         except Exception:  # noqa: BLE001
             info = None
-        films = shorts_daily.tmdb.best_movies(info, 3) if info else []
         age = today.year - int(who["born"][:4])
-        titles = [str(f.get("title") or f.get("original_title") or "") for f in films]
+        titles = shorts_daily.tmdb.known_for(info, 3) if info else []
         rows.append(f"{who['name']} ({who['en'] or '—'}), {age} {shorts_daily._years(age)}"
                     + (f"; известен по: {', '.join(titles)}" if titles else ""))
         cards_data.append((who, info, age, titles))
@@ -10015,7 +10016,7 @@ async def make_birthdays_post(bot: Bot, chat_id: int, people: list[dict[str, Any
             if not photo:
                 continue
             card = await asyncio.to_thread(
-                shorts_postcard.make_post_card, photo, who["name"], pill=("С ДНЁМ РОЖДЕНИЯ", ""),
+                shorts_postcard.make_post_card, photo, who["name"], pill=("С ДНЁМ РОЖДЕНИЯ", ""), portrait=True,
                 meta=f"{age} {shorts_daily._years(age)}",
                 extra=("Известен по: " if not who.get("female") else "Известна по: ") + ", ".join(f"«{t}»" for t in titles[:2])
                 if titles else None)

@@ -126,7 +126,7 @@ async def person(key: str, imdb: str) -> dict[str, Any] | None:
         if not people:
             return None
         return await _get(session, key, f"/person/{people[0]['id']}", language="ru-RU",
-                          append_to_response="movie_credits,images")
+                          append_to_response="movie_credits,tv_credits,images")
 
 
 async def person_by_name(key: str, name: str) -> dict[str, Any] | None:
@@ -260,6 +260,32 @@ def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
         films.setdefault(int(c["id"]), c)
     top = sorted(films.values(), key=lambda c: c.get("vote_count") or 0, reverse=True)[:n]
     return top
+
+
+def known_for(info: dict[str, Any], n: int = 3) -> list[str]:
+    """Чем человек известен зрителям: фильмы и сериалы вместе (у Дэвида Швиммера — «Друзья», а не только
+    «Мадагаскар»). Сериал весит по числу серий с его участием, озвучка — вдвое меньше роли в кадре."""
+    def weight(c: dict[str, Any], tv: bool) -> float:
+        char = str(c.get("character") or "")
+        if re.search(r"\b(self|himself|herself|host|narrator|себя|ведущ)", char, re.I):
+            return 0
+        w = float(c.get("vote_count") or 0)
+        if re.search(r"\(voice\)|голос", char, re.I):
+            w *= 0.5
+        if tv:
+            if set(c.get("genre_ids") or []) & {99, 10763, 10764, 10767}:  # док, новости, реалити, ток-шоу
+                return 0
+            eps = int(c.get("episode_count") or 0)
+            w *= 1.6 if eps >= 20 else 0.8 if eps >= 6 else 0.1
+        return w if (c.get("vote_count") or 0) >= 50 else 0
+    seen: dict[str, float] = {}
+    for c in best_movies(info, 12):
+        seen.setdefault(str(c.get("title") or c.get("original_title") or ""), weight(c, False))
+    for c in (info.get("tv_credits") or {}).get("cast") or []:
+        title = str(c.get("name") or c.get("original_name") or "")
+        if title:
+            seen[title] = max(seen.get(title, 0), weight(c, True))
+    return [t for t, w in sorted(seen.items(), key=lambda kv: -kv[1]) if t and w > 0][:n]
 
 
 def still_url(film: dict[str, Any]) -> str | None:
