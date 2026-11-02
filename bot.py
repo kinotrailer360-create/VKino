@@ -9412,11 +9412,14 @@ def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboar
 
 async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: str = "",
                      poll: list[str] | None = None, what: str = "Пост готов", question: str = POLL_QUESTION,
-                     quiz: dict[str, Any] | None = None, extra: dict[str, Any] | None = None) -> None:
+                     quiz: dict[str, Any] | None = None, extra: dict[str, Any] | None = None,
+                     note: str = "") -> None:
+    """note — строки для автора под сообщением (например, источники новости)."""
     await save_post(chat_id, ids, kind, poll, question, quiz, extra)
     await bot.send_message(chat_id, f"👆 {what}"
-                           + (f". После публикации в канале добавлю опрос «{escape(question)}»." if poll else "."),
-                           reply_markup=post_keyboard(ids[0], more, bool((extra or {}).get("yt"))))
+                           + (f". После публикации в канале добавлю опрос «{escape(question)}»." if poll else ".")
+                           + note, reply_markup=post_keyboard(ids[0], more, bool((extra or {}).get("yt"))),
+                           disable_web_page_preview=True)
 
 
 async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
@@ -9461,6 +9464,15 @@ async def _rutube_post_trailer(titles: list[str], work: Path) -> Path | None:
     except Exception as exc:  # noqa: BLE001
         logging.info("Tg post: rutube trailer failed: %s", exc)
         return None
+
+
+def _sources_note(posts: list[dict[str, Any]]) -> str:
+    """Строки «откуда новость» под постом (видит только автор в боте, в канал не уходят)."""
+    rows = []
+    for p in posts[:4]:
+        name = p.get("label") or f"t.me/{p.get('channel', '')}"
+        rows.append(f'• <a href="{escape(p["url"], quote=True)}">{escape(name)}</a>')
+    return ("\n\n📎 Источник (только для тебя):\n" + "\n".join(rows)) if rows else ""
 
 
 def _title_words(text: str) -> str:
@@ -9508,6 +9520,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         if not res:
             raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
         same = [fresh[i] for i in res["media"]]
+        sources = list(same)  # для автора под постом: откуда взята новость
         hist["urls"] = (hist["urls"] + [p["url"] for p in same])[-500:]
         hist["topics"] = (hist["topics"] + [res["topic"] or res["post"][:60]])[-60:]
         await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
@@ -9516,6 +9529,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         names = [_title_words(n) for n in (res["film"], res["film_en"]) if n and len(_title_words(n)) >= 3]
         if names:
             same = [p for p in same if any(_mentions_title(n, _title_words(p["text"])) for n in names)]
+        else:  # фильма нет — только главный пост новости, без соседних
+            same = same[:1]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -9561,7 +9576,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             caption = post_caption(res["post"], "#новости")
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
-                await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make")
+                await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
+                                 note=_sources_note(sources))
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return res["topic"] or "пост"
