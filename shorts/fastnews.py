@@ -165,21 +165,25 @@ async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEE
 
 
 async def check(feeds: list[str]) -> list[tuple[str, int | str]]:
-    """Для /fast: сколько новостей за сутки даёт каждый источник (или почему не читается)."""
+    """Для /fast: сколько новостей за сутки даёт каждый источник (или почему не читается). Все сразу,
+    Reddit — по очереди (частые запросы он режет)."""
     since = time.time() - 24 * 3600
-    out: list[tuple[str, int | str]] = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
-        for entry in feeds:
-            if not feed_url(entry):
-                out.append((entry, "X не подключён: нужен RSSHub (COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN в .env) "
-                                   "или RSS-ссылка rss.app"))
-                continue
+    reddit = asyncio.Lock()
+
+    async def one(session: aiohttp.ClientSession, entry: str) -> tuple[str, int | str]:
+        if not feed_url(entry):
+            return entry, ("X не подключён: нужен RSSHub (COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN в .env) "
+                           "или RSS-ссылка rss.app")
+        try:
             if "reddit.com" in entry:
-                await asyncio.sleep(1.5)
-            try:
-                out.append((entry, len(await _fetch(session, entry, since, 50))))
-            except Exception as exc:  # noqa: BLE001
-                hint = (" — RSSHub не запущен или нет TWITTER_AUTH_TOKEN" if rsshub() and
-                        str(feed_url(entry)).startswith(rsshub()) else "")
-                out.append((entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}"))
-    return out
+                async with reddit:
+                    await asyncio.sleep(1.5)
+                    return entry, len(await _fetch(session, entry, since, 50))
+            return entry, len(await _fetch(session, entry, since, 50))
+        except Exception as exc:  # noqa: BLE001
+            hint = (" — RSSHub не запущен или нет TWITTER_AUTH_TOKEN" if rsshub() and
+                    str(feed_url(entry)).startswith(rsshub()) else "")
+            return entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}"
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
+        return list(await asyncio.gather(*(one(session, e) for e in feeds)))

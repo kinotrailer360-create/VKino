@@ -7188,7 +7188,12 @@ async def fast_command(message: Message) -> None:
     action, _, arg = (message.text or "").partition(" ")[2].strip().partition(" ")
     arg = arg.strip()
     feeds = await fast_feeds()
-    if action == "add" and (arg.startswith(("http://", "https://", "x:", "@"))):
+    if action == "add" and not arg.startswith(("http://", "https://", "x:", "@")):
+        await message.answer("Напиши ссылку через пробел после команды, например:\n"
+                             "<code>/fast add https://rss.app/feeds/xxxxx.xml</code>\n"
+                             "или аккаунт X (если настроен RSSHub): <code>/fast add @DanielRPK</code>")
+        return
+    if action == "add":
         entry = f"x:{arg.lstrip('@')}" if arg.startswith("@") else arg
         if entry not in feeds:
             feeds.append(entry)
