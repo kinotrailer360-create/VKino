@@ -9336,6 +9336,7 @@ BOT_URL = os.getenv("BOT_URL", "https://t.me/VKino_360bot")  # бот в стр�
 def post_caption(text: str, rubric: str = "", links: list[tuple[str, str]] | None = None) -> str:
     """Текст поста → подпись в HTML: рубрика-хэштег, «Где смотреть» (ссылки на онлайн-кинотеатры) и подпись
     канала внизу — всё в пределах 1024 символов Telegram."""
+    text = shorts_ai.strip_citations(text)  # сноски поиска «([theguardian.com](https://…))» — не для канала
     text = re.sub(r"\s*🎬 KinoMir360 \| YouTube( \| KinoMir360 в MAX)?\s*$", "", text.strip())  # подпись добавим сами
     tail, tail_len = "", SIGN_LEN
     if rubric and rubric.lower() not in text.lower():

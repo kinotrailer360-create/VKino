@@ -1065,6 +1065,18 @@ def _films_from(data: dict[str, Any], extra: tuple[str, ...] = ()) -> list[dict[
     return out
 
 
+def strip_citations(text: str) -> str:
+    """Убирает сноски, которые ИИ с поиском вставляет в текст: «([theguardian.com](https://…))»,
+    «[1]», «【3†source】», голые ссылки в скобках; [текст](ссылка) → текст."""
+    text = re.sub(r"\s*\(\s*\[[^\]]{1,80}\]\(https?://[^)\s]+\)(?:\s*,?\s*\[[^\]]{1,80}\]\(https?://[^)\s]+\))*\s*\)",
+                  "", text)
+    text = re.sub(r"\[([^\]]{1,200})\]\(https?://[^)\s]+\)", r"\1", text)
+    text = re.sub(r"\s*\(\s*https?://[^)\s]+\s*\)", "", text)
+    text = re.sub(r"\s*【[^】]{0,40}】|\s*\[\d+(?:,\s*\d+)*\]", "", text)
+    text = re.sub(r"[ \t]+([.,!?;:])", r"\1", text)
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
 def _clean_post(data: dict[str, Any] | None) -> str:
     post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str((data or {}).get("post") or "")).strip()
     return post[:1020] if len(post) >= 80 else ""
