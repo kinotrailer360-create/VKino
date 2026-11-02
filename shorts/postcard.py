@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from .cards import ASSETS, _cover, _font, _gradient
 
@@ -42,11 +42,34 @@ def _title_font(draw: ImageDraw.ImageDraw, title: str) -> tuple[ImageFont.FreeTy
 def make_post_card(img: Image.Image, title: str, place: int = 0, total: int = 0, rating: float | None = None,
                    rating_label: str = "", year: int | str | None = None, genres: list[str] | None = None,
                    actors: list[str] | None = None, pill: tuple[str, str] | None = None,
-                   meta: str | None = None, extra: str | None = None, episode: str | None = None) -> Image.Image:
+                   meta: str | None = None, extra: str | None = None, episode: str | None = None,
+                   portrait: bool = False) -> Image.Image:
     """Карточка фильма для подборки; без данных (фильм не с Кинопоиска) — только название и знак канала.
     pill — своя плашка вместо рейтинга (например («🎂», «51»)); meta и extra — свои строки вместо
     «год · жанр» и «В ролях: …» (например «Роль: Нео»)."""
-    card = _cover(img.convert("RGB"), W, H, y_bias=0.3).convert("RGBA")
+    if portrait:  # портрет: фото сверху, надписи ниже лица — на размытом продолжении фото
+        probe = ImageDraw.Draw(Image.new("RGB", (W, H)))
+        n_rows = len(_title_font(probe, title.upper())[1])
+        text_top = H - 250 - round(_title_font(probe, title.upper())[0].size * 1.12) * n_rows \
+            - (50 if extra or actors else 0) - (50 if meta or meta is None else 0)
+        ph = max(600, text_top + 40)
+        card = _cover(img.convert("RGB"), W, H, 0.3).filter(ImageFilter.GaussianBlur(40)).convert("RGBA")
+        card.alpha_composite(Image.new("RGBA", (W, H), INK + (150,)))
+        # портрет целиком по высоте (лицо не увеличиваем до подбородка под текстом), по бокам — размытый фон
+        pw = min(W, max(round(img.width * ph / img.height), 780))
+        photo = _cover(img.convert("RGB"), pw, ph, y_bias=0.1).convert("RGBA")
+        mask = Image.new("L", (pw, ph), 255)
+        mask.paste(Image.linear_gradient("L").resize((pw, 200)).point(lambda v: 255 - v), (0, ph - 200))
+        if pw < W:  # мягкие края слева и справа
+            ramp = Image.linear_gradient("L").transpose(Image.ROTATE_90).resize((90, ph))  # слева направо: 255→0
+            edges = Image.new("L", (pw, ph), 255)
+            edges.paste(ramp.transpose(Image.FLIP_LEFT_RIGHT) if ramp.getpixel((0, 0)) > 128 else ramp, (0, 0))
+            edges.paste(ramp if ramp.getpixel((0, 0)) > 128 else ramp.transpose(Image.FLIP_LEFT_RIGHT), (pw - 90, 0))
+            mask = ImageChops.darker(mask, edges)
+        photo.putalpha(mask)
+        card.alpha_composite(photo, ((W - pw) // 2, 0))
+    else:
+        card = _cover(img.convert("RGB"), W, H, y_bias=0.3).convert("RGBA")
     card.alpha_composite(_gradient(W, 300, 170, 0))
     card.alpha_composite(_gradient(W, 900, 0, 250, INK), (0, H - 900))
     draw = ImageDraw.Draw(card)

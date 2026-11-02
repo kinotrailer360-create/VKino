@@ -56,6 +56,8 @@ from shorts import clips as shorts_clips
 from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
 from shorts import news as shorts_news
+from shorts import fastnews as shorts_fast
+from shorts import rt as shorts_rt
 from shorts import lumean as shorts_lumean
 from shorts import music as shorts_music
 from shorts import pronounce as shorts_pronounce
@@ -6886,6 +6888,16 @@ async def news_feeds() -> list[str]:
     return feeds if isinstance(feeds, list) and feeds else list(shorts_news.DEFAULT_FEEDS)
 
 
+async def fast_feeds() -> list[str]:
+    """Быстрые зарубежные источники (Reddit, Deadline, инсайдеры, X): свой список или стандартный."""
+    raw = await shorts_setting("fast_feeds")
+    try:
+        feeds = json.loads(raw) if raw else None
+    except ValueError:
+        feeds = None
+    return feeds if isinstance(feeds, list) and feeds else list(shorts_fast.DEFAULT_FEEDS)
+
+
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     seo = result.seo
     video = await bot.send_video(
@@ -7166,6 +7178,42 @@ async def feeds_action(message: Message, text: str) -> None:
         "<code>/feeds default</code> — стандартный список"
     )
     await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+@router.message(Command("fast"))
+async def fast_command(message: Message) -> None:
+    """/fast — быстрые зарубежные источники новостей: проверить, добавить, удалить."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    action, _, arg = (message.text or "").partition(" ")[2].strip().partition(" ")
+    arg = arg.strip()
+    feeds = await fast_feeds()
+    if action == "add" and (arg.startswith(("http://", "https://", "x:", "@"))):
+        entry = f"x:{arg.lstrip('@')}" if arg.startswith("@") else arg
+        if entry not in feeds:
+            feeds.append(entry)
+        await set_shorts_setting("fast_feeds", json.dumps(feeds))
+        await message.answer(f"✅ Добавил: <code>{escape(entry[:90])}</code>")
+        return
+    if action == "del" and arg.isdigit() and 1 <= int(arg) <= len(feeds):
+        removed = feeds.pop(int(arg) - 1)
+        await set_shorts_setting("fast_feeds", json.dumps(feeds) if feeds else None)
+        await message.answer(f"✅ Удалил: <code>{escape(removed[:90])}</code>")
+        return
+    if action == "default":
+        await set_shorts_setting("fast_feeds", None)
+        await message.answer("✅ Вернул стандартный список быстрых источников.")
+        return
+    wait = await message.answer("⏳ Проверяю быстрые источники…")
+    lines = ["⚡ <b>Быстрые источники</b> (Reddit, Deadline, инсайдеры, X) — новостей за сутки:"]
+    for i, (entry, res) in enumerate(await shorts_fast.check(feeds), 1):
+        mark = f"✅ {res}" if isinstance(res, int) and res else ("⚪ 0" if res == 0 else f"❌ {escape(str(res))}")
+        lines.append(f"{i}. {escape(shorts_fast.label(entry))} — {mark}\n<code>{escape(entry[:90])}</code>")
+    lines.append(
+        "\n<code>/fast add URL</code> — добавить RSS (в том числе X через rss.app)\n"
+        "<code>/fast add @Имя</code> — аккаунт X (нужен свой Nitter/RSSHub: NITTER_URL в .env)\n"
+        "<code>/fast del N</code> — удалить\n<code>/fast default</code> — стандартный список")
+    await wait.edit_text("\n".join(lines), disable_web_page_preview=True)
 
 
 @router.message(Command("say"))
@@ -9250,6 +9298,7 @@ class PostState(StatesGroup):
     actor = State()
     digest = State()
     listlink = State()
+    rt = State()
 
 
 async def _posts_history() -> dict[str, list[str]]:
@@ -9409,16 +9458,25 @@ async def _rutube_post_trailer(titles: list[str], work: Path) -> Path | None:
         return None
 
 
-async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
-    """Пост в стиле канала автора по самой интересной свежей новости (за сутки) из Telegram-каналов, кроме
-    своего, с фото или видео из источника. Присылает в чаты; возвращает тему или "" (новых новостей нет)."""
+async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
+    """Пост в стиле канала автора по самой интересной свежей новости, с фото или видео из источника.
+    mode: "tg" — Telegram-каналы за сутки (кроме своего); "fast" — быстрые зарубежные источники (Reddit,
+    Deadline, инсайдеры, X) за 12 часов — там новости раньше; "all" — и то и другое.
+    Присылает в чаты; возвращает тему или "" (новых новостей нет)."""
     async with post_lock:
         own = POST_CHANNEL.lstrip("@").lower()
         channels = [c for c in await fact_channels() if c.lower() != own]
-        posts = await shorts_tgsearch.latest(channels, hours=24, per_channel=5)
+        posts = await shorts_tgsearch.latest(channels, hours=24, per_channel=5) if mode != "fast" else []
         hist = await _posts_history()
         used = set(hist["urls"])
-        fresh = [p for p in posts if p["url"] not in used][:30]
+        fresh = [p for p in posts if p["url"] not in used][:30 if mode == "tg" else 20]
+        if mode != "tg":
+            try:
+                fast = await asyncio.wait_for(shorts_fast.latest(await fast_feeds()), 60)
+            except Exception as exc:  # noqa: BLE001
+                logging.info("Tg post: fast sources failed: %s", exc)
+                fast = []
+            fresh += [p for p in fast if p["url"] not in used][:30 if mode == "fast" else 15]
         if not fresh:
             return ""
         try:  # что уже вышло в своём канале — ИИ эти новости не повторит
@@ -9472,7 +9530,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int]) -> str:
             caption = post_caption(res["post"], "#новости")
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
-                await offer_post(bot, chat_id, ids, kind, "pt:make")
+                await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make")
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return res["topic"] or "пост"
@@ -9491,6 +9549,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows = [[_btn(f"{HOLIDAYS[k][0]}: подборка к празднику", f"pt:l:h:{k}")]
             for k in holidays_now(datetime.now(MSK).date())]
     rows += [[_btn("📰 Свежая новость из каналов", "pt:make")]]
+    rows += [[_btn("⚡ Инсайды и слухи раньше всех (Reddit, X, Deadline)", "pt:fast")]]
     rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
     rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
              for k in range(0, len(SHORTS_GENRES), 3)]
@@ -9501,6 +9560,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows.append([_btn("🧩 Сводка по теме из всех каналов", "pt:dg")])
     rows.append([_btn("🎂 День рождения звезды", "bd:list"), _btn("📅 Этот день в кино", "pt:an")])
     rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
+    rows.append([_btn("🍅 Что пишут критики и зрители (Rotten Tomatoes)", "pt:rt")])
     rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
     rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
     rows.append([_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")])
@@ -9721,7 +9781,9 @@ async def make_birthday_post(bot: Bot, chat_id: int, chosen: dict[str, Any] | No
                       "year": str(f.get("release_date") or "")[:4], "rating": float(f.get("vote_average") or 0),
                       "role": role, "poster": f.get("poster_path") or f.get("backdrop_path")})
     who_is = "режиссёр" if director else "актриса" if female else "актёр"
+    fame = shorts_daily.tmdb.known_for(info, 4)
     material = (f"{name}" + (f" ({who['en']})" if who["en"] else "") + f", {who_is}, сегодня {age} {years}.\n"
+                + (f"Чем известен зрителям прежде всего (фильмы и сериалы): {', '.join(fame)}\n" if fame else "")
                 + "Лучшие фильмы:\n" + "\n".join(
                     f"— «{f['title']}» ({f['year']})" + (f", роль: {f['role']}" if f["role"] else "")
                     for f in films)
@@ -9743,12 +9805,12 @@ async def make_birthday_post(bot: Bot, chat_id: int, chosen: dict[str, Any] | No
     work.mkdir(parents=True, exist_ok=True)
     try:
         cards: list[Path] = []
-        known = ", ".join(f"«{f['title']}»" for f in films[:2])
+        known = ", ".join(f"«{t}»" for t in (shorts_daily.tmdb.known_for(info, 2) or [f["title"] for f in films[:2]]))
         for url in shorts_daily.tmdb.profile_urls(info)[:2]:
             photo = await _image(url, work, "face")
             if photo:
                 card = await asyncio.to_thread(
-                    shorts_postcard.make_post_card, photo, name, pill=("С ДНЁМ РОЖДЕНИЯ", ""),
+                    shorts_postcard.make_post_card, photo, name, pill=("С ДНЁМ РОЖДЕНИЯ", ""), portrait=True,
                     meta=f"Сегодня {age} {years}", extra=f"{'Известна' if female else 'Известен'} по: {known}")
                 cards.append(work / "face.jpg")
                 card.save(cards[-1], quality=92)
@@ -9993,9 +10055,8 @@ async def make_birthdays_post(bot: Bot, chat_id: int, people: list[dict[str, Any
             info = await shorts_daily.tmdb.person(TMDB_API_KEY, who["imdb"])
         except Exception:  # noqa: BLE001
             info = None
-        films = shorts_daily.tmdb.best_movies(info, 3) if info else []
         age = today.year - int(who["born"][:4])
-        titles = [str(f.get("title") or f.get("original_title") or "") for f in films]
+        titles = shorts_daily.tmdb.known_for(info, 3) if info else []
         rows.append(f"{who['name']} ({who['en'] or '—'}), {age} {shorts_daily._years(age)}"
                     + (f"; известен по: {', '.join(titles)}" if titles else ""))
         cards_data.append((who, info, age, titles))
@@ -10015,7 +10076,7 @@ async def make_birthdays_post(bot: Bot, chat_id: int, people: list[dict[str, Any
             if not photo:
                 continue
             card = await asyncio.to_thread(
-                shorts_postcard.make_post_card, photo, who["name"], pill=("С ДНЁМ РОЖДЕНИЯ", ""),
+                shorts_postcard.make_post_card, photo, who["name"], pill=("С ДНЁМ РОЖДЕНИЯ", ""), portrait=True,
                 meta=f"{age} {shorts_daily._years(age)}",
                 extra=("Известен по: " if not who.get("female") else "Известна по: ") + ", ".join(f"«{t}»" for t in titles[:2])
                 if titles else None)
@@ -11070,7 +11131,7 @@ async def posts_auto_loop(bot: Bot) -> None:
             if (await shorts_setting("posts_auto") == "on" and time.monotonic() - last >= POSTS_EVERY
                     and now.hour not in POSTS_NIGHT):
                 last = time.monotonic()
-                await make_tg_post(bot, sorted(ADMIN_IDS))
+                await make_tg_post(bot, sorted(ADMIN_IDS), "all")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -11217,6 +11278,10 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "Бот найдёт посты об этом во всех каналах из списка за последние 3 дня, ИИ соберёт их в один пост "
             "без повторов (главное, подробности, кто что сказал), фото возьму из постов.\n\n<i>Передумал — /cancel</i>")
         return
+    if action == "rt":
+        await message.answer("🍅 Ищу свежие и ближайшие премьеры…")
+        await message.answer(*await rt_menu())
+        return
     if action == "ac":
         await state.set_state(PostState.actor)
         await message.answer(
@@ -11285,19 +11350,22 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "новости из каналов. Нажми «📢 Опубликовать» под тем, что нравится. Выключить — та же кнопка."
             if on else "🔕 Авто-посты выключены.")
         return
-    if action == "make":
+    if action in ("make", "fast"):
         if post_lock.locked():
             await message.answer("⏳ Пост уже пишется — подожди минуту.")
             return
-        wait = await message.answer("📝 Читаю свежие посты каналов за сутки, ИИ выбирает новость и пишет пост…")
+        wait = await message.answer(
+            "📝 Читаю свежие посты каналов за сутки, ИИ выбирает новость и пишет пост…" if action == "make" else
+            "⚡ Читаю Reddit, Deadline, Variety, инсайдеров и X за 12 часов — ИИ выбирает новость, которой ещё нет "
+            "в русских каналах, и пишет пост…")
 
         async def job() -> None:
             try:
-                topic = await make_tg_post(message.bot, [chat_id])
+                topic = await make_tg_post(message.bot, [chat_id], "tg" if action == "make" else "fast")
                 if topic:
                     await wait.delete()
                 else:
-                    await wait.edit_text("🤷 Новых новостей за сутки нет — всё уже было в прошлых постах.")
+                    await wait.edit_text("🤷 Новых новостей нет — всё уже было в прошлых постах.")
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Tg post failed")
                 await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
@@ -12481,12 +12549,265 @@ async def send_weekly_digest(bot: Bot) -> int:
     return sent
 
 
+# --- Rotten Tomatoes: что пишут критики и зрители; оповещение, когда сняли эмбарго на рецензии
+
+RT_EVERY = 3 * 3600  # как часто проверять оценки премьер
+RT_CRITICS_MIN = 10  # рецензий — оценка критиков уже что-то значит
+
+
+async def rt_menu() -> tuple[str, InlineKeyboardMarkup]:
+    today = datetime.now(MSK).date()
+    try:
+        films = await shorts_daily.tmdb.releases(TMDB_API_KEY, (today - timedelta(days=21)).isoformat(),
+                                                 (today + timedelta(days=30)).isoformat(), 12)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("RT menu: tmdb failed: %s", exc)
+        films = []
+    rows = [[_btn(f"{'🆕' if f['date'] <= today.isoformat() else '⏳'} {f['title'][:40]} ({f['date'][8:10]}."
+                  f"{f['date'][5:7]})", f"rt:f:{f['id']}")] for f in films]
+    alerts = await shorts_setting("rt_alerts") != "off"
+    rows.append([_btn("✏️ Другой фильм — напишу название", "rt:q")])
+    rows.append([_btn("🔕 Не сообщать о снятии эмбарго" if alerts else "🔔 Сообщать о снятии эмбарго",
+                      "rt:off" if alerts else "rt:on")])
+    return ("🍅 <b>Что пишут критики и зрители</b> — оценки и рецензии с Rotten Tomatoes.\n\n"
+            "Выбери фильм: 🆕 — уже вышел в США, ⏳ — премьера скоро (рецензии появляются, когда снимут эмбарго, "
+            "обычно за несколько дней до премьеры).\n"
+            + ("🔔 Как только критики увидят фильм или появятся оценки зрителей, пришлю уведомление с кнопкой поста."
+               if alerts else "🔕 Уведомления о снятии эмбарго выключены."),
+            InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+def _rt_film_buttons(tmdb_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🍅 Что пишут критики", f"rt:c:{tmdb_id}")],
+        [_btn("🍿 Что пишут зрители", f"rt:a:{tmdb_id}")]])
+
+
+async def _rt_state() -> dict[str, Any]:
+    try:
+        data = json.loads(await shorts_setting("rt_watch") or "{}")
+    except ValueError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _rt_url(film: dict[str, Any], web: bool = True) -> str | None:
+    """Страница фильма на RT (запоминаем, чтобы не искать каждый раз)."""
+    state = await _rt_state()
+    st = state.get(str(film["id"])) or {}
+    if st.get("url"):
+        return st["url"]
+    from shorts import websearch as shorts_websearch
+    url = await shorts_rt.find(film["original"], film["year"], shorts_websearch.search if web else None)
+    if url:
+        state = await _rt_state()
+        state[str(film["id"])] = {**(state.get(str(film["id"])) or {}), "url": url}
+        await set_shorts_setting("rt_watch", json.dumps(state))
+    return url
+
+
+async def make_rt_post(bot: Bot, chat_id: int, tmdb_id: int, audience: bool = False) -> None:
+    """Пост «Что пишут критики» (Tomatometer, консенсус, мнения изданий) или «Что говорят зрители»
+    (Popcornmeter, что нравится и нет) по странице фильма на Rotten Tomatoes; без неё — по поиску."""
+    film = await shorts_daily.tmdb.movie(TMDB_API_KEY, tmdb_id)
+    if not film:
+        raise RuntimeError("фильм не нашёлся на TMDB")
+    url = await _rt_url(film)
+    data: dict[str, Any] = {}
+    if url:
+        try:
+            data = await shorts_rt.info(url)
+        except Exception as exc:  # noqa: BLE001
+            logging.info("RT post: %s failed: %s", url, exc)
+    key = "audience" if audience else "critics"
+    have = data.get(key) is not None or bool(data.get(f"{key}_reviews") or data.get(f"{key}_reviews_text"))
+    title = film["title"]
+    material = (f"Фильм: «{title}» ({film['original']}, {film['year']}), премьера в США: {film['date']}.\n"
+                + (shorts_rt.as_material(data, audience) if data else
+                   "Страница Rotten Tomatoes не прочиталась — оценки и мнения найди в Google (Rotten Tomatoes, "
+                   "Metacritic, рецензии изданий)."))
+    if audience:
+        task = (f"Напиши пост «Что говорят зрители о «{title}»»: заголовок КАПСОМ с эмодзи 🍿 и оценкой зрителей "
+                "(Popcornmeter на Rotten Tomatoes) и числом оценок; 2–4 строки «✅ …» и «❌ …» — что зрителям "
+                "понравилось и что нет (по отзывам, переведи по смыслу, без спойлеров); сравни с оценкой критиков, "
+                "если она есть (совпали или разошлись); короткий вывод — стоит ли идти. Если оценок зрителей ещё "
+                "нет — так и скажи, цифры не придумывай.")
+    else:
+        task = (f"Напиши пост «Что пишут критики о «{title}»»: заголовок КАПСОМ с эмодзи 🍅 и рейтингом "
+                "Tomatometer (например «🍅 КРИТИКИ ПОСМОТРЕЛИ «…»: 92% НА ROTTEN TOMATOES»), сколько рецензий; "
+                "консенсус критиков своими словами; 3–4 мнения строками «🗣 Издание: суть в одну фразу» — переведи, "
+                "имена и издания только из материала; что хвалят и что ругают; короткий вывод — стоит ли ждать. "
+                "Без спойлеров. Если рецензий ещё нет (эмбарго) — так и скажи, цифры не придумывай.")
+    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material, search=not have)
+    if not post:
+        raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+    work = SHORTS_DIR / f"rt_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        files: list[Path] = []
+        img = await _image(film["poster"] or film["backdrop"], work, "rt")
+        if img:
+            score = data.get(key)
+            parts = [f"Критики {data['critics']}%" if data.get("critics") is not None else "",
+                     f"Зрители {data['audience']}%" if data.get("audience") is not None else ""]
+            card = await asyncio.to_thread(
+                shorts_postcard.make_post_card, img, title,
+                pill=(("ЗРИТЕЛИ" if audience else "КРИТИКИ"), f"{score}%") if score is not None else None,
+                meta=" · ".join(p for p in parts if p) or film["year"], extra="Rotten Tomatoes")
+            files = [work / "rt.jpg"]
+            card.save(files[0], quality=92)
+        ids, kind = await _send_media(bot, chat_id, files, post_caption(post, "#рецензии"))
+        await offer_post(bot, chat_id, ids, kind, f"rt:{'a' if audience else 'c'}:{tmdb_id}",
+                         what="Пост «что говорят зрители» готов" if audience else "Пост «что пишут критики» готов")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def rt_watch(bot: Bot) -> None:
+    """Проверка премьер: критики увидели фильм (сняли эмбарго) или появились оценки зрителей — пишем админам."""
+    if await shorts_setting("rt_alerts") == "off" or not TMDB_API_KEY:
+        return
+    today = datetime.now(MSK).date()
+    films = await shorts_daily.tmdb.releases(TMDB_API_KEY, (today - timedelta(days=14)).isoformat(),
+                                             (today + timedelta(days=45)).isoformat(), 20)
+    state, sent = await _rt_state(), 0
+    for film in films:
+        fid = str(film["id"])
+        st = state.get(fid) or {}
+        if not st.get("url"):
+            if st.get("tries", 0) >= 3:
+                continue
+            st["tries"] = st.get("tries", 0) + 1
+            try:
+                st["url"] = await shorts_rt.find(film["original"], film["year"])
+            except Exception as exc:  # noqa: BLE001
+                logging.info("RT watch: find %s failed: %s", film["original"], exc)
+            state[fid] = st
+            if not st.get("url"):
+                continue
+        try:
+            sc = await shorts_rt.page_scores(st["url"])
+        except Exception as exc:  # noqa: BLE001
+            logging.info("RT watch: %s failed: %s", st["url"], exc)
+            continue
+        first, old = not st.get("seen"), film["date"] < (today - timedelta(days=3)).isoformat()
+        st["seen"] = 1
+        notes: list[tuple[str, str]] = []
+        if sc.get("critics") is not None and (sc.get("critics_count") or RT_CRITICS_MIN) >= RT_CRITICS_MIN \
+                and "c" not in st:
+            st["c"] = sc["critics"]
+            if not (first and old):
+                notes.append((f"🍅 <b>Критики посмотрели «{escape(film['title'])}»</b> ({escape(film['original'])}, "
+                              f"премьера в США {film['date'][8:10]}.{film['date'][5:7]}): <b>{sc['critics']}%</b> на "
+                              "Rotten Tomatoes" + (f" ({sc['critics_count']} рецензий)" if sc.get("critics_count")
+                                                   else "") + ". Эмбарго снято — можно сделать пост первыми.",
+                              f"rt:c:{fid}"))
+        if sc.get("audience") is not None and "a" not in st:
+            st["a"] = sc["audience"]
+            if not (first and old):
+                notes.append((f"🍿 <b>Появились оценки зрителей «{escape(film['title'])}»</b>: <b>{sc['audience']}%"
+                              "</b> на Rotten Tomatoes" + (f" (критики — {sc['critics']}%)" if sc.get("critics")
+                                                           is not None else "") + ".", f"rt:a:{fid}"))
+        state[fid] = st
+        for text, data in notes:
+            if sent >= 4:
+                break
+            sent += 1
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("🍅 Сделать пост" if data.startswith("rt:c") else "🍿 Сделать пост", data)],
+                [_btn("🔕 Не присылать такие уведомления", "rt:off")]])
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, text, reply_markup=markup)
+                except Exception:  # noqa: BLE001
+                    pass
+    if len(state) > 300:  # старые фильмы забываем
+        state = dict(list(state.items())[-300:])
+    await set_shorts_setting("rt_watch", json.dumps(state))
+
+
+@router.callback_query(F.data.startswith("rt:"))
+async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    message = callback.message
+    _, kind, arg = ((callback.data or "") + "::").split(":")[:3]
+    if kind in ("on", "off"):
+        await set_shorts_setting("rt_alerts", None if kind == "on" else "off")
+        await message.answer("🔔 Буду сообщать, когда критики посмотрят премьеру и когда появятся оценки зрителей."
+                             if kind == "on" else "🔕 Уведомления о снятии эмбарго выключены. Включить — 📝 Посты → "
+                             "🍅 Что пишут критики.")
+        return
+    if kind == "q":
+        await state.set_state(PostState.rt)
+        await message.answer("✏️ Напиши название фильма — можно по-русски или в оригинале, лучше с годом: "
+                             "<code>Аватар: Огонь и пепел</code> или <code>Avatar: Fire and Ash 2025</code>."
+                             "\n\n<i>Передумал — /cancel</i>")
+        return
+    if not arg.isdigit():
+        return
+    if kind == "f":
+        await message.answer("Что сделать?", reply_markup=_rt_film_buttons(int(arg)))
+        return
+    if kind in ("c", "a"):
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту и нажми кнопку ещё раз.")
+            return
+        wait = await message.answer("🍿 Читаю отзывы зрителей на Rotten Tomatoes, ИИ пишет пост…" if kind == "a" else
+                                    "🍅 Читаю рецензии критиков на Rotten Tomatoes, ИИ пишет пост…")
+        chat_id = message.chat.id
+
+        async def rt_job() -> None:
+            try:
+                async with post_lock:
+                    await make_rt_post(message.bot, chat_id, int(arg), kind == "a")
+                await wait.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("RT post failed")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+
+        _run_job(rt_job)
+
+
+@router.message(PostState.rt, F.text, ~F.text.startswith("/"))
+async def rt_title(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    query = (message.text or "").strip()[:100]
+    year = re.search(r"\b(19|20)\d{2}\b", query)
+    name = re.sub(r"\b(19|20)\d{2}\b", "", query).strip(" ,()")
+    try:
+        found = await shorts_daily.tmdb.search_movie(TMDB_API_KEY, name)
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"❌ Поиск не удался: <code>{escape(str(exc)[:200])}</code>")
+        return
+    if year:
+        found = sorted(found, key=lambda f: f["year"] != year.group(0))
+    if not found:
+        await message.answer("🤷 Не нашёл такой фильм. Попробуй оригинальное название.")
+        return
+    if len(found) == 1 or (year and found[0]["year"] == year.group(0)):
+        f = found[0]
+        await message.answer(f"🎬 «{escape(f['title'])}» ({escape(f['original'])}, {f['year'] or '—'}). Что сделать?",
+                             reply_markup=_rt_film_buttons(f["id"]))
+        return
+    await message.answer("Какой фильм?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"{f['title'][:40]} ({f['year'] or '—'})", f"rt:f:{f['id']}")] for f in found[:6]]))
+
+
 async def growth_loop(bot: Bot) -> None:
     """Раз в 10 минут: уведомления из избранного (раз в 3 часа), подборка недели (пятница, 18:00 Екб)."""
-    last_alerts = 0.0
+    last_alerts = last_rt = 0.0
     while True:
         await asyncio.sleep(600)
         try:
+            if time.time() - last_rt > RT_EVERY and 8 <= datetime.now(POST_TZ).hour < 23:
+                last_rt = time.time()
+                try:
+                    await rt_watch(bot)
+                except Exception:  # noqa: BLE001
+                    logging.exception("RT watch failed")
             if time.time() - last_alerts > 3 * 3600:
                 last_alerts = time.time()
                 await favorites_alerts(bot)
@@ -12900,6 +13221,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
+        BotCommand(command="fast", description="Быстрые источники: Reddit, X, Deadline"),
         BotCommand(command="trailer", description="Проверить скачивание трейлера"),
         BotCommand(command="clips", description="Трейлеры в роликах: on/off"),
         BotCommand(command="music", description="Сменить фоновую музыку"),

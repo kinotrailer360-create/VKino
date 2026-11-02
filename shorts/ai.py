@@ -856,7 +856,9 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     {"post": текст, "topic": тема, "media": [номера постов о той же новости — оттуда фото/видео]} или None."""
     if not available(key) or not posts:
         return None
-    listing = "\n\n".join(f"{i}. [t.me/{p['channel']}]\n{p['text']}" for i, p in enumerate(posts, 1))
+    listing = "\n\n".join(f"{i}. [{p.get('label') or 't.me/' + p['channel']}]\n{p['text']}"
+                          for i, p in enumerate(posts, 1))
+    foreign = any(p.get("lang") == "en" for p in posts)
     rules = (
         "Ты ведёшь Telegram-канал о кино KinoMir360. Ниже свежие посты других каналов о кино. Выбери ОДНУ самую "
         "интересную для широкой аудитории новость: трейлер, премьера, кастинг, продолжение, сборы, награды, "
@@ -864,6 +866,12 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         + ("\n".join(f"— {t}" for t in recent[-40:]) or "—")
         + ("\n\nУЖЕ ОПУБЛИКОВАНО В НАШЕМ КАНАЛЕ — эти новости не бери, даже другими словами:\n" + own_posts[:5000]
            if own_posts else "")
+        + ("\n\nЧАСТЬ ПОСТОВ — ЗАРУБЕЖНЫЕ ИСТОЧНИКИ (Reddit, X, Deadline, Variety, THR, инсайдеры) на английском: "
+           "там новости появляются раньше русских каналов, их ценность — скорость. Переведи сам смысл; фильмы — "
+           "как в российском прокате, если названия ещё нет — оригинальное; имена — по-русски. Сообщения "
+           "инсайдеров (X, Reddit, InSneider, Daniel Richtman, MyTimeToShineHello) без подтверждения крупных "
+           "изданий подавай как слух или инсайд и называй источник («по данным инсайдера …»). Если у поста только "
+           "заголовок — подробности ищи в Google, не выдумывай." if foreign else "")
         + "\n\nСверь новость с другими постами (и с Google, если можешь); неподтверждённое подавай как слух. "
         "Напиши пост своими словами (не копируй ни чужие посты, ни образец — даже если новость похожа) "
         "точно в стиле и формате образца: заголовок "
