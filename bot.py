@@ -9478,6 +9478,26 @@ def _sources_note(posts: list[dict[str, Any]]) -> str:
     return ("\n\n📎 Источник (только для тебя):\n" + "\n".join(rows)) if rows else ""
 
 
+_STOP_STEMS = {"фильм", "сериа", "котор", "также", "перво", "будет", "сезон", "студи", "режис", "трейл", "премь",
+               "прока", "релиз", "покаж", "снима", "получ", "стане", "сообщ", "расск", "объяв", "верну", "собра",
+               "новог", "новый", "новая", "новые", "котор", "тольк", "после", "сейча", "больш", "долла", "милли",
+               "зрите", "истор", "росси", "недел", "сегод", "главн", "вышел", "выйде", "выход", "канал", "подпи",
+               "перес", "друго", "другу", "этого", "своей", "своих", "всего", "можно", "очень", "когда", "через"}
+_STOP_EN = {"this", "that", "with", "from", "have", "will", "their", "they", "film", "movie", "series", "first",
+            "after", "about", "into", "more", "season", "trailer", "official", "release", "today", "news", "just",
+            "been", "were", "what", "when", "which", "while", "would", "could", "also", "than", "then", "over"}
+
+
+def _key_tokens(text: str) -> set[str]:
+    """Опознавательные слова текста для сверки «о том же ли новость»: латинские слова, числа (кроме годов) и
+    основы длинных русских слов без общих («фильм», «сезон», «премьера»…)."""
+    t = str(text or "").lower().replace("ё", "е")
+    latin = {w for w in re.findall(r"[a-z][a-z0-9]{3,}", t)} - _STOP_EN
+    nums = {n for n in re.findall(r"\d{2,}", t) if not re.fullmatch(r"(19|20)\d\d", n)}
+    cyr = {w[:5] for w in re.findall(r"[а-я]{6,}", t)} - _STOP_STEMS
+    return latin | nums | cyr
+
+
 def _title_words(text: str) -> str:
     """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
     return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
@@ -9534,6 +9554,10 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             same = [p for p in same if any(_mentions_title(n, _title_words(p["text"])) for n in names)]
         else:  # фильма нет — только главный пост новости, без соседних
             same = same[:1]
+        # и только если в источнике есть те же имена, названия или цифры, что в готовом посте: ИИ бывает
+        # называет номер чужого поста (в посте о Warner Bros. оказалось видео про Zelda)
+        about = _key_tokens(" ".join([res["post"], res["film"], res["film_en"]]))
+        same = [p for p in same if len(about & _key_tokens(p["text"])) >= 2]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
