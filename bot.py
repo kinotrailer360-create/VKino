@@ -101,6 +101,23 @@ _SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|AUTH", re.I)
 _SECRET_QS = re.compile(r"((?:api_?key|key|token|access_token|secret|auth)=)[^&\s'\"]+", re.I)
 
 
+class _RedactSecrets(logging.Filter):
+    """Журнал сервера тоже без ключей: aiohttp пишет в ошибки полный адрес запроса (?api_key=…)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            clean = _safe_err(msg)
+            if clean != msg:
+                record.msg, record.args = clean, ()
+            if record.exc_info and record.exc_info[1] is not None:
+                text = _safe_err(logging.Formatter().formatException(record.exc_info))
+                record.exc_info, record.exc_text = None, text
+        except Exception:  # noqa: BLE001 — журнал не должен падать из-за фильтра
+            pass
+        return True
+
+
 def _safe_err(exc: BaseException | str) -> str:
     """Текст ошибки для Telegram без ключей: aiohttp кладёт в ошибку полный адрес запроса, а у TMDB и других
     ключ стоит в адресе (?api_key=…). Вырезаем значения всех секретов из .env и параметры-ключи."""
@@ -7186,7 +7203,7 @@ async def feeds_action(message: Message, text: str) -> None:
     await message.answer("⏳ Проверяю ленты новостей…")
     lines = ["📰 <b>Ленты новостей</b> (свежих за 48 ч):"]
     for i, (url, res) in enumerate(await shorts_news.check_feeds(feeds), 1):
-        mark = f"✅ {res}" if isinstance(res, int) and res else f"❌ {escape(str(res))}"
+        mark = f"✅ {res}" if isinstance(res, int) and res else f"❌ {escape(_safe_err(str(res)))}"
         lines.append(f"{i}. {mark}\n<code>{escape(url[:90])}</code>")
     lines.append(
         "\n<code>/feeds add URL</code> — добавить RSS\n"
@@ -7228,7 +7245,7 @@ async def fast_command(message: Message) -> None:
     wait = await message.answer("⏳ Проверяю быстрые источники…")
     lines = ["⚡ <b>Быстрые источники</b> (Reddit, Deadline, инсайдеры, X) — новостей за сутки:"]
     for i, (entry, res, name) in enumerate(await shorts_fast.check(feeds), 1):
-        mark = f"✅ {res}" if isinstance(res, int) and res else ("⚪ 0" if res == 0 else f"❌ {escape(str(res))}")
+        mark = f"✅ {res}" if isinstance(res, int) and res else ("⚪ 0" if res == 0 else f"❌ {escape(_safe_err(str(res)))}")
         lines.append(f"{i}. {escape(name)} — {mark}\n<code>{escape(entry[:90])}</code>")
     lines.append(
         "\n<code>/fast add URL</code> — добавить RSS (в том числе X через rss.app)\n"
@@ -9472,22 +9489,28 @@ PUBLISH_HELP = ("Добавь бота в администраторы кана�
 
 
 def _season_of(text: str) -> int | None:
-    """Номер сезона из текста новости: «3-го сезона», «третий сезон», «сезон 2», «season 4»."""
+    """Номер сезона из текста новости: «3-го сезона», «третий сезон», «сезон 2», «season 4». Если сезонов
+    несколько («после финала 2 сезона „Игры“ вышел трейлер 3-го сезона…»), берём ближайший к слову «трейлер»;
+    «продлили на 2 сезона», «после 5 сезонов» — число сезонов, а не номер."""
     words = {"втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6, "седьм": 7, "восьм": 8, "девят": 9, "десят": 10}
     t = str(text or "").lower()
-    for m in re.finditer(r"(\d{1,2})\s*-?\s*(?:го|й|ий|ого)?\s+сезон(\w*)|сезон\w*\s+(\d{1,2})\b|"
+    found: list[tuple[int, int]] = []  # (позиция, номер)
+    for m in re.finditer(r"(\d{1,2})\s*-?\s*(го|й|ий|ого)?\s+сезон(\w*)|сезон\w*\s+(\d{1,2})\b|"
                          r"season\s+(\d{1,2})", t):
         if m.group(1):
             before = t[max(0, m.start() - 12):m.start()]
-            # «продлили на 2 сезона», «после 5 сезонов», «уже 3 сезона» — это число сезонов, а не номер
-            if m.group(2) in ("ов",) or re.search(r"\b(на|после|из|все|всех|уже|ещё|еще|спустя|за)\s*$", before):
+            if m.group(3) == "ов" or (not m.group(2) and re.search(
+                    r"\b(на|после|из|все|всех|уже|ещё|еще|спустя|за)\s*$", before)):
                 continue
-            if m.group(2) == "а" and not re.search(r"-?\s*(?:го|й|ий|ого)\b", m.group(0)) and \
-                    re.search(r"\b(на|после|из|уже|ещё|еще|за)\b", before):
-                continue
-        return int(next(g for g in (m.group(1), m.group(3), m.group(4)) if g))
-    m = re.search(r"\b(втор|трет|четв|пят|шест|седьм|восьм|девят|десят)\w*\s+сезон", t)
-    return words[m.group(1)] if m else None
+        found.append((m.start(), int(next(g for g in (m.group(1), m.group(4), m.group(5)) if g))))
+    for m in re.finditer(r"\b(втор|трет|четв|пят|шест|седьм|восьм|девят|десят)\w*\s+сезон", t):
+        found.append((m.start(), words[m.group(1)]))
+    if not found:
+        return None
+    trailer = [m.start() for m in re.finditer(r"трейлер|тизер|trailer|teaser", t)]
+    if trailer:
+        return min(found, key=lambda f: min(abs(f[0] - p) for p in trailer))[1]
+    return min(found)[1]
 
 
 async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
@@ -9531,8 +9554,20 @@ def _key_tokens(text: str) -> set[str]:
     t = str(text or "").lower().replace("ё", "е")
     latin = {w for w in re.findall(r"[a-z][a-z0-9]{3,}", t)} - _STOP_EN
     nums = {n for n in re.findall(r"\d{2,}", t) if not re.fullmatch(r"(19|20)\d\d", n)}
-    cyr = {w[:5] for w in re.findall(r"[а-я]{6,}", t)} - _STOP_STEMS
+    # основа русского слова от 4 букв: без окончания («дюна/дюны» → «дюн», «ривз/ривза» → «рив»), до 6 букв
+    cyr = {w[:min(6, max(3, len(w) - 2))] for w in re.findall(r"[а-я]{4,}", t)}
+    cyr = {c for c in cyr if c[:5] not in _STOP_STEMS and c not in _STOP_STEMS}
     return latin | nums | cyr
+
+
+def _shared(about: set[str], words: set[str]) -> set[str]:
+    """Общие опознавательные слова; русские основы совпадают и по началу («мстите» ~ «мстител»)."""
+    out = about & words
+    cyr = [a for a in about if a.isalpha() and not a.isascii()]
+    for w in words - out:
+        if w.isalpha() and not w.isascii() and any(w.startswith(a) or a.startswith(w) for a in cyr):
+            out.add(w)
+    return out
 
 
 def _title_words(text: str) -> str:
@@ -9593,15 +9628,17 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             same = same[:1]
         # и только если в источнике есть те же имена, названия или цифры, что в готовом посте: ИИ бывает
         # называет номер чужого поста (в посте о Warner Bros. оказалось видео про Zelda)
-        about = _key_tokens(" ".join([res["post"], res["film"], res["film_en"]]))
-        about_en = _key_tokens(res["film_en"]) | {t for t in about if t.isdigit() or t.isascii()}
+        about = _key_tokens(" ".join([res["post"], res["film"], res["film_en"], res["person"]]))
+        names_en = _key_tokens(" ".join([res["film_en"], res["person_en"]]))
+        about_en = names_en | {t for t in about if t.isdigit() or t.isascii()}
 
         def related(p: dict[str, Any]) -> bool:
             words = _key_tokens(p["text"])
             if p.get("lang") == "en":  # пост уже по-русски, имена в нём — кириллицей: сверяем с латиницей и числами
                 hits = about_en & words
-                return any(not t.isdigit() for t in hits) or len(hits) >= 2
-            return len(about & words) >= 2
+                # одного общего слова мало («marvel», «star») — нужно название/имя из новости или два совпадения
+                return bool(hits & names_en) or len(hits) >= 2
+            return len(_shared(about, words)) >= 2
 
         same = [p for p in same if related(p)]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
@@ -9641,6 +9678,13 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                     with_media = [{"image": url}] if url else []
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: tmdb poster skipped: %s", exc)
+            if not with_media and (res["person_en"] or res["person"]):  # смерть, юбилей — портрет человека с TMDB
+                try:
+                    info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res["person_en"] or res["person"])
+                    url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
+                    with_media = [{"image": url}] if url else []
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Tg post: tmdb person skipped: %s", exc)
             # последнее — маленькая обложка видео из самой новости
             with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
             files = await shorts_tgsearch.download_media(album, work, limit=10, prefix="alb") if album else []
@@ -12735,13 +12779,29 @@ async def _rt_item(key: str) -> dict[str, Any] | None:
     if not m:
         return None
     if m.group(1):
-        return await shorts_daily.tmdb.tv_season(TMDB_API_KEY, int(m.group(2)), int(m.group(3) or 0))
+        return await shorts_daily.tmdb.tv_season(TMDB_API_KEY, int(m.group(2)), int(m.group(3) or 0),
+                                                 datetime.now(MSK).date().isoformat())
     film = await shorts_daily.tmdb.movie(TMDB_API_KEY, int(m.group(2)))
     return {**film, "kind": "movie"} if film else None
 
 
-async def _rt_premieres(back: int, ahead: int, n_films: int, n_tv: int) -> list[dict[str, Any]]:
-    """Фильмы (премьера в кино США) и сезоны сериалов с премьерой между «сегодня − back» и «+ ahead» дней."""
+_rt_premieres_cache: dict[tuple[int, ...], tuple[float, list[dict[str, Any]]]] = {}
+
+
+async def _rt_premieres(back: int = 21, ahead: int = 45, n_films: int = 20, n_tv: int = 12) -> list[dict[str, Any]]:
+    """Фильмы (премьера в кино США) и сезоны сериалов с премьерой между «сегодня − back» и «+ ahead» дней.
+    Список на час общий для меню и автопроверки — TMDB не дёргаем заново."""
+    args = (back, ahead, n_films, n_tv)
+    cached = _rt_premieres_cache.get(args)
+    if cached and time.time() - cached[0] < 3600 and cached[1]:
+        return cached[1]
+    items = await _rt_premieres_load(*args)
+    if items:
+        _rt_premieres_cache[args] = (time.time(), items)
+    return items
+
+
+async def _rt_premieres_load(back: int, ahead: int, n_films: int, n_tv: int) -> list[dict[str, Any]]:
     today = datetime.now(MSK).date()
     since, until = (today - timedelta(days=back)).isoformat(), (today + timedelta(days=ahead)).isoformat()
     films, seasons = await asyncio.gather(shorts_daily.tmdb.releases(TMDB_API_KEY, since, until, n_films),
@@ -12751,20 +12811,14 @@ async def _rt_premieres(back: int, ahead: int, n_films: int, n_tv: int) -> list[
     return out + (seasons if isinstance(seasons, list) else [])
 
 
-_rt_menu_cache: dict[str, Any] = {"at": 0.0, "items": []}
-
-
 async def rt_menu() -> tuple[str, InlineKeyboardMarkup]:
     today = datetime.now(MSK).date().isoformat()
-    if time.time() - _rt_menu_cache["at"] < 3600 and _rt_menu_cache["items"]:
-        items = _rt_menu_cache["items"]  # премьеры за час не меняются — не дёргаем TMDB на каждое открытие
-    else:
-        try:
-            items = await _rt_premieres(21, 30, 10, 8)
-            _rt_menu_cache.update(at=time.time(), items=items)
-        except Exception as exc:  # noqa: BLE001
-            logging.info("RT menu: tmdb failed: %s", exc)
-            items = []
+    try:  # тот же список, что у автопроверки (кэш на час); в меню — 10 фильмов и 8 сезонов
+        found = await _rt_premieres()
+    except Exception as exc:  # noqa: BLE001
+        logging.info("RT menu: tmdb failed: %s", exc)
+        found = []
+    items = [i for i in found if i.get("kind") != "tv"][:10] + [i for i in found if i.get("kind") == "tv"][:8]
     rows = [[_btn(f"{'📺' if i.get('kind') == 'tv' else '🎬'}{'🆕' if i['date'] <= today else '⏳'} "
                   f"{_rt_name(i)[:42]} ({i['date'][8:10]}.{i['date'][5:7]})", f"rt:f:{_rt_key(i)}")] for i in items]
     alerts = await shorts_setting("rt_alerts") != "off"
@@ -12893,17 +12947,20 @@ async def rt_watch(bot: Bot) -> None:
     if await shorts_setting("rt_alerts") == "off" or not TMDB_API_KEY:
         return
     today = datetime.now(MSK).date()
-    items = await _rt_premieres(14, 45, 20, 12)
+    items = await _rt_premieres()
     state, sent = await _rt_state(), 0
     changed: dict[str, dict[str, Any]] = {}
     for item in items:
         key, tv = _rt_key(item), item.get("kind") == "tv"
         st = dict(state.get(key) or {})
         if "c" in st and "a" in st:
-            continue  # обо всём уже сообщили — страницу не качаем
+            changed[key] = st  # обо всём уже сообщили — страницу не качаем, но помним (не вытеснит лимит 300)
+            continue
         if not st.get("url"):
             if st.get("tries", 0) >= 3:
-                continue
+                if time.time() - st.get("ts", 0) < 86400:
+                    continue
+                st["tries"] = 0  # через сутки — новая попытка (RT мог быть недоступен)
             st["tries"] = st.get("tries", 0) + 1
             try:
                 st["url"] = await _rt_find(item, web=False)
@@ -12923,7 +12980,8 @@ async def rt_watch(bot: Bot) -> None:
         when = f"премьера{' сезона' if tv else ' в США'} {item['date'][8:10]}.{item['date'][5:7]}"
         enough = RT_CRITICS_MIN_TV if tv else RT_CRITICS_MIN
         notes: list[tuple[str, str, str, int]] = []  # (текст, кнопка, отметка, оценка)
-        if sc.get("critics") is not None and (sc.get("critics_count") or enough) >= enough and "c" not in st:
+        count = sc.get("critics_count")  # нет числа рецензий — верим оценке; 0 или мало — рано
+        if sc.get("critics") is not None and (count is None or count >= enough) and "c" not in st:
             if first and old:  # давно вышедший фильм при первой проверке — молча запоминаем
                 st["c"] = sc["critics"]
             else:
@@ -12992,6 +13050,9 @@ async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if not RT_KEY.fullmatch(arg):
         return
     if kind == "f":
+        if arg.startswith("t") and "s" in arg and not await _rt_item(arg):  # сезона с таким номером нет
+            await message.answer("🤷 У этого сериала на TMDB нет такого сезона. Напиши название с другим номером.")
+            return
         if arg.startswith("t") and "s" not in arg:  # сериал без сезона — текущий сезон
             item = await _rt_item(arg)
             if not item:
@@ -13035,10 +13096,15 @@ async def rt_title(message: Message, state: FSMContext) -> None:
         name, year = query.strip(), None
     try:
         films, shows = await asyncio.gather(shorts_daily.tmdb.search_movie(TMDB_API_KEY, name),
-                                            shorts_daily.tmdb.search_tv(TMDB_API_KEY, name))
+                                            shorts_daily.tmdb.search_tv(TMDB_API_KEY, name), return_exceptions=True)
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"❌ Поиск не удался: <code>{escape(_safe_err(exc)[:200])}</code>")
         return
+    if isinstance(films, BaseException) and isinstance(shows, BaseException):
+        await message.answer(f"❌ Поиск не удался: <code>{escape(_safe_err(films)[:200])}</code>")
+        return
+    films = films if isinstance(films, list) else []
+    shows = shows if isinstance(shows, list) else []
     n = int(next(g for g in season.groups() if g)) if season else 0
     if season:  # просили сезон — значит, сериал
         films = []
@@ -13105,40 +13171,43 @@ async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | Non
 
 
 async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
+    # новости и сценарий — до очереди сборки: сеть и ИИ не держат шортсы, очередь только на монтаж
+    today = datetime.now(MSK).date()
+    start = today - timedelta(days=6)
+    months = shorts_daily.MONTHS
+    label = (f"{start.day}–{today.day} {months[today.month - 1]}" if start.month == today.month else
+             f"{start.day} {months[start.month - 1]} — {today.day} {months[today.month - 1]}")
+    own = POST_CHANNEL.lstrip("@").lower()
+    channels = [c for c in await fact_channels() if c.lower() != own]
+    posts = await shorts_tgsearch.latest(channels, hours=168, per_channel=12)
+    try:
+        fast = await shorts_fast.latest(await fast_feeds(), hours=168, per_feed=25, timeout=100)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Weekly video: fast sources failed: %s", exc)
+        fast = []
+    pool = _spread_by_day(posts, 80) + _spread_by_day(fast, 60)  # вся неделя, а не последние сутки
+    if len(pool) < 10:
+        raise RuntimeError("за неделю почти нет новостей в источниках — проверь каналы (/channels) и /fast")
+    listing, size = [], 0
+    for i, p in enumerate(pool, 1):
+        text = re.sub(r"\s+", " ", p["text"])[:450]
+        row = f"{i}. [{p.get('label') or 't.me/' + p['channel']}] {text}"
+        if size + len(row) > 30000:
+            break
+        listing.append(row)
+        size += len(row)
+    if status:
+        await status.edit_text("🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
+    script = await shorts_ai.write_weekly_episode(
+        GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
+        await shorts_setting("weekly_last") or "")
+    if not script:
+        raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
+    if status and shorts_lock.locked():
+        await status.edit_text("⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
-        today = datetime.now(MSK).date()
-        start = today - timedelta(days=6)
-        months = shorts_daily.MONTHS
-        label = (f"{start.day}–{today.day} {months[today.month - 1]}" if start.month == today.month else
-                 f"{start.day} {months[start.month - 1]} — {today.day} {months[today.month - 1]}")
-        own = POST_CHANNEL.lstrip("@").lower()
-        channels = [c for c in await fact_channels() if c.lower() != own]
-        posts = await shorts_tgsearch.latest(channels, hours=168, per_channel=12)
-        try:
-            fast = await shorts_fast.latest(await fast_feeds(), hours=168, per_feed=25, timeout=100)
-        except Exception as exc:  # noqa: BLE001
-            logging.info("Weekly video: fast sources failed: %s", exc)
-            fast = []
-        pool = _spread_by_day(posts, 80) + _spread_by_day(fast, 60)  # вся неделя, а не последние сутки
-        if len(pool) < 10:
-            raise RuntimeError("за неделю почти нет новостей в источниках — проверь каналы (/channels) и /fast")
-        listing, size = [], 0
-        for i, p in enumerate(pool, 1):
-            text = re.sub(r"\s+", " ", p["text"])[:450]
-            row = f"{i}. [{p.get('label') or 't.me/' + p['channel']}] {text}"
-            if size + len(row) > 30000:
-                break
-            listing.append(row)
-            size += len(row)
-        if status:
-            await status.edit_text("🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
-        script = await shorts_ai.write_weekly_episode(
-            GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
-            await shorts_setting("weekly_last") or "")
-        if not script:
-            raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
         work = SHORTS_DIR / f"weekly_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -13215,10 +13284,21 @@ async def weekly_video_job(bot: Bot) -> None:
         await status.delete()
     except Exception as exc:  # noqa: BLE001
         logging.exception("Weekly video failed")
+        # упал (сбой ИИ, сети, перезапуск) — ещё одна попытка через полчаса, но не больше двух за воскресенье
+        now = datetime.now(POST_TZ)
+        week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
+        tries = await shorts_setting("weekly_video_tries") or ""
+        n = int(tries.split(":")[1]) if tries.startswith(week + ":") else 0
+        retry = n < 1 and "уже собирается" not in str(exc)
+        await set_shorts_setting("weekly_video_tries", f"{week}:{n + 1}")
+        if retry:
+            await set_shorts_setting("weekly_video_retry_at", str(time.time() + 1800))
+            await set_shorts_setting("weekly_video_done", None)
         for admin_id in admins:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
-                                                 "</code>\nПовторить — 📝 Посты → «🎞 Выпуск «Новости кино»».")
+                                                 "</code>\n" + ("Попробую ещё раз через 30 минут. " if retry else "")
+                                       + "Собрать вручную — 📝 Посты → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -13242,6 +13322,7 @@ async def growth_loop(bot: Bot) -> None:
                     and await shorts_setting("weekly_video") != "off"
                     and await shorts_setting("weekly_video_done") != week
                     and time.time() - float(await shorts_setting("weekly_video_at") or 0) > 20 * 3600
+                    and time.time() > float(await shorts_setting("weekly_video_retry_at") or 0)
                     and not weekly_busy):
                 await set_shorts_setting("weekly_video_done", week)
                 _run_job(lambda: weekly_video_job(bot))
@@ -13684,6 +13765,8 @@ async def main() -> None:
             "%(message)s"
         ),
     )
+    for handler in logging.getLogger().handlers:  # ключи из адресов запросов — не в журнал
+        handler.addFilter(_RedactSecrets())
 
     await init_db()
     web_runner = await start_miniapp_server()

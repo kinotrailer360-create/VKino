@@ -888,7 +888,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         "Google." + GRAMMAR + NEWS_RULES + "\n\nОБРАЗЕЦ СТИЛЯ (факты из него не бери):\n" + POST_STYLE
         + '\n\nОтветь только JSON: {"post": "текст поста", "topic": "о чём новость, 3–6 слов", '
         '"film": "название фильма или сериала по-русски или пусто", "film_en": "оригинальное название или пусто", '
-        '"trailer": true, если новость — вышел трейлер или тизер, иначе false, '
+        '"person": "главный человек новости по-русски или пусто", "person_en": "его имя латиницей или пусто", '
+        '"trailer": true или false (true — если новость: вышел трейлер или тизер), '
         '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
     )
     data = await _post_json(key, rules + "\n\nПОСТЫ:\n" + listing)  # Google → сильная модель → фактчекер
@@ -907,6 +908,7 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
             media.append(i)
     return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
+            "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
             "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true"}
 
 
@@ -1721,8 +1723,8 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
         '"outro": ["…"], "stories": [{"headline": "заголовок новости КАПСОМ, до 40 символов", "chapter": "тот же заголовок '
         'обычными буквами для таймкода («Умер Патрик Стюарт»)", "film": "фильм или '
         'сериал по-русски или пусто", "film_en": "оригинальное название или пусто", "person": "главный человек '
-        'новости по-русски или пусто", "person_en": "его имя латиницей или пусто", "mourning": true, если новость '
-        'о смерти, иначе false, "lines": ["…"], "media": [номера постов об этой новости]}]}'
+        'новости по-русски или пусто", "person_en": "его имя латиницей или пусто", "mourning": true или false '
+        '(true — если новость о смерти), "lines": ["…"], "media": [номера постов об этой новости]}]}'
         "\n\nНОВОСТИ НЕДЕЛИ:\n" + listing
     )
     data = await _post_json(key, prompt, verify=False)

@@ -185,7 +185,7 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
             if cached and time.time() - cached[0] < REDDIT_EVERY:
                 raw = cached[1]
             else:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)  # пауза между запросами к Reddit (чаще — 429)
                 try:
                     raw = await _download(session, url)
                     _reddit_cache[url] = (time.time(), raw)

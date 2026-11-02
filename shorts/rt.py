@@ -90,7 +90,7 @@ async def find(title: str, year: str = "", search: Any = None) -> str | None:
         try:
             for r in await search(f"{title} {year} Rotten Tomatoes"):
                 m = URL_RE.search(str(r.get("url") or r.get("link") or ""))
-                if m:
+                if m and await _check(m.group(0).rstrip("/"), title, year):  # чужая страница хуже, чем никакой
                     return m.group(0).rstrip("/")
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: rt web search failed: %s", exc)
@@ -130,11 +130,22 @@ async def find_tv(title: str, season: int, year: str = "", first_year: str = "",
         try:
             for r in await search(f"{title} season {season} Rotten Tomatoes"):
                 m = TV_URL_RE.search(str(r.get("url") or r.get("link") or ""))
-                if m:
+                if m and await _check(f"{BASE}/tv/{m.group(1)}/s{season:02d}", title, ""):
                     return f"{BASE}/tv/{m.group(1)}/s{season:02d}"
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: rt tv web search failed: %s", exc)
     return None
+
+
+async def _check(url: str, title: str, year: str) -> bool:
+    """Страница из веб-поиска действительно о нашем фильме (название и год)."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
+            page = await _get(session, url)
+        return bool(page) and _matches(page, title, year)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: rt check %s failed: %s", url, exc)
+        return False
 
 
 def _num(value: Any) -> int | None:
