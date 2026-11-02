@@ -12554,38 +12554,69 @@ async def send_weekly_digest(bot: Bot) -> int:
     return sent
 
 
-# --- Rotten Tomatoes: что пишут критики и зрители; оповещение, когда сняли эмбарго на рецензии
+# --- Rotten Tomatoes: что пишут критики и зрители о фильмах и сезонах сериалов; оповещение о снятии эмбарго
 
 RT_EVERY = 3 * 3600  # как часто проверять оценки премьер
-RT_CRITICS_MIN = 10  # рецензий — оценка критиков уже что-то значит
+RT_CRITICS_MIN = 10  # рецензий — оценка критиков уже что-то значит (у сезонов сериалов рецензий меньше)
+RT_CRITICS_MIN_TV = 5
+RT_KEY = re.compile(r"(t?)(\d+)(?:s(\d+))?")
+
+
+def _rt_key(item: dict[str, Any]) -> str:
+    """Ключ для кнопок и памяти: «123» — фильм, «t456s2» — 2 сезон сериала."""
+    return f"t{item['id']}s{item['season']}" if item.get("kind") == "tv" else str(item["id"])
+
+
+def _rt_name(item: dict[str, Any]) -> str:
+    return f"{item['title']} — {item['season']} сезон" if item.get("kind") == "tv" else item["title"]
+
+
+async def _rt_item(key: str) -> dict[str, Any] | None:
+    m = RT_KEY.fullmatch(key)
+    if not m:
+        return None
+    if m.group(1):
+        return await shorts_daily.tmdb.tv_season(TMDB_API_KEY, int(m.group(2)), int(m.group(3) or 0))
+    film = await shorts_daily.tmdb.movie(TMDB_API_KEY, int(m.group(2)))
+    return {**film, "kind": "movie"} if film else None
+
+
+async def _rt_premieres(back: int, ahead: int, n_films: int, n_tv: int) -> list[dict[str, Any]]:
+    """Фильмы (премьера в кино США) и сезоны сериалов с премьерой между «сегодня − back» и «+ ahead» дней."""
+    today = datetime.now(MSK).date()
+    since, until = (today - timedelta(days=back)).isoformat(), (today + timedelta(days=ahead)).isoformat()
+    films, seasons = await asyncio.gather(shorts_daily.tmdb.releases(TMDB_API_KEY, since, until, n_films),
+                                          shorts_daily.tmdb.tv_seasons(TMDB_API_KEY, since, until, n_tv),
+                                          return_exceptions=True)
+    out = [{**f, "kind": "movie"} for f in films] if isinstance(films, list) else []
+    return out + (seasons if isinstance(seasons, list) else [])
 
 
 async def rt_menu() -> tuple[str, InlineKeyboardMarkup]:
-    today = datetime.now(MSK).date()
+    today = datetime.now(MSK).date().isoformat()
     try:
-        films = await shorts_daily.tmdb.releases(TMDB_API_KEY, (today - timedelta(days=21)).isoformat(),
-                                                 (today + timedelta(days=30)).isoformat(), 12)
+        items = await _rt_premieres(21, 30, 10, 8)
     except Exception as exc:  # noqa: BLE001
         logging.info("RT menu: tmdb failed: %s", exc)
-        films = []
-    rows = [[_btn(f"{'🆕' if f['date'] <= today.isoformat() else '⏳'} {f['title'][:40]} ({f['date'][8:10]}."
-                  f"{f['date'][5:7]})", f"rt:f:{f['id']}")] for f in films]
+        items = []
+    rows = [[_btn(f"{'📺' if i.get('kind') == 'tv' else '🎬'}{'🆕' if i['date'] <= today else '⏳'} "
+                  f"{_rt_name(i)[:42]} ({i['date'][8:10]}.{i['date'][5:7]})", f"rt:f:{_rt_key(i)}")] for i in items]
     alerts = await shorts_setting("rt_alerts") != "off"
-    rows.append([_btn("✏️ Другой фильм — напишу название", "rt:q")])
+    rows.append([_btn("✏️ Другой фильм или сериал — напишу название", "rt:q")])
     rows.append([_btn("🔕 Не сообщать о снятии эмбарго" if alerts else "🔔 Сообщать о снятии эмбарго",
                       "rt:off" if alerts else "rt:on")])
     return ("🍅 <b>Что пишут критики и зрители</b> — оценки и рецензии с Rotten Tomatoes.\n\n"
-            "Выбери фильм: 🆕 — уже вышел в США, ⏳ — премьера скоро (рецензии появляются, когда снимут эмбарго, "
-            "обычно за несколько дней до премьеры).\n"
-            + ("🔔 Как только критики увидят фильм или появятся оценки зрителей, пришлю уведомление с кнопкой поста."
-               if alerts else "🔕 Уведомления о снятии эмбарго выключены."),
+            "🎬 — фильм, 📺 — сезон сериала; 🆕 — уже вышел, ⏳ — премьера скоро (рецензии появляются, когда "
+            "снимут эмбарго, обычно за несколько дней до премьеры).\n"
+            + ("🔔 Как только критики увидят фильм или сезон, или появятся оценки зрителей, пришлю уведомление с "
+               "кнопкой поста." if alerts else "🔕 Уведомления о снятии эмбарго выключены."),
             InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-def _rt_film_buttons(tmdb_id: int) -> InlineKeyboardMarkup:
+def _rt_film_buttons(key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("🍅 Что пишут критики", f"rt:c:{tmdb_id}")],
-        [_btn("🍿 Что пишут зрители", f"rt:a:{tmdb_id}")]])
+        [_btn("🍅 Что пишут критики", f"rt:c:{key}")],
+        [_btn("🍿 Что пишут зрители", f"rt:a:{key}")]])
 
 
 async def _rt_state() -> dict[str, Any]:
@@ -12596,53 +12627,66 @@ async def _rt_state() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-async def _rt_url(film: dict[str, Any], web: bool = True) -> str | None:
-    """Страница фильма на RT (запоминаем, чтобы не искать каждый раз)."""
-    state = await _rt_state()
-    st = state.get(str(film["id"])) or {}
+async def _rt_find(item: dict[str, Any], web: bool) -> str | None:
+    from shorts import websearch as shorts_websearch
+    search = shorts_websearch.search if web else None
+    if item.get("kind") == "tv":
+        return await shorts_rt.find_tv(item["original"], item["season"], item["year"], item.get("first_year", ""),
+                                       search)
+    return await shorts_rt.find(item["original"], item["year"], search)
+
+
+async def _rt_url(item: dict[str, Any], web: bool = True) -> str | None:
+    """Страница фильма или сезона на RT (запоминаем, чтобы не искать каждый раз)."""
+    key = _rt_key(item)
+    st = (await _rt_state()).get(key) or {}
     if st.get("url"):
         return st["url"]
-    from shorts import websearch as shorts_websearch
-    url = await shorts_rt.find(film["original"], film["year"], shorts_websearch.search if web else None)
+    url = await _rt_find(item, web)
     if url:
         state = await _rt_state()
-        state[str(film["id"])] = {**(state.get(str(film["id"])) or {}), "url": url}
+        state[key] = {**(state.get(key) or {}), "url": url}
         await set_shorts_setting("rt_watch", json.dumps(state))
     return url
 
 
-async def make_rt_post(bot: Bot, chat_id: int, tmdb_id: int, audience: bool = False) -> None:
+async def make_rt_post(bot: Bot, chat_id: int, key: str, audience: bool = False) -> None:
     """Пост «Что пишут критики» (Tomatometer, консенсус, мнения изданий) или «Что говорят зрители»
-    (Popcornmeter, что нравится и нет) по странице фильма на Rotten Tomatoes; без неё — по поиску."""
-    film = await shorts_daily.tmdb.movie(TMDB_API_KEY, tmdb_id)
-    if not film:
-        raise RuntimeError("фильм не нашёлся на TMDB")
-    url = await _rt_url(film)
+    (Popcornmeter, что нравится и нет) о фильме или сезоне сериала по Rotten Tomatoes; без страницы — по поиску."""
+    item = await _rt_item(key)
+    if not item:
+        raise RuntimeError("не нашёл фильм или сериал на TMDB")
+    url = await _rt_url(item)
     data: dict[str, Any] = {}
     if url:
         try:
             data = await shorts_rt.info(url)
         except Exception as exc:  # noqa: BLE001
             logging.info("RT post: %s failed: %s", url, exc)
-    key = "audience" if audience else "critics"
-    have = data.get(key) is not None or bool(data.get(f"{key}_reviews") or data.get(f"{key}_reviews_text"))
-    title = film["title"]
-    material = (f"Фильм: «{title}» ({film['original']}, {film['year']}), премьера в США: {film['date']}.\n"
+    part = "audience" if audience else "critics"
+    have = data.get(part) is not None or bool(data.get(f"{part}_reviews") or data.get(f"{part}_reviews_text"))
+    tv = item.get("kind") == "tv"
+    title = item["title"]
+    about = f"{item['season']} сезоне сериала «{title}»" if tv else f"«{title}»"
+    material = ((f"Сериал: «{title}» ({item['original']}), {item['season']} сезон, премьера сезона: {item['date']}.\n"
+                 if tv else f"Фильм: «{title}» ({item['original']}, {item['year']}), премьера в США: {item['date']}.\n")
                 + (shorts_rt.as_material(data, audience) if data else
                    "Страница Rotten Tomatoes не прочиталась — оценки и мнения найди в Google (Rotten Tomatoes, "
                    "Metacritic, рецензии изданий)."))
     if audience:
-        task = (f"Напиши пост «Что говорят зрители о «{title}»»: заголовок КАПСОМ с эмодзи 🍿 и оценкой зрителей "
+        task = (f"Напиши пост «Что говорят зрители о {about}»: заголовок КАПСОМ с эмодзи 🍿 и оценкой зрителей "
                 "(Popcornmeter на Rotten Tomatoes) и числом оценок; 2–4 строки «✅ …» и «❌ …» — что зрителям "
                 "понравилось и что нет (по отзывам, переведи по смыслу, без спойлеров); сравни с оценкой критиков, "
-                "если она есть (совпали или разошлись); короткий вывод — стоит ли идти. Если оценок зрителей ещё "
-                "нет — так и скажи, цифры не придумывай.")
+                "если она есть (совпали или разошлись); короткий вывод — стоит ли смотреть. Если оценок зрителей "
+                "ещё нет — так и скажи, цифры не придумывай.")
     else:
-        task = (f"Напиши пост «Что пишут критики о «{title}»»: заголовок КАПСОМ с эмодзи 🍅 и рейтингом "
-                "Tomatometer (например «🍅 КРИТИКИ ПОСМОТРЕЛИ «…»: 92% НА ROTTEN TOMATOES»), сколько рецензий; "
-                "консенсус критиков своими словами; 3–4 мнения строками «🗣 Издание: суть в одну фразу» — переведи, "
-                "имена и издания только из материала; что хвалят и что ругают; короткий вывод — стоит ли ждать. "
-                "Без спойлеров. Если рецензий ещё нет (эмбарго) — так и скажи, цифры не придумывай.")
+        task = (f"Напиши пост «Что пишут критики о {about}»: заголовок КАПСОМ с эмодзи 🍅 и рейтингом "
+                f"Tomatometer (например «🍅 КРИТИКИ ПОСМОТРЕЛИ {'2 СЕЗОН «…»' if tv else '«…»'}: 92% НА ROTTEN "
+                "TOMATOES»), сколько рецензий; консенсус критиков своими словами; 3–4 мнения строками «🗣 Издание: "
+                "суть в одну фразу» — переведи, имена и издания только из материала; что хвалят и что ругают"
+                + ("; лучше или хуже прошлых сезонов, если критики об этом пишут" if tv else "")
+                + "; короткий вывод — стоит ли ждать. Без спойлеров. Если рецензий ещё нет (эмбарго) — так и скажи, "
+                "цифры не придумывай.")
     post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, material, search=not have)
     if not post:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
@@ -12650,44 +12694,45 @@ async def make_rt_post(bot: Bot, chat_id: int, tmdb_id: int, audience: bool = Fa
     work.mkdir(parents=True, exist_ok=True)
     try:
         files: list[Path] = []
-        img = await _image(film["poster"] or film["backdrop"], work, "rt")
+        img = await _image(item["poster"] or item["backdrop"], work, "rt")
         if img:
-            score = data.get(key)
+            score = data.get(part)
             parts = [f"Критики {data['critics']}%" if data.get("critics") is not None else "",
                      f"Зрители {data['audience']}%" if data.get("audience") is not None else ""]
             card = await asyncio.to_thread(
                 shorts_postcard.make_post_card, img, title,
                 pill=(("ЗРИТЕЛИ" if audience else "КРИТИКИ"), f"{score}%") if score is not None else None,
-                meta=" · ".join(p for p in parts if p) or film["year"], extra="Rotten Tomatoes")
+                meta=" · ".join(p for p in parts if p) or item["year"], extra="Rotten Tomatoes",
+                episode=f"{item['season']} сезон" if tv else None)
             files = [work / "rt.jpg"]
             card.save(files[0], quality=92)
         ids, kind = await _send_media(bot, chat_id, files, post_caption(post, "#рецензии"))
-        await offer_post(bot, chat_id, ids, kind, f"rt:{'a' if audience else 'c'}:{tmdb_id}",
+        await offer_post(bot, chat_id, ids, kind, f"rt:{'a' if audience else 'c'}:{key}",
                          what="Пост «что говорят зрители» готов" if audience else "Пост «что пишут критики» готов")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 async def rt_watch(bot: Bot) -> None:
-    """Проверка премьер: критики увидели фильм (сняли эмбарго) или появились оценки зрителей — пишем админам."""
+    """Проверка премьер фильмов и сезонов: критики увидели (сняли эмбарго) или появились оценки зрителей —
+    пишем админам."""
     if await shorts_setting("rt_alerts") == "off" or not TMDB_API_KEY:
         return
     today = datetime.now(MSK).date()
-    films = await shorts_daily.tmdb.releases(TMDB_API_KEY, (today - timedelta(days=14)).isoformat(),
-                                             (today + timedelta(days=45)).isoformat(), 20)
+    items = await _rt_premieres(14, 45, 20, 12)
     state, sent = await _rt_state(), 0
-    for film in films:
-        fid = str(film["id"])
-        st = state.get(fid) or {}
+    for item in items:
+        key, tv = _rt_key(item), item.get("kind") == "tv"
+        st = state.get(key) or {}
         if not st.get("url"):
             if st.get("tries", 0) >= 3:
                 continue
             st["tries"] = st.get("tries", 0) + 1
             try:
-                st["url"] = await shorts_rt.find(film["original"], film["year"])
+                st["url"] = await _rt_find(item, web=False)
             except Exception as exc:  # noqa: BLE001
-                logging.info("RT watch: find %s failed: %s", film["original"], exc)
-            state[fid] = st
+                logging.info("RT watch: find %s failed: %s", item["original"], exc)
+            state[key] = st
             if not st.get("url"):
                 continue
         try:
@@ -12695,25 +12740,26 @@ async def rt_watch(bot: Bot) -> None:
         except Exception as exc:  # noqa: BLE001
             logging.info("RT watch: %s failed: %s", st["url"], exc)
             continue
-        first, old = not st.get("seen"), film["date"] < (today - timedelta(days=3)).isoformat()
+        first, old = not st.get("seen"), item["date"] < (today - timedelta(days=3)).isoformat()
         st["seen"] = 1
+        name = escape(_rt_name(item))
+        when = f"премьера{' сезона' if tv else ' в США'} {item['date'][8:10]}.{item['date'][5:7]}"
+        enough = RT_CRITICS_MIN_TV if tv else RT_CRITICS_MIN
         notes: list[tuple[str, str]] = []
-        if sc.get("critics") is not None and (sc.get("critics_count") or RT_CRITICS_MIN) >= RT_CRITICS_MIN \
-                and "c" not in st:
+        if sc.get("critics") is not None and (sc.get("critics_count") or enough) >= enough and "c" not in st:
             st["c"] = sc["critics"]
             if not (first and old):
-                notes.append((f"🍅 <b>Критики посмотрели «{escape(film['title'])}»</b> ({escape(film['original'])}, "
-                              f"премьера в США {film['date'][8:10]}.{film['date'][5:7]}): <b>{sc['critics']}%</b> на "
-                              "Rotten Tomatoes" + (f" ({sc['critics_count']} рецензий)" if sc.get("critics_count")
-                                                   else "") + ". Эмбарго снято — можно сделать пост первыми.",
-                              f"rt:c:{fid}"))
+                notes.append((f"🍅 <b>Критики посмотрели «{name}»</b> ({escape(item['original'])}, {when}): "
+                              f"<b>{sc['critics']}%</b> на Rotten Tomatoes"
+                              + (f" ({sc['critics_count']} рецензий)" if sc.get("critics_count") else "")
+                              + ". Эмбарго снято — можно сделать пост первыми.", f"rt:c:{key}"))
         if sc.get("audience") is not None and "a" not in st:
             st["a"] = sc["audience"]
             if not (first and old):
-                notes.append((f"🍿 <b>Появились оценки зрителей «{escape(film['title'])}»</b>: <b>{sc['audience']}%"
-                              "</b> на Rotten Tomatoes" + (f" (критики — {sc['critics']}%)" if sc.get("critics")
-                                                           is not None else "") + ".", f"rt:a:{fid}"))
-        state[fid] = st
+                notes.append((f"🍿 <b>Появились оценки зрителей «{name}»</b>: <b>{sc['audience']}%</b> на Rotten "
+                              "Tomatoes" + (f" (критики — {sc['critics']}%)" if sc.get("critics") is not None
+                                            else "") + ".", f"rt:a:{key}"))
+        state[key] = st
         for text, data in notes:
             if sent >= 4:
                 break
@@ -12726,7 +12772,7 @@ async def rt_watch(bot: Bot) -> None:
                     await bot.send_message(admin_id, text, reply_markup=markup)
                 except Exception:  # noqa: BLE001
                     pass
-    if len(state) > 300:  # старые фильмы забываем
+    if len(state) > 300:  # старые фильмы и сезоны забываем
         state = dict(list(state.items())[-300:])
     await set_shorts_setting("rt_watch", json.dumps(state))
 
@@ -12741,20 +12787,30 @@ async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     _, kind, arg = ((callback.data or "") + "::").split(":")[:3]
     if kind in ("on", "off"):
         await set_shorts_setting("rt_alerts", None if kind == "on" else "off")
-        await message.answer("🔔 Буду сообщать, когда критики посмотрят премьеру и когда появятся оценки зрителей."
-                             if kind == "on" else "🔕 Уведомления о снятии эмбарго выключены. Включить — 📝 Посты → "
-                             "🍅 Что пишут критики.")
+        await message.answer("🔔 Буду сообщать, когда критики посмотрят премьеру фильма или сезона сериала и когда "
+                             "появятся оценки зрителей." if kind == "on" else
+                             "🔕 Уведомления о снятии эмбарго выключены. Включить — 📝 Посты → 🍅 Что пишут критики.")
         return
     if kind == "q":
         await state.set_state(PostState.rt)
-        await message.answer("✏️ Напиши название фильма — можно по-русски или в оригинале, лучше с годом: "
-                             "<code>Аватар: Огонь и пепел</code> или <code>Avatar: Fire and Ash 2025</code>."
+        await message.answer("✏️ Напиши название фильма или сериала — можно по-русски или в оригинале. Для фильма "
+                             "лучше с годом, для сериала — с номером сезона:\n<code>Аватар: Огонь и пепел</code>\n"
+                             "<code>Avatar: Fire and Ash 2025</code>\n<code>Пацаны 5 сезон</code>\n"
+                             "Без номера сезона возьму новый (если скоро выходит) или последний вышедший."
                              "\n\n<i>Передумал — /cancel</i>")
         return
-    if not arg.isdigit():
+    if not RT_KEY.fullmatch(arg):
         return
     if kind == "f":
-        await message.answer("Что сделать?", reply_markup=_rt_film_buttons(int(arg)))
+        if arg.startswith("t") and "s" not in arg:  # сериал без сезона — текущий сезон
+            item = await _rt_item(arg)
+            if not item:
+                await message.answer("🤷 У этого сериала на TMDB нет сезонов с датами.")
+                return
+            arg = _rt_key(item)
+            await message.answer(f"📺 «{escape(_rt_name(item))}» (премьера сезона {item['date'] or '—'}). "
+                                 "Другой сезон — напиши название с номером через «✏️ Другой фильм или сериал».")
+        await message.answer("Что сделать?", reply_markup=_rt_film_buttons(arg))
         return
     if kind in ("c", "a"):
         if post_lock.locked():
@@ -12767,7 +12823,7 @@ async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         async def rt_job() -> None:
             try:
                 async with post_lock:
-                    await make_rt_post(message.bot, chat_id, int(arg), kind == "a")
+                    await make_rt_post(message.bot, chat_id, arg, kind == "a")
                 await wait.delete()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("RT post failed")
@@ -12778,27 +12834,44 @@ async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(PostState.rt, F.text, ~F.text.startswith("/"))
 async def rt_title(message: Message, state: FSMContext) -> None:
+    """Название фильма или сериала (с годом или номером сезона) → кнопки «критики» и «зрители»."""
     await state.clear()
     query = (message.text or "").strip()[:100]
+    season = re.search(r"(\d{1,2})\s*(?:-?й\s*)?сезон|сезон\s*(\d{1,2})|season\s*(\d{1,2})|\bs(\d{1,2})\b", query, re.I)
     year = re.search(r"\b(19|20)\d{2}\b", query)
-    name = re.sub(r"\b(19|20)\d{2}\b", "", query).strip(" ,()")
+    name = re.sub(r"(\d{1,2})\s*(?:-?й\s*)?сезон\w*|сезон\w*\s*\d{1,2}|season\s*\d{1,2}|\bs\d{1,2}\b|\b(19|20)\d{2}\b",
+                  "", query, flags=re.I).strip(" ,()-—")
     try:
-        found = await shorts_daily.tmdb.search_movie(TMDB_API_KEY, name)
+        films, shows = await asyncio.gather(shorts_daily.tmdb.search_movie(TMDB_API_KEY, name),
+                                            shorts_daily.tmdb.search_tv(TMDB_API_KEY, name))
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"❌ Поиск не удался: <code>{escape(str(exc)[:200])}</code>")
         return
+    n = int(next(g for g in season.groups() if g)) if season else 0
+    if season:  # просили сезон — значит, сериал
+        films = []
     if year:
-        found = sorted(found, key=lambda f: f["year"] != year.group(0))
-    if not found:
-        await message.answer("🤷 Не нашёл такой фильм. Попробуй оригинальное название.")
+        films = sorted(films, key=lambda f: f["year"] != year.group(0))
+    options = ([(f"📺 {s['title'][:38]} ({s['year'] or '—'})" + (f" — {n} сезон" if n else ""),
+                 f"t{s['id']}" + (f"s{n}" if n else "")) for s in shows[:4]]
+               + [(f"🎬 {f['title'][:40]} ({f['year'] or '—'})", str(f["id"])) for f in films[:4]])
+    if not films and shows and n:  # сериал с номером сезона — проверяем, что такой сезон есть
+        item = await _rt_item(f"t{shows[0]['id']}s{n}")
+        if not item and len(shows) == 1:
+            await message.answer(f"🤷 У сериала «{escape(shows[0]['title'])}» на TMDB нет {n} сезона.")
+            return
+        if item and len(shows) == 1:
+            await message.answer(f"📺 «{escape(_rt_name(item))}» (премьера сезона {item['date'] or '—'}). Что сделать?",
+                                 reply_markup=_rt_film_buttons(_rt_key(item)))
+            return
+    if not options:
+        await message.answer("🤷 Не нашёл такой фильм или сериал. Попробуй оригинальное название.")
         return
-    if len(found) == 1 or (year and found[0]["year"] == year.group(0)):
-        f = found[0]
-        await message.answer(f"🎬 «{escape(f['title'])}» ({escape(f['original'])}, {f['year'] or '—'}). Что сделать?",
-                             reply_markup=_rt_film_buttons(f["id"]))
+    if len(options) == 1 and not options[0][1].startswith("t"):
+        await message.answer(f"{options[0][0]}. Что сделать?", reply_markup=_rt_film_buttons(options[0][1]))
         return
-    await message.answer("Какой фильм?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [_btn(f"{f['title'][:40]} ({f['year'] or '—'})", f"rt:f:{f['id']}")] for f in found[:6]]))
+    await message.answer("Что именно?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(text, f"rt:f:{key}")] for text, key in options]))
 
 
 async def growth_loop(bot: Bot) -> None:

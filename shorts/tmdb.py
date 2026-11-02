@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import re
+from datetime import date, timedelta
 from typing import Any
 
 import aiohttp
@@ -341,3 +343,83 @@ async def search_movie(key: str, query: str, n: int = 5) -> list[dict[str, Any]]
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         data = await _get(session, key, "/search/movie", query=query.strip(), language="ru-RU")
     return [_movie_row(r) for r in (data.get("results") or [])[:n] if r.get("id")]
+
+
+TV_SKIP_GENRES = {10763, 10764, 10766, 10767}  # новости, реалити, мыльные оперы, ток-шоу
+
+
+def _season_row(show: dict[str, Any], season: dict[str, Any]) -> dict[str, Any]:
+    n = int(season.get("season_number") or 0)
+    poster = season.get("poster_path") or show.get("poster_path")
+    return {"id": int(show["id"]), "season": n, "kind": "tv",
+            "title": str(show.get("name") or show.get("original_name") or ""),
+            "original": str(show.get("original_name") or show.get("name") or ""),
+            "date": str(season.get("air_date") or ""), "year": str(season.get("air_date") or "")[:4],
+            "first_year": str(show.get("first_air_date") or "")[:4],
+            "poster": f"{IMG}w780{poster}" if poster else None,
+            "backdrop": f"{IMG}w1280{show['backdrop_path']}" if show.get("backdrop_path") else None,
+            "popularity": float(show.get("popularity") or 0)}
+
+
+def current_season(show: dict[str, Any], today: str) -> dict[str, Any] | None:
+    """Сезон, о котором сейчас пишут: новый, если премьера в ближайшие 30 дней, иначе последний вышедший."""
+    seasons = sorted((s for s in show.get("seasons") or [] if (s.get("season_number") or 0) > 0 and s.get("air_date")),
+                     key=lambda s: s["air_date"])
+    if not seasons:
+        return None
+    soon_limit = (date.fromisoformat(today) + timedelta(days=30)).isoformat()
+    soon = [s for s in seasons if today < s["air_date"] <= soon_limit]
+    aired = [s for s in seasons if s["air_date"] <= today]
+    return soon[0] if soon else (aired[-1] if aired else seasons[0])
+
+
+async def tv_details(session: aiohttp.ClientSession, key: str, tv_id: int) -> dict[str, Any]:
+    return await _get(session, key, f"/tv/{tv_id}", language="ru-RU")
+
+
+async def tv_seasons(key: str, since: str, until: str, n: int = 10) -> list[dict[str, Any]]:
+    """Популярные сериалы, у которых новый сезон стартует (или стартовал) между датами: по строке на сезон."""
+    if not key:
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
+        data = await _get(session, key, "/discover/tv", language="ru-RU", sort_by="popularity.desc",
+                          without_genres="10763,10764,10766,10767", **{"air_date.gte": since, "air_date.lte": until,
+                                                                       "vote_count.gte": 30})
+        shows = [r for r in (data.get("results") or [])[:30]
+                 if r.get("id") and not set(r.get("genre_ids") or []) & TV_SKIP_GENRES]
+        details = await asyncio.gather(*(tv_details(session, key, int(r["id"])) for r in shows),
+                                       return_exceptions=True)
+    out = []
+    for show in details:
+        if isinstance(show, BaseException) or not show.get("id"):
+            continue
+        for season in show.get("seasons") or []:
+            if (season.get("season_number") or 0) > 0 and since <= str(season.get("air_date") or "") <= until:
+                out.append(_season_row(show, season))
+    return out[:n]
+
+
+async def tv_season(key: str, tv_id: int, season: int = 0) -> dict[str, Any] | None:
+    """Сезон сериала; season=0 — текущий (скоро выходит или последний вышедший)."""
+    if not key:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        show = await tv_details(session, key, tv_id)
+    if not show.get("id"):
+        return None
+    if season:
+        found = next((s for s in show.get("seasons") or [] if s.get("season_number") == season), None)
+    else:
+        found = current_season(show, date.today().isoformat())
+    return _season_row(show, found) if found else None
+
+
+async def search_tv(key: str, query: str, n: int = 5) -> list[dict[str, Any]]:
+    if not key or not query.strip():
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _get(session, key, "/search/tv", query=query.strip(), language="ru-RU")
+    return [{"id": int(r["id"]), "title": str(r.get("name") or r.get("original_name") or ""),
+             "year": str(r.get("first_air_date") or "")[:4], "kind": "tv"}
+            for r in (data.get("results") or [])[:n] if r.get("id")
+            and not set(r.get("genre_ids") or []) & TV_SKIP_GENRES]
