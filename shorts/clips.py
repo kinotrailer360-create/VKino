@@ -110,8 +110,33 @@ def _norm(text: object) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text)).strip()
 
 
-async def rutube_trailer(titles: list[str], year: int | None = None) -> dict | None:
+def _season_in(title: str, n: int) -> bool:
+    """В названии ролика есть именно этот сезон: «3 сезон», «3-й сезон», «сезон 3», «season 3», «S03»."""
+    import re
+    return bool(re.search(rf"(?<!\d){n}\s*(?:-?(?:й|го|ий))?\s*сезон|сезон\w*\s*{n}(?!\d)|season\s*{n}(?!\d)|"
+                          rf"\bs0?{n}(?!\d)", title))
+
+
+def _age_days(v: dict) -> float | None:
+    from datetime import datetime, timezone
+    for key in ("publication_ts", "created_ts"):
+        raw = str(v.get(key) or "")
+        if raw:
+            try:
+                ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+            except ValueError:
+                continue
+    return None
+
+
+async def rutube_trailer(titles: list[str], year: int | None = None, season: int | None = None,
+                         fresh_days: float | None = None) -> dict | None:
     """Лучший трейлер на Rutube: название фильма + «трейлер», не платный, не 18+, 30–400 с.
+    season — нужен трейлер именно этого сезона (в названии ролика есть номер сезона; со 2-го сезона без
+    номера не берём — это может быть трейлер первого). fresh_days — ролик выложен не раньше (новость о
+    только что вышедшем трейлере: старый трейлер не подходит).
 
     Возвращает {"url", "duration", "title"} или None. Поиск работает не из всех стран:
     с серверов в США Rutube отдаёт пустой список, из Европы — нормально.
@@ -122,8 +147,9 @@ async def rutube_trailer(titles: list[str], year: int | None = None) -> dict | N
     if not names:
         return None
     timeout = aiohttp.ClientTimeout(total=15)
+    query = f"{titles[0]} {season} сезон трейлер" if season and season > 1 else f"{titles[0]} трейлер"
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(RUTUBE_SEARCH, params={"query": f"{titles[0]} трейлер", "format": "json"},
+        async with session.get(RUTUBE_SEARCH, params={"query": query, "format": "json"},
                                headers={"accept": "application/json"}) as resp:
             data = await resp.json(content_type=None)
 
@@ -143,6 +169,11 @@ async def rutube_trailer(titles: list[str], year: int | None = None) -> dict | N
                 continue  # перед названием что-то ещё — скорее всего это другой фильм или мультфильм
         if not any(w in title for w in TRAILER_WORDS):
             continue
+        if season and season > 1 and not _season_in(title, season):
+            continue  # трейлер другого сезона (или непонятно какого)
+        age = _age_days(v)
+        if fresh_days is not None and age is not None and age > fresh_days:
+            continue  # старый ролик, а новость — о новом трейлере
         score = 1.0
         score += 3 if v.get("is_official") else 0
         score += 1 if "русск" in title or "дубл" in title else 0

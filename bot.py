@@ -9457,10 +9457,25 @@ PUBLISH_HELP = ("Добавь бота в администраторы кана�
                 "(канал → Изменить → Администраторы → Добавить администратора → найди бота).")
 
 
-async def _rutube_post_trailer(titles: list[str], work: Path) -> Path | None:
-    """Трейлер фильма со звуком с Rutube для поста (до 3 минут, до 50 МБ); None — не нашёлся или не скачался."""
+def _season_of(text: str) -> int | None:
+    """Номер сезона из текста новости: «3-го сезона», «третий сезон», «сезон 2», «season 4»."""
+    words = {"втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6, "седьм": 7, "восьм": 8, "девят": 9, "десят": 10}
+    t = str(text or "").lower()
+    m = re.search(r"(\d{1,2})\s*-?\s*(?:го|й|ий|ого)?\s+сезон|сезон\w*\s+(\d{1,2})\b|season\s+(\d{1,2})", t)
+    if m:
+        return int(next(g for g in m.groups() if g))
+    m = re.search(r"\b(втор|трет|четв|пят|шест|седьм|восьм|девят|десят)\w*\s+сезон", t)
+    return words[m.group(1)] if m else None
+
+
+async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
+                               fresh: bool = False) -> Path | None:
+    """Трейлер фильма со звуком с Rutube для поста (до 3 минут, до 50 МБ); None — не нашёлся или не скачался.
+    season — трейлер именно этого сезона; fresh — новость о только что вышедшем трейлере (ролик не старше
+    двух недель): иначе к «трейлеру 3-го сезона» попадал старый трейлер первого."""
     try:
-        found = await asyncio.wait_for(shorts_clips.rutube_trailer([t for t in titles if t]), 20)
+        found = await asyncio.wait_for(shorts_clips.rutube_trailer(
+            [t for t in titles if t], season=season, fresh_days=14 if fresh else None), 20)
         if not found:
             return None
         return await asyncio.wait_for(shorts_clips.download_trailer(found["url"], work / "trailer.mp4"), 300)
@@ -9567,7 +9582,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             with_media = [p for p in same if p.get("video")]
             # 2) новость о трейлере — сам трейлер со звуком с Rutube
             if not with_media and res["trailer"] and res["film"]:
-                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work)
+                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work,
+                                                     _season_of(res["post"]), fresh=True)
                 with_media = [{"file": trailer}] if trailer else []
             # 3) фото из постов об этой новости
             with_media = with_media or [p for p in same if p.get("image")]
@@ -11715,7 +11731,8 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
                 files = await shorts_tgsearch.download_media(
                     [{"video": s["video"]} for s in sources if s.get("video")], work, limit=1, prefix="link")
             if not files and res["trailer"] and res["film"]:
-                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work)
+                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work,
+                                                     _season_of(res["post"]), fresh=True)
                 files = [trailer] if trailer else []
             if not files:
                 files = await shorts_tgsearch.download_media(

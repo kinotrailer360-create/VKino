@@ -34,6 +34,8 @@ ACCENT = (255, 184, 28)
 INK = (14, 14, 18)
 CARD_SEC = 2.4  # заставка «Новость 3» между новостями
 PREVIEW_MB = 46  # превью для Telegram (бот может отправить до 50 МБ)
+INTRO_CLIP = ASSETS / "weekly_intro.mp4"  # анимированные заставка и концовка (исходник — tools/intro, Remotion)
+OUTRO_CLIP = ASSETS / "weekly_outro.mp4"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://t.me/KinoMir360)"}
 
 
@@ -286,6 +288,15 @@ async def _segment(work: Path, name: str, slides: list[tuple[Path, float]], over
     return out
 
 
+async def _brand_clip(src: Path, out: Path) -> Path:
+    """Готовый ролик (заставка или концовка) в те же параметры, что у сегментов, — чтобы склеить без
+    перекодирования всего выпуска."""
+    await _run("ffmpeg", "-v", "error", "-y", "-i", str(src), "-vf", f"scale={W}:{H},fps={FPS},format=yuv420p",
+               "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k",
+               "-ar", "48000", "-ac", "2", str(out))
+    return out
+
+
 def _even_slides(paths: list[Path], starts: list[float], total: float) -> list[tuple[Path, float]]:
     """Картинки по фразам: смена картинки на начале фразы, примерно поровну (каждая — не меньше 3 с)."""
     if not paths:
@@ -343,8 +354,14 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     intro_card = work / "intro_card.jpg"
     slide_image(title_card(first_img, "KINOMIR360", "НОВОСТИ КИНО ЗА НЕДЕЛЮ", date_label)).save(intro_card,
                                                                                             quality=90)
-    segments.append(await _segment(work, "intro", [(intro_card, dur + 0.4)], None, voice, dur + 0.4))
     chapters.append((0.0, "Вступление"))
+    if INTRO_CLIP.exists():  # анимированная заставка с логотипом — самое начало выпуска
+        try:
+            segments.append(await _brand_clip(INTRO_CLIP, work / "brand_intro.mp4"))
+            clock += await _duration(segments[-1])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: weekly intro clip skipped: %s", exc)
+    segments.append(await _segment(work, "intro", [(intro_card, dur + 0.4)], None, voice, dur + 0.4))
     clock += dur + 0.4
 
     whoosh = ASSETS / "whoosh.wav"
@@ -375,8 +392,14 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     outro_card = work / "outro_card.jpg"
     slide_image(title_card(first_img, "ПОДПИШИСЬ — НОВЫЙ ВЫПУСК КАЖДОЕ ВОСКРЕСЕНЬЕ", "СПАСИБО, ЧТО СМОТРИТЕ!",
                            "YouTube @kinomir360 · Telegram @KinoMir360")).save(outro_card, quality=90)
-    segments.append(await _segment(work, "outro", [(outro_card, dur + 2.0)], None, voice, dur + 2.0))
+    tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
+    segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail))
     chapters.append((clock, "Итоги и вопрос зрителям"))
+    if OUTRO_CLIP.exists():  # «Спасибо, что смотрите!» и кнопка «Подписаться»
+        try:
+            segments.append(await _brand_clip(OUTRO_CLIP, work / "brand_outro.mp4"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: weekly outro clip skipped: %s", exc)
 
     await daily._progress(88, "Склейка и музыка")
     body = work / "body.mp4"
