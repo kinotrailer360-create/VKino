@@ -48,11 +48,18 @@ def nitter() -> str:
     return os.getenv("NITTER_URL", "").strip().rstrip("/")
 
 
+def rsshub() -> str:
+    """Свой RSSHub (в docker-compose — сервис rsshub, включается COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN)."""
+    return os.getenv("RSSHUB_URL", "").strip().rstrip("/")
+
+
 def feed_url(entry: str) -> str | None:
     """Адрес ленты: x:Имя → RSS аккаунта через Nitter/RSSHub (если задан NITTER_URL), иначе как есть."""
     entry = entry.strip()
     m = re.fullmatch(r"(?:x:|@|https?://(?:www\.)?(?:x|twitter)\.com/)@?(\w{1,30})/?", entry, re.I)
     if m:
+        if rsshub():
+            return f"{rsshub()}/twitter/user/{m.group(1)}"
         return f"{nitter()}/{m.group(1)}/rss" if nitter() else None
     return entry if entry.startswith("http") else None
 
@@ -67,6 +74,8 @@ def label(entry: str) -> str:
     if "reddit.com" in url.netloc and sub:
         return f"Reddit r/{sub.group(1)}"
     host = url.netloc.removeprefix("www.")
+    if "/twitter/user/" in url.path:
+        return f"X @{url.path.rstrip('/').rsplit('/', 1)[1]}"
     if "nitter" in host or (nitter() and entry.startswith(nitter())):  # готовая ссылка Nitter: /Имя/rss
         return f"X @{url.path.strip('/').split('/')[0]}"
     return host.split(".")[0].capitalize() if host else entry[:30]
@@ -162,12 +171,15 @@ async def check(feeds: list[str]) -> list[tuple[str, int | str]]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
         for entry in feeds:
             if not feed_url(entry):
-                out.append((entry, "для X нужен NITTER_URL или RSS-ссылка (rss.app)"))
+                out.append((entry, "X не подключён: нужен RSSHub (COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN в .env) "
+                                   "или RSS-ссылка rss.app"))
                 continue
             if "reddit.com" in entry:
                 await asyncio.sleep(1.5)
             try:
                 out.append((entry, len(await _fetch(session, entry, since, 50))))
             except Exception as exc:  # noqa: BLE001
-                out.append((entry, f"{type(exc).__name__}: {str(exc)[:80]}"))
+                hint = (" — RSSHub не запущен или нет TWITTER_AUTH_TOKEN" if rsshub() and
+                        str(feed_url(entry)).startswith(rsshub()) else "")
+                out.append((entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}"))
     return out
