@@ -95,6 +95,20 @@ VIDEO_PROVIDER_API_TOKEN = os.getenv(
 ).strip()
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+
+
+_SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|AUTH", re.I)
+_SECRET_QS = re.compile(r"((?:api_?key|key|token|access_token|secret|auth)=)[^&\s'\"]+", re.I)
+
+
+def _safe_err(exc: BaseException | str) -> str:
+    """Текст ошибки для Telegram без ключей: aiohttp кладёт в ошибку полный адрес запроса, а у TMDB и других
+    ключ стоит в адресе (?api_key=…). Вырезаем значения всех секретов из .env и параметры-ключи."""
+    text = str(exc) or type(exc).__name__ if isinstance(exc, BaseException) else str(exc)
+    for name, value in os.environ.items():
+        if value and len(value) >= 8 and _SECRET_ENV.search(name):
+            text = text.replace(value, "***")
+    return _SECRET_QS.sub(r"\1***", text)
 # основной ключ Gemini; запасные (GEMINI_API_KEY_2, _3 — с других аккаунтов Google) shorts.ai берёт сам,
 # когда у основного кончается лимит
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GEMINI_API_KEY_2", "")
@@ -6683,7 +6697,7 @@ async def rutube_debug(
         await message.answer(
             "❌ Rutube недоступен с сервера:\n"
             f"<code>{escape(type(exc).__name__)}: "
-            f"{escape(str(exc)[:300])}</code>"
+            f"{escape(_safe_err(exc)[:300])}</code>"
         )
         return
 
@@ -6759,7 +6773,7 @@ async def broadcast(
             "Символы &lt; &gt; &amp; пиши как "
             "<code>&amp;lt;</code> <code>&amp;gt;</code> "
             "<code>&amp;amp;</code>.\n\n"
-            f"<code>{escape(str(exc))}</code>"
+            f"<code>{escape(_safe_err(exc))}</code>"
         )
         return
 
@@ -6897,7 +6911,7 @@ async def fast_feeds() -> list[str]:
         feeds = json.loads(raw) if raw else None
     except ValueError:
         feeds = None
-    return feeds if isinstance(feeds, list) and feeds else list(shorts_fast.DEFAULT_FEEDS)
+    return feeds if isinstance(feeds, list) else list(shorts_fast.DEFAULT_FEEDS)  # [] — автор удалил все
 
 
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
@@ -7066,7 +7080,7 @@ async def shorts_daily_loop(
                             await bot.send_message(
                                 admin_id,
                                 "❌ Ежедневный шортс не собрался:\n"
-                                f"<code>{escape(str(exc)[-700:])}</code>\n\n"
+                                f"<code>{escape(_safe_err(exc)[-700:])}</code>\n\n"
                                 "Попробуй вручную: /short",
                             )
                         except Exception:
@@ -7130,7 +7144,7 @@ async def start_short(message: Message, theme: str) -> None:
                 pass
             await message.answer(
                 "❌ Шортс не собрался:\n"
-                f"<code>{escape(str(exc)[-700:])}</code>"
+                f"<code>{escape(_safe_err(exc)[-700:])}</code>"
             )
 
     task = asyncio.create_task(job())
@@ -7204,7 +7218,7 @@ async def fast_command(message: Message) -> None:
         return
     if action == "del" and arg.isdigit() and 1 <= int(arg) <= len(feeds):
         removed = feeds.pop(int(arg) - 1)
-        await set_shorts_setting("fast_feeds", json.dumps(feeds) if feeds else None)
+        await set_shorts_setting("fast_feeds", json.dumps(feeds))  # пустой список — пусто, а не стандартный
         await message.answer(f"✅ Удалил: <code>{escape(removed[:90])}</code>")
         return
     if action == "default":
@@ -7361,7 +7375,7 @@ async def trailer_sources(item: dict[str, Any]) -> tuple[list[tuple[str, str]], 
             notes.append(f"Rutube: HTTP {status}, результатов {len(results)}, подходящих нет ({top})")
     except Exception as exc:
         logging.exception("Rutube trailer search failed")
-        notes.append(f"Rutube: поиск не удался ({type(exc).__name__}: {str(exc)[:120]})")
+        notes.append(f"Rutube: поиск не удался ({type(exc).__name__}: {_safe_err(exc)[:120]})")
     return sources, notes
 
 
@@ -7396,7 +7410,7 @@ async def trailer_action(message: Message, query: str) -> None:
         except Exception as exc:
             logging.exception("Clip link test failed for %s", query)
             await message.answer(
-                f"❌ <code>{escape(type(exc).__name__)}: {escape(str(exc)[:300])}</code>",
+                f"❌ <code>{escape(type(exc).__name__)}: {escape(_safe_err(exc)[:300])}</code>",
                 disable_web_page_preview=True,
             )
         finally:
@@ -7406,7 +7420,7 @@ async def trailer_action(message: Message, query: str) -> None:
     try:
         found = await kp.search(query, limit=1)
     except Exception as exc:
-        await message.answer(f"❌ Поиск не удался: <code>{escape(str(exc)[:200])}</code>")
+        await message.answer(f"❌ Поиск не удался: <code>{escape(_safe_err(exc)[:200])}</code>")
         return
     if not found:
         await message.answer("Фильм не найден.")
@@ -7423,7 +7437,7 @@ async def trailer_action(message: Message, query: str) -> None:
             report.append(f"✅ {name}")
         except Exception as exc:
             logging.exception("Clip test failed for %s", url)
-            report.append(f"❌ {name}: <code>{escape(type(exc).__name__)}: {escape(str(exc)[:250])}</code>")
+            report.append(f"❌ {name}: <code>{escape(type(exc).__name__)}: {escape(_safe_err(exc)[:250])}</code>")
         finally:
             out.unlink(missing_ok=True)
     await message.answer("\n".join(report), disable_web_page_preview=True)
@@ -7472,7 +7486,7 @@ async def ai_status_action(message: Message) -> None:
         for name, ok, info in await shorts_ai.probe(GEMINI_API_KEY):
             rows.append(f"   {'✅' if ok else '❌'} {escape(name)}: {escape(info)}")
     except Exception as exc:
-        rows.append(f"   ❌ проверка не удалась: {escape(str(exc)[:200])}")
+        rows.append(f"   ❌ проверка не удалась: {escape(_safe_err(exc)[:200])}")
     await wait.delete()
     if not shorts_ai.BEAT_KEY:
         rows.append("3. BeatAPI: нет переменной BEAT_API_KEY ❌")
@@ -7486,7 +7500,7 @@ async def ai_status_action(message: Message) -> None:
                         f"   модель: <code>{escape(st['model'])}</code>\n"
                         f"   бесплатных моделей: {len(free)}{listing}")
         except Exception as exc:
-            rows.append(f"3. BeatAPI: ❌ {escape(str(exc)[:300])}")
+            rows.append(f"3. BeatAPI: ❌ {escape(_safe_err(exc)[:300])}")
         await wait.delete()
     await message.answer("\n".join(rows))
 
@@ -7552,7 +7566,7 @@ async def clone_action(message: Message, media: Any) -> None:
         clone = await shorts_lumean.create_clone(buf.getvalue(), f"KinoMir360 {datetime.now(MSK):%d.%m %H:%M}")
     except Exception as exc:
         logging.exception("Voice clone failed")
-        await message.answer(f"❌ Не получилось отправить голос на клонирование: <code>{escape(str(exc)[:400])}</code>")
+        await message.answer(f"❌ Не получилось отправить голос на клонирование: <code>{escape(_safe_err(exc)[:400])}</code>")
         return
     await message.answer("⏳ Голос отправлен на клонирование. Обычно это несколько минут — напишу, когда будет готов.")
 
@@ -7739,7 +7753,7 @@ async def voice_list_action(message: Message, gender: str) -> tuple[str, InlineK
         voices = await shorts_lumean.library(gender)
     except Exception as exc:
         logging.exception("Voice library failed")
-        await message.answer(f"❌ Не получилось загрузить голоса: <code>{escape(str(exc)[:300])}</code>")
+        await message.answer(f"❌ Не получилось загрузить голоса: <code>{escape(_safe_err(exc)[:300])}</code>")
         return None
     rows = [[_btn(f"▶️ {_voice_label(v)}", f"sh:vp:{v['voice_id']}") for v in voices[k:k + 2]]
             for k in range(0, len(voices), 2)]
@@ -7759,7 +7773,7 @@ async def voice_preview_action(message: Message, voice_id: str) -> None:
             data = await shorts_lumean.preview(str(voice["preview_url"]))
     except Exception as exc:
         logging.exception("Voice preview failed")
-        await message.answer(f"❌ Не получилось загрузить образец: <code>{escape(str(exc)[:300])}</code>")
+        await message.answer(f"❌ Не получилось загрузить образец: <code>{escape(_safe_err(exc)[:300])}</code>")
         return
     name = _voice_label(voice) if voice else voice_id
     about = escape(str((voice or {}).get("description") or "")[:300])
@@ -7998,7 +8012,7 @@ async def download_action(message: Message, url: str) -> None:
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Video download failed: %s", url)
-            await wait.edit_text(f"❌ Не скачалось: <code>{escape(str(exc)[-400:])}</code>")
+            await wait.edit_text(f"❌ Не скачалось: <code>{escape(_safe_err(exc)[-400:])}</code>")
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -8123,7 +8137,7 @@ async def music_make_job(message: Message, status: Message, moods: list[str]) ->
             done.append(label)
         except Exception as exc:
             logging.exception("Shorts: music for %s failed", mood)
-            failed.append(f"{label}: {escape(str(exc)[:200])}")
+            failed.append(f"{label}: {escape(_safe_err(exc)[:200])}")
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -8285,7 +8299,7 @@ async def review_generate(message: Message, state: FSMContext, notes: str) -> No
         script = await shorts_review.write_script(film, notes, GEMINI_API_KEY)
     except Exception as exc:
         logging.exception("Review script failed")
-        await wait.edit_text(f"❌ Сценарий не написался: <code>{escape(str(exc)[:400])}</code>",
+        await wait.edit_text(f"❌ Сценарий не написался: <code>{escape(_safe_err(exc)[:400])}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("🔄 Ещё раз", "rv:redo")], [_btn("❌ Отмена", "rv:cancel")]]))
         return
@@ -8368,7 +8382,7 @@ async def start_review(message: Message, script: dict[str, Any], media: list[dic
                 await status.edit_text("❌ Сборка остановилась — причина ниже")
             except TelegramBadRequest:
                 pass
-            await message.answer(f"❌ Обзор не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+            await message.answer(f"❌ Обзор не собрался:\n<code>{escape(_safe_err(exc)[-700:])}</code>")
 
     task = asyncio.create_task(job())
     shorts_jobs.add(task)
@@ -8540,7 +8554,7 @@ async def facts_condense(message: Message, state: FSMContext) -> None:
         facts = await shorts_ai.condense_facts(GEMINI_API_KEY, data["fx_title"], data["fx_text"])
     except Exception as exc:
         logging.exception("Facts condense failed")
-        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("🔄 Ещё раз", "fx:redo")], [_btn("❌ Отмена", "fx:cancel")]]))
         return
@@ -8565,7 +8579,7 @@ async def facts_find(message: Message, state: FSMContext) -> None:
         new = await shorts_daily.find_film(kp._get, data["fx_title"], upcoming=True)
     except Exception as exc:
         logging.exception("Facts film search failed")
-        await message.answer(f"❌ Поиск на Кинопоиске не удался: <code>{escape(str(exc)[:300])}</code>")
+        await message.answer(f"❌ Поиск на Кинопоиске не удался: <code>{escape(_safe_err(exc)[:300])}</code>")
         return
     if not old and not new:
         # на Кинопоиске так не называется — ИИ ищет настоящее название в интернете и Telegram-каналах
@@ -8606,7 +8620,7 @@ async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | 
         if film is None:  # «Ещё раз» — тот же фильм
             film = await kp._get(f"/movie/{int(str(data['fx_film'])[3:])}")
     except Exception as exc:
-        await message.answer(f"❌ Не получилось: <code>{escape(str(exc)[:300])}</code>")
+        await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
         return
     rumors = shorts_daily.is_upcoming(film)
     film = shorts_daily.renamed(film, data.get("fx_display") or "")
@@ -8638,7 +8652,7 @@ async def facts_web(message: Message, state: FSMContext, film: dict[str, Any] | 
     except Exception as exc:
         ticker.cancel()
         logging.exception("Facts web search failed")
-        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("🔄 Ещё раз", "fx:redo")], [_btn("📝 Вставлю свой текст", "fx:own")],
                                  [_btn("❌ Отмена", "fx:cancel")]]))
@@ -8802,7 +8816,7 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         try:
             film = await kp._get(f"/movie/{int(action[5:])}")
         except Exception as exc:
-            await message.answer(f"❌ Кинопоиск не ответил: <code>{escape(str(exc)[:300])}</code>")
+            await message.answer(f"❌ Кинопоиск не ответил: <code>{escape(_safe_err(exc)[:300])}</code>")
             return
         await facts_web(message, state, film)
     elif action == "redo" and data.get("fx_mode") == "review":
@@ -8851,7 +8865,7 @@ async def facts_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                     await status.edit_text("❌ Сборка остановилась — причина ниже")
                 except TelegramBadRequest:
                     pass
-                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(_safe_err(exc)[-700:])}</code>")
 
         task = asyncio.create_task(job())
         shorts_jobs.add(task)
@@ -8974,7 +8988,7 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
     except Exception as exc:
         logging.exception("Custom post parsing failed")
         await wait.edit_text(f"❌ Не получилось разобрать {'картинки' if images else 'текст'}: "
-                             f"<code>{escape(str(exc)[:300])}</code>\n\n" + CUSTOM_HELP)
+                             f"<code>{escape(_safe_err(exc)[:300])}</code>\n\n" + CUSTOM_HELP)
         await state.set_state(CustomState.text)
         return
     await wait.delete()
@@ -9064,7 +9078,7 @@ async def holiday_short(message: Message, state: FSMContext, key: str) -> None:
                 ids.append(int(f["id"]))
     except Exception as exc:  # noqa: BLE001
         logging.exception("Holiday short pick failed")
-        await wait.edit_text(f"❌ Не получилось подобрать фильмы: <code>{escape(str(exc)[:300])}</code>")
+        await wait.edit_text(f"❌ Не получилось подобрать фильмы: <code>{escape(_safe_err(exc)[:300])}</code>")
         return
     await wait.delete()
     if len(ids) < shorts_daily.CUSTOM_MIN:
@@ -9092,7 +9106,7 @@ async def start_custom(message: Message, state: FSMContext, title: str, ids: lis
                 await status.edit_text("❌ Сборка остановилась — причина ниже")
             except TelegramBadRequest:
                 pass
-            await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+            await message.answer(f"❌ Шортс не собрался:\n<code>{escape(_safe_err(exc)[-700:])}</code>")
 
     task = asyncio.create_task(job())
     shorts_jobs.add(task)
@@ -9222,7 +9236,7 @@ async def custom_video(message: Message, state: FSMContext) -> None:
         found = await shorts_copycat.extract(src, work, GEMINI_API_KEY)
     except Exception as exc:
         logging.exception("Copycat extraction failed")
-        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>")
         return
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -9461,9 +9475,17 @@ def _season_of(text: str) -> int | None:
     """Номер сезона из текста новости: «3-го сезона», «третий сезон», «сезон 2», «season 4»."""
     words = {"втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6, "седьм": 7, "восьм": 8, "девят": 9, "десят": 10}
     t = str(text or "").lower()
-    m = re.search(r"(\d{1,2})\s*-?\s*(?:го|й|ий|ого)?\s+сезон|сезон\w*\s+(\d{1,2})\b|season\s+(\d{1,2})", t)
-    if m:
-        return int(next(g for g in m.groups() if g))
+    for m in re.finditer(r"(\d{1,2})\s*-?\s*(?:го|й|ий|ого)?\s+сезон(\w*)|сезон\w*\s+(\d{1,2})\b|"
+                         r"season\s+(\d{1,2})", t):
+        if m.group(1):
+            before = t[max(0, m.start() - 12):m.start()]
+            # «продлили на 2 сезона», «после 5 сезонов», «уже 3 сезона» — это число сезонов, а не номер
+            if m.group(2) in ("ов",) or re.search(r"\b(на|после|из|все|всех|уже|ещё|еще|спустя|за)\s*$", before):
+                continue
+            if m.group(2) == "а" and not re.search(r"-?\s*(?:го|й|ий|ого)\b", m.group(0)) and \
+                    re.search(r"\b(на|после|из|уже|ещё|еще|за)\b", before):
+                continue
+        return int(next(g for g in (m.group(1), m.group(3), m.group(4)) if g))
     m = re.search(r"\b(втор|трет|четв|пят|шест|седьм|восьм|девят|десят)\w*\s+сезон", t)
     return words[m.group(1)] if m else None
 
@@ -9495,7 +9517,7 @@ def _sources_note(posts: list[dict[str, Any]]) -> str:
 
 _STOP_STEMS = {"фильм", "сериа", "котор", "также", "перво", "будет", "сезон", "студи", "режис", "трейл", "премь",
                "прока", "релиз", "покаж", "снима", "получ", "стане", "сообщ", "расск", "объяв", "верну", "собра",
-               "новог", "новый", "новая", "новые", "котор", "тольк", "после", "сейча", "больш", "долла", "милли",
+               "новог", "новый", "новая", "новые", "тольк", "после", "сейча", "больш", "долла", "милли",
                "зрите", "истор", "росси", "недел", "сегод", "главн", "вышел", "выйде", "выход", "канал", "подпи",
                "перес", "друго", "другу", "этого", "своей", "своих", "всего", "можно", "очень", "когда", "через"}
 _STOP_EN = {"this", "that", "with", "from", "have", "will", "their", "they", "film", "movie", "series", "first",
@@ -9541,7 +9563,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         fresh = [p for p in posts if p["url"] not in used][:30 if mode == "tg" else 20]
         if mode != "tg":
             try:
-                fast = await asyncio.wait_for(shorts_fast.latest(await fast_feeds()), 60)
+                fast = await shorts_fast.latest(await fast_feeds(), timeout=50)
             except Exception as exc:  # noqa: BLE001
                 logging.info("Tg post: fast sources failed: %s", exc)
                 fast = []
@@ -9572,7 +9594,16 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         # и только если в источнике есть те же имена, названия или цифры, что в готовом посте: ИИ бывает
         # называет номер чужого поста (в посте о Warner Bros. оказалось видео про Zelda)
         about = _key_tokens(" ".join([res["post"], res["film"], res["film_en"]]))
-        same = [p for p in same if len(about & _key_tokens(p["text"])) >= 2]
+        about_en = _key_tokens(res["film_en"]) | {t for t in about if t.isdigit() or t.isascii()}
+
+        def related(p: dict[str, Any]) -> bool:
+            words = _key_tokens(p["text"])
+            if p.get("lang") == "en":  # пост уже по-русски, имена в нём — кириллицей: сверяем с латиницей и числами
+                hits = about_en & words
+                return any(not t.isdigit() for t in hits) or len(hits) >= 2
+            return len(about & words) >= 2
+
+        same = [p for p in same if related(p)]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -9840,7 +9871,7 @@ async def _image(url: str | None, work: Path, prefix: str) -> Image.Image | None
         return None
     got = await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix=prefix)
     try:
-        return Image.open(got[0]).convert("RGB") if got else None
+        return await asyncio.to_thread(lambda: Image.open(got[0]).convert("RGB")) if got else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -10088,7 +10119,7 @@ async def birthday_buttons(callback: CallbackQuery) -> None:
         try:
             people = await shorts_daily.wiki.birthdays(today.month, today.day, limit=20)
         except Exception as exc:  # noqa: BLE001
-            await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:300])}</code>")
+            await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
             return
         if not people:
             await wait.edit_text("Сегодня в Википедии нет именинников из кино 🤷")
@@ -10132,7 +10163,7 @@ async def birthday_buttons(callback: CallbackQuery) -> None:
                 await wait.delete()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Birthday post failed")
-                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(job)
 
@@ -10147,7 +10178,8 @@ async def make_birthdays_post(bot: Bot, chat_id: int, people: list[dict[str, Any
         except Exception:  # noqa: BLE001
             info = None
         age = today.year - int(who["born"][:4])
-        titles = shorts_daily.tmdb.known_for(info, 3) if info else []
+        titles = (shorts_daily.tmdb.known_for(info, 3) or [str(f.get("title") or f.get("original_title") or "")
+                  for f in shorts_daily.tmdb.best_movies(info, 3)]) if info else []
         rows.append(f"{who['name']} ({who['en'] or '—'}), {age} {shorts_daily._years(age)}"
                     + (f"; известен по: {', '.join(titles)}" if titles else ""))
         cards_data.append((who, info, age, titles))
@@ -11135,13 +11167,14 @@ async def youtube_button(callback: CallbackQuery) -> None:
                     await wait.edit_text(f"✅ {'Выпуск' if long else 'Шортс'} на YouTube: {link}{thumb_note}")
                 else:
                     await wait.edit_text(
-                        f"✅ Шортс загружен, но YouTube сделал его <b>приватным</b>: {link}\n\nТак Google поступает "
+                        f"✅ {'Выпуск' if long else 'Шортс'} загружен, но YouTube сделал его <b>приватным</b>: {link}"
+                        f"{thumb_note}\n\nТак Google поступает "
                         "с роликами из непроверенных проектов. Открой YouTube Studio → ролик → «Доступ» → "
                         "«Открытый доступ», а чтобы дальше загружались сразу открытыми — подай заявку на аудит "
                         "(support.google.com/youtube/contact/yt_api_form).")
             except Exception as exc:  # noqa: BLE001
                 logging.exception("YouTube upload failed")
-                await message.answer(f"❌ YouTube: <code>{escape(str(exc)[:300])}</code>")
+                await message.answer(f"❌ YouTube: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(job)
 
@@ -11180,7 +11213,7 @@ async def publish_due(bot: Bot) -> None:
             text = "✅ Пост вышел в канале по расписанию."
         except Exception as exc:  # noqa: BLE001
             logging.exception("Scheduled post failed")
-            text = (f"❌ Пост по расписанию не вышел: <code>{escape(str(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
+            text = (f"❌ Пост по расписанию не вышел: <code>{escape(_safe_err(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
         try:
             await bot.send_message(q["chat"], text)
         except Exception:  # noqa: BLE001
@@ -11293,7 +11326,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         except Exception as exc:  # noqa: BLE001
             await callback.answer()
             await message.answer(f"❌ Не получилось опубликовать в {escape(POST_CHANNEL)}: "
-                                 f"<code>{escape(str(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
+                                 f"<code>{escape(_safe_err(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
             return
         await callback.answer("✅ Опубликовано")
         try:
@@ -11389,6 +11422,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                              "📝 Посты → «🎞 Выпуск «Новости кино»».")
         return
     if action == "wv":
+        if weekly_busy:
+            await message.answer("⏳ Выпуск уже собирается — пришлю, как будет готов.")
+            return
         status = await message.answer("🎞 Собираю выпуск «Новости кино» за неделю: 6–8 новостей, голос, картинки, "
                                       "заставки. Это 15–40 минут — пришлю, когда будет готово."
                                       + ("\n⏳ Сейчас собирается другой ролик — начну сразу после него."
@@ -11401,7 +11437,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 await status.delete()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Weekly video failed")
-                await status.edit_text(f"❌ Выпуск не собрался: <code>{escape(str(exc)[:300])}</code>")
+                await status.edit_text(f"❌ Выпуск не собрался: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(weekly_job)
         return
@@ -11444,7 +11480,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 await wait.delete()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Post failed")
-                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(other_job)
         return
@@ -11465,7 +11501,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 await wait.delete()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("List post failed")
-                await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(str(exc)[:300])}</code>")
+                await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(list_job)
         return
@@ -11495,7 +11531,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                     await wait.edit_text("🤷 Новых новостей нет — всё уже было в прошлых постах.")
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Tg post failed")
-                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(job)
 
@@ -11604,7 +11640,7 @@ async def post_list_link(message: Message, state: FSMContext) -> None:
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("List-by-link post failed")
-            await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(str(exc)[:300])}</code>")
+            await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(job)
 
@@ -11626,7 +11662,7 @@ async def post_digest(message: Message, state: FSMContext) -> None:
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Digest post failed")
-            await wait.edit_text(f"❌ Сводка не получилась: <code>{escape(str(exc)[:300])}</code>")
+            await wait.edit_text(f"❌ Сводка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(digest_job)
 
@@ -11648,7 +11684,7 @@ async def post_actor(message: Message, state: FSMContext) -> None:
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Actor post failed")
-            await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+            await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(actor_job)
 
@@ -11680,7 +11716,7 @@ async def post_from_link(message: Message, state: FSMContext) -> None:
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Link post failed")
-            await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+            await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(job)
 
@@ -11693,7 +11729,7 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
         try:
             sources.append(await shorts_linkfetch.fetch(url))
         except Exception as exc:  # noqa: BLE001
-            failed.append(f"{url[:60]} — {str(exc)[:80]}")
+            failed.append(f"{url[:60]} — {_safe_err(exc)[:80]}")
     if text:
         sources.append({"url": "", "title": "", "text": text, "image": None, "video": None, "thumb": None})
     if not sources:
@@ -11707,7 +11743,7 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
                 if m.get("image")]
         for path in await shorts_tgsearch.download_media(imgs[:3], pic_dir, limit=3, prefix="v"):
             try:
-                pics.append(Image.open(path).convert("RGB"))
+                pics.append(await asyncio.to_thread(lambda p=path: Image.open(p).convert("RGB")))
             except Exception:  # noqa: BLE001
                 pass
     finally:
@@ -11767,7 +11803,7 @@ async def post_edit_text(message: Message, state: FSMContext) -> None:
         else:
             await message.bot.edit_message_caption(chat_id=message.chat.id, message_id=first, caption=caption)
     except TelegramBadRequest as exc:
-        await message.answer(f"❌ Не получилось поправить: <code>{escape(str(exc)[:200])}</code>")
+        await message.answer(f"❌ Не получилось поправить: <code>{escape(_safe_err(exc)[:200])}</code>")
         return
     await message.answer("✅ Текст поста обновлён.", reply_markup=post_keyboard(first, yt=bool(meta.get("yt"))))
 
@@ -11813,7 +11849,7 @@ async def news_generate(message: Message, state: FSMContext) -> None:
         script = await shorts_lore.write_news(data.get("news_text") or "", GEMINI_API_KEY, TMDB_API_KEY)
     except Exception as exc:
         logging.exception("News script failed")
-        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>",
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("🔄 Ещё раз", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]]))
         return
@@ -11835,7 +11871,7 @@ async def lore_generate(message: Message, state: FSMContext) -> None:
         script = await shorts_lore.write_script(data["lore_name"], data.get("lore_hook") or "", GEMINI_API_KEY)
     except Exception as exc:
         logging.exception("Lore script failed")
-        await wait.edit_text(f"❌ Сценарий не написался: <code>{escape(str(exc)[:400])}</code>",
+        await wait.edit_text(f"❌ Сценарий не написался: <code>{escape(_safe_err(exc)[:400])}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("🔄 Ещё раз", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]]))
         return
@@ -12033,7 +12069,7 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                     await status.edit_text("❌ Сборка остановилась — причина ниже")
                 except TelegramBadRequest:
                     pass
-                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+                await message.answer(f"❌ Шортс не собрался:\n<code>{escape(_safe_err(exc)[-700:])}</code>")
 
         task = asyncio.create_task(job())
         shorts_jobs.add(task)
@@ -12128,7 +12164,7 @@ async def dub_source(message: Message, state: FSMContext) -> None:
         lines, _ = await shorts_dub.translate(src, work, GEMINI_API_KEY)
     except Exception as exc:
         logging.exception("Dub source failed")
-        await wait.edit_text(f"❌ Не получилось: <code>{escape(str(exc)[:400])}</code>")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>")
         return
     await wait.delete()
     await state.set_state(None)
@@ -12216,7 +12252,7 @@ async def dub_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                     await status.edit_text("❌ Сборка остановилась — причина ниже")
                 except TelegramBadRequest:
                     pass
-                await message.answer(f"❌ Перевод не собрался:\n<code>{escape(str(exc)[-700:])}</code>")
+                await message.answer(f"❌ Перевод не собрался:\n<code>{escape(_safe_err(exc)[-700:])}</code>")
 
         task = asyncio.create_task(job())
         shorts_jobs.add(task)
@@ -12390,7 +12426,7 @@ async def contact_reply(message: Message, state: FSMContext) -> None:
         except TelegramForbiddenError:
             await message.reply("❌ Человек заблокировал бота — ответ не дойдёт.")
         except Exception as exc:  # noqa: BLE001
-            await message.reply(f"❌ Не отправилось: <code>{escape(str(exc)[:200])}</code>")
+            await message.reply(f"❌ Не отправилось: <code>{escape(_safe_err(exc)[:200])}</code>")
     else:  # человек отвечает на ответ админа — снова админам
         await contact_to_admins(message)
         await message.answer("✅ Передал администратору.")
@@ -12715,13 +12751,20 @@ async def _rt_premieres(back: int, ahead: int, n_films: int, n_tv: int) -> list[
     return out + (seasons if isinstance(seasons, list) else [])
 
 
+_rt_menu_cache: dict[str, Any] = {"at": 0.0, "items": []}
+
+
 async def rt_menu() -> tuple[str, InlineKeyboardMarkup]:
     today = datetime.now(MSK).date().isoformat()
-    try:
-        items = await _rt_premieres(21, 30, 10, 8)
-    except Exception as exc:  # noqa: BLE001
-        logging.info("RT menu: tmdb failed: %s", exc)
-        items = []
+    if time.time() - _rt_menu_cache["at"] < 3600 and _rt_menu_cache["items"]:
+        items = _rt_menu_cache["items"]  # премьеры за час не меняются — не дёргаем TMDB на каждое открытие
+    else:
+        try:
+            items = await _rt_premieres(21, 30, 10, 8)
+            _rt_menu_cache.update(at=time.time(), items=items)
+        except Exception as exc:  # noqa: BLE001
+            logging.info("RT menu: tmdb failed: %s", exc)
+            items = []
     rows = [[_btn(f"{'📺' if i.get('kind') == 'tv' else '🎬'}{'🆕' if i['date'] <= today else '⏳'} "
                   f"{_rt_name(i)[:42]} ({i['date'][8:10]}.{i['date'][5:7]})", f"rt:f:{_rt_key(i)}")] for i in items]
     alerts = await shorts_setting("rt_alerts") != "off"
@@ -12751,12 +12794,19 @@ async def _rt_state() -> dict[str, Any]:
 
 
 async def _rt_find(item: dict[str, Any], web: bool) -> str | None:
+    """Страница на RT. Адрес RT строится из английского названия: у корейских, японских, французских фильмов
+    оригинальное название не подходит («/m/_2025») — берём английское с TMDB."""
     from shorts import websearch as shorts_websearch
     search = shorts_websearch.search if web else None
+    name = item["original"]
+    if not re.fullmatch(r"[A-Za-z0-9 :;,.!?'&\-–—()]+", name or ""):
+        try:
+            name = await shorts_daily.tmdb.english_title(TMDB_API_KEY, item.get("kind") or "movie", item["id"]) or name
+        except Exception as exc:  # noqa: BLE001
+            logging.info("RT: english title of %s failed: %s", item["id"], exc)
     if item.get("kind") == "tv":
-        return await shorts_rt.find_tv(item["original"], item["season"], item["year"], item.get("first_year", ""),
-                                       search)
-    return await shorts_rt.find(item["original"], item["year"], search)
+        return await shorts_rt.find_tv(name, item["season"], item["year"], item.get("first_year", ""), search)
+    return await shorts_rt.find(name, item["year"], search)
 
 
 async def _rt_url(item: dict[str, Any], web: bool = True) -> str | None:
@@ -12838,15 +12888,19 @@ async def make_rt_post(bot: Bot, chat_id: int, key: str, audience: bool = False)
 
 async def rt_watch(bot: Bot) -> None:
     """Проверка премьер фильмов и сезонов: критики увидели (сняли эмбарго) или появились оценки зрителей —
-    пишем админам."""
+    пишем админам. Отметку «уже сообщили» ставим только после отправки: что не влезло в лимит прохода,
+    придёт в следующий раз."""
     if await shorts_setting("rt_alerts") == "off" or not TMDB_API_KEY:
         return
     today = datetime.now(MSK).date()
     items = await _rt_premieres(14, 45, 20, 12)
     state, sent = await _rt_state(), 0
+    changed: dict[str, dict[str, Any]] = {}
     for item in items:
         key, tv = _rt_key(item), item.get("kind") == "tv"
-        st = state.get(key) or {}
+        st = dict(state.get(key) or {})
+        if "c" in st and "a" in st:
+            continue  # обо всём уже сообщили — страницу не качаем
         if not st.get("url"):
             if st.get("tries", 0) >= 3:
                 continue
@@ -12855,7 +12909,7 @@ async def rt_watch(bot: Bot) -> None:
                 st["url"] = await _rt_find(item, web=False)
             except Exception as exc:  # noqa: BLE001
                 logging.info("RT watch: find %s failed: %s", item["original"], exc)
-            state[key] = st
+            changed[key] = st
             if not st.get("url"):
                 continue
         try:
@@ -12868,36 +12922,49 @@ async def rt_watch(bot: Bot) -> None:
         name = escape(_rt_name(item))
         when = f"премьера{' сезона' if tv else ' в США'} {item['date'][8:10]}.{item['date'][5:7]}"
         enough = RT_CRITICS_MIN_TV if tv else RT_CRITICS_MIN
-        notes: list[tuple[str, str]] = []
+        notes: list[tuple[str, str, str, int]] = []  # (текст, кнопка, отметка, оценка)
         if sc.get("critics") is not None and (sc.get("critics_count") or enough) >= enough and "c" not in st:
-            st["c"] = sc["critics"]
-            if not (first and old):
+            if first and old:  # давно вышедший фильм при первой проверке — молча запоминаем
+                st["c"] = sc["critics"]
+            else:
                 notes.append((f"🍅 <b>Критики посмотрели «{name}»</b> ({escape(item['original'])}, {when}): "
                               f"<b>{sc['critics']}%</b> на Rotten Tomatoes"
                               + (f" ({sc['critics_count']} рецензий)" if sc.get("critics_count") else "")
-                              + ". Эмбарго снято — можно сделать пост первыми.", f"rt:c:{key}"))
+                              + ". Эмбарго снято — можно сделать пост первыми.", f"rt:c:{key}", "c", sc["critics"]))
         if sc.get("audience") is not None and "a" not in st:
-            st["a"] = sc["audience"]
-            if not (first and old):
+            if first and old:
+                st["a"] = sc["audience"]
+            else:
                 notes.append((f"🍿 <b>Появились оценки зрителей «{name}»</b>: <b>{sc['audience']}%</b> на Rotten "
                               "Tomatoes" + (f" (критики — {sc['critics']}%)" if sc.get("critics") is not None
-                                            else "") + ".", f"rt:a:{key}"))
-        state[key] = st
-        for text, data in notes:
+                                            else "") + ".", f"rt:a:{key}", "a", sc["audience"]))
+        for text, data, mark, score in notes:
             if sent >= 4:
-                break
+                break  # остальное — в следующую проверку (отметку не ставим)
             sent += 1
             markup = InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("🍅 Сделать пост" if data.startswith("rt:c") else "🍿 Сделать пост", data)],
                 [_btn("🔕 Не присылать такие уведомления", "rt:off")]])
+            delivered = False
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(admin_id, text, reply_markup=markup)
+                    delivered = True
                 except Exception:  # noqa: BLE001
                     pass
-    if len(state) > 300:  # старые фильмы и сезоны забываем
-        state = dict(list(state.items())[-300:])
-    await set_shorts_setting("rt_watch", json.dumps(state))
+            if delivered:
+                st[mark] = score
+        changed[key] = st
+    if not changed:
+        return
+    # пока мы ходили в сеть, _rt_url мог запомнить новые страницы — сливаем, а не затираем
+    fresh = await _rt_state()
+    now = time.time()
+    for key, st in changed.items():
+        fresh[key] = {**(fresh.get(key) or {}), **st, "ts": now}
+    if len(fresh) > 300:  # забываем то, что дольше всех не трогали
+        fresh = dict(sorted(fresh.items(), key=lambda kv: (kv[1] or {}).get("ts", 0))[-300:])
+    await set_shorts_setting("rt_watch", json.dumps(fresh))
 
 
 @router.callback_query(F.data.startswith("rt:"))
@@ -12950,7 +13017,7 @@ async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 await wait.delete()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("RT post failed")
-                await wait.edit_text(f"❌ Пост не получился: <code>{escape(str(exc)[:300])}</code>")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(rt_job)
 
@@ -12964,11 +13031,13 @@ async def rt_title(message: Message, state: FSMContext) -> None:
     year = re.search(r"\b(19|20)\d{2}\b", query)
     name = re.sub(r"(\d{1,2})\s*(?:-?й\s*)?сезон\w*|сезон\w*\s*\d{1,2}|season\s*\d{1,2}|\bs\d{1,2}\b|\b(19|20)\d{2}\b",
                   "", query, flags=re.I).strip(" ,()-—")
+    if not name:  # «1917», «2012» — это название, а не год
+        name, year = query.strip(), None
     try:
         films, shows = await asyncio.gather(shorts_daily.tmdb.search_movie(TMDB_API_KEY, name),
                                             shorts_daily.tmdb.search_tv(TMDB_API_KEY, name))
     except Exception as exc:  # noqa: BLE001
-        await message.answer(f"❌ Поиск не удался: <code>{escape(str(exc)[:200])}</code>")
+        await message.answer(f"❌ Поиск не удался: <code>{escape(_safe_err(exc)[:200])}</code>")
         return
     n = int(next(g for g in season.groups() if g)) if season else 0
     if season:  # просили сезон — значит, сериал
@@ -13003,9 +13072,39 @@ WEEKLY_TIMEOUT = 80 * 60  # выпуск на 8 минут собирается 
 WEEKLY_DAY, WEEKLY_HOUR = 6, 10  # воскресенье, 10:00 (время автора)
 
 
+def _spread_by_day(posts: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Посты понемногу за каждый день (по очереди: самый свежий каждого дня, потом второй…) — иначе при
+    многих каналах все места заняли бы новости последних суток."""
+    days: dict[str, list[dict[str, Any]]] = {}
+    for p in sorted(posts, key=lambda p: -p.get("time", 0)):
+        day = datetime.fromtimestamp(p.get("time", 0), MSK).date().isoformat()
+        days.setdefault(day, []).append(p)
+    out: list[dict[str, Any]] = []
+    while len(out) < limit and any(days.values()):
+        for day in sorted(days, reverse=True):
+            if days[day] and len(out) < limit:
+                out.append(days[day].pop(0))
+    return out
+
+
+weekly_busy = False  # выпуск собирается или ждёт очереди — второй не запускаем
+
+
 async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
     """Новости недели (Telegram-каналы и быстрые зарубежные источники) → сценарий ведущего → выпуск 16:9 с
     голосом, картинками, заставками и таймкодами → превью в Telegram и кнопка загрузки на YouTube."""
+    global weekly_busy
+    if weekly_busy:
+        raise RuntimeError("выпуск уже собирается — дождись его, он придёт сюда")
+    weekly_busy = True
+    try:
+        await _make_weekly_video(bot, chat_ids, status)
+        await set_shorts_setting("weekly_video_at", str(time.time()))
+    finally:
+        weekly_busy = False
+
+
+async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -13018,11 +13117,11 @@ async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | Non
         channels = [c for c in await fact_channels() if c.lower() != own]
         posts = await shorts_tgsearch.latest(channels, hours=168, per_channel=12)
         try:
-            fast = await asyncio.wait_for(shorts_fast.latest(await fast_feeds(), hours=168, per_feed=25), 120)
+            fast = await shorts_fast.latest(await fast_feeds(), hours=168, per_feed=25, timeout=100)
         except Exception as exc:  # noqa: BLE001
             logging.info("Weekly video: fast sources failed: %s", exc)
             fast = []
-        pool = posts[:80] + fast[:60]
+        pool = _spread_by_day(posts, 80) + _spread_by_day(fast, 60)  # вся неделя, а не последние сутки
         if len(pool) < 10:
             raise RuntimeError("за неделю почти нет новостей в источниках — проверь каналы (/channels) и /fast")
         listing, size = [], 0
@@ -13094,6 +13193,17 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         await bot.send_message(chat_id, escape(seo["warning"]))
 
 
+rt_watch_busy = asyncio.Lock()
+
+
+async def rt_watch_job(bot: Bot) -> None:
+    async with rt_watch_busy:
+        try:
+            await asyncio.wait_for(rt_watch(bot), 20 * 60)
+        except Exception:  # noqa: BLE001
+            logging.exception("RT watch failed")
+
+
 async def weekly_video_job(bot: Bot) -> None:
     """По расписанию: полоска сборки — первому админу, готовый выпуск — всем админам."""
     admins = sorted(ADMIN_IDS)
@@ -13107,7 +13217,7 @@ async def weekly_video_job(bot: Bot) -> None:
         logging.exception("Weekly video failed")
         for admin_id in admins:
             try:
-                await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(str(exc)[:300])}"
+                await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
                                                  "</code>\nПовторить — 📝 Посты → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
@@ -13119,12 +13229,10 @@ async def growth_loop(bot: Bot) -> None:
     while True:
         await asyncio.sleep(600)
         try:
-            if time.time() - last_rt > RT_EVERY and 8 <= datetime.now(POST_TZ).hour < 23:
+            if (time.time() - last_rt > RT_EVERY and 8 <= datetime.now(POST_TZ).hour < 23
+                    and not rt_watch_busy.locked()):
                 last_rt = time.time()
-                try:
-                    await rt_watch(bot)
-                except Exception:  # noqa: BLE001
-                    logging.exception("RT watch failed")
+                _run_job(lambda: rt_watch_job(bot))  # отдельно: медленный RT не задерживает остальное
             if time.time() - last_alerts > 3 * 3600:
                 last_alerts = time.time()
                 await favorites_alerts(bot)
@@ -13132,7 +13240,9 @@ async def growth_loop(bot: Bot) -> None:
             week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
             if (now.weekday() == WEEKLY_DAY and now.hour >= WEEKLY_HOUR and ADMIN_IDS
                     and await shorts_setting("weekly_video") != "off"
-                    and await shorts_setting("weekly_video_done") != week):
+                    and await shorts_setting("weekly_video_done") != week
+                    and time.time() - float(await shorts_setting("weekly_video_at") or 0) > 20 * 3600
+                    and not weekly_busy):
                 await set_shorts_setting("weekly_video_done", week)
                 _run_job(lambda: weekly_video_job(bot))
             if (now.weekday() == 4 and now.hour >= 18 and await shorts_setting("digest") != "off"

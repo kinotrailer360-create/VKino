@@ -23,7 +23,9 @@ services:
       DATABASE_URL: postgresql://vkino:${POSTGRES_PASSWORD}@db:5432/vkino
       WEBAPP_URL: https://${DOMAIN}
       PORT: "8080"
-      RSSHUB_URL: ${RSSHUB_URL:-http://rsshub:1200}  # аккаунты X для быстрых новостей (/fast)
+      # аккаунты X для быстрых новостей (/fast): RSSHub работает, только если в .env есть COMPOSE_PROFILES=x
+      RSSHUB_URL: ${RSSHUB_URL:-}
+      COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
     depends_on:
       db:
         condition: service_healthy

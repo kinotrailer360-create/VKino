@@ -51,7 +51,12 @@ class Episode:
 async def _run(*args: str) -> None:
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
                                                 stderr=asyncio.subprocess.PIPE)
-    _, err = await proc.communicate()
+    try:
+        _, err = await proc.communicate()
+    except asyncio.CancelledError:  # таймаут сборки — ffmpeg не должен работать дальше и писать в удалённую папку
+        proc.kill()
+        await proc.wait()
+        raise
     if proc.returncode:
         raise RuntimeError(f"{args[0]}: {err.decode(errors='ignore')[-500:]}")
 
@@ -69,14 +74,23 @@ async def _duration(path: Path) -> float:
 
 # ---------------------------------------------------------------- картинки
 
-async def _download(session: aiohttp.ClientSession, url: str) -> Image.Image | None:
+def _decode(data: bytes, mourning: bool) -> Image.Image | None:
+    """Байты → картинка RGB, сразу уменьшенная (кадру 1920×1080 больше не нужно — и память не держим)."""
+    img = Image.open(io.BytesIO(data))
+    img.load()
+    img = img.convert("RGB")
+    if min(img.size) < 200:
+        return None
+    img.thumbnail((2400, 2400), Image.LANCZOS)
+    return ImageOps.grayscale(img).convert("RGB") if mourning else img
+
+
+async def _download(session: aiohttp.ClientSession, url: str, mourning: bool = False) -> Image.Image | None:
     try:
         async with session.get(url) as resp:
             resp.raise_for_status()
-            img = Image.open(io.BytesIO(await resp.read()))
-            img.load()
-        img = img.convert("RGB")
-        return img if min(img.size) >= 200 else None
+            data = await resp.read()
+        return await asyncio.to_thread(_decode, data, mourning)  # разбор картинки — не в цикле событий бота
     except Exception as exc:  # noqa: BLE001
         log.info("shorts: weekly image %s skipped: %s", url[:80], exc)
         return None
@@ -85,41 +99,46 @@ async def _download(session: aiohttp.ClientSession, url: str) -> Image.Image | N
 async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_key: str,
                        limit: int = 6) -> list[Image.Image]:
     """Картинки к новости: фото людей, кадры и постер фильма с TMDB, фото из постов-источников."""
-    urls: list[str] = []
     person = story.get("person_en") or story.get("person")
-    if person:
+    name = story.get("film_en") or story.get("film")
+
+    async def person_urls() -> list[str]:
+        if not person:
+            return []
         try:
             info = await tmdb.person_by_name(tmdb_key, person)
-            urls += tmdb.profile_urls(info)[:2] if info else []
+            return tmdb.profile_urls(info)[:2] if info else []
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: weekly person %s failed: %s", person, exc)
-    name = story.get("film_en") or story.get("film")
-    if name:
+            return []
+
+    async def film_urls() -> list[str]:
+        if not name:
+            return []
         try:
             found = await tmdb.search_movie(tmdb_key, name) or []
             kind = "movie"
             if not found:
                 found, kind = await tmdb.search_tv(tmdb_key, name) or [], "tv"
-            if found:
-                urls += await tmdb.backdrops(tmdb_key, kind, int(found[0]["id"]), 3)
-                if found[0].get("poster"):
-                    urls.append(found[0]["poster"])
+            if not found:
+                return []
+            out = await tmdb.backdrops(tmdb_key, kind, int(found[0]["id"]), 3)
+            return out + ([found[0]["poster"]] if found[0].get("poster") else [])
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: weekly film %s failed: %s", name, exc)
+            return []
+
+    people, films = await asyncio.gather(person_urls(), film_urls())
+    urls: list[str] = people + films
     for i in story.get("media") or []:
         if 1 <= i <= len(posts):
             p = posts[i - 1]
             urls += [m["image"] for m in p.get("media") or [] if m.get("image")][:3] or (
                 [p["image"]] if p.get("image") else [])
-    out: list[Image.Image] = []
+    wanted = list(dict.fromkeys(urls))[:limit + 3]  # с запасом на битые
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
-        for url in dict.fromkeys(urls):
-            if len(out) >= limit:
-                break
-            img = await _download(session, url)
-            if img:
-                out.append(ImageOps.grayscale(img).convert("RGB") if story.get("mourning") else img)
-    return out
+        got = await asyncio.gather(*(_download(session, u, bool(story.get("mourning"))) for u in wanted))
+    return [img for img in got if img][:limit]
 
 
 def slide_image(img: Image.Image) -> Image.Image:
@@ -338,6 +357,16 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         first_img = first_img or (imgs[0] if imgs else None)
         await daily._progress(3 + round(12 * (k + 1) / total_n), "Картинки к новостям")
 
+    def card_file(bg: Image.Image | None, top: str, big: str, small: str, path: Path,
+                  mourning: bool = False) -> Path:
+        slide_image(title_card(bg, top, big, small, mourning)).save(path, quality=90)
+        return path
+
+    def overlay_file(headline: str, n: int, total: int, mourning: bool, path: Path) -> Path:
+        overlay(headline, n, total, mourning).save(path)
+        return path
+
+    # тяжёлые операции с картинками (размытие, текст) — в отдельном потоке, иначе бот на это время «замирает»
     def save_slides(imgs: list[Image.Image], prefix: str) -> list[Path]:
         out = []
         for i, img in enumerate(imgs):
@@ -352,8 +381,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     if not voiced:
         notes.append(daily.no_voice_note(voiced))
     intro_card = work / "intro_card.jpg"
-    slide_image(title_card(first_img, "KINOMIR360", "НОВОСТИ КИНО ЗА НЕДЕЛЮ", date_label)).save(intro_card,
-                                                                                            quality=90)
+    await asyncio.to_thread(card_file, first_img, "KINOMIR360", "НОВОСТИ КИНО ЗА НЕДЕЛЮ", date_label, intro_card)
     chapters.append((0.0, "Вступление"))
     if INTRO_CLIP.exists():  # анимированная заставка с логотипом — самое начало выпуска
         try:
@@ -371,8 +399,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         imgs = pictures[k]
         bg = imgs[0] if imgs else first_img
         card = work / f"card{n}.jpg"
-        slide_image(title_card(bg, f"НОВОСТЬ {n}", story["headline"], mourning=story["mourning"])).save(
-            card, quality=90)
+        await asyncio.to_thread(card_file, bg, f"НОВОСТЬ {n}", story["headline"], "", card, story["mourning"])
         segments.append(await _segment(work, f"card{n}", [(card, CARD_SEC)], None,
                                        whoosh if whoosh.exists() else None, CARD_SEC))
         chapters.append((clock, story.get("chapter") or story["headline"].capitalize()))
@@ -380,9 +407,9 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         voice, starts, dur, voiced = await _voice(story["lines"], work / f"v{n}")
         if not voiced and not notes:
             notes.append(daily.no_voice_note(voiced))
-        paths = save_slides(imgs, f"st{n}") or [card]
+        paths = await asyncio.to_thread(save_slides, imgs, f"st{n}") or [card]
         over = work / f"over{n}.png"
-        overlay(story["headline"], n, total_n, story["mourning"]).save(over)
+        await asyncio.to_thread(overlay_file, story["headline"], n, total_n, story["mourning"], over)
         total = dur + 0.5
         segments.append(await _segment(work, f"story{n}", _even_slides(paths, starts, total), over, voice, total))
         clock += total
@@ -390,8 +417,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     await daily._progress(84, "Финал выпуска")
     voice, starts, dur, voiced = await _voice(script["outro"], work / "v_outro")
     outro_card = work / "outro_card.jpg"
-    slide_image(title_card(first_img, "ПОДПИШИСЬ — НОВЫЙ ВЫПУСК КАЖДОЕ ВОСКРЕСЕНЬЕ", "СПАСИБО, ЧТО СМОТРИТЕ!",
-                           "YouTube @kinomir360 · Telegram @KinoMir360")).save(outro_card, quality=90)
+    await asyncio.to_thread(card_file, first_img, "ПОДПИШИСЬ — НОВЫЙ ВЫПУСК КАЖДОЕ ВОСКРЕСЕНЬЕ",
+                            "СПАСИБО, ЧТО СМОТРИТЕ!", "YouTube @kinomir360 · Telegram @KinoMir360", outro_card)
     tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
     segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail))
     chapters.append((clock, "Итоги и вопрос зрителям"))
@@ -432,7 +459,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
             preview = None
 
     cover = work / "cover.jpg"
-    thumbnail(first_img, stories[0]["headline"], date_label).save(cover, quality=92)
+    await asyncio.to_thread(lambda: thumbnail(first_img, stories[0]["headline"], date_label).save(cover, quality=92))
     seo = build_seo(script, chapters, date_label)
     if notes:
         seo["warning"] = "\n".join(notes)
