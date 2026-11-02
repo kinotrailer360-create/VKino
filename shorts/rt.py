@@ -25,6 +25,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 URL_RE = re.compile(r"https?://(?:www\.)?rottentomatoes\.com/m/[a-z0-9_\-]+", re.I)
+TV_URL_RE = re.compile(r"https?://(?:www\.)?rottentomatoes\.com/tv/([a-z0-9_\-]+)(?:/s(\d{1,2}))?", re.I)
 
 
 def slug(title: str) -> str:
@@ -93,6 +94,46 @@ async def find(title: str, year: str = "", search: Any = None) -> str | None:
                     return m.group(0).rstrip("/")
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: rt web search failed: %s", exc)
+    return None
+
+
+async def find_tv(title: str, season: int, year: str = "", first_year: str = "", search: Any = None) -> str | None:
+    """Страница сезона сериала на RT: /tv/название/s02. year — год сезона, first_year — год первого сезона
+    (у тёзок адрес с годом: /tv/name_2019)."""
+    if not title or season < 1:
+        return None
+    s = slug(title)
+    bases = [f"{BASE}/tv/{s}"] + ([f"{BASE}/tv/{s}_{first_year}"] if first_year else [])
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
+        for base in bases:
+            url = f"{base}/s{season:02d}"
+            try:
+                page = await _get(session, url)
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: rt %s failed: %s", url, exc)
+                continue
+            if page and _matches(page, title, ""):
+                return url
+        try:  # поиск самого сайта
+            page = await _get(session, f"{BASE}/search?search={quote(title)}")
+            for path in dict.fromkeys(re.findall(r'href="((?:https://www\.rottentomatoes\.com)?/tv/[a-z0-9_\-]+)/?"',
+                                                 page)):
+                base = path if path.startswith("http") else BASE + path
+                if SequenceMatcher(None, base.rsplit("/", 1)[1].rstrip("_0123456789"), s).ratio() < 0.8:
+                    continue
+                cand = await _get(session, f"{base}/s{season:02d}")
+                if cand and _matches(cand, title, ""):
+                    return f"{base}/s{season:02d}"
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: rt tv search failed: %s", exc)
+    if search:
+        try:
+            for r in await search(f"{title} season {season} Rotten Tomatoes"):
+                m = TV_URL_RE.search(str(r.get("url") or r.get("link") or ""))
+                if m:
+                    return f"{BASE}/tv/{m.group(1)}/s{season:02d}"
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: rt tv web search failed: %s", exc)
     return None
 
 
