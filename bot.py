@@ -9463,6 +9463,20 @@ async def _rutube_post_trailer(titles: list[str], work: Path) -> Path | None:
         return None
 
 
+def _title_words(text: str) -> str:
+    """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
+    return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
+
+
+def _mentions_title(name: str, text: str) -> bool:
+    """Название есть в тексте — с учётом падежей: каждое слово названия по основе («левиафана», «мстителей»)."""
+    if name in text:
+        return True
+    words = [w for w in name.split() if len(w) >= 3]
+    hits = [w[:max(3, len(w) - 2)] in text for w in words]
+    return bool(words) and hits[0] and sum(hits) * 2 >= len(words)
+
+
 async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
     """Пост в стиле канала автора по самой интересной свежей новости, с фото или видео из источника.
     mode: "tg" — Telegram-каналы за сутки (кроме своего); "fast" — быстрые зарубежные источники (Reddit,
@@ -9497,6 +9511,11 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         hist["urls"] = (hist["urls"] + [p["url"] for p in same])[-500:]
         hist["topics"] = (hist["topics"] + [res["topic"] or res["post"][:60]])[-60:]
         await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+        # фото и видео — только из постов, где упомянут сам фильм: ИИ иногда даёт номер соседнего поста
+        # (в посте о «Leviathan» оказался баннер Game Pass из той же ленты X)
+        names = [_title_words(n) for n in (res["film"], res["film_en"]) if n and len(_title_words(n)) >= 3]
+        if names:
+            same = [p for p in same if any(_mentions_title(n, _title_words(p["text"])) for n in names)]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -9526,6 +9545,13 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                     with_media = [{"image": url}] if url else []
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: kinopoisk image skipped: %s", exc)
+            if not with_media and (res["film_en"] or res["film"]):  # постер с TMDB (новинок нет на Кинопоиске)
+                try:
+                    url = await shorts_daily.tmdb.poster_by_title(
+                        TMDB_API_KEY, [n for n in (res["film_en"], res["film"]) if n])
+                    with_media = [{"image": url}] if url else []
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Tg post: tmdb poster skipped: %s", exc)
             # последнее — маленькая обложка видео из самой новости
             with_media = with_media or [{"image": p["thumb"]} for p in same if p.get("thumb")]
             files = await shorts_tgsearch.download_media(album, work, limit=10, prefix="alb") if album else []
