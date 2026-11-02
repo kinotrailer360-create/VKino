@@ -53,8 +53,13 @@ def nitter() -> str:
 
 
 def rsshub() -> str:
-    """Свой RSSHub (в docker-compose — сервис rsshub, включается COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN)."""
-    return os.getenv("RSSHUB_URL", "").strip().rstrip("/")
+    """Свой RSSHub: RSSHUB_URL или сервис rsshub из docker-compose — только если он включён (COMPOSE_PROFILES=x
+    в .env). Без него аккаунты X не читаются, а /fast подсказывает, как подключить."""
+    url = os.getenv("RSSHUB_URL", "").strip().rstrip("/")
+    if url:
+        return url
+    profiles = {p.strip() for p in os.getenv("COMPOSE_PROFILES", "").split(",")}
+    return "http://rsshub:1200" if "x" in profiles else ""
 
 
 def feed_url(entry: str) -> str | None:
@@ -97,10 +102,15 @@ def _text(raw: Any) -> str:
 
 
 def _image(entry: Any) -> str | None:
+    """Картинка новости: сначала полноразмерная (media_content), потом превью — но не крошечные значки."""
     for media in (entry.get("media_content") or []) + (entry.get("media_thumbnail") or []):
         url = str(media.get("url") or "")
-        if url and "image" in str(media.get("type") or "image"):
-            return html.unescape(url)
+        width = int(str(media.get("width") or 0) or 0) if str(media.get("width") or "0").isdigit() else 0
+        if not url or "image" not in str(media.get("type") or "image"):
+            continue
+        if (0 < width < 300) or "thumbs.redditmedia.com" in url:  # значок 70–140 px — в посте будет мылом
+            continue
+        return html.unescape(url)
     for link in entry.get("links") or []:
         if link.get("rel") == "enclosure" and str(link.get("type") or "").startswith("image") and link.get("href"):
             return str(link["href"])
@@ -142,7 +152,7 @@ def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> li
             if body:
                 break
         body = body or _text(entry.get("summary"))
-        if body.lower().startswith(title.lower()[:40]):
+        if body.lower().startswith(title.lower()):  # тело повторяет заголовок — убираем повтор
             body = body[len(title):].strip()
         article = _article(entry)
         text = (f"{title}\n{body}".strip() + (f"\nИсточник статьи: {urlparse(article).netloc}" if article else ""))
@@ -189,21 +199,35 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
     return await asyncio.to_thread(parse, raw, label(entry), since, per_feed)
 
 
-async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEED) -> list[dict[str, Any]]:
-    """Свежие новости всех источников в виде постов каналов, новые первыми."""
+async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEED,
+                 timeout: float = 50) -> list[dict[str, Any]]:
+    """Свежие новости всех источников в виде постов каналов, новые первыми. Что не успело за timeout секунд,
+    отбрасываем, но успевшее сохраняем (медленный Reddit не должен утянуть за собой Deadline и Variety)."""
     since = time.time() - hours * 3600
     sem = asyncio.Semaphore(4)
 
     async def one(session: aiohttp.ClientSession, entry: str) -> list[dict[str, Any]]:
-        async with sem:
-            try:
+        try:
+            if "reddit.com" in (feed_url(entry) or ""):
+                # Reddit идёт по одному со своим замком и паузой — общие слоты при этом не занимает
                 return await _fetch(session, entry, since, per_feed)
-            except Exception as exc:  # noqa: BLE001
-                log.info("shorts: fast feed %s failed: %s", entry, exc)
-                return []
+            async with sem:
+                return await _fetch(session, entry, since, per_feed)
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: fast feed %s failed: %s", entry, exc)
+            return []
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
-        results = await asyncio.gather(*(one(session, f) for f in feeds))
+        tasks = [asyncio.create_task(one(session, f)) for f in feeds]
+        if not tasks:
+            return []
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            log.info("shorts: %d fast feeds too slow, skipped", len(pending))
+            await asyncio.gather(*pending, return_exceptions=True)
+    results = [t.result() for t in done if not t.cancelled() and not t.exception()]
     return sorted((p for chunk in results for p in chunk), key=lambda p: -p["time"])
 
 

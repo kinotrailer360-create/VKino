@@ -385,7 +385,7 @@ async def tv_seasons(key: str, since: str, until: str, n: int = 10) -> list[dict
         data = await _get(session, key, "/discover/tv", language="ru-RU", sort_by="popularity.desc",
                           without_genres="10763,10764,10766,10767", **{"air_date.gte": since, "air_date.lte": until,
                                                                        "vote_count.gte": 30})
-        shows = [r for r in (data.get("results") or [])[:30]
+        shows = [r for r in (data.get("results") or [])[:max(n + 4, 12)]
                  if r.get("id") and not set(r.get("genre_ids") or []) & TV_SKIP_GENRES]
         details = await asyncio.gather(*(tv_details(session, key, int(r["id"])) for r in shows),
                                        return_exceptions=True)
@@ -423,3 +423,12 @@ async def search_tv(key: str, query: str, n: int = 5) -> list[dict[str, Any]]:
              "year": str(r.get("first_air_date") or "")[:4], "kind": "tv"}
             for r in (data.get("results") or [])[:n] if r.get("id")
             and not set(r.get("genre_ids") or []) & TV_SKIP_GENRES]
+
+
+async def english_title(key: str, kind: str, tmdb_id: int) -> str:
+    """Английское название фильма или сериала (для сайтов вроде Rotten Tomatoes)."""
+    if not key:
+        return ""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        data = await _get(session, key, f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}", language="en-US")
+    return str(data.get("name") or data.get("title") or "")

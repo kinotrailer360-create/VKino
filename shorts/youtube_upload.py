@@ -74,10 +74,18 @@ async def access_token(client_id: str, secret: str, refresh: str) -> str:
 
 
 def _tags(raw: str) -> list[str]:
+    """Теги в лимите YouTube (500 знаков на все): тег с пробелом YouTube считает в кавычках (+2 знака),
+    между тегами — запятая. Без повторов."""
     out: list[str] = []
-    for tag in (t.strip().lstrip("#") for t in raw.split(",")):
-        if tag and len(",".join(out + [tag])) <= 480:
-            out.append(tag)
+    size = 0
+    for tag in (t.strip().lstrip("#")[:100] for t in raw.split(",")):
+        if not tag or tag.lower() in {t.lower() for t in out}:
+            continue
+        cost = len(tag) + (2 if " " in tag else 0) + (1 if out else 0)
+        if size + cost > 480:
+            continue
+        out.append(tag)
+        size += cost
     return out
 
 
