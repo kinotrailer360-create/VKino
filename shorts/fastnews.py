@@ -27,7 +27,7 @@ log = logging.getLogger("shorts")
 
 DEFAULT_FEEDS = [
     "https://www.reddit.com/r/movies/search.rss?q=flair%3ANews&restrict_sr=1&sort=new",
-    "https://www.reddit.com/r/boxoffice/search.rss?q=flair%3A%22Industry+News%22&restrict_sr=1&sort=new",
+    "https://www.reddit.com/r/boxoffice/new/.rss?limit=25",
     "https://deadline.com/feed/",
     "https://variety.com/v/film/feed/",
     "https://www.hollywoodreporter.com/c/movies/movie-news/feed/",
@@ -41,6 +41,10 @@ DEFAULT_FEEDS = [
 HOURS = 12
 PER_FEED = 6
 TEXT_MAX = 900
+REDDIT_SKIP = re.compile(r"\b(?:thread|discussion|megathread|predictions?|projections?|update)\b|\?\s*$", re.I)
+REDDIT_EVERY = 600  # Reddit без входа режет частые запросы (429): одну ленту — не чаще раза в 10 минут
+REDDIT_STALE = 6 * 3600  # при отказе берём последнюю сохранённую ленту, если ей меньше 6 часов
+_reddit_cache: dict[str, tuple[float, bytes]] = {}
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://t.me/KinoMir360)"}
 
 
@@ -61,6 +65,8 @@ def feed_url(entry: str) -> str | None:
         if rsshub():
             return f"{rsshub()}/twitter/user/{m.group(1)}"
         return f"{nitter()}/{m.group(1)}/rss" if nitter() else None
+    if "/r/boxoffice/search.rss" in entry:  # в RSS Reddit нет флеров — поиск по флеру пуст, берём свежие посты
+        return "https://www.reddit.com/r/boxoffice/new/.rss?limit=25"
     return entry if entry.startswith("http") else None
 
 
@@ -128,6 +134,8 @@ def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> li
         published = calendar.timegm(stamp) if stamp else 0.0
         if not title or not link or published < since:
             continue
+        if source.startswith("Reddit") and REDDIT_SKIP.search(title):
+            continue
         body = ""
         for part in entry.get("content") or []:
             body = _text(part.get("value"))
@@ -160,17 +168,22 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
     url = feed_url(entry)
     if not url:
         return []
-    if "reddit.com" in url:  # Reddit режет частые запросы (429): по одному, с паузой и одним повтором
+    if "reddit.com" in url:  # Reddit режет частые запросы (429): по одному, с паузой, не чаще раза в 10 минут
         _reddit = _reddit or asyncio.Lock()
         async with _reddit:
-            await asyncio.sleep(3)
-            try:
-                raw = await _download(session, url)
-            except aiohttp.ClientResponseError as exc:
-                if exc.status != 429:
-                    raise
-                await asyncio.sleep(10)
-                raw = await _download(session, url)
+            cached = _reddit_cache.get(url)
+            if cached and time.time() - cached[0] < REDDIT_EVERY:
+                raw = cached[1]
+            else:
+                await asyncio.sleep(3)
+                try:
+                    raw = await _download(session, url)
+                    _reddit_cache[url] = (time.time(), raw)
+                except aiohttp.ClientResponseError as exc:
+                    if exc.status != 429 or not cached or time.time() - cached[0] > REDDIT_STALE:
+                        raise
+                    log.info("shorts: reddit 429, using cached %s", url)
+                    raw = cached[1]
     else:
         raw = await _download(session, url)
     return await asyncio.to_thread(parse, raw, label(entry), since, per_feed)
