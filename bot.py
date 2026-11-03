@@ -9349,7 +9349,8 @@ async def _posts_history() -> dict[str, list[str]]:
             "people": list(data.get("people") or []), "facts": list(data.get("facts") or []),
             "quiz": list(data.get("quiz") or []), "quotes": list(data.get("quotes") or []),
             "anniv": list(data.get("anniv") or []), "evening": list(data.get("evening") or []),
-            "battle": list(data.get("battle") or []), "bloopers": list(data.get("bloopers") or [])}
+            "battle": list(data.get("battle") or []), "bloopers": list(data.get("bloopers") or []),
+            "stories": list(data.get("stories") or [])}
 
 
 # рубрики — хэштег в каждом посте; закреп-навигатор ведёт по ним (тап по хэштегу ищет посты канала)
@@ -9591,6 +9592,35 @@ def _shared(about: set[str], words: set[str]) -> set[str]:
     return out
 
 
+STORY_HOURS = 72  # о том же событии за это время второй пост не делаем
+
+
+def _story_tokens(res: dict[str, Any]) -> list[str]:
+    return sorted(_key_tokens(" ".join(str(res.get(k) or "") for k in
+                                       ("post", "film", "film_en", "person", "person_en"))))
+
+
+def _repeats(words: set[str], stories: list[dict[str, Any]], english: bool = False) -> bool:
+    """Это та же новость, что уже была за последние STORY_HOURS часов? (Джонни Депп и «Пираты» из четырёх
+    каналов — одна история.) Русский текст: много общих опознавательных слов; английский: общие латинские
+    слова (имена и названия — в посте они записаны и латиницей)."""
+    now = time.time()
+    for st in stories:
+        if now - st.get("at", 0) > STORY_HOURS * 3600:
+            continue
+        old = set(st.get("tokens") or [])
+        if not old or not words:
+            continue
+        if english:
+            if len({w for w in words & old if w.isascii() and not w.isdigit()}) >= 3:
+                return True
+            continue
+        hits = _shared(old, words)
+        if len(hits) >= 4 and len(hits) / min(len(old), len(words)) >= 0.35:
+            return True
+    return False
+
+
 def _title_words(text: str) -> str:
     """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
     return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
@@ -9632,10 +9662,32 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             logging.info("Tg post: own channel read failed: %s", exc)
             mine = []
         own_text = "\n".join("— " + re.sub(r"\s+", " ", p["text"])[:200] for p in mine)
-        res = await shorts_ai.write_post(GEMINI_API_KEY, fresh, hist["topics"], own_text)
+        stories = [st for st in hist["stories"] if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
+        # посты о событии, про которое уже был пост (за 3 дня), — сразу убираем: другой канал, та же новость
+        fresh = [p for p in fresh if not _repeats(_key_tokens(p["text"]), stories, p.get("lang") == "en")]
+        if not fresh:
+            return ""
+        res = None
+        for _ in range(3):  # ИИ всё же выбрал повтор — отбрасываем эти посты и просим другую новость
+            res = await shorts_ai.write_post(GEMINI_API_KEY, fresh, hist["topics"], own_text)
+            if not res:
+                raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+            if not _repeats(set(_story_tokens(res)), stories):
+                break
+            logging.info("Tg post: repeat of a recent story skipped: %s", res["topic"])
+            dup = {fresh[i]["url"] for i in res["media"]}
+            hist["urls"] = (hist["urls"] + list(dup))[-500:]
+            fresh = [p for p in fresh if p["url"] not in dup and not _repeats(
+                _key_tokens(p["text"]), stories + [{"at": time.time(), "tokens": _story_tokens(res)}],
+                p.get("lang") == "en")]
+            res = None
+            if not fresh:
+                break
         if not res:
-            raise RuntimeError(shorts_ai.last_error or "ИИ не написал пост")
+            await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+            return ""
         same = [fresh[i] for i in res["media"]]
+        hist["stories"] = (stories + [{"at": int(time.time()), "tokens": _story_tokens(res)}])[-60:]
         sources = list(same)  # для автора под постом: откуда взята новость
         hist["urls"] = (hist["urls"] + [p["url"] for p in same])[-500:]
         hist["topics"] = (hist["topics"] + [res["topic"] or res["post"][:60]])[-60:]
