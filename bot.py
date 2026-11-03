@@ -3330,8 +3330,14 @@ def admin_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="🎬 Шортсы",
+                    text="🎬 Видео: шортсы и YouTube",
                     callback_data="sh:menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📝 Посты в Telegram-канал",
+                    callback_data="pt:menu",
                 )
             ],
             [
@@ -7665,7 +7671,9 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 def shorts_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
-        [_btn("📝 Пост для ТГ: новость или подборка ▸", "pt:menu")],
+        [_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")],
+        [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
+        [_btn("📝 Посты в Telegram-канал ▸", "pt:menu")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         *[[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")] for k in holidays_now(datetime.now(MSK).date())],
@@ -7675,7 +7683,6 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
         [_btn("📰 Своя новость: вставлю текст", "lo:news")],
-        [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
@@ -7808,7 +7815,7 @@ async def voice_preview_action(message: Message, voice_id: str) -> None:
 
 
 SHORTS_MENU_TEXT = (
-    "🎬 <b>Шортсы KinoMir360</b>\n\n"
+    "🎬 <b>Видео KinoMir360: шортсы и YouTube</b>\n\n"
     "Нажми тему — ролик соберётся за 2–5 минут и придёт сюда вместе с SEO для YouTube и TikTok.\n"
     "Каждый день в 8:00 по Москве ролик приходит сам."
 )
@@ -9782,37 +9789,61 @@ LIST_POSTS = {  # подборки для поста: ключ темы шорт
 }
 
 
+POST_SECTIONS: dict[str, tuple[str, str]] = {  # раздел меню постов → (кнопка, заголовок)
+    "news": ("📰 Новости", "📰 <b>Новости</b> — свежее из Telegram-каналов и зарубежных источников, по ссылке или сводкой."),
+    "lists": ("🎬 Подборки", "🎬 <b>Подборки</b> — новинки, топы, жанры и темы; постеры фирменными карточками."),
+    "dates": ("🎂 Даты и люди", "🎂 <b>Даты и люди</b> — дни рождения, круглые даты, актёры, оценки критиков."),
+    "fun": ("💬 Рубрики и вовлечение", "💬 <b>Рубрики и вовлечение</b> — факты, викторины, голосования, фильм вечера."),
+    "promo": ("📣 Продвижение канала", "📣 <b>Продвижение</b> — реклама, бот, буст, закреп, розыгрыш, статьи."),
+}
+
+
 def posts_menu() -> InlineKeyboardMarkup:
-    keys = list(LIST_POSTS)
+    """Посты в Telegram-канал — по разделам, чтобы не листать длинный список."""
     rows = [[_btn(f"{HOLIDAYS[k][0]}: подборка к празднику", f"pt:l:h:{k}")]
             for k in holidays_now(datetime.now(MSK).date())]
-    rows += [[_btn("📰 Свежая новость из каналов", "pt:make")]]
-    rows += [[_btn("⚡ Инсайды и слухи раньше всех (Reddit, X, Deadline)", "pt:fast")]]
-    rows += [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
-    rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
-             for k in range(0, len(SHORTS_GENRES), 3)]
-    rows.append([_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")])
-    rows.append([_btn("🎉 Подборки к праздникам ▸", "pt:hol")])
-    rows.append([_btn("🔗 Пост по ссылке или тексту", "pt:lk")])
-    rows.append([_btn("🔗 Подборка по ссылке или тексту", "pt:ll")])
-    rows.append([_btn("🧩 Сводка по теме из всех каналов", "pt:dg")])
-    rows.append([_btn("🎂 День рождения звезды", "bd:list"), _btn("📅 Этот день в кино", "pt:an")])
-    rows.append([_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")])
-    rows.append([_btn("🍅 Что пишут критики и зрители (Rotten Tomatoes)", "pt:rt")])
-    rows.append([_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")])
-    rows.append([_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")])
-    rows.append([_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")])
-    rows.append([_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")])
-    rows.append([_btn("🎬 Фильм вечера", "pt:ev"), _btn("⚔️ Битва фильмов", "pt:bt")])
-    rows.append([_btn("🗳 Выбор подписчиков", "pt:vt"), _btn("🎭 Ляпы в кино", "pt:bl")])
-    rows.append([_btn("🗳 Итог голосования → факты", "pt:vr")])
-    rows.append([_btn("📣 Реклама канала (подпишись)", "pt:pr"), _btn("🤖 Пост про бота", "pt:ab")])
-    rows.append([_btn("🎯 Рекомендация: что посмотреть (опрос в боте)", "pt:rq")])
-    rows.append([_btn("🏆 Знатоки месяца (викторина)", "pt:qw"), _btn("⭐ Топ подписчиков", "pt:us")])
-    rows.append([_btn("📌 Закреп-навигатор", "pt:nv"), _btn("⚡ Буст канала", "pt:bs")])
-    rows.append([_btn("🎁 Розыгрыш", "pt:gv"), _btn("📰 Статья для Дзен/VK", "pt:ar")])
-    rows.append([_btn("🗓 Автоплан постов (вкл/выкл)", "pt:plan")])
-    rows.append([_btn("🔔 Авто-посты 30 мин (новости)", "pt:auto")])
+    rows.append([_btn("📰 Свежая новость", "pt:make"), _btn("⚡ Инсайды раньше всех", "pt:fast")])
+    rows += [[_btn(POST_SECTIONS[a][0] + " ▸", f"pt:sec:{a}"), _btn(POST_SECTIONS[b][0] + " ▸", f"pt:sec:{b}")]
+             for a, b in (("news", "lists"), ("dates", "fun"))]
+    rows.append([_btn(POST_SECTIONS["promo"][0] + " ▸", "pt:sec:promo")])
+    rows.append([_btn("🗓 Автоплан постов", "pt:plan"), _btn("🔔 Авто-новости 30 мин", "pt:auto")])
+    rows.append([_btn("🎬 Видео для YouTube и шортсы ▸", "sh:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def posts_section(name: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if name == "news":
+        rows = [[_btn("📰 Свежая новость из каналов", "pt:make")],
+                [_btn("⚡ Инсайды и слухи раньше всех (Reddit, X, Deadline)", "pt:fast")],
+                [_btn("🔗 Пост по ссылке или тексту", "pt:lk")],
+                [_btn("🧩 Сводка по теме из всех каналов", "pt:dg")],
+                [_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")]]
+    elif name == "lists":
+        keys = list(LIST_POSTS)
+        rows = [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
+        rows += [[_btn(f"🎭 {g.capitalize()}", f"pt:l:genre:{g}") for g in SHORTS_GENRES[k:k + 3]]
+                 for k in range(0, len(SHORTS_GENRES), 3)]
+        rows += [[_btn("🎨 Ещё подборки: малобюджетные хорроры, концовки… ▸", "pt:styles")],
+                 [_btn("🎉 Подборки к праздникам ▸", "pt:hol")],
+                 [_btn("🔗 Подборка по ссылке или тексту", "pt:ll")]]
+    elif name == "dates":
+        rows = [[_btn("🎂 День рождения звезды", "bd:list"), _btn("📅 Этот день в кино", "pt:an")],
+                [_btn("🎭 Фильмы и сериалы с актёром", "pt:ac")],
+                [_btn("🍅 Что пишут критики и зрители (Rotten Tomatoes)", "pt:rt")]]
+    elif name == "fun":
+        rows = [[_btn("💡 Факты: новое", "pt:fx:new"), _btn("📼 Факты: классика", "pt:fx:old")],
+                [_btn("🧩 Угадай фильм по кадру", "pt:qz"), _btn("💬 Цитата дня", "pt:qt")],
+                [_btn("🎬 Фильм вечера", "pt:ev"), _btn("⚔️ Битва фильмов", "pt:bt")],
+                [_btn("🗳 Выбор подписчиков", "pt:vt"), _btn("🗳 Итог голосования → факты", "pt:vr")],
+                [_btn("🎭 Ляпы в кино", "pt:bl")],
+                [_btn("🎯 Рекомендация: что посмотреть (опрос в боте)", "pt:rq")],
+                [_btn("🏆 Знатоки месяца (викторина)", "pt:qw"), _btn("⭐ Топ подписчиков", "pt:us")]]
+    elif name == "promo":
+        rows = [[_btn("📣 Реклама канала (подпишись)", "pt:pr"), _btn("🤖 Пост про бота", "pt:ab")],
+                [_btn("📌 Закреп-навигатор", "pt:nv"), _btn("⚡ Буст канала", "pt:bs")],
+                [_btn("🎁 Розыгрыш", "pt:gv"), _btn("📰 Статья для Дзен/VK", "pt:ar")]]
+    rows.append([_btn("⬅️ Все разделы", "pt:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -11586,9 +11617,21 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer("🎨 <b>Подборки по стилю</b> — ИИ подберёт фильмы по теме (Кинопоиск, интернет), "
                              "постеры — фирменными карточками.", reply_markup=style_menu())
         return
-    if action == "menu":
-        await message.answer("📝 <b>Пост для Telegram-канала</b>\n\nСвежая новость из каналов или подборка на "
-                             "вечер — с постерами, в стиле канала.", reply_markup=posts_menu())
+    if action in ("menu", "home"):
+        text = "📝 <b>Посты в Telegram-канал</b>\n\nВыбери раздел. Видео для YouTube и шортсы — кнопка внизу."
+        if action == "home":  # «⬅️ Все разделы» из раздела — меняем то же сообщение
+            try:
+                await message.edit_text(text, reply_markup=posts_menu())
+                return
+            except TelegramBadRequest:
+                pass
+        await message.answer(text, reply_markup=posts_menu())
+        return
+    if kind == "sec" and arg in POST_SECTIONS:
+        try:
+            await message.edit_text(POST_SECTIONS[arg][1], reply_markup=posts_section(arg))
+        except TelegramBadRequest:
+            await message.answer(POST_SECTIONS[arg][1], reply_markup=posts_section(arg))
         return
     if action == "ll":
         await state.set_state(PostState.listlink)
@@ -11609,7 +11652,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await set_shorts_setting("weekly_video", None if action == "wvon" else "off")
         await message.answer("🔔 Каждое воскресенье в 10:00 (Екатеринбург) соберу выпуск «Новости кино» и пришлю "
                              "сюда." if action == "wvon" else "🔕 По воскресеньям выпуск больше не собираю. Вручную — "
-                             "📝 Посты → «🎞 Выпуск «Новости кино»».")
+                             "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
         return
     if action == "wv":
         if weekly_busy:
@@ -13183,7 +13226,7 @@ async def rt_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await set_shorts_setting("rt_alerts", None if kind == "on" else "off")
         await message.answer("🔔 Буду сообщать, когда критики посмотрят премьеру фильма или сезона сериала и когда "
                              "появятся оценки зрителей." if kind == "on" else
-                             "🔕 Уведомления о снятии эмбарго выключены. Включить — 📝 Посты → 🍅 Что пишут критики.")
+                             "🔕 Уведомления о снятии эмбарго выключены. Включить — 📝 Посты → 🎂 Даты и люди → 🍅 Что пишут критики.")
         return
     if kind == "q":
         await state.set_state(PostState.rt)
@@ -13444,7 +13487,7 @@ async def weekly_video_job(bot: Bot) -> None:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
                                                  "</code>\n" + ("Попробую ещё раз через 30 минут. " if retry else "")
-                                       + "Собрать вручную — 📝 Посты → «🎞 Выпуск «Новости кино»».")
+                                       + "Собрать вручную — 🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
 
