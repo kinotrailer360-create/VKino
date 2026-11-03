@@ -10478,7 +10478,7 @@ async def make_anniversary_post(bot: Bot, chat_id: int) -> None:
     """«Этот день в кино»: самый известный фильм, вышедший в этот день круглое число лет назад."""
     today = datetime.now(MSK).date()
     hist = await _posts_history()
-    best, best_years, best_votes = None, 0, 0
+    best, best_years, best_votes, best_field = None, 0, 0, ""
     for years in ANNIVERSARIES:
         try:
             day = today.replace(year=today.year - years)
@@ -10489,14 +10489,17 @@ async def make_anniversary_post(bot: Bot, chat_id: int) -> None:
                                                **{field: shorts_daily._range(day, day), "votes.kp": "50000-100000000"}):
                 votes = int((d.get("votes") or {}).get("kp") or 0)
                 if d.get("id") and f"{d['id']}:{today.year}" not in hist["anniv"] and votes > best_votes:
-                    best, best_years, best_votes = d, years, votes
+                    best, best_years, best_votes, best_field = d, years, votes, field
     if not best:
         raise NothingToday("сегодня нет круглых дат у известных фильмов")
     film = await kp._get(f"/movie/{best['id']}")
     material = _film_line(film) + "\n\nФакты с Кинопоиска:\n" + "\n".join(
         f"— {f}" for f in shorts_daily.usable_facts(film)[:8])
     years_word = shorts_daily._years(best_years)
-    post = await shorts_ai.anniversary_post(GEMINI_API_KEY, material, best_years) or "\n".join(
+    when = f"{today.day} {shorts_daily.MONTHS[today.month - 1].upper()} {today.year - best_years} ГОДА"
+    where = "В РОССИЙСКИЙ ПРОКАТ" if best_field == "premiere.russia" else "НА ЭКРАНЫ"
+    post = await shorts_ai.anniversary_post(
+        GEMINI_API_KEY, material, best_years, f"{best_years} {years_word.upper()} НАЗАД, {when}, {where}") or "\n".join(
         [f"📅 {best_years} {years_word.upper()} НАЗАД ВЫШЕЛ {_label(film).upper()}!", "",
          str(film.get("shortDescription") or film.get("description") or "")[:300], "",
          "Пересматривали? 👇", "", "❤️ — классика 🔥 — пересмотрю сегодня", "", "#ЭтотДеньВКино #Кино #KinoMir360"])
