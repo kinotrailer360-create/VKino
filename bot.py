@@ -9456,8 +9456,28 @@ async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: st
                            disable_web_page_preview=True)
 
 
+async def _unqueue(chat_id: int, first: int) -> bool:
+    """Снять пост с отложенной публикации; True — он там был."""
+    queue = await _json_setting("posts_queue", [])
+    rest = [q for q in queue if not (q["chat"] == chat_id and q["first"] == first)]
+    if len(rest) != len(queue):
+        await set_shorts_setting("posts_queue", json.dumps(rest))
+    return len(rest) != len(queue)
+
+
+async def _mark_published(chat_id: int, first: int) -> None:
+    meta = await _json_setting("posts_meta", {})
+    key = f"{chat_id}:{first}"
+    if key in meta:
+        meta[key]["published"] = int(time.time())
+        await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
+
+
 async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
-    """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?»."""
+    """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?».
+    Пост снимается с отложенной публикации (вышел сейчас — по расписанию повторно не выйдет) и помечается
+    опубликованным (повторное нажатие спросит подтверждение)."""
+    await _unqueue(chat_id, first)
     meta = await _post_meta(chat_id, first)
     button = meta.get("button")
     if button and len(meta["ids"]) == 1:  # пост со ссылкой-кнопкой (бот, буст): копируем вместе с кнопкой
@@ -9465,6 +9485,7 @@ async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
             inline_keyboard=[[InlineKeyboardButton(text=button["text"], url=button["url"])]]))
     else:
         await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
+    await _mark_published(chat_id, first)
     vote = meta.get("vote")
     if vote:  # «Выбор подписчиков»: опрос запоминаем — в пятницу бот подведёт итог и сделает пост о победителе
         sent = await bot.send_poll(POST_CHANNEL, VOTE_QUESTION, vote["titles"], is_anonymous=True)
@@ -11240,7 +11261,22 @@ def _hour_slots(now: datetime) -> list[datetime]:
 
 
 def _when(at: datetime, now: datetime) -> str:
-    return ("сегодня" if at.date() == now.date() else "завтра") + at.strftime(" в %H:%M")
+    days = (at.date() - now.date()).days
+    day = {0: "сегодня", 1: "завтра", -1: "вчера"}.get(days, at.strftime("%d.%m"))
+    return day + at.strftime(" в %H:%M")
+
+
+async def _scheduled() -> list[dict[str, Any]]:
+    """Отложенные посты в канал (у всех админов — канал общий), по времени."""
+    return sorted((q for q in await _json_setting("posts_queue", []) if q["at"] > time.time() - 60),
+                  key=lambda q: q["at"])
+
+
+def _busy_note(queue: list[dict[str, Any]], now: datetime) -> str:
+    if not queue:
+        return "\n\nЗапланированных постов нет."
+    rows = [f"📌 {_when(datetime.fromtimestamp(q['at'], POST_TZ), now)}" for q in queue[:10]]
+    return "\n\n<b>Уже запланировано</b> (📌 на кнопках — занято):\n" + "\n".join(rows)
 
 
 async def publish_due(bot: Bot) -> None:
@@ -11365,6 +11401,15 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     chat_id = message.chat.id
     kind, _, arg = action.partition(":")
     if kind == "p" and arg.isdigit():  # опубликовать сейчас
+        done = (await _post_meta(chat_id, int(arg))).get("published")
+        if done:
+            await callback.answer()
+            await message.edit_text(
+                f"⚠️ Этот пост уже вышел в канале {_when(datetime.fromtimestamp(done, POST_TZ), datetime.now(POST_TZ))}"
+                f" ({POST_TZ_NAME}). Опубликовать ещё раз?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [_btn("📢 Да, ещё раз", f"pt:pf:{arg}")], [_btn("⬅️ Нет", f"pt:b:{arg}")]]))
+            return
+    if (kind == "p" or kind == "pf") and arg.isdigit():
         try:
             await publish_post(message.bot, chat_id, int(arg))
         except Exception as exc:  # noqa: BLE001
@@ -11383,12 +11428,50 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if kind == "t" and arg.isdigit():  # «⏰ Позже»: сначала час (ближайшие 24 часа, время автора)
         now = datetime.now(POST_TZ)
         hours = _hour_slots(now)
-        buttons = [_btn(("" if h.date() == now.date() else "завтра ") + h.strftime("%H:00"),
+        queue = [q for q in await _scheduled() if not (q["chat"] == chat_id and q["first"] == int(arg))]
+        taken = {int(q["at"]) // 3600 for q in queue}
+        buttons = [_btn(("📌" if int(h.timestamp()) // 3600 in taken else "")
+                        + ("" if h.date() == now.date() else "завтра ") + h.strftime("%H:00"),
                         f"pt:h:{arg}:{int(h.timestamp()) // 3600}") for h in hours]
         rows = [buttons[k:k + 4] for k in range(0, len(buttons), 4)]
+        if queue:
+            rows.append([_btn(f"📋 Что запланировано ({len(queue)})", f"pt:q:{arg}")])
         rows.append([_btn("⬅️ Назад", f"pt:b:{arg}")])
-        await message.edit_text(f"⏰ Выбери час публикации (время {POST_TZ_NAME}), потом — минуты.",
+        await message.edit_text(f"⏰ Выбери час публикации (время {POST_TZ_NAME}), потом — минуты."
+                                + _busy_note(queue, now), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    if kind == "q" and arg.isdigit():  # список отложенных: показать пост или снять с публикации
+        now = datetime.now(POST_TZ)
+        queue = await _scheduled()
+        rows = []
+        for q in queue[:10]:
+            label = _when(datetime.fromtimestamp(q["at"], POST_TZ), now)
+            mine = q["chat"] == chat_id
+            rows.append([_btn(f"👁 {label}", f"pt:v:{q['chat']}:{q['first']}") if mine else
+                         _btn(f"📌 {label} (у другого админа)", f"pt:q:{arg}")]
+                        + ([_btn("❌ Снять", f"pt:x:{arg}:{q['first']}")] if mine else []))
+        rows.append([_btn("⬅️ К выбору времени", f"pt:t:{arg}")])
+        await message.edit_text("📋 <b>Запланированные посты</b>. «👁» — показать пост, «❌ Снять» — отменить "
+                                "отложенную публикацию." if queue else "📋 Запланированных постов нет.",
                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    if kind == "v":  # показать запланированный пост ещё раз
+        owner, _, first = arg.partition(":")
+        if owner.isdigit() and first.isdigit() and int(owner) == chat_id:
+            meta = await _post_meta(chat_id, int(first))
+            try:
+                await message.bot.copy_messages(chat_id, chat_id, meta["ids"])
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(f"Пост уже не показать (удалён из чата?): <code>{escape(_safe_err(exc)[:150])}</code>")
+        return
+    if kind == "x":  # снять с публикации из списка
+        back, _, first = arg.partition(":")
+        if back.isdigit() and first.isdigit():
+            await _unqueue(chat_id, int(first))
+            await message.answer("❌ Отложенная публикация снята. Пост остался в чате — его можно опубликовать "
+                                 "или поставить на другое время кнопками под ним.")
+            await message.edit_text("📋 Обновляю список…", reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_btn("📋 Показать список", f"pt:q:{back}")]]))
         return
     if kind == "h":  # потом минуты: :00, :15, :30, :45
         first, _, hour = arg.partition(":")
@@ -11398,9 +11481,17 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         now = time.time()
         mins = [start + m * 60 for m in (0, 15, 30, 45) if start + m * 60 > now + 60]
         label = datetime.fromtimestamp(start, POST_TZ).strftime("%H")
-        rows = [[_btn(f"{label}:{datetime.fromtimestamp(t, POST_TZ):%M}", f"pt:s:{first}:{t // 60}") for t in mins]]
+        queue = [q for q in await _scheduled() if not (q["chat"] == chat_id and q["first"] == int(first))]
+        # занято — если другой пост выходит ближе 15 минут к этому времени
+        busy = [t for t in mins if any(abs(q["at"] - t) < 15 * 60 for q in queue)]
+        rows = [[_btn(("📌 " if t in busy else "") + f"{label}:{datetime.fromtimestamp(t, POST_TZ):%M}",
+                      f"pt:s:{first}:{t // 60}") for t in mins]]
         rows.append([_btn("⬅️ Другой час", f"pt:t:{first}")])
-        await message.edit_text(f"⏰ Час выбран: {label}:00. Теперь минуты (время {POST_TZ_NAME}).",
+        here = [q for q in queue if start - 15 * 60 < q["at"] < start + 75 * 60]
+        note = ("\n\n📌 В это время уже есть: " + ", ".join(
+            datetime.fromtimestamp(q["at"], POST_TZ).strftime("%H:%M") for q in here)
+            + ". Лучше выбрать минуты без 📌 — два поста подряд хуже смотрятся." if here else "")
+        await message.edit_text(f"⏰ Час выбран: {label}:00. Теперь минуты (время {POST_TZ_NAME})." + note,
                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r]))
         return
     if kind == "b" and arg.isdigit():
