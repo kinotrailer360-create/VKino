@@ -13387,9 +13387,20 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
         size += len(row)
     if status:
         await status.edit_text("🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
-    script = await shorts_ai.write_weekly_episode(
-        GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
-        await shorts_setting("weekly_last") or "")
+    script = None
+    for attempt in range(3):  # Gemini упёрся в минутный лимит — ждём и пробуем снова, а не бросаем выпуск
+        script = await shorts_ai.write_weekly_episode(
+            GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
+            await shorts_setting("weekly_last") or "")
+        if script:
+            break
+        wait = re.search(r"снова через (\d+) мин", shorts_ai.last_error or "")
+        if not wait or attempt == 2 or int(wait.group(1)) > 20:
+            break
+        mins = int(wait.group(1)) + 1
+        if status:
+            await status.edit_text(f"⏳ ИИ сейчас на минутном лимите — подожду {mins} мин и продолжу сценарий выпуска…")
+        await asyncio.sleep(mins * 60)
     if not script:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
     if status and shorts_lock.locked():

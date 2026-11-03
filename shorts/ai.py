@@ -369,8 +369,20 @@ def _json_from(text: str) -> Any:
         raise AIError(f"в ответе нет JSON: «{text.strip()[:80]}»")
     try:
         return json.loads(text[start:end + 1])
-    except ValueError:  # лишняя запятая в конце списка — частая ошибка моделей
+    except ValueError:
+        pass
+    try:  # лишняя запятая в конце списка — частая ошибка моделей
         return json.loads(re.sub(r",\s*([\]}])", r"\1", text[start:end + 1]))
+    except ValueError as exc:
+        # длинный ответ (сценарий выпуска) — кавычки внутри строк, пропущенные запятые: чиним, а не выбрасываем
+        try:
+            import json_repair
+            fixed = json_repair.loads(text[start:])
+        except Exception:  # noqa: BLE001
+            raise exc from None
+        if isinstance(fixed, (dict, list)) and fixed:
+            return fixed
+        raise exc from None
 
 
 # у бесплатного Groq лимит ~7000 токенов в минуту (≈ 4 символа на токен по-русски): длинный материал
