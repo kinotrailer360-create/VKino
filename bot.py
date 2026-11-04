@@ -202,6 +202,15 @@ if not DATABASE_URL:
 
 pool: asyncpg.Pool | None = None
 router = Router()
+
+
+@router.errors()
+async def quiet_not_modified(event: Any) -> bool | None:
+    """Нажали кнопку, а сообщение и так такое же («message is not modified») — это не ошибка, молчим."""
+    exc = getattr(event, "exception", None)
+    if isinstance(exc, TelegramBadRequest) and "not modified" in str(exc):
+        return True
+    return None
 contact_router = Router()  # ответы в переписке «написать админу» — раньше всех остальных обработчиков
 
 MAIN_MENU_LABELS = {
@@ -13359,6 +13368,19 @@ async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | Non
         weekly_busy = False
 
 
+async def _edit_quiet(message: Message | None, text: str) -> None:
+    """Обновить строку статуса; «message is not modified» (тот же текст) и прочие сбои правки — не ошибка сборки."""
+    if message is None:
+        return
+    try:
+        await message.edit_text(text)
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc):
+            logging.info("Status edit failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Status edit failed: %s", exc)
+
+
 async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
     # новости и сценарий — до очереди сборки: сеть и ИИ не держат шортсы, очередь только на монтаж
     today = datetime.now(MSK).date()
@@ -13399,7 +13421,7 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
         listing.append(row)
         size += len(row)
     if status:
-        await status.edit_text("🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
+        await _edit_quiet(status, "🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
     script = None
     for attempt in range(3):  # Gemini упёрся в минутный лимит — ждём и пробуем снова, а не бросаем выпуск
         script = await shorts_ai.write_weekly_episode(
@@ -13412,12 +13434,12 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
             break
         mins = int(wait.group(1)) + 1
         if status:
-            await status.edit_text(f"⏳ ИИ сейчас на минутном лимите — подожду {mins} мин и продолжу сценарий выпуска…")
+            await _edit_quiet(status, f"⏳ ИИ сейчас на минутном лимите — подожду {mins} мин и продолжу сценарий выпуска…")
         await asyncio.sleep(mins * 60)
     if not script:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
     if status and shorts_lock.locked():
-        await status.edit_text("⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
+        await _edit_quiet(status, "⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
