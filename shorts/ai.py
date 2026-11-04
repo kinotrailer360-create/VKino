@@ -1994,3 +1994,28 @@ async def edit_episode(key: str, script: dict[str, Any]) -> list[str] | None:
             script[kind][i] = new
     script["edited"] = EDITOR_VERSION
     return fixes
+
+
+async def media_fits(key: str, image: Image.Image, post: str) -> bool | None:
+    """Подходит ли картинка (фото или кадр видео из поста-источника) к новости. В ленте X к посту бывает
+    прикреплено фото соседней новости или цитируемого поста (к слуху о сериале DC пришёл Линк из «Зельды»).
+    True/False; None — ИИ не ответил (тогда картинку не трогаем)."""
+    if not available(key) and not RESERVE_KEY:
+        return None
+    prompt = (
+        "Это картинка, которую бот собирается поставить к посту-новости о кино. Бывает, что к посту-источнику "
+        "прикреплено фото другой новости: другой фильм, сериал, игра, персонаж или человек. Подходит ли картинка "
+        "к ЭТОЙ новости? Подходит: кадр, постер, логотип, актёр или персонаж из этой новости, логотип её студии "
+        "или франшизы. Не подходит: явно другой фильм, игра, персонаж или человек. Сомневаешься — подходит.\n"
+        "Ответь только JSON: {\"fits\": true или false, \"seen\": \"что на картинке, 3–6 слов\"}\n\n"
+        "НОВОСТЬ:\n" + post[:1200])
+    try:
+        data = await _with_reserve(key, [{"text": prompt}, _thumb(image)], prompt, image)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI media_fits failed: %s", exc)
+        return None
+    fits = data.get("fits") if isinstance(data, dict) else None
+    if isinstance(fits, str):
+        fits = fits.strip().lower() == "true"
+    log.info("shorts: media check: fits=%s seen=%s", fits, (data or {}).get("seen") if isinstance(data, dict) else "")
+    return fits if isinstance(fits, bool) else None

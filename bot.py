@@ -9748,6 +9748,56 @@ def _season_of(text: str) -> int | None:
     return min(found)[1]
 
 
+async def _media_frame(path: Path, work: Path) -> Image.Image | None:
+    """Картинка для проверки: само фото или кадр видео на 1-й секунде."""
+    try:
+        if path.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv"):
+            frame = work / f"{path.stem}_check.jpg"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(path), "-frames:v", "1", str(frame),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), 60)
+            path = frame
+        return await asyncio.to_thread(lambda: Image.open(path).convert("RGB"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _check_media(files: list[Path], res: dict[str, Any], work: Path) -> list[Path]:
+    """Фото и видео поста — только о той же новости: ИИ смотрит на каждое (до 4). Не подошло ничего — постер
+    фильма или портрет человека из базы (TMDB), иначе пост без картинки (её можно добавить кнопкой)."""
+    if not files:
+        return files
+    news = f"{res['post'][:900]}\nФильм/сериал: {res.get('film') or '—'} ({res.get('film_en') or '—'}). " \
+           f"Человек: {res.get('person') or '—'} ({res.get('person_en') or '—'})."
+    keep: list[Path] = []
+    for k, path in enumerate(files):
+        if k >= 4:
+            keep.append(path)
+            continue
+        img = await _media_frame(path, work)
+        fits = await shorts_ai.media_fits(GEMINI_API_KEY, img, news) if img else None
+        if fits is False:
+            logging.info("Tg post: media %s rejected for %s", path.name, res.get("topic"))
+            continue
+        keep.append(path)
+    if keep:
+        return keep
+    url = None
+    try:
+        if res.get("film_en") or res.get("film"):
+            url = await shorts_daily.tmdb.poster_by_title(
+                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+        if not url and (res.get("person_en") or res.get("person")):
+            info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
+            url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: replacement image failed: %s", exc)
+    if not url:
+        return []
+    return await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix="repl")
+
+
 async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
                                fresh: bool = False) -> Path | None:
     """Трейлер фильма со звуком с Rutube для поста (до 3 минут, до 50 МБ); None — не нашёлся или не скачался.
@@ -10046,6 +10096,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             if len(files) < 2:
                 files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
                          await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
+            files = await _check_media(files, res, work)  # ИИ смотрит, о том ли картинка (Линк к новости DC)
             caption = post_caption(res["post"], "#новости")
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
