@@ -554,6 +554,9 @@ def _clock(sec: float) -> str:
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
 
 
+cache_stats = [0, 0]  # фраз из кэша озвучки / всего фраз в выпуске
+
+
 class VoiceChanged(RuntimeError):
     """Основной голос (клон в Lumean) отказал посреди выпуска — дальше был бы другой голос."""
 
@@ -564,6 +567,8 @@ async def _voice(lines: list[str], work: Path) -> tuple[Path, list[float], float
     work.mkdir(parents=True, exist_ok=True)
     for attempt in range(2):
         voice, starts, voiced, _ = await daily.synthesize(lines, work, careful=True)
+        cache_stats[0] += daily.voice_cache_hits
+        cache_stats[1] += len(lines)
         note = daily.tts_note or ""
         if not (lumean.enabled() and "Lumean" in note and "не сработал" in note):
             return voice, starts, await _duration(voice), voiced
@@ -587,6 +592,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     first_img: Image.Image | None = None
 
     daily.stressed.clear()
+    cache_stats[:] = [0, 0]
     await daily._progress(3, "Картинки к новостям")
     pictures: list[list[Image.Image]] = []
     for k, story in enumerate(stories):
@@ -730,6 +736,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     seo = build_seo(script, chapters, date_label)
     if notes:
         seo["warning"] = "\n".join(notes)
+    if cache_stats[0]:
+        seo["cache"] = f"{cache_stats[0]} из {cache_stats[1]}"
     if daily.stressed:  # автор слушает и правит неверные через /say — следующая сборка прочтёт верно
         seo["stress"] = ", ".join(sorted(daily.stressed, key=str.lower))
     await daily._progress(98, "Готово")

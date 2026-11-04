@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import io
 import json
@@ -10,6 +11,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -19,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, lumean, news, pronounce, tgsearch, tmdb, wiki
+from . import ai, clips, lumean, news, pronounce, stressdb, tgsearch, tmdb, wiki
 from . import music as musiclib
 from .cards import card_overlay, make_card, make_cover
 
@@ -1005,10 +1007,96 @@ async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
         for i, text in zip(todo, fixed or []):
             texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
     out = [_speakable(pronounce.plain_russian(text)) for text in texts]
+    # на проверку автору — ударения ИИ и словаря (имена, редкие слова); от нейросети во всех словах — не шлём
     for text in out:
         for word in re.findall(rf"[\w{pronounce.STRESS}-]*{pronounce.STRESS}[\w{pronounce.STRESS}-]*", text):
             stressed[word] = stressed.get(word, 0) + 1
-    return out
+    return await _accent(out)
+
+
+DATA_DIR = Path(os.getenv("VKINO_DATA", "/tmp/kinomir_data"))  # в Docker — том, переживает обновления бота
+VOICE_CACHE = DATA_DIR / "voice_cache"
+VOICE_CACHE_MAX = 4000  # фраз (~150 МБ); старые удаляем
+voice_cache_hits = 0  # сколько фраз последней озвучки взято из кэша (не оплачено заново)
+
+
+def _voice_key(text: str, pause: float) -> Path:
+    raw = f"{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{pause:g}|{text}"
+    return VOICE_CACHE / (hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".mp3")
+
+
+async def _lumean_cached(speak: list[str], parts: list[Path], work: Path, pause: float) -> None:
+    """Озвучка Lumean с кэшем по фразам: уже оплаченная фраза (тот же текст, голос и ударения) берётся из кэша,
+    заказываются только новые или исправленные. Перемонтаж выпуска после правки одного слова — это одна-две
+    фразы, а не весь выпуск."""
+    global voice_cache_hits
+    texts = [_for_lumean(t) for t in speak]
+    keys = [_voice_key(t, pause) for t in texts]
+    todo = []
+    for i, key in enumerate(keys):
+        if key.exists() and key.stat().st_size > 1000:
+            shutil.copyfile(key, parts[i])
+            os.utime(key)  # нужная фраза — свежая, при чистке кэша удаляются давно не нужные
+        else:
+            todo.append(i)
+    voice_cache_hits = len(speak) - len(todo)
+    if not todo:
+        return
+    await lumean.synthesize([texts[i] for i in todo], [parts[i] for i in todo], work, pause)
+    await _verify_parts([speak[i] for i in todo], [parts[i] for i in todo], work, pause)
+    try:
+        VOICE_CACHE.mkdir(parents=True, exist_ok=True)
+        for i in todo:
+            if parts[i].exists() and parts[i].stat().st_size > 1000:
+                shutil.copyfile(parts[i], keys[i])
+        files = sorted(VOICE_CACHE.glob("*.mp3"), key=lambda f: f.stat().st_mtime)
+        for old in files[:max(0, len(files) - VOICE_CACHE_MAX)]:
+            old.unlink(missing_ok=True)
+    except OSError as exc:
+        log.info("shorts: voice cache write failed: %s", exc)
+
+
+def accent_url() -> str:
+    """Сервис ударений RUAccent: свой адрес из .env или контейнер accent (COMPOSE_PROFILES=accent)."""
+    url = os.getenv("ACCENT_URL", "").strip()
+    if url:
+        return url.rstrip("/")
+    profiles = {p.strip() for p in os.getenv("COMPOSE_PROFILES", "").split(",")}
+    return "http://accent:8000" if "accent" in profiles else ""
+
+
+accent_note = ""  # почему сервис ударений не сработал (для /voice и отчёта)
+
+
+async def _accent(texts: list[str]) -> list[str]:
+    """Ударения во всех обычных словах от нейросети RUAccent (если сервис включён). Не ответил — без них."""
+    global accent_note
+    url = accent_url()
+    if not texts:
+        return texts
+    if not url and os.getenv("STRESS_DICT", "1") == "0":
+        return texts
+    if not url:  # без сервиса — словарь ударений на диске (3 млн словоформ, почти без памяти)
+        if not await stressdb.ready(DATA_DIR):
+            accent_note = stressdb.status
+            return texts
+        plain = [t.replace(pronounce.STRESS, "") for t in texts]
+        found = stressdb.lookup([w.lower() for t in plain for w in re.findall(r"[А-Яа-яЁё]+", t)])
+        return [pronounce.merge_stress(t, stressdb.accented(p, found)) for t, p in zip(texts, plain)]
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+            async with session.post(f"{url}/accent",
+                                    json={"texts": [t.replace(pronounce.STRESS, "") for t in texts]}) as resp:
+                resp.raise_for_status()
+                got = (await resp.json()).get("texts") or []
+    except Exception as exc:  # noqa: BLE001
+        accent_note = f"сервис ударений не ответил: {str(exc)[:150] or type(exc).__name__}"
+        log.warning("shorts: accent service failed: %s", exc)
+        return texts
+    accent_note = ""
+    if len(got) != len(texts):
+        return texts
+    return [pronounce.merge_stress(t, str(a)) for t, a in zip(texts, got)]
 
 
 def _for_lumean(text: str) -> str:
@@ -1083,9 +1171,8 @@ async def synthesize(lines: list[str], work: Path, pause: float | None = None,
     if lumean.enabled():
         # основной голос — ElevenLabs через Lumean; не вышло — как раньше, голос Microsoft
         try:
-            await lumean.synthesize([_for_lumean(t) for t in speak], parts, work, pause or lumean.PAUSE)
+            await _lumean_cached(speak, parts, work, pause or lumean.PAUSE)
             words = [[] for _ in speak]
-            await _verify_parts(speak, parts, work, pause or lumean.PAUSE)
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Lumean TTS failed: %s", exc)
             lumean_note = f"🗣 Голос ElevenLabs (Lumean) не сработал ({str(exc)[:200]}) — озвучено голосом Microsoft."

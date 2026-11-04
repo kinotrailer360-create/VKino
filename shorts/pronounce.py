@@ -157,6 +157,30 @@ DEFAULT: dict[str, str] = {
     "трейлер": "трЕйлер",
     "трейлера": "трЕйлера",
     "уик-энд": "уик-э́нд",
+    # выпуск 4 ноября, перемонтаж: разбор озвучки
+    "Мэтью": "МЭттью",
+    "Мэттью": "МЭттью",
+    "Мэйтью": "МЭттью",
+    "Райзборо": "РАйзборо",
+    "Райсборо": "РАйзборо",
+    "Андреа": "АндрЕа",
+    "Крэггер": "КрЭггер",
+    "Крэггера": "КрЭггера",
+    "кобура": "кобурА",
+    "кобуре": "кобурЕ",
+    "кобуры": "кобурЫ",
+    "кобуру": "кобурУ",
+    "забирать": "забирАть",
+    "забирает": "забирАет",
+    "забирают": "забирАют",
+    "забирал": "забирАл",
+    "забирала": "забирАла",
+    "наизусть": "наизУсть",
+    "блокбастер": "блокбАстер",
+    "Диккенс": "ДИккенс",
+    "Диккенса": "ДИккенса",
+    "Маккеллен": "МаккЕллен",
+    "Гринт": "ГрИнт",
     "Майкл": "МАйкл",
     "Майкла": "МАйкла",
     "Marvel Studios": "Марвел Стьюдиос",
@@ -371,3 +395,45 @@ def plain_russian(text: str) -> str:
 
 def needs_rewrite(text: str) -> bool:
     return bool(re.search(r"[0-9A-Za-z]", text))
+
+
+# ---------------------------------------------------------------- ударения от сервиса RUAccent
+
+_WORD = re.compile(rf"[А-Яа-яЁё{STRESS}+]+(?:-[А-Яа-яЁё{STRESS}+]+)*")
+_LOWER_VOWELS = "аеёиоуыэюя"
+
+
+def _plain(word: str) -> str:
+    return word.replace(STRESS, "").replace("+", "").lower().replace("ё", "е")
+
+
+def merge_stress(ours: str, accented: str) -> str:
+    """Ударения RUAccent («кобур+е») переносим в наш текст знаком U+0301 — только в обычные слова (со строчной
+    буквы, от двух гласных) и только где ударения ещё нет: имена и наш словарь важнее нейросети («О́скар»).
+    Слова не совпали (сервис что-то поменял) — текст как был."""
+    mine = list(_WORD.finditer(ours))
+    theirs = _WORD.findall(accented)
+    if len(mine) != len(theirs) or any(_plain(m.group(0)) != _plain(t) for m, t in zip(mine, theirs)):
+        return ours
+    out, pos = [], 0
+    for m, t in zip(mine, theirs):
+        word = m.group(0)
+        out.append(ours[pos:m.start()])
+        pos = m.end()
+        vowels = sum(ch in _LOWER_VOWELS for ch in word.lower())
+        start = not ours[:m.start()].strip() or ours[:m.start()].rstrip()[-1:] in ".!?…"  # начало предложения
+        if STRESS in word or "+" not in t or not (word[:1].islower() or start) or vowels < 2 or "ё" in word:
+            out.append(word)
+            continue
+        letters, res = t.replace("+", ""), []
+        stressed = len(t.split("+", 1)[0])  # позиция ударной гласной в слове без «+»
+        for k, ch in enumerate(word):
+            res.append(ch)
+            if k == stressed and ch.lower() in _LOWER_VOWELS and letters[k:k + 1].lower() in _LOWER_VOWELS + "ё":
+                if letters[k] in "ёЁ" and ch in "еЕ":
+                    res[-1] = "ё" if ch == "е" else "Ё"  # «все» → «всё» по смыслу
+                else:
+                    res.append(STRESS)
+        out.append("".join(res))
+    out.append(ours[pos:])
+    return "".join(out)

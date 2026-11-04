@@ -1913,3 +1913,60 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
             "outro": phrases(data.get("outro"))[:4] or
             ["Какая новость удивила вас больше всего? Пишите в комментариях и подписывайтесь. До встречи!"],
             "stories": stories[:9]}
+
+
+EDITOR_RULES = (
+    "Ты — литературный редактор и корректор русского текста для озвучки голосом (новости кино на YouTube). "
+    "Исправь в каждой фразе ошибки пяти видов, НЕ меняя фактов, цифр, порядка фраз и стиля ведущего:\n"
+    "1. Произношение имён: иностранные имена — как их пишут российские СМИ и дубляж (Мэттью Макконахи, Андреа "
+    "Райзборо, Такаси Ямадзаки, Зак Креггер, Джейсон Стейтем, Тай Уэст, Кадзуо Исигуро, Чарльз Диккенс).\n"
+    "2. Знаков ударения не ставь и не убирай — их расставляет следующий шаг.\n"
+    "3. Склонение: падежи имён («выбор Тая Уэста», «Майклу Манну»), числительных, названий. Названия в "
+    "«ёлочках» в одном перечислении — единообразно: либо все склонены («от «Карт, денег, двух стволов» до "
+    "«Гнева человеческого»»), либо с родовым словом («от фильма «Карты, деньги, два ствола» до фильма «Гнев "
+    "человеческий»»).\n"
+    "4. Грамматика: согласование, управление («рецензии на фильм», а не «рецензии фильма»), число («схватки "
+    "чудовищ»), деепричастные обороты только при действующем лице («оружие, находившееся в кобуре, "
+    "выстрелило», а не «оружие выстрелило, находясь в кобуре»).\n"
+    "5. Речевые ошибки: плеоназмы и тавтология («С какой ролью у вас прежде всего ассоциируется Мэттью "
+    "Макконахи?», а не «…Макконахи… этот актёр»), неверная сочетаемость («добилась успеха», а не «получила "
+    "успех»; «скорейшего выздоровления»), нелогичные сравнения («от героя романтических комедий до одного из "
+    "главных драматических артистов»), повтор одного слова в соседних фразах, лишние слова.\n"
+    "Фраза без ошибок — без изменений. Длина фразы — примерно та же (до 25 слов).")
+
+
+async def edit_episode(key: str, script: dict[str, Any]) -> list[str] | None:
+    """Редактор-корректор сценария выпуска перед озвучкой: правит фразы на месте (произношение имён,
+    склонение, грамматика, речевые ошибки) и возвращает список правок для автора. None — ИИ не ответил."""
+    blocks = [("intro", None), *[("story", k) for k in range(len(script.get("stories") or []))], ("outro", None)]
+    texts: list[str] = []
+    where: list[tuple[str, int | None, int]] = []
+    for kind, k in blocks:
+        lines = script[kind] if kind != "story" else script["stories"][k]["lines"]
+        for i, line in enumerate(lines):
+            where.append((kind, k, i))
+            texts.append(line)
+    if not texts:
+        return []
+    listing = "\n".join(f"{n + 1}. {t}" for n, t in enumerate(texts))
+    prompt = (EDITOR_RULES + "\n\nОтветь только JSON: {\"lines\": [\"фраза 1\", …] — ровно " + str(len(texts))
+              + " фраз в том же порядке, \"fixes\": [\"что исправлено: было → стало (вид ошибки)\", …]}\n\n"
+              "ТЕКСТ ВЫПУСКА:\n" + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
+        out = [strip_citations(re.sub(r"\s+", " ", str(t))).strip() for t in data["lines"]]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI edit_episode failed: %s", exc)
+        return None
+    if len(out) != len(texts):
+        log.warning("shorts: AI edit_episode returned %d lines of %d", len(out), len(texts))
+        return None
+    for (kind, k, i), old, new in zip(where, texts, out):
+        if not new or not (len(old) * 0.6 <= len(new) <= len(old) * 1.6 + 20):
+            continue  # явно испорченную фразу не берём
+        if kind == "story":
+            script["stories"][k]["lines"][i] = new
+        else:
+            script[kind][i] = new
+    script["edited"] = True
+    return [re.sub(r"\s+", " ", str(f)).strip()[:200] for f in data.get("fixes") or [] if str(f).strip()][:40]

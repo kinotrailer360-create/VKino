@@ -25,7 +25,13 @@ services:
       PORT: "8080"
       # аккаунты X для быстрых новостей (/fast): RSSHub работает, только если в .env есть COMPOSE_PROFILES=x
       RSSHUB_URL: ${RSSHUB_URL:-}
+      # ударения для озвучки (RUAccent): работает, только если в .env есть accent в COMPOSE_PROFILES
+      ACCENT_URL: ${ACCENT_URL:-}
+      # словарь ударений и кэш озвученных фраз — в томе, чтобы не скачивать и не оплачивать заново после обновлений
+      VKINO_DATA: /data
       COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
+    volumes:
+      - data:/data
     depends_on:
       db:
         condition: service_healthy
@@ -46,6 +52,17 @@ services:
     logging:
       options: {max-size: "10m", max-file: "3"}
 
+  accent:
+    # Ударения во всех словах озвучки (нейросеть RUAccent, ~2 ГБ памяти). Включается строкой в .env:
+    #   COMPOSE_PROFILES=accent        (вместе с X: COMPOSE_PROFILES=x,accent)
+    build: ./accent
+    profiles: ["accent"]
+    restart: always
+    volumes:
+      - accent:/models
+    logging:
+      options: {max-size: "10m", max-file: "3"}
+
   caddy:
     # сам получает и продлевает HTTPS-сертификат — мини-приложение Telegram работает только по https
     image: caddy:2-alpine
@@ -61,3 +78,5 @@ services:
 volumes:
   db:
   caddy:
+  accent:
+  data:
