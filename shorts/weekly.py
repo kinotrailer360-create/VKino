@@ -358,10 +358,20 @@ async def _segment(work: Path, name: str, slides: list[tuple[Path, float]], over
 async def _brand_clip(src: Path, out: Path) -> Path:
     """Готовый ролик (заставка или концовка) в те же параметры, что у сегментов, — чтобы склеить без
     перекодирования всего выпуска."""
-    await _run("ffmpeg", "-v", "error", "-y", "-i", str(src), "-vf", f"scale={W}:{H},fps={FPS},format=yuv420p",
-               "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k",
-               "-ar", "48000", "-ac", "2", str(out))
+    # тишина вторым входом: если у ролика нет своего звука, берётся она — у всех кусков одинаковая дорожка
+    await _run("ffmpeg", "-v", "error", "-y", "-i", str(src), "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+               "-filter_complex", f"[0:v]scale={W}:{H},fps={FPS},format=yuv420p[v]", "-map", "[v]",
+               "-map", "0:a?" if await _has_audio(src) else "1:a", "-shortest", "-r", str(FPS), "-c:v", "libx264",
+               "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", str(out))
     return out
+
+
+async def _has_audio(path: Path) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0",
+        str(path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await asyncio.wait_for(proc.communicate(), 60)
+    return bool(out.strip())
 
 
 def _even_slides(paths: list[Path], starts: list[float], total: float) -> list[tuple[Path, float]]:

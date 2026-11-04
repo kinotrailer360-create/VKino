@@ -49,11 +49,21 @@ async def check_url(url: str) -> None:
             raise UnsafeURL(f"{host} ведёт во внутреннюю сеть")
 
 
+def _same_origin(url: str, trusted: str) -> bool:
+    """Тот же сервер, что доверенный (схема, хост и порт — разобранные, а не сравнение строк: иначе
+    «http://rsshub:1200@чужой-сайт/» тоже начиналось бы с доверенного адреса)."""
+    a, b = urlparse(url), urlparse(trusted)
+    try:
+        return (a.scheme, a.hostname, a.port or 0) == (b.scheme, b.hostname, b.port or 0) and not a.username
+    except ValueError:
+        return False
+
+
 async def fetch(session: aiohttp.ClientSession, url: str, limit: int = MAX_BYTES, trusted: str = "") -> bytes:
     """GET с проверкой адреса на каждом перенаправлении и потолком размера. trusted — свой адрес из .env
     (RSSHub в docker-сети: он внутренний, но его задал владелец бота)."""
     for _ in range(MAX_REDIRECTS + 1):
-        if not (trusted and url.startswith(trusted)):
+        if not (trusted and _same_origin(url, trusted)):
             await check_url(url)
         async with session.get(url, allow_redirects=False) as resp:
             if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):

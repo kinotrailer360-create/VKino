@@ -17,7 +17,7 @@ from html import escape
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote_plus, urlencode
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse
 
 import aiohttp
 import asyncpg
@@ -2608,7 +2608,9 @@ def validate_webapp_init_data(raw: str, max_age: int = 86400) -> dict[str, Any] 
         if not hmac.compare_digest(calculated, received_hash):
             return None
         auth_date = int(pairs.get("auth_date", "0"))
-        if auth_date <= 0 or abs(int(time.time()) - auth_date) > max_age:
+        now = int(time.time())
+        # 24 ч: Mini App не обновляет initData, пока открыт (фильм смотрят долго); из будущего — не больше 5 мин
+        if auth_date <= 0 or now - auth_date > max_age or auth_date - now > 300:
             return None
         user_raw = pairs.get("user")
         user = json.loads(user_raw) if user_raw else None
@@ -2755,10 +2757,20 @@ async def api_playback(request: web.Request) -> web.Response:
     )
 
 
+_progress_seen: dict[int, float] = {}  # пользователь → время последнего сохранения прогресса
+
+
 async def api_progress(request: web.Request) -> web.Response:
     user = request_telegram_user(request)
     if not user:
         return web.json_response({"error": "unauthorized"}, status=401)
+    # плеер шлёт прогресс раз в 10 с; чаще 3 с с одного пользователя — не пишем в базу
+    uid, now = int(user.get("id") or 0), time.monotonic()
+    if now - _progress_seen.get(uid, 0) < 3:
+        return web.json_response({"ok": True, "throttled": True})
+    _progress_seen[uid] = now
+    if len(_progress_seen) > 50_000:
+        _progress_seen.clear()
     try:
         payload = await request.json()
         movie_id = int(payload.get("movie_id", 0))
@@ -2843,14 +2855,18 @@ async def sync_video_provider_once() -> int:
             voice_name = str(item.get("voice") or item.get("voice_name") or "Original").strip()[:80]
             quality = int(item.get("quality"))
             playback_url = str(item.get("url") or item.get("playback_url") or "").strip()
-            if quality not in {360, 480, 720, 1080} or not playback_url.startswith("https://"):
+            parsed = urlparse(playback_url)
+            if quality not in {360, 480, 720, 1080} or parsed.scheme != "https" or not parsed.hostname \
+                    or parsed.username or " " in playback_url:
                 continue
             season = item.get("season")
             episode = item.get("episode")
             season_number = int(season) if season not in (None, "", 0, "0") else None
             episode_number = int(episode) if episode not in (None, "", 0, "0") else None
             source_type = str(item.get("type") or item.get("source_type") or "link")[:20]
-            active = bool(item.get("active", True))
+            raw_active = item.get("active", True)  # строка «false» — это выключено, а не True
+            active = raw_active if isinstance(raw_active, bool) else str(raw_active).strip().lower() in (
+                "1", "true", "yes", "on")
         except Exception:
             continue
         existing_id = await db().fetchval(
@@ -13598,10 +13614,16 @@ async def weekly_video_job(bot: Bot) -> None:
 
 async def growth_loop(bot: Bot) -> None:
     """Раз в 10 минут: уведомления из избранного (раз в 3 часа), подборка недели (пятница, 18:00 Екб)."""
-    last_alerts = last_rt = 0.0
+    last_alerts = last_rt = last_clean = 0.0
     while True:
         await asyncio.sleep(600)
         try:
+            if time.time() - last_clean > 86400:  # раз в сутки: старые события статистики не копим вечно
+                last_clean = time.time()
+                try:
+                    await db().execute("DELETE FROM bot_events WHERE created_at < NOW() - INTERVAL '400 days'")
+                except Exception:  # noqa: BLE001
+                    logging.exception("bot_events cleanup failed")
             if (time.time() - last_rt > RT_EVERY and 8 <= datetime.now(POST_TZ).hour < 23
                     and not rt_watch_busy.locked()):
                 last_rt = time.time()
@@ -14089,7 +14111,7 @@ async def main() -> None:
         shorts_daily_loop(bot)
     )
     posts_task = asyncio.create_task(posts_auto_loop(bot))
-    growth_task = asyncio.create_task(growth_loop(bot))  # noqa: F841 — уведомления из избранного, подборка недели
+    growth_task = asyncio.create_task(growth_loop(bot))  # уведомления из избранного, подборка недели, выпуск
 
     dp = Dispatcher()
     dp.message.outer_middleware(activity_tracker)
@@ -14123,6 +14145,7 @@ async def main() -> None:
         reminder_task.cancel()
         shorts_task.cancel()
         posts_task.cancel()
+        growth_task.cancel()
         commands_task.cancel()
 
         try:
