@@ -13776,13 +13776,23 @@ async def yt_trailers_watch(bot: Bot) -> None:
     только запоминает, что уже вышло (иначе пришла бы сразу пачка старых трейлеров)."""
     if await shorts_setting("yt_trailers") == "off":
         return
-    found = await shorts_yttrailers.latest(hours=36)
+    found = await shorts_yttrailers.latest(hours=36, extra=await _json_setting("yt_channels", {}))
     raw = await shorts_setting("yt_seen")
     seen = list(json.loads(raw)) if raw else None
     if seen is None:
-        await set_shorts_setting("yt_seen", json.dumps([v["id"] for v in found]))
+        await set_shorts_setting("yt_seen", json.dumps(
+            [v["id"] for v in found] + ["t:" + shorts_yttrailers.film_key(v["title"]) for v in found]))
         return
-    fresh = [v for v in found if v["id"] not in seen][:6]
+    fresh = []
+    # тот же трейлер у студии и у сборщика трейлеров — одно сообщение, со ссылкой на ролик студии
+    found.sort(key=lambda v: (v["studio"] in shorts_yttrailers.AGGREGATORS, -v["time"]))
+    for v in found:
+        key = "t:" + shorts_yttrailers.film_key(v["title"])
+        if v["id"] in seen or key in seen:
+            continue
+        seen.append(key)
+        fresh.append(v)
+    fresh = fresh[:6]
     if not fresh:
         return
     info = await _json_setting("yt_info", {})
@@ -13854,15 +13864,41 @@ async def trailers_command(message: Message) -> None:
         await set_shorts_setting("yt_trailers", None if arg == "on" else "off")
         await message.answer("🔔 Трейлеры с YouTube включены." if arg == "on" else "🔕 Трейлеры с YouTube выключены.")
         return
+    mine = await _json_setting("yt_channels", {})
+    raw_arg = (message.text or "").partition(" ")[2].strip()
+    if arg.startswith("add "):
+        try:
+            got = await shorts_yttrailers.channel_id(raw_arg[4:])
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ Не открылся канал: <code>{escape(_safe_err(exc)[:200])}</code>")
+            return
+        if not got:
+            await message.answer("Не нашёл канал. Пришли ссылку вида <code>/trailers add https://www.youtube.com/@Vertical_Official</code>")
+            return
+        mine[got[1]] = got[0]
+        await set_shorts_setting("yt_channels", json.dumps(mine, ensure_ascii=False))
+        await message.answer(f"✅ Канал «{escape(got[1])}» добавлен — новые трейлеры с него тоже буду присылать.")
+        return
+    if arg.startswith("del "):
+        name = raw_arg[4:].strip()
+        if mine.pop(name, None) is None:
+            await message.answer("Такого своего канала нет. Список — /trailers")
+            return
+        await set_shorts_setting("yt_channels", json.dumps(mine, ensure_ascii=False))
+        await message.answer(f"✅ Канал «{escape(name)}» убран.")
+        return
     on = await shorts_setting("yt_trailers") != "off"
     wait = await message.answer("🎬 Смотрю свежие трейлеры на каналах студий…")
-    found = await shorts_yttrailers.latest(hours=72)
+    found = await shorts_yttrailers.latest(hours=72, extra=mine)
     rows = [f"• {escape(v['studio'])}: <a href=\"{v['url']}\">{escape(v['title'][:80])}</a>" for v in found[:15]]
     await wait.edit_text(
         f"🎬 <b>Трейлеры с YouTube-каналов студий</b> — {'включены ✅' if on else 'выключены ❌'} (проверка раз в "
-        f"30 минут, с 8 до 23).\nКаналы: {escape(', '.join(shorts_yttrailers.STUDIOS))}.\n\nЗа 3 дня:\n"
+        f"30 минут, с 8 до 23).\nКаналы: {escape(', '.join(shorts_yttrailers.STUDIOS))}."
+        + (f"\nТвои каналы: {escape(', '.join(mine))}." if mine else "") + "\n\nЗа 3 дня:\n"
         + ("\n".join(rows) if rows else "новых трейлеров нет")
-        + "\n\n<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать",
+        + "\n\n<code>/trailers add ссылка на канал</code> — добавить свой канал (трейлеры любой студии)\n"
+          "<code>/trailers del Название</code> — убрать свой канал\n"
+          "<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать",
         disable_web_page_preview=True)
 
 

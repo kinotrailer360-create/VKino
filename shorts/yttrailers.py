@@ -40,10 +40,22 @@ STUDIOS: dict[str, str] = {
     "Prime Video": "UCQJWtTnAHhEG5w4uN0udnUQ",
     "HBO": "UCVTQuK2CaWaTgSsoNkn5AiQ",
     "Apple TV": "UC1Myj674wRVXB9I4c6Hm5zA",
+    "Amazon MGM Studios": "UCf5CjDJvsFvtVIhkfmKAwAA",
+    "Focus Features": "UCU4SM3j_9TNWaSu8KdGV50g",
+    "Searchlight": "UCor9rW6PgxSQ9vUPWQdnaYQ",
+    "NEON": "UCpy5dRhZd-JbZP4NsrnLt1w",
+    "Blumhouse": "UCCEfOHkckMXnoZQAjUZsMig",
+    "Vertical": "UCpR3kmSyTYszJHWEcmpcnFQ",  # «Lords of War» — пропустили, пока его не было в списке
+    "Roadside Attractions": "UCeWcRKRM54EAK2Dl-klMGAw",
+    "Sony Pictures Classics": "UCruD_lL-5fmllpKMSL-yCyQ",
+    # сборщик трейлеров всех студий (и небольших): ловит то, чего нет в списке выше
+    "Rotten Tomatoes Trailers": "UCi8e0iOVk1fEOogdfu4YgfA",
 }
 TRAILER = re.compile(r"\b(?:trailers?|teasers?)\b|трейлер|тизер", re.I)
 SKIP = re.compile(r"full movie|behind the scenes|featurette|#shorts|reaction|recap|clip\b|scene\b|"
-                  r"audio description|sign language|\bASL\b", re.I)
+                  r"audio description|sign language|\bASL\b|this week|weekly|compilation|best (?:new )?trailers",
+                  re.I)
+AGGREGATORS = {"Rotten Tomatoes Trailers"}  # один трейлер у студии и у сборщика — берём ролик студии
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://t.me/KinoMir360)"}
 
 
@@ -64,8 +76,39 @@ def _parse(raw: bytes, studio: str, since: float) -> list[dict[str, Any]]:
     return out
 
 
-async def latest(hours: float = 24) -> list[dict[str, Any]]:
-    """Трейлеры и тизеры студий за последние часы, новые первыми."""
+def film_key(title: str) -> str:
+    """Один и тот же трейлер у студии и у сборщика: «Lords of War | Official Teaser #1 (HD) | Vertical» и
+    «Lords of War Teaser Trailer (2027)» → «lords of war». Для одного сообщения вместо двух."""
+    t = title.split("|")[0].lower()
+    t = re.sub(r"\(.*?\)|\[.*?\]|#\d+|\b(?:official|final|new|teaser|trailers?|тизер|трейлер|hd|4k|"
+               r"red band|uk|us|international|\d{4})\b", " ", t)
+    return re.sub(r"[^\w]+", " ", t).strip()
+
+
+async def channel_id(link: str) -> tuple[str, str] | None:
+    """Ссылка на канал (youtube.com/@Имя, /channel/UC…, @Имя) → (ID канала, название) — для /trailers add."""
+    link = link.strip()
+    m = re.search(r"(UC[\w-]{22})", link)
+    handle = re.search(r"@([\w.-]{3,40})", link)
+    if not m and not handle:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
+        cid = m.group(1) if m else ""
+        if not cid:
+            page = (await netsafe.fetch(session, f"https://www.youtube.com/@{handle.group(1)}", 4 * 1024 * 1024)
+                    ).decode("utf-8", "ignore")
+            found = re.search(r'"externalId":"(UC[\w-]{22})"', page) or re.search(
+                r'itemprop="identifier" content="(UC[\w-]{22})"', page)
+            if not found:
+                return None
+            cid = found.group(1)
+        raw = await netsafe.fetch(session, FEED + cid, 3 * 1024 * 1024)
+    title = (feedparser.parse(raw).get("feed") or {}).get("title") or ""
+    return (cid, html.unescape(str(title))) if title else None
+
+
+async def latest(hours: float = 24, extra: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Трейлеры и тизеры студий (и своих каналов автора extra) за последние часы, новые первыми."""
     since = time.time() - hours * 3600
 
     async def one(session: aiohttp.ClientSession, studio: str, channel: str) -> list[dict[str, Any]]:
@@ -77,5 +120,5 @@ async def latest(hours: float = 24) -> list[dict[str, Any]]:
             return []
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=HEADERS) as session:
-        found = await asyncio.gather(*(one(session, s, c) for s, c in STUDIOS.items()))
+        found = await asyncio.gather(*(one(session, s, c) for s, c in {**STUDIOS, **(extra or {})}.items()))
     return sorted((v for chunk in found for v in chunk), key=lambda v: -v["time"])
