@@ -1996,46 +1996,33 @@ async def edit_episode(key: str, script: dict[str, Any]) -> list[str] | None:
     return fixes
 
 
-async def media_fits(key: str, image: Image.Image, post: str) -> bool | None:
-    """Подходит ли картинка (фото или кадр видео из поста-источника) к новости. В ленте X к посту бывает
-    прикреплено фото соседней новости или цитируемого поста (к слуху о сериале DC пришёл Линк из «Зельды»).
-    True/False; None — ИИ не ответил (тогда картинку не трогаем)."""
+async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | None, str]:
+    """Подходит ли картинка (фото или кадр видео) к новости. В ленте X к посту бывает прикреплено фото соседней
+    новости, а поиск по каналам и базам фильмов промахивается: к «Дюне 3» пришёл логотип «Мстителей», к смерти
+    Тинто Брасса — постер сериала «Trinity». (True/False/None — ИИ не ответил, что увидел на картинке)."""
     if not available(key) and not RESERVE_KEY:
-        return None
+        return None, ""
     prompt = (
-        "Это картинка, которую бот собирается поставить к посту-новости о кино. Бывает, что к посту-источнику "
-        "прикреплено фото другой новости: другой фильм, сериал, игра, персонаж или человек. Подходит ли картинка "
-        "к ЭТОЙ новости? Подходит: кадр, постер, логотип, актёр или персонаж из этой новости, логотип её студии "
-        "или франшизы. Не подходит: явно другой фильм, игра, персонаж или человек. Сомневаешься — подходит.\n"
-        "Ответь только JSON: {\"fits\": true или false, \"seen\": \"что на картинке, 3–6 слов\"}\n\n"
-        "НОВОСТЬ:\n" + post[:1200])
+        "Ты бильд-редактор новостного канала о кино. Это картинка, которую бот собирается поставить к посту. "
+        "Сначала прочитай ВСЕ надписи на картинке (названия, логотипы) и пойми, кто или что на ней. Потом реши, "
+        "подходит ли она к ЭТОЙ новости.\n"
+        "Подходит: кадр, постер или логотип фильма/сериала, о котором новость; фото людей из новости; кадр из "
+        "фильмов человека, о котором новость (для новости о смерти или юбилее — его известные фильмы).\n"
+        "НЕ подходит: на картинке название или логотип ДРУГОГО фильма, сериала, игры или франшизы (новость о "
+        "«Дюне», а на картинке «Мстители»); другой человек; постер фильма, к которому человек из новости не "
+        "имеет отношения.\n"
+        "Ответь только JSON: {\"seen\": \"что на картинке и какие надписи, до 12 слов\", \"fits\": true или "
+        "false}\n\nНОВОСТЬ:\n" + post[:1200])
     try:
-        data = await _with_reserve(key, [{"text": prompt}, _thumb(image)], prompt, image)
+        data = await _with_reserve(key, [{"text": prompt}, _thumb(image, 768)], prompt, image)
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI media_fits failed: %s", exc)
-        return None
-    fits = data.get("fits") if isinstance(data, dict) else None
+        return None, ""
+    if not isinstance(data, dict):
+        return None, ""
+    fits = data.get("fits")
     if isinstance(fits, str):
         fits = fits.strip().lower() == "true"
-    log.info("shorts: media check: fits=%s seen=%s", fits, (data or {}).get("seen") if isinstance(data, dict) else "")
-    return fits if isinstance(fits, bool) else None
-
-
-async def translate_roles(items: list[tuple[str, str]], key: str | None = None) -> list[str] | None:
-    """Роли персонажей по-русски, как в российском дубляже: [(фильм, роль латиницей)] → ["Бастер Мун", …].
-    Не знает — пустая строка (лучше без роли, чем английское имя голосом)."""
-    key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key
-    if not items or not (available(key) or RESERVE_KEY):
-        return None
-    listing = "\n".join(f"{i + 1}. «{film}» — {role}" for i, (film, role) in enumerate(items))
-    prompt = ("Переведи имена персонажей на русский так, как их зовут в российском дубляже и прокате этих "
-              "фильмов (Buster Moon → Бастер Мун, Rust Cohle → Раст Коул, Cooper → Купер). Описательные роли — "
-              "по-русски коротко (Bartender → бармен). Не уверен — пустая строка. Ответь только JSON: "
-              "{\"roles\": [\"…\", …]} — столько же, в том же порядке.\n\n" + listing)
-    try:
-        data = await _with_reserve(key, [{"text": prompt}], prompt)
-        out = [str(r or "").strip() for r in data["roles"]]
-    except Exception as exc:  # noqa: BLE001
-        log.warning("shorts: AI translate_roles failed: %s", exc)
-        return None
-    return out if len(out) == len(items) else None
+    seen = re.sub(r"\s+", " ", str(data.get("seen") or "")).strip()[:120]
+    log.info("shorts: media check: fits=%s seen=%s", fits, seen)
+    return (fits if isinstance(fits, bool) else None), seen
