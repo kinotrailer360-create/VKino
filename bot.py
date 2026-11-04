@@ -9669,6 +9669,14 @@ def _key_tokens(text: str) -> set[str]:
     return latin | nums | cyr
 
 
+def _proper_names(text: str) -> str:
+    """Слова с заглавной буквы не в начале предложения (имена, названия) и всё в «ёлочках»."""
+    out = re.findall(r"«([^»]{2,60})»", text)
+    for m in re.finditer(r"(?<![.!?…\n]\s)(?<!^)(?<=\s)([A-ZА-ЯЁ][a-zа-яё]{2,}(?:[\s-][A-ZА-ЯЁ][a-zа-яё]{2,})*)", text):
+        out.append(m.group(1))
+    return " ".join(out)
+
+
 def _shared(about: set[str], words: set[str]) -> set[str]:
     """Общие опознавательные слова; русские основы совпадают и по началу («мстите» ~ «мстител»)."""
     out = about & words
@@ -9789,6 +9797,9 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         # и только если в источнике есть те же имена, названия или цифры, что в готовом посте: ИИ бывает
         # называет номер чужого поста (в посте о Warner Bros. оказалось видео про Zelda)
         about = _key_tokens(" ".join([res["post"], res["film"], res["film_en"], res["person"]]))
+        # имена и названия новости: общие слова («экранизация», «хоррор», «роман») совпадают у разных новостей —
+        # без общего имени фото чужого поста не берём (к посту про Андерсона пришёл портрет Деппа)
+        names_ru = _key_tokens(" ".join([res["film"], res["person"], _proper_names(res["post"])]))
         names_en = _key_tokens(" ".join([res["film_en"], res["person_en"]]))
         about_en = names_en | {t for t in about if t.isdigit() or t.isascii()}
 
@@ -9798,7 +9809,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                 hits = about_en & words
                 # одного общего слова мало («marvel», «star») — нужно название/имя из новости или два совпадения
                 return bool(hits & names_en) or len(hits) >= 2
-            return len(_shared(about, words)) >= 2
+            hits = _shared(about, words)
+            return len(hits) >= 2 and bool(_shared(names_ru | names_en, words))
 
         same = [p for p in same if related(p)]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
