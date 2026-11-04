@@ -1344,7 +1344,7 @@ async def rewrite_post(key: str, sources: str, note: str = "",
             "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true"}
 
 
-async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | None:
+async def spoken_form(texts: list[str], key: str | None = None, premium: bool = False) -> list[str] | None:
     """Фразы для озвучки: числа — словами в нужном падеже, латиница — русскими буквами по звучанию."""
     key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key
     if not available(key) or not texts:
@@ -1369,7 +1369,8 @@ async def spoken_form(texts: list[str], key: str | None = None) -> list[str] | N
         "Ответь JSON: {\"texts\": [\"...\", ...]} — столько же фраз, в том же порядке.\n\n" + listing
     )
     try:
-        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        # выпуск для YouTube (premium) — сильной моделью: слабая ставит ударения наугад («Оска́р»)
+        data = await _with_reserve(key, [{"text": prompt}], prompt, premium=premium)
         out = [str(t).strip() for t in data["texts"]]
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI spoken_form failed: %s", exc)
@@ -1786,9 +1787,24 @@ WEEKLY_STYLE = (
     "высказываний о группах людей, политике и религии. Печальные новости — бережно, без шуток.")
 
 
+def _num(value: Any) -> float:
+    try:
+        return float(str(value).replace(",", ".").replace(" ", "")) if value not in (None, "") else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _money(raw: Any) -> dict[str, float]:
+    """Деньги новости для графика (млн $): только положительные правдоподобные числа."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {k: _num(raw.get(k)) for k in ("gross", "budget", "forecast")}
+    return {k: v for k, v in out.items() if 0 < v < 5000}
+
+
 async def write_weekly_episode(key: str, listing: str, today: str, recent: str = "",
                                n: int = 7, period: str = "за последнюю неделю",
-                               next_day: str = "в следующее воскресенье") -> dict[str, Any] | None:
+                               next_day: str = "в следующее воскресенье", keep: str = "") -> dict[str, Any] | None:
     """Сценарий еженедельного выпуска «Новости кино» (YouTube, 6–9 минут) по новостям недели (listing —
     пронумерованные посты каналов и зарубежных источников).
     {"title", "description", "tags", "intro": [фразы], "outro": [фразы],
@@ -1813,18 +1829,30 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
         "новости — плавный переход от предыдущей («А теперь к хорошим новостям…», «Из мира супергероев…»), "
         "кроме первой новости. Названия — как в российском прокате, в «ёлочках»; имена — по-русски. Без "
         "эмодзи, хэштегов и ссылок в фразах; числа можно цифрами.\n"
+        "ТЕКСТ ЧИТАЕТ ГОЛОС: в lines, intro и outro НИ ОДНОГО слова латиницей — имена и названия только "
+        "русскими буквами, как их произносят («Тай Уэст», а не «Ti West»; трилогия «Икс», «Пёрл»; «Роттен "
+        "Томейтоуз»; «Кадзуо Исигуро»). Названия фильмов — полностью и в кавычках-ёлочках, перечисления "
+        "фильмов — каждый в своих ёлочках («автора «Схватки», «Соучастника» и «Вора»).\n"
+        "Если новость о деньгах (сборы, бюджет, прогноз старта, окупаемость) — заполни money числами из "
+        "источников в миллионах долларов: gross — сборы на сегодня (мировые, если известны), budget — бюджет "
+        "производства, forecast — прогноз сборов стартового уик-энда (если новость о прогнозе). Чего нет в "
+        "источниках — 0, не выдумывай. По этим числам в ролике рисуется график.\n"
         "intro — 2–3 фразы: приветствие («Привет! С вами KinoMir360…») и анонс 2–3 главных тем выпуска. "
         "outro — 2–3 фразы: какая новость удивила больше всего — пишите в комментариях, подпишитесь, до встречи "
         f"{next_day}. Название канала пиши именно так: KinoMir360."
-        + (f"\n\nЭТО УЖЕ БЫЛО В ПРОШЛОМ ВЫПУСКЕ — не повторяй:\n{recent[:2000]}" if recent else "")
+        + (f"\n\nЭТО УЖЕ БЫЛО В ПРОШЛОМ ВЫПУСКЕ — не повторяй:\n{recent[:2000]}" if recent and not keep else "")
+        + (f"\n\nВЫПУСК ПЕРЕСОБИРАЕТСЯ: темы уже утверждены автором — возьми РОВНО эти новости в этом порядке "
+           f"(не добавляй и не заменяй), найди их в списке ниже и напиши текст заново, точно по фактам:\n"
+           f"{keep[:2000]}" if keep else "")
         + GRAMMAR
         + '\n\nОтветь только JSON: {"title": "название видео для YouTube: 2–3 главные новости КАПСОМ через « / » '
         'и в конце « / Новости кино», до 95 символов", "description": "2–3 предложения описания выпуска", '
         '"tags": "25–30 тегов через запятую (новости кино, названия, имена, год)", "intro": ["…"], '
         '"outro": ["…"], "stories": [{"headline": "заголовок новости КАПСОМ, до 40 символов", "chapter": "тот же заголовок '
         'обычными буквами для таймкода («Умер Патрик Стюарт»)", "film": "фильм или '
-        'сериал по-русски или пусто", "film_en": "оригинальное название или пусто", "person": "главный человек '
-        'новости по-русски или пусто", "person_en": "его имя латиницей или пусто", "mourning": true или false '
+        'сериал по-русски или пусто", "film_en": "оригинальное название или пусто", "year": год выхода этого фильма '
+        'или сериала (у будущих — ожидаемый) или 0, "money": {"gross": 0, "budget": 0, "forecast": 0}, '
+        '"person": "главный человек новости по-русски или пусто", "person_en": "его имя латиницей или пусто", "mourning": true или false '
         '(true — если новость о смерти), "lines": ["…"], "media": [номера постов об этой новости]}]}'
         "\n\nНОВОСТИ НЕДЕЛИ:\n" + listing
     )
@@ -1859,6 +1887,7 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
                         "film_en": str(s.get("film_en") or "").strip(" «»\""),
                         "person": str(s.get("person") or "").strip(), "person_en": str(s.get("person_en") or "").strip(),
                         "mourning": s.get("mourning") is True or str(s.get("mourning")).lower() == "true",
+                        "year": _num(s.get("year")), "money": _money(s.get("money")),
                         "lines": lines[:12], "media": media})
     if len(stories) < 3:
         return None

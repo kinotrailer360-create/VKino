@@ -21,7 +21,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from . import daily, lumean, netsafe, tmdb
+from . import boxchart, daily, lumean, netsafe, tmdb
 from . import music as musiclib
 from .cards import ASSETS, _cover, _font
 
@@ -129,6 +129,7 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
         names = [n for n in (story.get("film_en"), story.get("film")) if n]
         if not names:
             return []
+        year = _int(story.get("year"))
         tries = list(dict.fromkeys(names + [re.split(r"[:.—–-]", n)[0].strip() for n in names]))
         for query in tries:
             if len(query) < 3:
@@ -146,7 +147,7 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
                 return max(max(tmdb.similar(c[0].get("title") or "", q), tmdb.similar(c[0].get("original") or "", q))
                            for q in (query, *names))
 
-            good = [c for c in cands if score(c) >= 0.93]
+            good = [c for c in cands if score(c) >= 0.93 and _year_ok(c[0], year)]
             if not good:
                 continue
             # из точных совпадений — самый популярный, фильм раньше сериала
@@ -183,6 +184,20 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
         got = await asyncio.gather(*(_download(session, u, bool(story.get("mourning"))) for u in wanted))
     return [img for img in got if img][:limit]
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(str(value or "0")[:4])
+    except ValueError:
+        return 0
+
+
+def _year_ok(row: dict[str, Any], year: int) -> bool:
+    """Год найденного фильма совпадает с годом из новости (±1): новость о «Догфайте» Гая Ричи (2028) не должна
+    брать кадры одноимённого фильма 1991 года. Год неизвестен — не проверяем."""
+    got = _int(row.get("year") or row.get("date") or row.get("first_air_date"))
+    return not year or not got or abs(got - year) <= 1
 
 
 def _words(text: str) -> str:
@@ -249,13 +264,18 @@ def title_card(bg: Image.Image | None, top: str, big: str, small: str = "", mour
     base = ImageEnhance.Brightness(base).enhance(0.38).convert("RGBA")
     draw = ImageDraw.Draw(base)
     color = (210, 210, 210) if mourning else ACCENT
-    draw.text((W // 2, 300), top, font=_font("Montserrat.ttf", 48, "Bold"), fill=color, anchor="mm")
+    # камера едет по кадру, увеличенному на 10%: края обрезаются — текст держим в пределах W - 400
+    safe = W - 400
+    top_size = 48
+    while draw.textlength(top, font=_font("Montserrat.ttf", top_size, "Bold")) > safe and top_size > 26:
+        top_size -= 2
+    draw.text((W // 2, 300), top, font=_font("Montserrat.ttf", top_size, "Bold"), fill=color, anchor="mm")
     words, rows, size = big.split(), [], 120
     while size >= 60:
         font = _font("Oswald.ttf", size, "Bold")
         rows = [""]
         for w in words:
-            if draw.textlength(f"{rows[-1]} {w}".strip(), font=font) <= W - 240:
+            if draw.textlength(f"{rows[-1]} {w}".strip(), font=font) <= safe:
                 rows[-1] = f"{rows[-1]} {w}".strip()
             else:
                 rows.append(w)
@@ -315,7 +335,14 @@ def thumbnail(img: Image.Image | None, text: str, date_label: str) -> Image.Imag
 # ---------------------------------------------------------------- монтаж
 
 async def _slide_clip(img_path: Path, over: Path | None, dur: float, out: Path, reverse: bool) -> None:
-    """Кусок видео из картинки: камера медленно едет вбок, поверх — плашка заголовка."""
+    """Кусок видео из картинки: камера медленно едет вбок, поверх — плашка заголовка. Готовый ролик (график
+    сборов) — как есть, в те же параметры (последний кадр держим, если ролик короче)."""
+    if img_path.suffix == ".mp4":
+        await _run("ffmpeg", "-v", "error", "-y", "-i", str(img_path), "-vf",
+                   f"scale={W}:{H},fps={FPS},tpad=stop_mode=clone:stop_duration=30,format=yuv420p",
+                   "-t", f"{dur:.3f}", "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                   "-an", str(out))
+        return
     x = f"(iw-{W})*(1-min(t/{dur:.3f}\\,1))" if reverse else f"(iw-{W})*min(t/{dur:.3f}\\,1)"
     chain = f"[0:v]crop={W}:{H}:x='{x}':y='(ih-{H})/2',fps={FPS}"
     args = ["ffmpeg", "-v", "error", "-y", "-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
@@ -385,6 +412,66 @@ def _even_slides(paths: list[Path], starts: list[float], total: float) -> list[t
     return [(paths[k % len(paths)], max(e - s, 0.5)) for k, (s, e) in enumerate(zip(cuts, ends))]
 
 
+def _insert_clip(slides: list[tuple[Path, float]], t0: float, clip: Path, dur: float,
+                 total: float) -> list[tuple[Path, float]]:
+    """Вставить ролик (график) в ряд картинок с момента t0: картинки на это время уступают место."""
+    t1 = min(t0 + dur, total)
+    spans, t = [], 0.0
+    for path, d in slides:
+        s, e = t, t + d
+        t = e
+        if e <= t0 or s >= t1:
+            spans.append((s, e, path))
+            continue
+        if s < t0:
+            spans.append((s, t0, path))
+        if e > t1:
+            spans.append((t1, e, path))
+    spans.append((t0, t1, clip))
+    spans.sort(key=lambda x: x[0])
+    out: list[list[Any]] = []
+    for s, e, path in spans:
+        if out and e - s < 1.0 and out[-1][0].suffix != ".mp4" and path.suffix != ".mp4":
+            out[-1][1] += e - s  # обрезок короче секунды — продлеваем прошлую картинку
+        else:
+            out.append([path, e - s])
+    return [(p, d) for p, d in out if d > 0.05]
+
+
+MONEY = re.compile(r"сбор|кассов|бюджет|окуп|уик-?энд", re.I)  # новость о деньгах, а не просто «в прокате с…»
+
+
+async def _money_clips(work: Path, n: int, story: dict[str, Any], lines: list[str], starts: list[float],
+                       total: float, bg: Image.Image | None, tmdb_key: str) -> list[tuple[float, Path, float]]:
+    """Графики про деньги для новости о сборах: [(начало, ролик, длительность)] — с фразы, где речь о сборах."""
+    if not (story.get("money") or any(MONEY.search(x) for x in lines)) or total < 18:
+        return []
+    names = [x for x in (story.get("film_en"), story.get("film")) if x]
+    if not names:
+        return []
+    try:
+        info = await tmdb.box_office(tmdb_key, names, _int(story.get("year")))
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: weekly box office %s failed: %s", names[0], exc)
+        info = None
+    charts = boxchart.plan(story, info)[: 2 if total >= 32 else 1]
+    if not charts:
+        return []
+    each = 8.0
+    first = next((i for i, x in enumerate(lines) if MONEY.search(x)), 0)
+    t0 = starts[first] if first < len(starts) else total * 0.25
+    t0 = max(0.0, min(t0, total - each * len(charts) - 1.0))
+    out = []
+    for k, (kind, data) in enumerate(charts):
+        try:
+            clip = await boxchart.render(kind, data, bg, each, work / f"money{n}_{k}.mp4")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: weekly chart %s failed: %s", kind, exc)
+            continue
+        out.append((t0 + k * each, clip, each))
+    return out
+
+
 def _clock(sec: float) -> str:
     sec = int(sec)
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
@@ -399,7 +486,7 @@ async def _voice(lines: list[str], work: Path) -> tuple[Path, list[float], float
     сбой), пробуем ещё раз, а потом останавливаем сборку — чтобы в середине не заговорил голос Microsoft."""
     work.mkdir(parents=True, exist_ok=True)
     for attempt in range(2):
-        voice, starts, voiced, _ = await daily.synthesize(lines, work)
+        voice, starts, voiced, _ = await daily.synthesize(lines, work, careful=True)
         note = daily.tts_note or ""
         if not (lumean.enabled() and "Lumean" in note and "не сработал" in note):
             return voice, starts, await _duration(voice), voiced
@@ -422,6 +509,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     notes: list[str] = []
     first_img: Image.Image | None = None
 
+    daily.stressed.clear()
     await daily._progress(3, "Картинки к новостям")
     pictures: list[list[Image.Image]] = []
     for k, story in enumerate(stories):
@@ -494,16 +582,31 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         over = work / f"over{n}.png"
         await asyncio.to_thread(overlay_file, story["headline"], n, total_n, story["mourning"], over)
         total = dur + 0.5
-        segments.append(await _segment(work, f"story{n}", _even_slides(paths, starts, total), over, voice, total))
+        slides = _even_slides(paths, starts, total)
+        for t0, clip, length in await _money_clips(work, n, story, story["lines"], starts, total, bg, tmdb_key):
+            slides = _insert_clip(slides, t0, clip, length, total)  # сборы франшизы и окупаемость — графиком
+        segments.append(await _segment(work, f"story{n}", slides, over, voice, total))
         clock += total
 
     await daily._progress(84, "Финал выпуска")
     voice, starts, dur, voiced = await _voice(script["outro"], work / "v_outro")
     outro_card = work / "outro_card.jpg"
-    await asyncio.to_thread(card_file, first_img, "ПОДПИШИСЬ — НОВЫЕ ВЫПУСКИ ПО СРЕДАМ И ВОСКРЕСЕНЬЯМ",
-                            "СПАСИБО, ЧТО СМОТРИТЕ!", "YouTube @kinomir360 · Telegram @KinoMir360", outro_card)
+    # «Спасибо, что смотрите!» говорит анимированная концовка — здесь вопрос зрителям, без повтора
+    await asyncio.to_thread(card_file, first_img, "НОВЫЕ ВЫПУСКИ ПО СРЕДАМ И ВОСКРЕСЕНЬЯМ",
+                            "КАКАЯ НОВОСТЬ УДИВИЛА ВАС БОЛЬШЕ ВСЕГО?", "Пишите в комментариях",
+                            outro_card)
     tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
-    segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail))
+    # под финальные фразы — не одна карточка 15 секунд, а быстрый повтор кадров всех новостей выпуска
+    recap = await asyncio.to_thread(save_slides, [imgs[0] for imgs in pictures if imgs], "recap")
+    head = min(4.0, dur + tail)
+    slides = [(outro_card, dur + tail)]
+    if recap and dur + tail - head >= 2.0 * min(len(recap), 3):
+        each = (dur + tail - head) / len(recap)
+        if each < 1.6:
+            recap = recap[: max(1, int((dur + tail - head) / 1.6))]
+            each = (dur + tail - head) / len(recap)
+        slides = [(outro_card, head)] + [(path, each) for path in recap]
+    segments.append(await _segment(work, "outro", slides, None, voice, dur + tail))
     chapters.append((clock, "Итоги и вопрос зрителям"))
     if OUTRO_CLIP.exists():  # «Спасибо, что смотрите!» и кнопка «Подписаться»
         try:
@@ -550,6 +653,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     seo = build_seo(script, chapters, date_label)
     if notes:
         seo["warning"] = "\n".join(notes)
+    if daily.stressed:  # автор слушает и правит неверные через /say — следующая сборка прочтёт верно
+        seo["stress"] = ", ".join(sorted(daily.stressed, key=str.lower))
     await daily._progress(98, "Готово")
     return Episode(final, preview, cover, seo, length)
 

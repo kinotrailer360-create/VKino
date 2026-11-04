@@ -987,7 +987,10 @@ async def say_to_file(text: str, path: Path) -> list[float]:
         return words
 
 
-async def spoken_lines(lines: list[str]) -> list[str]:
+stressed: dict[str, int] = {}  # слова со знаком ударения в последней озвучке (выпуск шлёт их автору на проверку)
+
+
+async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
     """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
     русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
     texts = [pronounce.dates(pronounce.apply(text)) for text in lines]  # даты — сразу в нужном падеже
@@ -995,12 +998,17 @@ async def spoken_lines(lines: list[str]) -> list[str]:
     todo = list(range(len(texts)))
     if todo:
         try:  # не задерживаем сборку, если ИИ тормозит
-            fixed = await asyncio.wait_for(ai.spoken_form([texts[i] for i in todo]), timeout=60)
+            fixed = await asyncio.wait_for(ai.spoken_form([texts[i] for i in todo], premium=careful),
+                                           timeout=120 if careful else 60)
         except asyncio.TimeoutError:
             fixed = None
         for i, text in zip(todo, fixed or []):
             texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
-    return [_speakable(pronounce.plain_russian(text)) for text in texts]
+    out = [_speakable(pronounce.plain_russian(text)) for text in texts]
+    for text in out:
+        for word in re.findall(rf"[\w{pronounce.STRESS}-]*{pronounce.STRESS}[\w{pronounce.STRESS}-]*", text):
+            stressed[word] = stressed.get(word, 0) + 1
+    return out
 
 
 def _for_lumean(text: str) -> str:
@@ -1061,12 +1069,12 @@ async def _edge_pieces(text: str, path: Path, stem: Path) -> tuple[list[float], 
     return words, lost
 
 
-async def synthesize(lines: list[str], work: Path,
-                     pause: float | None = None) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
+async def synthesize(lines: list[str], work: Path, pause: float | None = None,
+                     careful: bool = False) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     global tts_error, tts_note
     tts_error, tts_note = None, None
-    speak = await spoken_lines(lines)
+    speak = await spoken_lines(lines, careful)
     parts: list[Path] = [work / f"voice_{i}.mp3" for i in range(len(lines))]
     words: list[list[float]] = []
     failed: list[int] = []
