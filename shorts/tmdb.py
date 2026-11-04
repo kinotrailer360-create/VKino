@@ -442,3 +442,49 @@ async def english_title(key: str, kind: str, tmdb_id: int) -> str:
         data = await _get(session, key, f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}", language="en-US")
     _EN_TITLES[(kind, tmdb_id)] = str(data.get("name") or data.get("title") or "")
     return _EN_TITLES[(kind, tmdb_id)]
+
+
+async def box_office(key: str, names: list[str], year: int = 0) -> dict[str, Any] | None:
+    """Деньги фильма для графики в выпуске: бюджет и сборы (TMDB, мировые, $) — его и прошлых фильмов франшизы.
+    {"title", "year", "budget", "revenue", "parts": [{"title", "year", "budget", "revenue"}]} или None.
+    Только точное совпадение названия (и года, если он известен): чужая франшиза на графике — хуже, чем никакой."""
+    if not key:
+        return None
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        best: dict[str, Any] | None = None
+        for name in [n for n in names if n and len(n) >= 2]:
+            data = await _get(session, key, "/search/movie", query=name, language="ru-RU")
+            for r in (data.get("results") or [])[:8]:
+                titles = [r.get("title") or "", r.get("original_title") or ""]
+                r_year = int(str(r.get("release_date") or "0")[:4] or 0)
+                if max(similar(name, t) for t in titles) < 0.93:
+                    continue
+                if year and r_year and abs(r_year - year) > 1:
+                    continue  # одноимённый старый фильм («Обитель зла» 2002 вместо 2026)
+                if best is None or (r.get("popularity") or 0) > (best.get("popularity") or 0):
+                    best = r
+            if best:
+                break
+        if not best:
+            return None
+        info = await _get(session, key, f"/movie/{best['id']}", language="ru-RU")
+        parts: list[dict[str, Any]] = []
+        coll = info.get("belongs_to_collection") or {}
+        if coll.get("id"):
+            try:
+                cdata = await _get(session, key, f"/collection/{coll['id']}", language="ru-RU")
+                ids = [int(p["id"]) for p in cdata.get("parts") or [] if p.get("id") and p.get("release_date")]
+                details = await asyncio.gather(*(_get(session, key, f"/movie/{i}", language="ru-RU") for i in ids),
+                                               return_exceptions=True)
+                for d in details:
+                    if isinstance(d, dict) and d.get("id"):
+                        parts.append({"id": int(d["id"]), "title": str(d.get("title") or d.get("original_title")),
+                                      "year": str(d.get("release_date") or "")[:4],
+                                      "budget": int(d.get("budget") or 0), "revenue": int(d.get("revenue") or 0)})
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: tmdb collection %s failed: %s", coll.get("id"), exc)
+        parts.sort(key=lambda p: p["year"])
+        return {"id": int(info["id"]), "title": str(info.get("title") or info.get("original_title") or ""),
+                "year": str(info.get("release_date") or "")[:4], "budget": int(info.get("budget") or 0),
+                "revenue": int(info.get("revenue") or 0), "parts": parts}

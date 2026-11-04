@@ -7244,6 +7244,34 @@ async def feeds_action(message: Message, text: str) -> None:
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
+@router.message(Command("title"))
+async def title_command(message: Message) -> None:
+    """/title Clayface = Глиноликий — как называть фильм в постах (важнее базы фильмов); /title — список."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    mine = await _json_setting("my_titles", {})
+    if arg.lower().startswith("del "):
+        key = arg[4:].strip()
+        found = next((k for k in mine if k.lower() == key.lower()), None)
+        if found:
+            mine.pop(found)
+            await set_shorts_setting("my_titles", json.dumps(mine, ensure_ascii=False))
+        await message.answer(f"✅ Убрал: {escape(key)}" if found else "Такого названия в словаре нет.")
+        return
+    if "=" in arg:
+        en, _, ru = (x.strip() for x in arg.partition("="))
+        if en and ru:
+            mine[en] = ru
+            await set_shorts_setting("my_titles", json.dumps(mine, ensure_ascii=False))
+            await message.answer(f"✅ В постах «{escape(en)}» будет «{escape(ru)}».")
+            return
+    rows = [f"• {escape(k)} → «{escape(v)}»" for k, v in (await _my_titles()).items()]
+    await message.answer("🎬 <b>Свои названия фильмов</b> (важнее базы фильмов):\n" + "\n".join(rows)
+                         + "\n\n<code>/title Clayface = Глиноликий</code> — добавить\n"
+                           "<code>/title del Clayface</code> — убрать")
+
+
 @router.message(Command("fast"))
 async def fast_command(message: Message) -> None:
     """/fast — быстрые зарубежные источники новостей: проверить, добавить, удалить."""
@@ -7733,6 +7761,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
         [_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")],
+        [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         [_btn("📝 Посты в Telegram-канал ▸", "pt:menu")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
@@ -9638,6 +9667,57 @@ async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None
         return None
 
 
+DEFAULT_TITLES = {"Clayface": "Глиноликий"}  # свои названия: важнее базы фильмов (/title)
+
+
+async def _my_titles() -> dict[str, str]:
+    titles = dict(DEFAULT_TITLES)
+    titles.update(await _json_setting("my_titles", {}))
+    return titles
+
+
+async def _official_title(name_en: str) -> str:
+    """Русское название по оригинальному: свой словарь автора (/title), TMDB (фильм или сериал), иначе
+    Кинопоиск. Пусто — не нашли."""
+    if not name_en or not re.search(r"[A-Za-z]", name_en):
+        return ""
+    mine = {k.lower(): v for k, v in (await _my_titles()).items()}
+    if name_en.strip().lower() in mine:
+        return mine[name_en.strip().lower()]
+    try:
+        films, shows = await asyncio.gather(shorts_daily.tmdb.search_movie(TMDB_API_KEY, name_en),
+                                            shorts_daily.tmdb.search_tv(TMDB_API_KEY, name_en), return_exceptions=True)
+        for cand in (films if isinstance(films, list) else [])[:5] + (shows if isinstance(shows, list) else [])[:5]:
+            if shorts_daily.tmdb.similar(cand.get("original") or "", name_en) >= 0.93 \
+                    and re.search(r"[А-Яа-яЁё]", cand.get("title") or ""):
+                return str(cand["title"])
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Official title %s via TMDB failed: %s", name_en, exc)
+    try:
+        film = await asyncio.wait_for(shorts_daily.find_film(kp._get, name_en), 20)
+        if film and shorts_daily.tmdb.similar(str(film.get("enName") or film.get("alternativeName") or ""),
+                                              name_en) >= 0.93 and re.search(r"[А-Яа-яЁё]", str(film.get("name") or "")):
+            return str(film["name"])
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Official title %s via Kinopoisk failed: %s", name_en, exc)
+    return ""
+
+
+async def _fix_titles(res: dict[str, Any]) -> dict[str, Any]:
+    """ИИ мог перевести название сам («Clayface» → «Клейкое лицо»): находим прокатное и меняем в тексте поста
+    (и в «ёлочках», и в заголовке КАПСОМ)."""
+    official = await _official_title(res.get("film_en") or "")
+    wrong = (res.get("film") or "").strip()
+    if not official or not wrong or official.lower() == wrong.lower():
+        return res
+    post = res["post"]
+    for old, new in ((wrong, official), (wrong.upper(), official.upper())):
+        post = post.replace(f"«{old}»", f"«{new}»").replace(old, new)
+    if post != res["post"]:
+        logging.info("Tg post: title fixed %r -> %r", wrong, official)
+    return {**res, "post": post, "film": official}
+
+
 def _sources_note(posts: list[dict[str, Any]]) -> str:
     """Строки «откуда новость» под постом (видит только автор в боте, в канал не уходят)."""
     rows = []
@@ -9781,6 +9861,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         if not res:
             await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
             return ""
+        res = await _fix_titles(res)  # «Клейкое лицо» → «Глиноликий»: прокатное название из базы фильмов
         same = [fresh[i] for i in res["media"]]
         hist["stories"] = (stories + [{"at": int(time.time()), "tokens": _story_tokens(res)}])[-60:]
         sources = list(same)  # для автора под постом: откуда взята новость
@@ -11749,6 +11830,24 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                              "сюда." if action == "wvon" else "🔕 По средам и воскресеньям выпуск больше не собираю. Вручную — "
                              "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
         return
+    if action == "wvre":
+        if weekly_busy:
+            await message.answer("⏳ Выпуск уже собирается — пришлю, как будет готов.")
+            return
+        status = await message.answer("🔁 Перемонтирую последний выпуск: тот же текст, озвучка заново с исправленными "
+                                      "ударениями (/say), графики сборов. 15–40 минут — пришлю, когда будет готово.")
+        chat_id = message.chat.id
+
+        async def remake_job() -> None:
+            try:
+                await make_weekly_video(message.bot, [chat_id], status, remake=True)
+                await status.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Weekly remake failed")
+                await status.edit_text(f"❌ Выпуск не перемонтировался: <code>{escape(_safe_err(exc)[:300])}</code>")
+
+        _run_job(remake_job)
+        return
     if action == "wv":
         if weekly_busy:
             await message.answer("⏳ Выпуск уже собирается — пришлю, как будет готов.")
@@ -13440,7 +13539,8 @@ def _spread_by_day(posts: list[dict[str, Any]], limit: int) -> list[dict[str, An
 weekly_busy = False  # выпуск собирается или ждёт очереди — второй не запускаем
 
 
-async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
+async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None,
+                            remake: bool = False) -> None:
     """Новости недели (Telegram-каналы и быстрые зарубежные источники) → сценарий ведущего → выпуск 16:9 с
     голосом, картинками, заставками и таймкодами → превью в Telegram и кнопка загрузки на YouTube."""
     global weekly_busy
@@ -13448,8 +13548,9 @@ async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | Non
         raise RuntimeError("выпуск уже собирается — дождись его, он придёт сюда")
     weekly_busy = True
     try:
-        await _make_weekly_video(bot, chat_ids, status)
-        await set_shorts_setting("weekly_video_at", str(time.time()))
+        await _make_weekly_video(bot, chat_ids, status, remake)
+        if not remake:  # перемонтаж — тот же выпуск: период следующего считаем от настоящего выпуска
+            await set_shorts_setting("weekly_video_at", str(time.time()))
     finally:
         weekly_busy = False
 
@@ -13467,12 +13568,42 @@ async def _edit_quiet(message: Message | None, text: str) -> None:
         logging.info("Status edit failed: %s", exc)
 
 
-async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
+def _saved_pool(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Посты-источники выпуска для перемонтажа: текст и картинки (номера постов в сценарии — по этому списку)."""
+    keep = ("text", "channel", "label", "image", "time")
+    out = []
+    for p in pool:
+        row = {k: p[k] for k in keep if p.get(k)}
+        row["text"] = str(row.get("text") or "")[:600]
+        media = [{"image": m["image"]} for m in p.get("media") or [] if isinstance(m, dict) and m.get("image")]
+        if media:
+            row["media"] = media[:4]
+        out.append(row)
+    return out
+
+
+async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None,
+                             remake: bool = False) -> None:
+    """remake — перемонтировать последний выпуск: тот же сценарий заново озвучить (с новыми ударениями из /say)
+    и смонтировать; если сценарий не сохранился (выпуск собран до этой версии) — те же темы, текст заново."""
+    saved: dict[str, Any] = {}
+    if remake:
+        try:
+            saved = json.loads(await shorts_setting("weekly_saved") or "{}")
+        except ValueError:
+            saved = {}
+        if saved.get("script") and saved.get("pool") is not None:
+            await _render_weekly(bot, chat_ids, status, saved["script"], saved["pool"], saved.get("label") or "")
+            return
+        if not await shorts_setting("weekly_last"):
+            raise RuntimeError("не нашёл прошлый выпуск — собери новый")
     # новости и сценарий — до очереди сборки: сеть и ИИ не держат шортсы, очередь только на монтаж
     today = datetime.now(MSK).date()
     # выпуски по средам и воскресеньям: новости с прошлого выпуска (3–4 дня), но не меньше 3 и не больше 7 дней
     last = float(await shorts_setting("weekly_video_at") or 0)
     hours = min(168, max(72, (time.time() - last) / 3600 + 12)) if last else 168
+    if remake:  # выпуск уже вышел (время записано после него) — берём новости последних 4 дней
+        hours = 96
     start = (datetime.now(MSK) - timedelta(hours=hours)).date()
     months = shorts_daily.MONTHS
     label = (f"{start.day}–{today.day} {months[today.month - 1]}" if start.month == today.month else
@@ -13512,7 +13643,8 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
     for attempt in range(3):  # Gemini упёрся в минутный лимит — ждём и пробуем снова, а не бросаем выпуск
         script = await shorts_ai.write_weekly_episode(
             GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
-            await shorts_setting("weekly_last") or "", period=period, next_day=next_day)
+            await shorts_setting("weekly_last") or "", period=period, next_day=next_day,
+            keep=(await shorts_setting("weekly_last") or "") if remake else "")
         if script:
             break
         wait = re.search(r"снова через (\d+) мин", shorts_ai.last_error or "")
@@ -13524,6 +13656,11 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
         await asyncio.sleep(mins * 60)
     if not script:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
+    await _render_weekly(bot, chat_ids, status, script, pool[:len(listing)], label)
+
+
+async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, script: dict[str, Any],
+                         pool: list[dict[str, Any]], label: str) -> None:
     if status and shorts_lock.locked():
         await _edit_quiet(status, "⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
     async with shorts_lock:
@@ -13541,6 +13678,12 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
                 raise RuntimeError(f"сборка шла дольше {WEEKLY_TIMEOUT // 60} минут и была прервана — застряла на "
                                    f"этапе: {shorts_daily.last_stage or 'начало'}") from None
             await set_shorts_setting("weekly_last", shorts_weekly.headlines(script))
+            try:  # для «🔁 Переозвучить и перемонтировать»: тот же текст и те же картинки
+                await set_shorts_setting("weekly_saved", json.dumps(
+                    {"script": script, "pool": _saved_pool(pool), "label": label, "at": time.time()},
+                    ensure_ascii=False))
+            except Exception:  # noqa: BLE001
+                logging.exception("Weekly script save failed")
             for chat_id in chat_ids:
                 await send_episode(bot, chat_id, ep, script)
         finally:
@@ -13574,6 +13717,7 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                  "загружу полное качество, название, описание с таймкодами, теги и обложку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
+            [_btn("🔁 Переозвучить и перемонтировать", "pt:wvre")],
             [_btn("🔕 Не собирать по ср и вс" if on else "🔔 Собирать по ср и вс в 10:00",
                   "pt:wvoff" if on else "pt:wvon")]]))
     for name, key in (("Название", "title"), ("Описание", "description"), ("Теги", "tags"),
@@ -13581,6 +13725,12 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         await bot.send_message(chat_id, f"<b>{name}:</b>\n<pre>{escape(seo[key])}</pre>")
     if seo.get("warning"):
         await bot.send_message(chat_id, escape(seo["warning"]))
+    if seo.get("stress"):
+        await bot.send_message(
+            chat_id, "🗣 <b>Ударения, которые поставил ИИ</b> (знак после ударной гласной):\n"
+                     f"{escape(seo['stress'][:3500])}\n\nУслышал неверное ударение — исправь: ударную гласную пиши "
+                     "заглавной, например <code>/say обитель = обИтель</code>. Потом жми «🔁 Переозвучить и "
+                     "перемонтировать» — выпуск соберётся с тем же текстом заново.")
 
 
 rt_watch_busy = asyncio.Lock()
@@ -14063,6 +14213,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="fast", description="Быстрые источники: Reddit, X, Deadline"),
+        BotCommand(command="title", description="Свои названия фильмов: /title Clayface = Глиноликий"),
         BotCommand(command="trailer", description="Проверить скачивание трейлера"),
         BotCommand(command="clips", description="Трейлеры в роликах: on/off"),
         BotCommand(command="music", description="Сменить фоновую музыку"),
