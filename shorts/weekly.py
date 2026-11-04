@@ -21,7 +21,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from . import daily, tmdb
+from . import daily, lumean, tmdb
 from . import music as musiclib
 from .cards import ASSETS, _cover, _font
 
@@ -372,10 +372,25 @@ def _clock(sec: float) -> str:
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
 
 
+class VoiceChanged(RuntimeError):
+    """Основной голос (клон в Lumean) отказал посреди выпуска — дальше был бы другой голос."""
+
+
 async def _voice(lines: list[str], work: Path) -> tuple[Path, list[float], float, bool]:
+    """Озвучка куска выпуска. Весь выпуск — одним голосом: если клон в Lumean не ответил (кончился баланс,
+    сбой), пробуем ещё раз, а потом останавливаем сборку — чтобы в середине не заговорил голос Microsoft."""
     work.mkdir(parents=True, exist_ok=True)
-    voice, starts, voiced, _ = await daily.synthesize(lines, work)
-    return voice, starts, await _duration(voice), voiced
+    for attempt in range(2):
+        voice, starts, voiced, _ = await daily.synthesize(lines, work)
+        note = daily.tts_note or ""
+        if not (lumean.enabled() and "Lumean" in note and "не сработал" in note):
+            return voice, starts, await _duration(voice), voiced
+        log.warning("shorts: weekly voice fell back (attempt %d): %s", attempt + 1, note[:200])
+        if attempt == 0:
+            await asyncio.sleep(20)
+    raise VoiceChanged("клон голоса в Lumean не ответил, выпуск остановлен, чтобы голос не сменился посреди "
+                       f"ролика. Причина: {note[:300]}. Если это «Insufficient balance» — пополни баланс Lumean "
+                       "и собери выпуск снова")
 
 
 async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]], tmdb_key: str,
