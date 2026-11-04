@@ -1916,6 +1916,9 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
             "stories": stories[:9]}
 
 
+EDITOR_VERSION = 2  # правила редактора поменялись — сохранённый выпуск при перемонтаже вычитывается заново
+
+
 def _unnumber(line: str) -> str:
     """«3. Текст фразы» → «Текст фразы»: номер из нумерованного списка, который ИИ вернул вместе с фразой."""
     return re.sub(r"^\s*\d{1,3}\s*[.)]\s+(?=\D)", "", line)
@@ -1989,5 +1992,5 @@ async def edit_episode(key: str, script: dict[str, Any]) -> list[str] | None:
             script["stories"][k]["lines"][i] = new
         else:
             script[kind][i] = new
-    script["edited"] = True
+    script["edited"] = EDITOR_VERSION
     return fixes

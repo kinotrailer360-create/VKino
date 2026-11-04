@@ -14005,7 +14005,8 @@ async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, 
     # номера фраз («2. …»), которые редактор раньше оставлял в тексте, — голос читал их вслух
     for lines in [script.get("intro") or [], script.get("outro") or []] + [st["lines"] for st in script["stories"]]:
         lines[:] = [shorts_ai._unnumber(x) for x in lines]
-    if not script.get("edited"):  # редактор-корректор: имена, склонение, грамматика, речевые ошибки
+    # редактор-корректор: имена, склонение, грамматика, речевые ошибки — и заново, если его правила обновились
+    if script.get("edited") != shorts_ai.EDITOR_VERSION:
         await _edit_quiet(status, "✍️ Редактор вычитывает текст выпуска: имена, падежи, грамматика, речевые ошибки…")
         fixes = await shorts_ai.edit_episode(GEMINI_API_KEY, script)
         if fixes is not None:
