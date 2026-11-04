@@ -52,6 +52,7 @@ from PIL import Image, ImageOps
 
 from shorts import ai as shorts_ai
 from shorts import narrator as shorts_narrator
+from shorts import yttrailers as shorts_yttrailers
 from shorts import tgsearch as shorts_tgsearch
 from shorts import postcard as shorts_postcard
 from shorts import clips as shorts_clips
@@ -13767,6 +13768,104 @@ async def make_rt_post(bot: Bot, chat_id: int, key: str, audience: bool = False)
         shutil.rmtree(work, ignore_errors=True)
 
 
+YT_EVERY = 30 * 60  # проверка YouTube-каналов студий — раз в полчаса
+
+
+async def yt_trailers_watch(bot: Bot) -> None:
+    """Новые трейлеры и тизеры на YouTube-каналах студий — админам с кнопкой «Сделать пост». Первый проход
+    только запоминает, что уже вышло (иначе пришла бы сразу пачка старых трейлеров)."""
+    if await shorts_setting("yt_trailers") == "off":
+        return
+    found = await shorts_yttrailers.latest(hours=36)
+    raw = await shorts_setting("yt_seen")
+    seen = list(json.loads(raw)) if raw else None
+    if seen is None:
+        await set_shorts_setting("yt_seen", json.dumps([v["id"] for v in found]))
+        return
+    fresh = [v for v in found if v["id"] not in seen][:6]
+    if not fresh:
+        return
+    info = await _json_setting("yt_info", {})
+    for v in reversed(fresh):  # по порядку выхода
+        info[v["id"]] = {k: v[k] for k in ("title", "studio", "url", "desc")}
+        caption = (f"🎬 <b>Новый трейлер</b> — {escape(v['studio'])}\n{escape(v['title'])}\n{v['url']}")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("📝 Сделать пост", f"ytr:p:{v['id']}")],
+            [_btn("🔕 Не присылать трейлеры", "ytr:off")]])
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_photo(admin_id, v["thumb"], caption=caption, reply_markup=kb)
+            except Exception:  # noqa: BLE001 — у старых видео нет maxres-обложки: без картинки
+                try:
+                    await bot.send_message(admin_id, caption, reply_markup=kb)
+                except Exception:  # noqa: BLE001
+                    logging.exception("YouTube trailer alert failed")
+        seen.append(v["id"])
+    await set_shorts_setting("yt_seen", json.dumps(seen[-400:]))
+    await set_shorts_setting("yt_info", json.dumps(dict(list(info.items())[-100:]), ensure_ascii=False))
+
+
+@router.callback_query(F.data.startswith("ytr:"))
+async def yt_trailer_buttons(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    _, kind, arg = ((callback.data or "") + "::").split(":")[:3]
+    message = callback.message
+    if kind in ("off", "on"):
+        await set_shorts_setting("yt_trailers", None if kind == "on" else "off")
+        await callback.answer("Готово")
+        await message.answer("🔔 Буду присылать новые трейлеры с YouTube-каналов студий." if kind == "on" else
+                             "🔕 Трейлеры с YouTube больше не присылаю. Включить: /trailers on")
+        return
+    if kind == "p":
+        v = (await _json_setting("yt_info", {})).get(arg)
+        if not v:
+            await callback.answer("Трейлер устарел — пришли ссылку через «🔗 Пост по ссылке»", show_alert=True)
+            return
+        await callback.answer()
+        if post_lock.locked():
+            await message.answer("⏳ Пост уже пишется — подожди минуту и нажми ещё раз.")
+            return
+        wait = await message.answer(f"📝 Пишу пост о трейлере «{escape(v['title'][:80])}»…")
+        text = (f"Новый официальный трейлер на YouTube-канале {v['studio']}: {v['title']}. "
+                f"Ссылка на трейлер: {v['url']}\n{v.get('desc') or ''}")
+
+        async def job() -> None:
+            try:
+                async with post_lock:
+                    await _make_link_post(message, [v["url"]], "это новость о вышедшем трейлере", text, None)
+                await wait.delete()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Trailer post failed")
+                await wait.edit_text(f"❌ Пост не получился: <code>{escape(_safe_err(exc)[:300])}</code>")
+
+        _run_job(job)
+        return
+    await callback.answer()
+
+
+@router.message(Command("trailers"))
+async def trailers_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip().lower()
+    if arg in ("on", "off"):
+        await set_shorts_setting("yt_trailers", None if arg == "on" else "off")
+        await message.answer("🔔 Трейлеры с YouTube включены." if arg == "on" else "🔕 Трейлеры с YouTube выключены.")
+        return
+    on = await shorts_setting("yt_trailers") != "off"
+    wait = await message.answer("🎬 Смотрю свежие трейлеры на каналах студий…")
+    found = await shorts_yttrailers.latest(hours=72)
+    rows = [f"• {escape(v['studio'])}: <a href=\"{v['url']}\">{escape(v['title'][:80])}</a>" for v in found[:15]]
+    await wait.edit_text(
+        f"🎬 <b>Трейлеры с YouTube-каналов студий</b> — {'включены ✅' if on else 'выключены ❌'} (проверка раз в "
+        f"30 минут, с 8 до 23).\nКаналы: {escape(', '.join(shorts_yttrailers.STUDIOS))}.\n\nЗа 3 дня:\n"
+        + ("\n".join(rows) if rows else "новых трейлеров нет")
+        + "\n\n<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать",
+        disable_web_page_preview=True)
+
+
 async def rt_watch(bot: Bot) -> None:
     """Проверка премьер фильмов и сезонов: критики увидели (сняли эмбарго) или появились оценки зрителей —
     пишем админам. Отметку «уже сообщили» ставим только после отправки: что не влезло в лимит прохода,
@@ -14246,7 +14345,7 @@ async def weekly_video_job(bot: Bot) -> None:
 
 async def growth_loop(bot: Bot) -> None:
     """Раз в 10 минут: уведомления из избранного (раз в 3 часа), подборка недели (пятница, 18:00 Екб)."""
-    last_alerts = last_rt = last_clean = 0.0
+    last_alerts = last_rt = last_clean = last_yt = 0.0
     while True:
         await asyncio.sleep(600)
         try:
@@ -14260,6 +14359,12 @@ async def growth_loop(bot: Bot) -> None:
                     and not rt_watch_busy.locked()):
                 last_rt = time.time()
                 _run_job(lambda: rt_watch_job(bot))  # отдельно: медленный RT не задерживает остальное
+            if time.time() - last_yt > YT_EVERY and 8 <= datetime.now(POST_TZ).hour < 23:
+                last_yt = time.time()
+                try:
+                    await asyncio.wait_for(yt_trailers_watch(bot), 120)
+                except Exception:  # noqa: BLE001
+                    logging.exception("YouTube trailers watch failed")
             if time.time() - last_alerts > 3 * 3600:
                 last_alerts = time.time()
                 await favorites_alerts(bot)
@@ -14683,6 +14788,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="stress", description="Ударения в озвучке: режим и сравнение на слух"),
         BotCommand(command="stop", description="Остановить сборку ролика или выпуска"),
+        BotCommand(command="trailers", description="Новые трейлеры с YouTube-каналов студий"),
         BotCommand(command="narrate", description="Диктор: текст → проверка → озвучка"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="fast", description="Быстрые источники: Reddit, X, Deadline"),
