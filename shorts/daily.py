@@ -1074,8 +1074,8 @@ async def _accent(texts: list[str]) -> list[str]:
     url = accent_url()
     if not texts:
         return texts
-    if not url and os.getenv("STRESS_DICT", "1") == "0":
-        return texts
+    if not url and (stress_mode != "all" or os.getenv("STRESS_DICT", "1") == "0"):
+        return texts  # ударения во всех словах — только в режиме all (голос от них сбивается)
     if not url:  # без сервиса — словарь ударений на диске (3 млн словоформ, почти без памяти)
         if not await stressdb.ready(DATA_DIR):
             accent_note = stressdb.status
@@ -1099,10 +1099,16 @@ async def _accent(texts: list[str]) -> list[str]:
     return [pronounce.merge_stress(t, str(a)) for t, a in zip(texts, got)]
 
 
+# Знаки ударения для голоса (меняется в боте: /stress):
+#   names — только имена, названия и слова из словаря /say (ударения ИИ и автора);
+#   all   — ещё и во всех обычных словах по словарю ударений (ElevenLabs от этого сбивается: «сэйчес», «январт»);
+#   off   — без знаков, голос ставит ударения сам.
+STRESS_MODES = ("names", "all", "off")
+stress_mode = "off" if os.getenv("LUMEAN_STRESS", "1") == "0" else "names"
+
+
 def _for_lumean(text: str) -> str:
-    """Голос ElevenLabs (Lumean) понимает знак ударения U+0301 после гласной — оставляем (иначе «Глиноликий»,
-    «Айсмен» и имена звучат с чужим ударением). LUMEAN_STRESS=0 в .env — убирать знаки, как раньше."""
-    return text if os.getenv("LUMEAN_STRESS", "1") != "0" else text.replace(pronounce.STRESS, "")
+    return text.replace(pronounce.STRESS, "") if stress_mode == "off" else text
 
 
 def _speakable(text: str) -> str:

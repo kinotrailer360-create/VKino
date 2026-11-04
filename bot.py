@@ -6907,6 +6907,9 @@ async def load_pronunciations() -> dict[str, str]:
     except ValueError:
         table = {}
     shorts_pronounce.CUSTOM = table if isinstance(table, dict) else {}
+    mode = await shorts_setting("stress_mode")
+    if mode in shorts_daily.STRESS_MODES:
+        shorts_daily.stress_mode = mode
     return shorts_pronounce.CUSTOM
 
 
@@ -7312,6 +7315,91 @@ async def fast_command(message: Message) -> None:
         "<code>/fast add @Имя</code> — аккаунт X через свой RSSHub (COMPOSE_PROFILES=x в .env)\n"
         "<code>/fast del N</code> — удалить\n<code>/fast default</code> — стандартный список")
     await wait.edit_text("\n".join(lines), disable_web_page_preview=True)
+
+
+STRESS_LABELS = {"names": "только имена и словарь /say", "all": "во всех словах", "off": "без знаков"}
+STRESS_TEST = ("Режиссёр Майкл Манн получил травму: оружие, находившееся в кобуре, случайно выстрелило. Сейчас "
+               "съёмки «Схватки 2» запланированы на январь, а Мэттью Макконахи получил «Оскар».")
+
+
+async def stress_menu() -> tuple[str, InlineKeyboardMarkup]:
+    await load_pronunciations()
+    mode = shorts_daily.stress_mode
+    text = ("🗣 <b>Ударения в озвучке</b>\n\nСейчас: <b>" + STRESS_LABELS[mode] + "</b>.\n\n"
+            "• <b>Только имена</b> — знак ударения в именах, названиях и словах из /say; обычные слова голос "
+            "читает сам.\n• <b>Во всех словах</b> — по словарю ударений; ElevenLabs от этого может сбиваться.\n"
+            "• <b>Без знаков</b> — голос ставит ударения сам.\n\n«🎧 Сравнить» озвучит одну фразу тремя способами — "
+            "выбери на слух (своя фраза: <code>/stress test текст</code>).")
+    rows = [[_btn(("✅ " if mode == m else "") + STRESS_LABELS[m].capitalize(), f"ud:{m}")] for m in STRESS_LABELS]
+    rows.append([_btn("🎧 Сравнить на слух", "ud:test")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def stress_test(bot: Bot, chat_id: int, phrase: str) -> None:
+    """Одна фраза тремя способами — автор выбирает режим ударений на слух."""
+    status = await bot.send_message(chat_id, "🎧 Озвучиваю фразу тремя способами…")
+    work = SHORTS_DIR / f"stress_{time.time_ns()}"
+    keep = shorts_daily.stress_mode
+    try:
+        async with shorts_lock:
+            await load_pronunciations()
+            await load_voice()
+            keep = shorts_daily.stress_mode
+            for mode in ("off", "names", "all"):
+                shorts_daily.stress_mode = mode
+                speech = await shorts_daily.spoken_lines([phrase], careful=True)
+                path, _, _, _ = await shorts_daily.synthesize(speech, work / mode, prepared=True)
+                mp3 = work / f"{mode}.mp3"
+                await shorts_weekly._run("ffmpeg", "-v", "error", "-y", "-i", str(path), "-c:a", "libmp3lame",
+                                         "-b:a", "160k", str(mp3))
+                await bot.send_audio(chat_id, FSInputFile(mp3, filename=f"udarenia_{mode}.mp3"),
+                                     caption=f"🗣 {STRESS_LABELS[mode].capitalize()}:\n{escape(speech[0][:900])}",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                         [_btn("✅ Так лучше", f"ud:{mode}")]]))
+        await status.delete()
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Stress test failed")
+        await status.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+    finally:
+        shorts_daily.stress_mode = keep
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@router.message(Command("stress"))
+async def stress_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    if arg.lower().startswith("test"):
+        phrase = arg[4:].strip() or STRESS_TEST
+        chat_id = message.chat.id
+        _run_job(lambda: stress_test(message.bot, chat_id, phrase[:400]))
+        return
+    await message.answer(*await stress_menu())
+
+
+@router.callback_query(F.data.startswith("ud:"))
+async def stress_buttons(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    kind = (callback.data or "")[3:]
+    if kind == "test":
+        await callback.answer()
+        chat_id = callback.message.chat.id
+        _run_job(lambda: stress_test(callback.bot, chat_id, STRESS_TEST))
+        return
+    if kind == "menu":
+        await callback.answer()
+        await callback.message.answer(*await stress_menu())
+        return
+    if kind in STRESS_LABELS:
+        await set_shorts_setting("stress_mode", kind)
+        shorts_daily.stress_mode = kind
+        await callback.answer("Сохранено")
+        await callback.message.answer(f"✅ Ударения в озвучке: <b>{STRESS_LABELS[kind]}</b>. Следующие ролики — так.")
+        return
+    await callback.answer()
 
 
 @router.message(Command("say"))
@@ -7801,6 +7889,7 @@ async def shorts_settings_menu() -> InlineKeyboardMarkup:
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
         [_btn("🎼 Музыка Lumean под настроение ▸", "sh:mlib")],
         [_btn("🗣 Произношение", "sh:say"), _btn("➕ Добавить слово", "sh:ask:say")],
+        [_btn("🎚 Ударения в озвучке", "ud:menu")],
         [_btn("🎙 Голос озвучки ▸", "sh:clone"), _btn("🔊 Проверить голос", "sh:ask:voice")],
         [_btn("📡 Проверить ленты", "sh:feeds"), _btn("➕ Добавить ленту", "sh:ask:feed")],
         [_btn("📡 Каналы для фактов и новостей", "sh:tgch")],
@@ -13795,6 +13884,9 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
 
 async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, script: dict[str, Any],
                          pool: list[dict[str, Any]], label: str) -> None:
+    # номера фраз («2. …»), которые редактор раньше оставлял в тексте, — голос читал их вслух
+    for lines in [script.get("intro") or [], script.get("outro") or []] + [st["lines"] for st in script["stories"]]:
+        lines[:] = [shorts_ai._unnumber(x) for x in lines]
     if not script.get("edited"):  # редактор-корректор: имена, склонение, грамматика, речевые ошибки
         await _edit_quiet(status, "✍️ Редактор вычитывает текст выпуска: имена, падежи, грамматика, речевые ошибки…")
         fixes = await shorts_ai.edit_episode(GEMINI_API_KEY, script)

@@ -1371,7 +1371,7 @@ async def spoken_form(texts: list[str], key: str | None = None, premium: bool = 
     try:
         # выпуск для YouTube (premium) — сильной моделью: слабая ставит ударения наугад («Оска́р»)
         data = await _with_reserve(key, [{"text": prompt}], prompt, premium=premium)
-        out = [str(t).strip() for t in data["texts"]]
+        out = [_unnumber(str(t).strip()) for t in data["texts"]]
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI spoken_form failed: %s", exc)
         return None
@@ -1915,6 +1915,11 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
             "stories": stories[:9]}
 
 
+def _unnumber(line: str) -> str:
+    """«3. Текст фразы» → «Текст фразы»: номер из нумерованного списка, который ИИ вернул вместе с фразой."""
+    return re.sub(r"^\s*\d{1,3}\s*[.)]\s+(?=\D)", "", line)
+
+
 EDITOR_RULES = (
     "Ты — литературный редактор и корректор русского текста для озвучки голосом (новости кино на YouTube). "
     "Исправь в каждой фразе ошибки пяти видов, НЕ меняя фактов, цифр, порядка фраз и стиля ведущего:\n"
@@ -1946,7 +1951,8 @@ async def edit_lines(key: str, texts: list[str]) -> tuple[list[str], list[str]] 
               "ТЕКСТ:\n" + listing)
     try:
         data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
-        got = [strip_citations(re.sub(r"\s+", " ", str(t))).strip() for t in data["lines"]]
+        # номер фразы из списка («2. …») ИИ иногда оставляет в ответе — голос читал его вслух
+        got = [_unnumber(strip_citations(re.sub(r"\s+", " ", str(t))).strip()) for t in data["lines"]]
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI edit_lines failed: %s", exc)
         return None
