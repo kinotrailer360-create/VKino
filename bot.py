@@ -7244,6 +7244,34 @@ async def feeds_action(message: Message, text: str) -> None:
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
+@router.message(Command("title"))
+async def title_command(message: Message) -> None:
+    """/title Clayface = Глиноликий — как называть фильм в постах (важнее базы фильмов); /title — список."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    mine = await _json_setting("my_titles", {})
+    if arg.lower().startswith("del "):
+        key = arg[4:].strip()
+        found = next((k for k in mine if k.lower() == key.lower()), None)
+        if found:
+            mine.pop(found)
+            await set_shorts_setting("my_titles", json.dumps(mine, ensure_ascii=False))
+        await message.answer(f"✅ Убрал: {escape(key)}" if found else "Такого названия в словаре нет.")
+        return
+    if "=" in arg:
+        en, _, ru = (x.strip() for x in arg.partition("="))
+        if en and ru:
+            mine[en] = ru
+            await set_shorts_setting("my_titles", json.dumps(mine, ensure_ascii=False))
+            await message.answer(f"✅ В постах «{escape(en)}» будет «{escape(ru)}».")
+            return
+    rows = [f"• {escape(k)} → «{escape(v)}»" for k, v in (await _my_titles()).items()]
+    await message.answer("🎬 <b>Свои названия фильмов</b> (важнее базы фильмов):\n" + "\n".join(rows)
+                         + "\n\n<code>/title Clayface = Глиноликий</code> — добавить\n"
+                           "<code>/title del Clayface</code> — убрать")
+
+
 @router.message(Command("fast"))
 async def fast_command(message: Message) -> None:
     """/fast — быстрые зарубежные источники новостей: проверить, добавить, удалить."""
@@ -9638,6 +9666,57 @@ async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None
         return None
 
 
+DEFAULT_TITLES = {"Clayface": "Глиноликий"}  # свои названия: важнее базы фильмов (/title)
+
+
+async def _my_titles() -> dict[str, str]:
+    titles = dict(DEFAULT_TITLES)
+    titles.update(await _json_setting("my_titles", {}))
+    return titles
+
+
+async def _official_title(name_en: str) -> str:
+    """Русское название по оригинальному: свой словарь автора (/title), TMDB (фильм или сериал), иначе
+    Кинопоиск. Пусто — не нашли."""
+    if not name_en or not re.search(r"[A-Za-z]", name_en):
+        return ""
+    mine = {k.lower(): v for k, v in (await _my_titles()).items()}
+    if name_en.strip().lower() in mine:
+        return mine[name_en.strip().lower()]
+    try:
+        films, shows = await asyncio.gather(shorts_daily.tmdb.search_movie(TMDB_API_KEY, name_en),
+                                            shorts_daily.tmdb.search_tv(TMDB_API_KEY, name_en), return_exceptions=True)
+        for cand in (films if isinstance(films, list) else [])[:5] + (shows if isinstance(shows, list) else [])[:5]:
+            if shorts_daily.tmdb.similar(cand.get("original") or "", name_en) >= 0.93 \
+                    and re.search(r"[А-Яа-яЁё]", cand.get("title") or ""):
+                return str(cand["title"])
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Official title %s via TMDB failed: %s", name_en, exc)
+    try:
+        film = await asyncio.wait_for(shorts_daily.find_film(kp._get, name_en), 20)
+        if film and shorts_daily.tmdb.similar(str(film.get("enName") or film.get("alternativeName") or ""),
+                                              name_en) >= 0.93 and re.search(r"[А-Яа-яЁё]", str(film.get("name") or "")):
+            return str(film["name"])
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Official title %s via Kinopoisk failed: %s", name_en, exc)
+    return ""
+
+
+async def _fix_titles(res: dict[str, Any]) -> dict[str, Any]:
+    """ИИ мог перевести название сам («Clayface» → «Клейкое лицо»): находим прокатное и меняем в тексте поста
+    (и в «ёлочках», и в заголовке КАПСОМ)."""
+    official = await _official_title(res.get("film_en") or "")
+    wrong = (res.get("film") or "").strip()
+    if not official or not wrong or official.lower() == wrong.lower():
+        return res
+    post = res["post"]
+    for old, new in ((wrong, official), (wrong.upper(), official.upper())):
+        post = post.replace(f"«{old}»", f"«{new}»").replace(old, new)
+    if post != res["post"]:
+        logging.info("Tg post: title fixed %r -> %r", wrong, official)
+    return {**res, "post": post, "film": official}
+
+
 def _sources_note(posts: list[dict[str, Any]]) -> str:
     """Строки «откуда новость» под постом (видит только автор в боте, в канал не уходят)."""
     rows = []
@@ -9781,6 +9860,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
         if not res:
             await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
             return ""
+        res = await _fix_titles(res)  # «Клейкое лицо» → «Глиноликий»: прокатное название из базы фильмов
         same = [fresh[i] for i in res["media"]]
         hist["stories"] = (stories + [{"at": int(time.time()), "tokens": _story_tokens(res)}])[-60:]
         sources = list(same)  # для автора под постом: откуда взята новость
@@ -14063,6 +14143,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="fast", description="Быстрые источники: Reddit, X, Deadline"),
+        BotCommand(command="title", description="Свои названия фильмов: /title Clayface = Глиноликий"),
         BotCommand(command="trailer", description="Проверить скачивание трейлера"),
         BotCommand(command="clips", description="Трейлеры в роликах: on/off"),
         BotCommand(command="music", description="Сменить фоновую музыку"),
