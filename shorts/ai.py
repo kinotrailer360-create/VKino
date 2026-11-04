@@ -2019,3 +2019,23 @@ async def media_fits(key: str, image: Image.Image, post: str) -> bool | None:
         fits = fits.strip().lower() == "true"
     log.info("shorts: media check: fits=%s seen=%s", fits, (data or {}).get("seen") if isinstance(data, dict) else "")
     return fits if isinstance(fits, bool) else None
+
+
+async def translate_roles(items: list[tuple[str, str]], key: str | None = None) -> list[str] | None:
+    """Роли персонажей по-русски, как в российском дубляже: [(фильм, роль латиницей)] → ["Бастер Мун", …].
+    Не знает — пустая строка (лучше без роли, чем английское имя голосом)."""
+    key = os.getenv("GEMINI_API_KEY", "").strip() if key is None else key
+    if not items or not (available(key) or RESERVE_KEY):
+        return None
+    listing = "\n".join(f"{i + 1}. «{film}» — {role}" for i, (film, role) in enumerate(items))
+    prompt = ("Переведи имена персонажей на русский так, как их зовут в российском дубляже и прокате этих "
+              "фильмов (Buster Moon → Бастер Мун, Rust Cohle → Раст Коул, Cooper → Купер). Описательные роли — "
+              "по-русски коротко (Bartender → бармен). Не уверен — пустая строка. Ответь только JSON: "
+              "{\"roles\": [\"…\", …]} — столько же, в том же порядке.\n\n" + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        out = [str(r or "").strip() for r in data["roles"]]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI translate_roles failed: %s", exc)
+        return None
+    return out if len(out) == len(items) else None

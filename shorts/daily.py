@@ -2050,7 +2050,7 @@ async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list
 
 # ---------------------------------------------------------------- день рождения
 
-BIRTHDAY_FILMS = 5
+BIRTHDAY_FILMS = 7  # автору у Макконахи пяти фильмов было мало
 
 
 def _years(n: int) -> str:
@@ -2066,14 +2066,18 @@ def person_uid(imdb: str) -> int:
     return -(10**12 + int(re.sub(r"\D", "", imdb) or 0))
 
 
-async def pick_birthday(today: date, exclude: set[int], tmdb_key: str) -> tuple[dict[str, Any], dict[str, Any],
-                                                                             list[dict[str, Any]]]:
-    """(человек из Викиданных, профиль TMDB, лучшие фильмы) — самый известный именинник с фильмами."""
-    people = await wiki.birthdays(today.month, today.day)
+async def pick_birthday(today: date, exclude: set[int], tmdb_key: str,
+                        pick: str = "") -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """(человек из Викиданных, профиль TMDB, лучшие фильмы) — самый известный именинник с фильмами; pick —
+    IMDb ID того, кого выбрал автор из списка (тогда только он, даже если о нём уже был ролик)."""
+    people = await wiki.birthdays(today.month, today.day, limit=20 if pick else 10)
+    if pick:
+        people = [p for p in people if p["imdb"] == pick]
     if not people:
-        raise RuntimeError("Сегодня в Викиданных нет известных именинников из кино")
+        raise RuntimeError("Сегодня в Викиданных нет известных именинников из кино" if not pick
+                           else "этого человека нет среди сегодняшних именинников — открой список заново")
     for who in people:
-        if person_uid(who["imdb"]) in exclude:
+        if not pick and person_uid(who["imdb"]) in exclude:
             continue
         try:
             info = await tmdb.person(tmdb_key, who["imdb"])
@@ -2085,7 +2089,8 @@ async def pick_birthday(today: date, exclude: set[int], tmdb_key: str) -> tuple[
         films = tmdb.best_movies(info, BIRTHDAY_FILMS)
         if len(films) >= 3:
             return who, info, films
-    raise RuntimeError("Не нашлось именинника с фильмами на TMDB (нужен TMDB_API_KEY)")
+    raise RuntimeError("Не нашлось именинника с фильмами на TMDB (нужен TMDB_API_KEY)" if not pick
+                       else "у этого человека на TMDB меньше трёх фильмов — выбери другого")
 
 
 def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]], female: bool) -> dict[str, str]:
@@ -2146,9 +2151,9 @@ async def _kp_role(fetch: Fetch | None, film: dict[str, Any], who: dict[str, Any
 
 async def make_birthday_short(work: Path, today: date, exclude: set[int] | None = None,
                               music: Path | None = None, tmdb_key: str = "",
-                              trailer_clips: bool = True, fetch: Fetch | None = None) -> ShortResult:
+                              trailer_clips: bool = True, fetch: Fetch | None = None, pick: str = "") -> ShortResult:
     await _progress(5, "Ищу именинника")
-    who, info, top = await pick_birthday(today, exclude or set(), tmdb_key)
+    who, info, top = await pick_birthday(today, exclude or set(), tmdb_key, pick)
     await _progress(12, f"{who['name']}: качаю кадры и трейлеры")
     name, female = who["name"], who["female"]
     born = date.fromisoformat(who["born"])
@@ -2181,13 +2186,21 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
             # роль по-русски с Кинопоиска; английскую с TMDB не показываем и не озвучиваем
             role = await _kp_role(fetch, f, who) if f.get("job") != "Director" else ""
             if not role:
-                tmdb_role = str(f.get("character") or "").strip()
-                role = "" if _latin(tmdb_role) else tmdb_role
+                tmdb_role = re.sub(r"\s*\((voice|uncredited)\)", "", str(f.get("character") or ""), flags=re.I).strip()
+                role = tmdb_role  # английскую роль ниже переведёт ИИ — без неё зритель не понял, кем он был
             f["_role"] = role
+            f["_voice"] = tmdb.is_voice(f)
             rows = [[("Роль", role)]] if role else [[("Режиссёр", name)]] if f.get("job") == "Director" else []
             cards.append({"image": path.name, "caption": " • ".join(x for x in [name, year] if x),
                           "info": rows, **video})
 
+    # роли латиницей («Buster Moon») — по-русски, как в дубляже; не перевелось — без роли, а не по-английски
+    latin = [k for k, f in enumerate(films) if f.get("_role") and _latin(f["_role"])]
+    if latin:
+        ru = await ai.translate_roles([(str(films[k].get("title") or ""), films[k]["_role"]) for k in latin])
+        for k, new in zip(latin, ru or [""] * len(latin)):
+            films[k]["_role"] = new if new and not _latin(new) else ""
+            cards[k]["info"] = [[("Роль", films[k]["_role"])]] if films[k]["_role"] else []
     portrait = _portrait(photo, 1080, 1350)
     cover = await asyncio.to_thread(make_cover, portrait, "ДЕНЬ РОЖДЕНИЯ", f"{name}\n{age} {_years(age)}!")
     cover_path = work / "cover.jpg"
@@ -2197,7 +2210,11 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
         title = f"«{f.get('title') or f.get('original_title')}»"
         head = f"И номер один — {title}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}."
         role = f.get("_role") or ""
-        return f"{head} Роль — {role}." if role and len(role) < 40 else head
+        if not role or len(role) >= 40:
+            return head
+        if f.get("_voice"):
+            return f"{head} {'Она озвучила' if female else 'Он озвучил'} — {role}."
+        return f"{head} Роль — {role}."
 
     lines = ([f"Сегодня день рождения празднует {name}! {he.capitalize()} {age} {_years(age)}. Лучшие фильмы:"]
              + [say(f, n - i) for i, f in enumerate(films)]
@@ -2236,9 +2253,11 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
     theme_key = theme_key or SCHEDULE[today.weekday()]
-    if theme_key == "birthday":
+    if theme_key.startswith("birthday"):  # «birthday:nm0000123» — именинник, выбранный автором из списка
+        pick = theme_key.partition(":")[2].strip()
+        theme_key = "birthday"
         try:
-            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips, fetch)
+            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips, fetch, pick)
         except Exception:
             if manual:
                 raise

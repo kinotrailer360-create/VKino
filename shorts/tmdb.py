@@ -260,8 +260,28 @@ def best_movies(info: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
         if (c.get("vote_count") or 0) < 50:
             continue
         films.setdefault(int(c["id"]), c)
-    top = sorted(films.values(), key=lambda c: c.get("vote_count") or 0, reverse=True)[:n]
+    top = sorted(films.values(), key=lambda c: (c.get("vote_count") or 0) * role_weight(c), reverse=True)[:n]
     return top
+
+
+def is_voice(credit: dict[str, Any]) -> bool:
+    return bool(re.search(r"\(voice\)|\bvoice\b|озвуч", str(credit.get("character") or ""), re.I))
+
+
+def role_weight(credit: dict[str, Any]) -> float:
+    """Насколько это роль самого человека, а не эпизод: главные роли (первые в титрах) важнее, озвучка — вдвое
+    меньше, камео и «без указания в титрах» почти не считаются. Иначе у Макконахи в «лучших» оказались
+    «Зверопой» (только голос) и «Дэдпул и Росомаха» (эпизод), а не «Настоящий детектив» и «Джентльмены»."""
+    if credit.get("job"):  # режиссура
+        return 1.0
+    order = credit.get("order")
+    weight = 1.0 if order is None or order <= 2 else 0.6 if order <= 6 else 0.3 if order <= 15 else 0.12
+    char = str(credit.get("character") or "")
+    if is_voice(credit):
+        weight *= 0.5
+    if re.search(r"uncredited|cameo|archive|камео", char, re.I):
+        weight *= 0.1
+    return weight
 
 
 def known_for(info: dict[str, Any], n: int = 3) -> list[str]:
