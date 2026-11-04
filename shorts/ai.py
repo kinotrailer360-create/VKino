@@ -1837,6 +1837,19 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
         "источников в миллионах долларов: gross — сборы на сегодня (мировые, если известны), budget — бюджет "
         "производства, forecast — прогноз сборов стартового уик-энда (если новость о прогнозе). Чего нет в "
         "источниках — 0, не выдумывай. По этим числам в ролике рисуется график.\n"
+        "graphics — 0–2 наглядные анимированные вставки к новости, где они уместны (ролик так информативнее), "
+        "ТОЛЬКО по фактам из источников; line — номер фразы в lines (с 1), с которой вставка появится. Виды: "
+        "{\"type\": \"rating\", \"line\": N, \"critics\": процент критиков или оценка из 10, \"audience\": "
+        "процент зрителей или 0, \"reviews\": число рецензий или 0, \"source\": \"Rotten Tomatoes\" / \"IMDb\" / "
+        "\"Кинопоиск\"} — оценки; {\"type\": \"timeline\", \"line\": N, \"items\": [{\"when\": \"начало 2027\", "
+        "\"what\": \"старт съёмок\"}, …]} — 2–5 этапов (съёмки, премьера, сезоны); {\"type\": \"quote\", "
+        "\"line\": N, \"who\": \"кто сказал\", \"text\": \"цитата по-русски до 200 знаков\"} — громкое высказывание; "
+        "{\"type\": \"date\", \"line\": N, \"date\": \"13 ноября 2026\", \"what\": \"премьера в кино\"} — дата "
+        "выхода; {\"type\": \"facts\", \"line\": N, \"title\": \"заголовок\", \"items\": [{\"value\": \"83\", "
+        "\"label\": \"года режиссёру\"}, …]} — 2–4 главные цифры новости; {\"type\": \"duo\", \"line\": N, "
+        "\"people\": [\"Guy Ritchie\", \"Jason Statham\"]} — совместные фильмы двух людей (имена латиницей); "
+        "{\"type\": \"films\", \"line\": N, \"person\": \"Matthew McConaughey\"} — главные фильмы человека "
+        "(день рождения, память, юбилей). Сборы и бюджет — не сюда, а в money.\n"
         "intro — 2–3 фразы: приветствие («Привет! С вами KinoMir360…») и анонс 2–3 главных тем выпуска. "
         "outro — 2–3 фразы: какая новость удивила больше всего — пишите в комментариях, подпишитесь, до встречи "
         f"{next_day}. Название канала пиши именно так: KinoMir360."
@@ -1851,7 +1864,7 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
         '"outro": ["…"], "stories": [{"headline": "заголовок новости КАПСОМ, до 40 символов", "chapter": "тот же заголовок '
         'обычными буквами для таймкода («Умер Патрик Стюарт»)", "film": "фильм или '
         'сериал по-русски или пусто", "film_en": "оригинальное название или пусто", "year": год выхода этого фильма '
-        'или сериала (у будущих — ожидаемый) или 0, "money": {"gross": 0, "budget": 0, "forecast": 0}, '
+        'или сериала (у будущих — ожидаемый) или 0, "money": {"gross": 0, "budget": 0, "forecast": 0}, "graphics": [], '
         '"person": "главный человек новости по-русски или пусто", "person_en": "его имя латиницей или пусто", "mourning": true или false '
         '(true — если новость о смерти), "lines": ["…"], "media": [номера постов об этой новости]}]}'
         "\n\nНОВОСТИ НЕДЕЛИ:\n" + listing
@@ -1888,6 +1901,7 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
                         "person": str(s.get("person") or "").strip(), "person_en": str(s.get("person_en") or "").strip(),
                         "mourning": s.get("mourning") is True or str(s.get("mourning")).lower() == "true",
                         "year": _num(s.get("year")), "money": _money(s.get("money")),
+                        "graphics": [g for g in s.get("graphics") or [] if isinstance(g, dict)][:3],
                         "lines": lines[:12], "media": media})
     if len(stories) < 3:
         return None

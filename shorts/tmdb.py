@@ -488,3 +488,37 @@ async def box_office(key: str, names: list[str], year: int = 0) -> dict[str, Any
         return {"id": int(info["id"]), "title": str(info.get("title") or info.get("original_title") or ""),
                 "year": str(info.get("release_date") or "")[:4], "budget": int(info.get("budget") or 0),
                 "revenue": int(info.get("revenue") or 0), "parts": parts}
+
+
+def _credit_ids(info: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Фильмы человека: роли и режиссура/сценарий/продюсирование (у режиссёра роли в кадре почти нет)."""
+    credits = info.get("movie_credits") or {}
+    rows = list(credits.get("cast") or []) + [c for c in credits.get("crew") or []
+                                               if c.get("job") in ("Director", "Screenplay", "Writer", "Producer")]
+    return {int(c["id"]): c for c in rows if c.get("id") and c.get("release_date") and 99 not in (c.get("genre_ids") or [])}
+
+
+async def joint_movies(key: str, a: str, b: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """Вышедшие фильмы, где работали оба (Гай Ричи и Джейсон Стейтем), по годам: ([имена по-русски],
+    [{title, year, poster}])."""
+    first, second = await asyncio.gather(person_by_name(key, a), person_by_name(key, b))
+    if not first or not second:
+        return [], []
+    one, two = _credit_ids(first), _credit_ids(second)
+    today = date.today().isoformat()
+    films = [one[i] for i in one.keys() & two.keys() if str(one[i].get("release_date")) <= today]
+    films.sort(key=lambda c: str(c.get("release_date")))
+    return [str(first.get("name") or a), str(second.get("name") or b)], [
+        {"title": str(c.get("title") or c.get("original_title") or ""), "year": str(c["release_date"])[:4],
+         "poster": f"{IMG}w342{c['poster_path']}" if c.get("poster_path") else None} for c in films]
+
+
+async def top_movies(key: str, name: str, n: int = 6) -> tuple[str, list[dict[str, Any]]]:
+    """Главные фильмы человека по годам (для дня рождения, памяти): (имя по-русски, [{title, year, poster}])."""
+    info = await person_by_name(key, name)
+    if not info:
+        return "", []
+    films = sorted(best_movies(info, n), key=lambda c: str(c.get("release_date")))
+    return str(info.get("name") or name), [
+        {"title": str(c.get("title") or c.get("original_title") or ""), "year": str(c.get("release_date"))[:4],
+         "poster": f"{IMG}w342{c['poster_path']}" if c.get("poster_path") else None} for c in films]

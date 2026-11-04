@@ -21,7 +21,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from . import boxchart, daily, lumean, netsafe, tmdb
+from . import boxchart, daily, lumean, motion, netsafe, tmdb
 from . import music as musiclib
 from .cards import ASSETS, _cover, _font
 
@@ -444,7 +444,7 @@ MONEY = re.compile(r"сбор|кассов|бюджет|окуп|уик-?энд"
 async def _money_clips(work: Path, n: int, story: dict[str, Any], lines: list[str], starts: list[float],
                        total: float, bg: Image.Image | None, tmdb_key: str) -> list[tuple[float, Path, float]]:
     """Графики про деньги для новости о сборах: [(начало, ролик, длительность)] — с фразы, где речь о сборах."""
-    if not (story.get("money") or any(MONEY.search(x) for x in lines)) or total < 18:
+    if not (story.get("money") or any(MONEY.search(x) for x in lines)) or total < 16:
         return []
     names = [x for x in (story.get("film_en"), story.get("film")) if x]
     if not names:
@@ -470,6 +470,83 @@ async def _money_clips(work: Path, n: int, story: dict[str, Any], lines: list[st
             continue
         out.append((t0 + k * each, clip, each))
     return out
+
+
+BIRTHDAY = re.compile(r"ИСПОЛНИЛОСЬ|ДЕНЬ РОЖДЕНИЯ|ЮБИЛЕ", re.I)
+
+
+async def _posters(films: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
+        imgs = await asyncio.gather(*(_download(session, f["poster"]) if f.get("poster") else asyncio.sleep(0)
+                                      for f in films))
+    return [{**f, "img": img} for f, img in zip(films, imgs)]
+
+
+async def _prepare(item: dict[str, Any], story: dict[str, Any], tmdb_key: str) -> dict[str, Any] | None:
+    """Данные для вставки, которых нет в сценарии: афиши с TMDB (совместные фильмы, главные фильмы, постер)."""
+    if item["type"] == "duo":
+        names, films = await tmdb.joint_movies(tmdb_key, *item["people"])
+        if len(films) < 2:
+            return None
+        films = films[-7:]
+        item["title"] = f"{names[0]} и {names[1]}: {len(films)} совместных фильмов".upper() if len(films) >= 5 else \
+            f"{names[0]} и {names[1]}: совместные фильмы".upper()
+        item["films"] = await _posters(films)
+    elif item["type"] == "films":
+        name, films = await tmdb.top_movies(tmdb_key, item["person"], 6)
+        if len(films) < 3:
+            return None
+        item["title"] = f"Главные фильмы: {name}".upper()
+        item["films"] = await _posters(films)
+    elif item["type"] == "date":
+        names = [x for x in (story.get("film_en"), story.get("film")) if x]
+        url = await tmdb.poster_by_title(tmdb_key, names, _int(story.get("year")) or None) if names else None
+        if url:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
+                item["poster_img"] = await _download(session, url)
+    return item
+
+
+async def _graphics(work: Path, n: int, story: dict[str, Any], starts: list[float], total: float,
+                    bg: Image.Image | None, tmdb_key: str) -> list[tuple[float, Path, float]]:
+    """Все моушн-вставки новости по времени, без наложений: графики сборов, оценки, таймлайн, цитата, дата,
+    цифры, афиши. Сколько — по длине новости (картинки и лица тоже должны остаться в кадре)."""
+    lines = story["lines"]
+    limit = 1 if total < 24 else 2 if total < 42 else 3
+    budget = total * 0.6  # не больше 60% новости — остальное фото и кадры
+    out = await _money_clips(work, n, story, lines, starts, total, bg, tmdb_key)
+    wanted = [motion.clean(g, story.get("film") or "") for g in story.get("graphics") or []]
+    items = [g for g in wanted if g]
+    if not items and story.get("person_en") and (story.get("mourning") or BIRTHDAY.search(story.get("headline") or "")):
+        items = [{"type": "films", "line": 2, "person": story["person_en"]}]  # фильмы юбиляра или ушедшего
+    for k, item in enumerate(items):
+        if len(out) >= limit or sum(c[2] for c in out) + motion.SECONDS > budget:
+            break
+        try:
+            ready = await _prepare(item, story, tmdb_key)
+            if not ready:
+                continue
+            clip = await motion.render(ready, bg, work / f"motion{n}_{k}.mp4", bool(story.get("mourning")))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: weekly motion %s failed: %s", item.get("type"), exc)
+            continue
+        idx = min(item["line"], len(starts)) - 1
+        out.append((starts[idx] if starts else total * 0.3, clip, motion.SECONDS))
+    # по времени и без наложений: следующая вставка — не раньше конца прошлой; не влезла — не ставим
+    out.sort(key=lambda c: c[0])
+    placed: list[tuple[float, Path, float]] = []
+    end = 1.0
+    for t0, clip, dur in out:
+        t0 = max(t0, end + (0.0 if not placed else 2.5))  # между вставками — хоть пара секунд картинки
+        if t0 + dur > total - 0.5:
+            t0 = total - 0.5 - dur
+            if placed and t0 < end:
+                continue
+        if t0 < 0:
+            continue
+        placed.append((t0, clip, dur))
+        end = t0 + dur
+    return placed
 
 
 def _clock(sec: float) -> str:
@@ -583,8 +660,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         await asyncio.to_thread(overlay_file, story["headline"], n, total_n, story["mourning"], over)
         total = dur + 0.5
         slides = _even_slides(paths, starts, total)
-        for t0, clip, length in await _money_clips(work, n, story, story["lines"], starts, total, bg, tmdb_key):
-            slides = _insert_clip(slides, t0, clip, length, total)  # сборы франшизы и окупаемость — графиком
+        for t0, clip, length in await _graphics(work, n, story, starts, total, bg, tmdb_key):
+            slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
         segments.append(await _segment(work, f"story{n}", slides, over, voice, total))
         clock += total
 
