@@ -21,7 +21,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from . import daily, lumean, tmdb
+from . import daily, lumean, netsafe, tmdb
 from . import music as musiclib
 from .cards import ASSETS, _cover, _font
 
@@ -68,7 +68,15 @@ async def _duration(path: Path) -> float:
     proc = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 60)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        proc.kill()
+        try:
+            await asyncio.shield(proc.wait())
+        except asyncio.CancelledError:
+            pass
+        raise
     try:
         return float(out.decode().strip())
     except ValueError:
@@ -80,6 +88,8 @@ async def _duration(path: Path) -> float:
 def _decode(data: bytes, mourning: bool) -> Image.Image | None:
     """Байты → картинка RGB, сразу уменьшенная (кадру 1920×1080 больше не нужно — и память не держим)."""
     img = Image.open(io.BytesIO(data))
+    if img.width * img.height > 50_000_000:  # 50 Мп — не картинка для кадра, а подвох или скан
+        return None
     img.load()
     img = img.convert("RGB")
     if min(img.size) < 200:
@@ -90,9 +100,7 @@ def _decode(data: bytes, mourning: bool) -> Image.Image | None:
 
 async def _download(session: aiohttp.ClientSession, url: str, mourning: bool = False) -> Image.Image | None:
     try:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            data = await resp.read()
+        data = await netsafe.fetch(session, url)  # только публичные адреса, до 15 МБ
         return await asyncio.to_thread(_decode, data, mourning)  # разбор картинки — не в цикле событий бота
     except Exception as exc:  # noqa: BLE001
         log.info("shorts: weekly image %s skipped: %s", url[:80], exc)
@@ -514,10 +522,14 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         preview = final
     else:
         try:  # качество ограничено и размером (crf), и потолком битрейта — превью влезает в 50 МБ
-            await _run("ffmpeg", "-v", "error", "-y", "-i", str(final), "-vf", "scale=854:480", "-c:v", "libx264",
-                       "-preset", "veryfast", "-crf", "27", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k",
-                       "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-movflags", "+faststart", str(preview))
-            if preview.stat().st_size > 49 * 1024 * 1024:
+            for scale, crf, rate in (("854:480", "27", kbps), ("640:360", "30", int(kbps * 0.7))):
+                await _run("ffmpeg", "-v", "error", "-y", "-i", str(final), "-vf", f"scale={scale}", "-c:v",
+                           "libx264", "-preset", "veryfast", "-crf", crf, "-maxrate", f"{rate}k", "-bufsize",
+                           f"{rate * 2}k", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-movflags", "+faststart",
+                           str(preview))
+                if preview.stat().st_size <= 49 * 1024 * 1024:
+                    break  # не влезло в 480p — второй заход в 360p
+            else:
                 preview = None
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: weekly preview failed: %s", exc)

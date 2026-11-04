@@ -3,3 +3,6 @@ deploy/.env
 __pycache__
 *.pyc
 tools/
+.env
+*.env
+**/.env

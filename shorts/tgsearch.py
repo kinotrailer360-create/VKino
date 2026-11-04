@@ -19,6 +19,8 @@ from typing import Any
 
 import aiohttp
 
+from . import netsafe
+
 log = logging.getLogger("shorts")
 
 URL = "https://t.me/s/{channel}"
@@ -232,7 +234,9 @@ async def download_media(posts: list[dict[str, Any]], work: Path, limit: int = 8
             if len(out) >= limit:
                 break
             try:
+                await netsafe.check_url(url)  # адрес из чужого поста или ленты — только публичный интернет
                 async with session.get(url) as resp:
+                    await netsafe.check_url(str(resp.url))  # и после перенаправлений
                     resp.raise_for_status()
                     if int(resp.headers.get("Content-Length") or 0) > MEDIA_MAX:
                         continue

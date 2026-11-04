@@ -9490,7 +9490,26 @@ async def _mark_published(chat_id: int, first: int) -> None:
         await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
 
 
+_publishing: set[tuple[int, int]] = set()  # посты, которые публикуются прямо сейчас (двойное нажатие)
+
+
+class AlreadyPublishing(RuntimeError):
+    pass
+
+
 async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
+    """Обёртка: один и тот же пост не публикуется дважды одновременно (двойное нажатие, кнопка + расписание)."""
+    key = (chat_id, first)
+    if key in _publishing:
+        raise AlreadyPublishing("этот пост уже публикуется")
+    _publishing.add(key)
+    try:
+        await _publish_post(bot, chat_id, first)
+    finally:
+        _publishing.discard(key)
+
+
+async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
     """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?».
     Пост снимается с отложенной публикации (вышел сейчас — по расписанию повторно не выйдет) и помечается
     опубликованным (повторное нажатие спросит подтверждение)."""
@@ -11507,6 +11526,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if (kind == "p" or kind == "pf") and arg.isdigit():
         try:
             await publish_post(message.bot, chat_id, int(arg))
+        except AlreadyPublishing:
+            await callback.answer("⏳ Уже публикую — секунду")
+            return
         except Exception as exc:  # noqa: BLE001
             await callback.answer()
             await message.answer(f"❌ Не получилось опубликовать в {escape(POST_CHANNEL)}: "

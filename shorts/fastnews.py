@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 import aiohttp
 import feedparser
 
+from . import netsafe
+
 log = logging.getLogger("shorts")
 
 DEFAULT_FEEDS = [
@@ -168,9 +170,8 @@ _reddit: asyncio.Lock | None = None
 
 
 async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        return await resp.read()
+    trusted = next((t for t in (rsshub(), nitter()) if t and url.startswith(t)), "")
+    return await netsafe.fetch(session, url, 5 * 1024 * 1024, trusted)
 
 
 async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_feed: int) -> list[dict[str, Any]]:
