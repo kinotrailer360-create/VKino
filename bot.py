@@ -7166,7 +7166,7 @@ async def start_short(message: Message, theme: str) -> None:
         theme = f"facts:{query}" if query else "facts"
     else:
         theme = theme.lower()
-    if theme and theme not in SHORT_THEMES and not theme.startswith(("genre:", "facts:")):
+    if theme and theme not in SHORT_THEMES and not theme.startswith(("genre:", "facts:", "birthday:")):
         await message.answer(
             "Использование: /short [тема]\n\n"
             + "\n".join(
@@ -7860,7 +7860,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
         [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
         *[[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")] for k in holidays_now(datetime.now(MSK).date())],
-        [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:go:birthday")],
+        [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
         [_btn("🎉 Шортс к празднику ▸", "sh:hol")],
         [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
         [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
@@ -8070,6 +8070,22 @@ async def shorts_panel(
         await show("🎭 <b>Топ какого жанра собрать?</b>", shorts_genres_menu())
     elif data == "sh:settings":
         await show("⚙️ <b>Настройки шортсов</b>", await shorts_settings_menu())
+    elif data == "sh:bdl":  # именинники дня — автор выбирает, про кого шортс
+        wait = await message.answer("🎂 Ищу, у кого из кино сегодня день рождения…")
+        today = datetime.now(MSK).date()
+        try:
+            people = await shorts_daily.wiki.birthdays(today.month, today.day, limit=20)
+        except Exception as exc:  # noqa: BLE001
+            await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+            return
+        if not people:
+            await wait.edit_text("Сегодня в Википедии нет именинников из кино 🤷")
+            return
+        rows = [[_btn(f"🎂 {p['name']}, {today.year - int(p['born'][:4])}", f"sh:go:birthday:{p['imdb']}")]
+                for p in people if p.get("imdb")][:20]
+        rows.append([_btn("🎲 Самый известный (автоматически)", "sh:go:birthday")])
+        await wait.edit_text("🎂 <b>Сегодня дни рождения</b> — от самых известных. Выбери, про кого шортс "
+                             "(лучшие фильмы и роли):", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     elif data.startswith("sh:go:"):
         await start_short(message, data[len("sh:go:"):])
     elif data.startswith("sh:ask:"):

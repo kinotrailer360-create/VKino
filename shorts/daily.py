@@ -2066,14 +2066,18 @@ def person_uid(imdb: str) -> int:
     return -(10**12 + int(re.sub(r"\D", "", imdb) or 0))
 
 
-async def pick_birthday(today: date, exclude: set[int], tmdb_key: str) -> tuple[dict[str, Any], dict[str, Any],
-                                                                             list[dict[str, Any]]]:
-    """(человек из Викиданных, профиль TMDB, лучшие фильмы) — самый известный именинник с фильмами."""
-    people = await wiki.birthdays(today.month, today.day)
+async def pick_birthday(today: date, exclude: set[int], tmdb_key: str,
+                        pick: str = "") -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """(человек из Викиданных, профиль TMDB, лучшие фильмы) — самый известный именинник с фильмами; pick —
+    IMDb ID того, кого выбрал автор из списка (тогда только он, даже если о нём уже был ролик)."""
+    people = await wiki.birthdays(today.month, today.day, limit=20 if pick else 10)
+    if pick:
+        people = [p for p in people if p["imdb"] == pick]
     if not people:
-        raise RuntimeError("Сегодня в Викиданных нет известных именинников из кино")
+        raise RuntimeError("Сегодня в Викиданных нет известных именинников из кино" if not pick
+                           else "этого человека нет среди сегодняшних именинников — открой список заново")
     for who in people:
-        if person_uid(who["imdb"]) in exclude:
+        if not pick and person_uid(who["imdb"]) in exclude:
             continue
         try:
             info = await tmdb.person(tmdb_key, who["imdb"])
@@ -2085,7 +2089,8 @@ async def pick_birthday(today: date, exclude: set[int], tmdb_key: str) -> tuple[
         films = tmdb.best_movies(info, BIRTHDAY_FILMS)
         if len(films) >= 3:
             return who, info, films
-    raise RuntimeError("Не нашлось именинника с фильмами на TMDB (нужен TMDB_API_KEY)")
+    raise RuntimeError("Не нашлось именинника с фильмами на TMDB (нужен TMDB_API_KEY)" if not pick
+                       else "у этого человека на TMDB меньше трёх фильмов — выбери другого")
 
 
 def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]], female: bool) -> dict[str, str]:
@@ -2146,9 +2151,9 @@ async def _kp_role(fetch: Fetch | None, film: dict[str, Any], who: dict[str, Any
 
 async def make_birthday_short(work: Path, today: date, exclude: set[int] | None = None,
                               music: Path | None = None, tmdb_key: str = "",
-                              trailer_clips: bool = True, fetch: Fetch | None = None) -> ShortResult:
+                              trailer_clips: bool = True, fetch: Fetch | None = None, pick: str = "") -> ShortResult:
     await _progress(5, "Ищу именинника")
-    who, info, top = await pick_birthday(today, exclude or set(), tmdb_key)
+    who, info, top = await pick_birthday(today, exclude or set(), tmdb_key, pick)
     await _progress(12, f"{who['name']}: качаю кадры и трейлеры")
     name, female = who["name"], who["female"]
     born = date.fromisoformat(who["born"])
@@ -2236,9 +2241,11 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
     theme_key = theme_key or SCHEDULE[today.weekday()]
-    if theme_key == "birthday":
+    if theme_key.startswith("birthday"):  # «birthday:nm0000123» — именинник, выбранный автором из списка
+        pick = theme_key.partition(":")[2].strip()
+        theme_key = "birthday"
         try:
-            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips, fetch)
+            return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips, fetch, pick)
         except Exception:
             if manual:
                 raise
