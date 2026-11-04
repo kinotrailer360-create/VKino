@@ -9914,6 +9914,11 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                         channels, [n for n in (res["film"], res["film_en"]) if n], per_channel=2), 40)
                     if res["trailer"]:
                         found = [p for p in found if re.search(r"трейлер|тизер|trailer|teaser", p["text"], re.I)]
+                    # пост именно об этой новости: фильм назван в начале поста и есть общее имя с новостью —
+                    # иначе брали видео из подборки, где фильм лишь упомянут (к посту об «Обсессии» Карри
+                    # Баркера пришёл ролик «From director Zack Snyder»)
+                    found = [p for p in found if related(p) and any(
+                        _mentions_title(n, _title_words(p["text"][:250])) for n in names)] if names else []
                     with_media = [p for p in found if p.get("video") or p.get("image")]
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: media search skipped: %s", exc)
