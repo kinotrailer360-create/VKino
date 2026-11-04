@@ -1935,38 +1935,49 @@ EDITOR_RULES = (
     "Фраза без ошибок — без изменений. Длина фразы — примерно та же (до 25 слов).")
 
 
+async def edit_lines(key: str, texts: list[str]) -> tuple[list[str], list[str]] | None:
+    """Редактор-корректор для озвучки: фразы на месте исправлены (имена, склонение, грамматика, речевые
+    ошибки) + список правок. Испорченную ИИ фразу оставляем как была. None — ИИ не ответил."""
+    if not texts:
+        return [], []
+    listing = "\n".join(f"{n + 1}. {t}" for n, t in enumerate(texts))
+    prompt = (EDITOR_RULES + "\n\nОтветь только JSON: {\"lines\": [\"фраза 1\", …] — ровно " + str(len(texts))
+              + " фраз в том же порядке, \"fixes\": [\"что исправлено: было → стало (вид ошибки)\", …]}\n\n"
+              "ТЕКСТ:\n" + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
+        got = [strip_citations(re.sub(r"\s+", " ", str(t))).strip() for t in data["lines"]]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI edit_lines failed: %s", exc)
+        return None
+    if len(got) != len(texts):
+        log.warning("shorts: AI edit_lines returned %d lines of %d", len(got), len(texts))
+        return None
+    out = [new if new and len(old) * 0.6 <= len(new) <= len(old) * 1.6 + 20 else old
+           for old, new in zip(texts, got)]
+    fixes = [re.sub(r"\s+", " ", str(f)).strip()[:200] for f in data.get("fixes") or [] if str(f).strip()][:40]
+    return out, fixes
+
+
 async def edit_episode(key: str, script: dict[str, Any]) -> list[str] | None:
-    """Редактор-корректор сценария выпуска перед озвучкой: правит фразы на месте (произношение имён,
-    склонение, грамматика, речевые ошибки) и возвращает список правок для автора. None — ИИ не ответил."""
-    blocks = [("intro", None), *[("story", k) for k in range(len(script.get("stories") or []))], ("outro", None)]
-    texts: list[str] = []
+    """Редактор-корректор сценария выпуска перед озвучкой: правит фразы на месте и возвращает список правок
+    для автора. None — ИИ не ответил."""
     where: list[tuple[str, int | None, int]] = []
-    for kind, k in blocks:
+    texts: list[str] = []
+    for kind, k in [("intro", None), *[("story", k) for k in range(len(script.get("stories") or []))],
+                    ("outro", None)]:
         lines = script[kind] if kind != "story" else script["stories"][k]["lines"]
         for i, line in enumerate(lines):
             where.append((kind, k, i))
             texts.append(line)
-    if not texts:
-        return []
-    listing = "\n".join(f"{n + 1}. {t}" for n, t in enumerate(texts))
-    prompt = (EDITOR_RULES + "\n\nОтветь только JSON: {\"lines\": [\"фраза 1\", …] — ровно " + str(len(texts))
-              + " фраз в том же порядке, \"fixes\": [\"что исправлено: было → стало (вид ошибки)\", …]}\n\n"
-              "ТЕКСТ ВЫПУСКА:\n" + listing)
-    try:
-        data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
-        out = [strip_citations(re.sub(r"\s+", " ", str(t))).strip() for t in data["lines"]]
-    except Exception as exc:  # noqa: BLE001
-        log.warning("shorts: AI edit_episode failed: %s", exc)
+    res = await edit_lines(key, texts)
+    if res is None:
         return None
-    if len(out) != len(texts):
-        log.warning("shorts: AI edit_episode returned %d lines of %d", len(out), len(texts))
-        return None
-    for (kind, k, i), old, new in zip(where, texts, out):
-        if not new or not (len(old) * 0.6 <= len(new) <= len(old) * 1.6 + 20):
-            continue  # явно испорченную фразу не берём
+    out, fixes = res
+    for (kind, k, i), new in zip(where, out):
         if kind == "story":
             script["stories"][k]["lines"][i] = new
         else:
             script[kind][i] = new
     script["edited"] = True
-    return [re.sub(r"\s+", " ", str(f)).strip()[:200] for f in data.get("fixes") or [] if str(f).strip()][:40]
+    return fixes

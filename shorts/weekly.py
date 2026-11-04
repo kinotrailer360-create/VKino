@@ -592,6 +592,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     first_img: Image.Image | None = None
 
     daily.stressed.clear()
+    daily.voice_issues.clear()
     cache_stats[:] = [0, 0]
     await daily._progress(3, "Картинки к новостям")
     pictures: list[list[Image.Image]] = []
@@ -736,6 +737,9 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     seo = build_seo(script, chapters, date_label)
     if notes:
         seo["warning"] = "\n".join(notes)
+    if daily.voice_issues:  # контроль озвучки: места, где распознавание услышало не то, что в тексте
+        seo["listen"] = "\n".join(f"«{x['want']}» → слышно «{x['got']}» (фраза: {x['text'][:60]}…)"
+                                  for x in daily.voice_issues[:15])
     if cache_stats[0]:
         seo["cache"] = f"{cache_stats[0]} из {cache_stats[1]}"
     if daily.stressed:  # автор слушает и правит неверные через /say — следующая сборка прочтёт верно
