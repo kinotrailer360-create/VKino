@@ -742,7 +742,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
                                   for x in daily.voice_issues[:15])
     if cache_stats[0]:
         seo["cache"] = f"{cache_stats[0]} из {cache_stats[1]}"
-    if daily.stressed:  # автор слушает и правит неверные через /say — следующая сборка прочтёт верно
+    # знаки ударения уходят голосу только в режимах names/all — без них список на проверку не нужен
+    if daily.stressed and daily.stress_mode != "off":
         seo["stress"] = ", ".join(sorted(daily.stressed, key=str.lower))
     await daily._progress(98, "Готово")
     return Episode(final, preview, cover, seo, length)

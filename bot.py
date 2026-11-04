@@ -12287,7 +12287,7 @@ async def narrate_text(message: Message, state: FSMContext) -> None:
                 caption=f"🗣 Текст для голоса: числа словами, ударения (знак над гласной). {chars} знаков.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [_btn("🎙 Озвучить моим голосом", "pt:narv")]]))
-            if res["stressed"]:
+            if res["stressed"] and shorts_daily.stress_mode != "off":
                 await bot.send_message(chat_id, "Ударения в именах и редких словах — проверь: "
                                        + escape(", ".join(res["stressed"])[:3000])
                                        + "\nНеверное — <code>/say слово = словО</code>, потом пришли текст снова.")

@@ -1312,10 +1312,18 @@ def _misheard(expected: str, heard: list[dict[str, Any]]) -> list[tuple[str, str
         dst = " ".join(got[j1:j2])
         if len(src.replace(" ", "")) < 5 or any(ch.isdigit() for ch in src):
             continue
-        if dst and SequenceMatcher(None, _norm_word(src), _norm_word(dst)).ratio() >= 0.85:
-            continue  # «режиссёры» / «режиссеры» — та же форма
+        if re.search(r"\d", dst) or (dst and re.fullmatch(r"[A-Za-z\s'.,-]+", dst)):
+            continue  # распознавание пишет числа цифрами («360»), а имена — латиницей («Rotten Tomatoes»)
+        if dst and (SequenceMatcher(None, _norm_word(src), _norm_word(dst)).ratio() >= 0.85 or (
+                _sound(src) == _sound(dst) and len(src.split()) == len(dst.split()))):
+            continue  # «режиссёры» / «режиссеры», «кобуре» / «кабуре» (безударное «о» звучит как «а») — то же
         out.append((src, dst or "—"))
     return out[:3]
+
+
+def _sound(text: str) -> str:
+    """Слово «как слышится»: безударные о/а и е/и в русской речи совпадают, твёрдый/мягкий знак не слышен."""
+    return _norm_word(text).translate(str.maketrans({"о": "а", "е": "и", "ъ": None, "ь": None}))
 
 
 def _norm_word(w: str) -> str:
