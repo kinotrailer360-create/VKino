@@ -2050,7 +2050,7 @@ async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list
 
 # ---------------------------------------------------------------- день рождения
 
-BIRTHDAY_FILMS = 5
+BIRTHDAY_FILMS = 7  # автору у Макконахи пяти фильмов было мало
 
 
 def _years(n: int) -> str:
@@ -2186,13 +2186,21 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
             # роль по-русски с Кинопоиска; английскую с TMDB не показываем и не озвучиваем
             role = await _kp_role(fetch, f, who) if f.get("job") != "Director" else ""
             if not role:
-                tmdb_role = str(f.get("character") or "").strip()
-                role = "" if _latin(tmdb_role) else tmdb_role
+                tmdb_role = re.sub(r"\s*\((voice|uncredited)\)", "", str(f.get("character") or ""), flags=re.I).strip()
+                role = tmdb_role  # английскую роль ниже переведёт ИИ — без неё зритель не понял, кем он был
             f["_role"] = role
+            f["_voice"] = tmdb.is_voice(f)
             rows = [[("Роль", role)]] if role else [[("Режиссёр", name)]] if f.get("job") == "Director" else []
             cards.append({"image": path.name, "caption": " • ".join(x for x in [name, year] if x),
                           "info": rows, **video})
 
+    # роли латиницей («Buster Moon») — по-русски, как в дубляже; не перевелось — без роли, а не по-английски
+    latin = [k for k, f in enumerate(films) if f.get("_role") and _latin(f["_role"])]
+    if latin:
+        ru = await ai.translate_roles([(str(films[k].get("title") or ""), films[k]["_role"]) for k in latin])
+        for k, new in zip(latin, ru or [""] * len(latin)):
+            films[k]["_role"] = new if new and not _latin(new) else ""
+            cards[k]["info"] = [[("Роль", films[k]["_role"])]] if films[k]["_role"] else []
     portrait = _portrait(photo, 1080, 1350)
     cover = await asyncio.to_thread(make_cover, portrait, "ДЕНЬ РОЖДЕНИЯ", f"{name}\n{age} {_years(age)}!")
     cover_path = work / "cover.jpg"
@@ -2202,7 +2210,11 @@ async def make_birthday_short(work: Path, today: date, exclude: set[int] | None 
         title = f"«{f.get('title') or f.get('original_title')}»"
         head = f"И номер один — {title}!" if place == 1 else f"Номер {NUMBERS.get(place, place)} — {title}."
         role = f.get("_role") or ""
-        return f"{head} Роль — {role}." if role and len(role) < 40 else head
+        if not role or len(role) >= 40:
+            return head
+        if f.get("_voice"):
+            return f"{head} {'Она озвучила' if female else 'Он озвучил'} — {role}."
+        return f"{head} Роль — {role}."
 
     lines = ([f"Сегодня день рождения празднует {name}! {he.capitalize()} {age} {_years(age)}. Лучшие фильмы:"]
              + [say(f, n - i) for i, f in enumerate(films)]
