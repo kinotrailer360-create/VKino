@@ -170,7 +170,7 @@ _reddit: asyncio.Lock | None = None
 
 
 async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
-    trusted = next((t for t in (rsshub(), nitter()) if t and url.startswith(t)), "")
+    trusted = next((t for t in (rsshub(), nitter()) if t and netsafe._same_origin(url, t)), "")
     return await netsafe.fetch(session, url, 5 * 1024 * 1024, trusted)
 
 
@@ -236,8 +236,13 @@ async def check(feeds: list[str]) -> list[tuple[str, int | str, str]]:
     """Для /fast: (источник, сколько новостей за сутки или почему не читается, имя). Все сразу; Reddit —
     по очереди (частые запросы он режет)."""
     since = time.time() - 24 * 3600
+    sem = asyncio.Semaphore(6)
 
     async def one(session: aiohttp.ClientSession, entry: str) -> tuple[str, int | str, str]:
+        async with sem:
+            return await _one(session, entry)
+
+    async def _one(session: aiohttp.ClientSession, entry: str) -> tuple[str, int | str, str]:
         name = label(entry)
         if not feed_url(entry):
             return entry, ("X не подключён: нужен RSSHub (COMPOSE_PROFILES=x и TWITTER_AUTH_TOKEN в .env) "

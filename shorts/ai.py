@@ -71,7 +71,32 @@ def available(key: str) -> bool:
 
 
 def lumean_llm_on() -> bool:
-    return bool(LUMEAN_LLM_KEY) and LLM_PRIMARY != "gemini"
+    return bool(LUMEAN_LLM_KEY) and LLM_PRIMARY != "gemini" and LUMEAN_MODE != "off"
+
+
+# как тратить платный Lumean (бот ставит из настроек, кнопки в /ai):
+#   important — первым только для важного (сценарий выпуска, пост по ссылке), остальное — бесплатный Gemini и Groq,
+#               Lumean — запасной, если они не ответили (по умолчанию);
+#   all — Lumean первым для всего (лучше тексты, дороже); off — Lumean для текстов не используется вовсе.
+LUMEAN_MODE = "important"
+# расход Lumean за сутки: {"date", "calls", "tokens_in", "tokens_out", "tasks": {задача: запросов}}
+lumean_usage: dict[str, Any] = {"date": "", "calls": 0, "tokens_in": 0, "tokens_out": 0, "tasks": {}}
+
+
+def _count_lumean(data: Any) -> None:
+    import datetime
+    import inspect
+    today = datetime.date.today().isoformat()
+    if lumean_usage["date"] != today:
+        lumean_usage.update(date=today, calls=0, tokens_in=0, tokens_out=0, tasks={})
+    usage = (data or {}).get("usage") or {} if isinstance(data, dict) else {}
+    lumean_usage["calls"] += 1
+    lumean_usage["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+    lumean_usage["tokens_out"] += int(usage.get("completion_tokens") or 0)
+    skip = {"_count_lumean", "_ask_lumean", "ask_lumean", "_with_reserve", "_post_json", "wait_for", "<module>"}
+    task = next((f.function for f in inspect.stack()[1:12] if f.function not in skip
+                 and f.filename.endswith(("ai.py", "daily.py", "weekly.py", "bot.py"))), "?")
+    lumean_usage["tasks"][task] = lumean_usage["tasks"].get(task, 0) + 1
 
 
 _lumean_model = ""
@@ -118,6 +143,8 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
                                 headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
             data = await resp.json(content_type=None)
             status = resp.status
+    if status == 200:
+        _count_lumean(data)
     if status != 200:
         err = (data.get("error") or {}) if isinstance(data, dict) else {}
         raise AIError(f"Lumean ИИ HTTP {status} ({model}): {str(err.get('message') or err.get('code') or data)[:200]}")
@@ -430,13 +457,16 @@ RESERVE_BUDGET = 90  # с на ответ резервного ИИ
 
 
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
-                        image: Image.Image | None = None) -> Any:
-    """Сначала сильная модель через Lumean (если подключена), потом Gemini, потом резервные ИИ.
+                        image: Image.Image | None = None, premium: bool = False) -> Any:
+    """Порядок ИИ. Важное (premium) или режим «all» — сначала сильная модель Lumean (платно), потом Gemini и
+    резервные. Остальное — бесплатные Gemini и Groq, а Lumean — только если они не ответили.
     Ошибка — с причинами всех."""
     errors = []
     # картинки в запросе, а листа для резервных моделей нет — сильной модели нечего показать, сразу Gemini
     blind = image is None and any("inline_data" in p for p in gemini_parts)
-    if lumean_llm_on() and not blind:
+    lumean_first = lumean_llm_on() and not blind and (premium or LUMEAN_MODE == "all")
+
+    async def ask_lumean() -> Any:
         try:
             result = await asyncio.wait_for(_ask_lumean(prompt, image), RESERVE_BUDGET + 60)
             log.info("shorts: Lumean LLM answered")
@@ -444,6 +474,12 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc) or "Lumean ИИ не ответил")
             log.warning("shorts: Lumean LLM failed: %s", exc)
+            return None
+
+    if lumean_first:
+        result = await ask_lumean()
+        if result is not None:
+            return result
     if key:
         try:
             return await _ask(key, gemini_parts)
@@ -458,6 +494,10 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc) or f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
             log.warning("shorts: reserve AI failed: %s", exc)
+    if not lumean_first and lumean_llm_on() and not blind:  # бесплатные не ответили — платный запасной
+        result = await ask_lumean()
+        if result is not None:
+            return result
     if BEAT_KEY:
         try:
             result = await asyncio.wait_for(_ask_beat(prompt, image), RESERVE_BUDGET)
@@ -996,7 +1036,7 @@ async def write_styled_post(key: str, task: str, material: str, search: bool = T
 
 async def _post_json(key: str, prompt: str, search: bool = True, need_search: bool = False,
                      query: str = "", verify: bool = True,
-                     images: list[Image.Image] | None = None) -> dict[str, Any] | None:
+                     images: list[Image.Image] | None = None, premium: bool = False) -> dict[str, Any] | None:
     """JSON-ответ для поста. query — сначала свой поиск (Groq Compound/DuckDuckGo/Tavily/Яндекс), результаты
     идут в задание; потом Gemini с поиском Google, иначе — сильная модель Lumean и резервные ИИ. need_search — без свежих
     данных из интернета не отвечаем (цифры, которых модель знать не может). verify — второй проход:
@@ -1024,7 +1064,7 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
         if need_search and not web:
             return None
         try:
-            data = await _with_reserve(key, [{"text": prompt}, *pics], prompt, (images or [None])[0])
+            data = await _with_reserve(key, [{"text": prompt}, *pics], prompt, (images or [None])[0], premium)
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)[:300]
             log.warning("shorts: post failed: %s", exc)
@@ -1293,7 +1333,7 @@ async def rewrite_post(key: str, sources: str, note: str = "",
         '"film_en": "оригинальное название или пусто", "trailer": true, если новость — вышел трейлер или тизер}')
     lead = re.sub(r"\[[^\]]*\]|https?://\S+", " ", sources)
     data = await _post_json(key, prompt, query=re.sub(r"\s+", " ", lead).strip()[:200],
-                            images=images)  # поиск, Google, фактчекер
+                            images=images, premium=True)  # поиск, Google, фактчекер; пост по ссылке — важное
     post = _clean_post(data)
     if not post:
         return None
@@ -1786,7 +1826,7 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
         '(true — если новость о смерти), "lines": ["…"], "media": [номера постов об этой новости]}]}'
         "\n\nНОВОСТИ НЕДЕЛИ:\n" + listing
     )
-    data = await _post_json(key, prompt, verify=False)
+    data = await _post_json(key, prompt, verify=False, premium=True)  # сценарий выпуска — важное
     if not isinstance(data, dict):
         return None
 

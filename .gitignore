@@ -1,3 +1,9 @@
 deploy/.env
 __pycache__/
 *.pyc
+.env
+.env.*
+*.env
+*.pem
+*.key
+client_secret*.json
