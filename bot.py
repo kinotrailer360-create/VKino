@@ -14459,6 +14459,8 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="voice", description="Проверить озвучку фразы"),
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
+        BotCommand(command="stress", description="Ударения в озвучке: режим и сравнение на слух"),
+        BotCommand(command="narrate", description="Диктор: текст → проверка → озвучка"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="fast", description="Быстрые источники: Reddit, X, Deadline"),
         BotCommand(command="title", description="Свои названия фильмов: /title Clayface = Глиноликий"),
