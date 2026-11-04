@@ -9521,6 +9521,7 @@ post_lock = asyncio.Lock()
 
 
 class PostState(StatesGroup):
+    media = State()
     narrate = State()
     edit = State()
     link = State()
@@ -9628,7 +9629,8 @@ async def _post_meta(chat_id: int, first: int) -> dict[str, Any]:
 
 def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboardMarkup:
     rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
-            [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")]]
+            [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")],
+            [_btn("🖼 Заменить или добавить фото/видео", f"pt:m:{first}")]]
     if yt:  # шортс — загрузка на YouTube одной кнопкой
         rows.insert(1, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
     if more:
@@ -11879,6 +11881,22 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.edit_text("Отложенная публикация отменена.",
                                 reply_markup=post_keyboard(int(arg), yt=bool(meta.get("yt"))))
         return
+    if kind == "m" and arg.isdigit():  # своё фото или видео к посту
+        await state.set_state(PostState.media)
+        await state.update_data(post_first=int(arg), post_kb=message.message_id, post_media=[], post_group="")
+        await message.answer("🖼 Пришли фото или видео для поста — одно или несколько (до 10, можно альбомом). "
+                             "Потом выберешь: заменить медиа в посте или добавить к тем, что уже есть.\n\n"
+                             "<i>Передумал — /cancel</i>")
+        return
+    if kind in ("mr", "ma") and arg.isdigit():  # заменить / добавить присланные медиа
+        data = await state.get_data()
+        await state.clear()
+        if data.get("post_first") != int(arg) or not data.get("post_media"):
+            await message.answer("Сначала нажми «🖼 Заменить или добавить фото/видео» под постом и пришли медиа.")
+            return
+        await post_set_media(message.bot, chat_id, int(arg), data["post_media"], add=kind == "ma",
+                             kb_message=data.get("post_kb"))
+        return
     if kind == "e" and arg.isdigit():  # поправить текст
         await state.set_state(PostState.edit)
         await state.update_data(post_first=int(arg))
@@ -12439,6 +12457,103 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
     if failed:
         await bot.send_message(chat_id, "⚠️ Не открылись:\n" + escape("\n".join(failed)))
     await offer_post(bot, chat_id, ids, kind, "pt:lk", what="Пост по ссылке готов")
+
+
+@router.message(PostState.media, F.photo | F.video | F.animation)
+async def post_media_collect(message: Message, state: FSMContext) -> None:
+    """Фото/видео автора для готового поста: копим (альбом приходит отдельными сообщениями), потом кнопки."""
+    data = await state.get_data()
+    first = data.get("post_first")
+    if not first:
+        await state.clear()
+        return
+    media = list(data.get("post_media") or [])
+    if message.photo:
+        media.append({"type": "photo", "id": message.photo[-1].file_id})
+    elif message.video:
+        media.append({"type": "video", "id": message.video.file_id})
+    elif message.animation:
+        media.append({"type": "animation", "id": message.animation.file_id})
+    media = media[:10]
+    group = message.media_group_id or ""
+    await state.update_data(post_media=media, post_group=group)
+    if group and group == data.get("post_group"):
+        return  # остальные части того же альбома — без лишних сообщений
+    await message.answer(
+        f"Получено: {len(media)}. Можно прислать ещё — или выбери:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🔁 Заменить медиа в посте", f"pt:mr:{first}")],
+            [_btn("➕ Добавить к текущим", f"pt:ma:{first}")]]))
+
+
+async def _post_parts(bot: Bot, chat_id: int, ids: list[int]) -> tuple[str, list[dict[str, str]]]:
+    """Текст (HTML) и медиа готового поста: Bot API не отдаёт сообщения по номеру — пересылаем их себе,
+    читаем и удаляем пересланное."""
+    caption, media = "", []
+    for mid in ids:
+        try:
+            fwd = await bot.forward_message(chat_id, chat_id, mid, disable_notification=True)
+        except TelegramBadRequest:
+            continue
+        try:
+            if not caption and (fwd.caption or fwd.text):
+                caption = fwd.html_text
+            if fwd.photo:
+                media.append({"type": "photo", "id": fwd.photo[-1].file_id})
+            elif fwd.video:
+                media.append({"type": "video", "id": fwd.video.file_id})
+            elif fwd.animation:
+                media.append({"type": "animation", "id": fwd.animation.file_id})
+        finally:
+            try:
+                await bot.delete_message(chat_id, fwd.message_id)
+            except TelegramBadRequest:
+                pass
+    return caption, media
+
+
+async def post_set_media(bot: Bot, chat_id: int, first: int, new: list[dict[str, str]], add: bool,
+                         kb_message: int | None = None) -> None:
+    """Пост с новыми фото/видео: текст тот же, медиа — присланные (замена) или старые + присланные; старый
+    вариант поста удаляется, новый — с теми же кнопками (опубликовать, позже, поправить…)."""
+    meta = await _post_meta(chat_id, first)
+    caption, old = await _post_parts(bot, chat_id, meta["ids"])
+    media = ((old if add else []) + new)[:10]
+    if len(media) >= 2:
+        media = [m for m in media if m["type"] != "animation"] or media[:1]  # GIF в альбом Telegram не берёт
+    if len(caption) > 1024 and media:
+        await bot.send_message(chat_id, "❌ Текст поста длиннее 1024 знаков — Telegram не даёт такую подпись к фото "
+                                        "или видео. Сократи текст («✏️ Поправить текст») и попробуй снова.")
+        return
+    try:
+        if len(media) >= 2:
+            items = [(InputMediaVideo(media=m["id"], supports_streaming=True, caption=caption if k == 0 else None)
+                      if m["type"] == "video" else InputMediaPhoto(media=m["id"], caption=caption if k == 0 else None))
+                     for k, m in enumerate(media)]
+            ids = [x.message_id for x in await bot.send_media_group(chat_id, items)]
+        elif media and media[0]["type"] == "video":
+            ids = [(await bot.send_video(chat_id, media[0]["id"], caption=caption, supports_streaming=True)).message_id]
+        elif media and media[0]["type"] == "animation":
+            ids = [(await bot.send_animation(chat_id, media[0]["id"], caption=caption)).message_id]
+        elif media:
+            ids = [(await bot.send_photo(chat_id, media[0]["id"], caption=caption)).message_id]
+        else:
+            return
+    except TelegramBadRequest as exc:
+        await bot.send_message(chat_id, f"❌ Не получилось: <code>{escape(_safe_err(exc)[:200])}</code>")
+        return
+    was_queued = await _unqueue(chat_id, first)
+    extra = {k: v for k, v in meta.items() if k not in ("ids", "kind", "poll", "question", "quiz")}
+    await save_post(chat_id, ids, "caption", meta.get("poll") or [], meta.get("question") or POLL_QUESTION,
+                    meta.get("quiz"), extra)
+    for mid in meta["ids"] + ([kb_message] if kb_message else []):  # старый вариант поста и его кнопки
+        try:
+            await bot.delete_message(chat_id, mid)
+        except TelegramBadRequest:
+            pass
+    await bot.send_message(chat_id, "👆 Пост с новыми медиа." + (
+        " Он стоял в расписании — выбери время заново («⏰ Позже»)." if was_queued else ""),
+        reply_markup=post_keyboard(ids[0], yt=bool(meta.get("yt"))))
 
 
 @router.message(PostState.edit, F.text, ~F.text.startswith("/"))

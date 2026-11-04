@@ -360,10 +360,13 @@ async def _concat(parts: list[Path], out: Path, work: Path) -> None:
     await _run("ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(out))
 
 
+MUSIC_DB = -27  # музыка под голосом (было −24 — автору громковато)
+
+
 async def _segment(work: Path, name: str, slides: list[tuple[Path, float]], over: Path | None,
-                   audio: Path | None, total: float) -> Path:
-    """Сегмент выпуска: куски-картинки подряд + звук (голос или «вжух»), AAC 48 кГц стерео — одинаковый у всех,
-    чтобы потом склеить без перекодирования."""
+                   audio: Path | None, total: float, music: Path | None = None) -> Path:
+    """Сегмент выпуска: куски-картинки подряд + звук (голос или «вжух») и своя музыка новости (плавно входит и
+    уходит), AAC 48 кГц стерео — одинаковый у всех, чтобы потом склеить без перекодирования."""
     clips = []
     for k, (img, dur) in enumerate(slides):
         clip = work / f"{name}_s{k}.mp4"
@@ -373,9 +376,16 @@ async def _segment(work: Path, name: str, slides: list[tuple[Path, float]], over
     await _concat(clips, video, work)
     out = work / f"{name}.mp4"
     audio_in = ["-i", str(audio)] if audio else ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
-    await _run("ffmpeg", "-v", "error", "-y", "-i", str(video), *audio_in, "-map", "0:v", "-map", "1:a",
-               "-af", "apad", "-t", f"{total:.3f}", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
-               "-ac", "2", str(out))
+    if music and music.exists():
+        fade = max(0.0, total - 0.8)
+        mix = ["-stream_loop", "-1", "-i", str(music), "-filter_complex",
+               f"[1:a]aresample=48000,apad[v];[2:a]aresample=48000,volume={MUSIC_DB}dB,afade=t=in:d=0.6,"
+               f"afade=t=out:st={fade:.3f}:d=0.8[m];[v][m]amix=inputs=2:duration=first:dropout_transition=0,"
+               "volume=2[a]", "-map", "0:v", "-map", "[a]"]
+    else:
+        mix = ["-map", "0:v", "-map", "1:a", "-af", "apad"]
+    await _run("ffmpeg", "-v", "error", "-y", "-i", str(video), *audio_in, *mix, "-t", f"{total:.3f}",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", str(out))
     for clip in clips:
         clip.unlink(missing_ok=True)
     video.unlink(missing_ok=True)
@@ -644,7 +654,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         slides += [(path, each) for path in teaser_paths]
     else:
         slides = [(intro_card, dur + 0.4)]
-    segments.append(await _segment(work, "intro", slides, None, voice, dur + 0.4))
+    main_music = musiclib.pick("новости кино") or ASSETS / "music.mp3"  # общая тема выпуска: вступление и финал
+    segments.append(await _segment(work, "intro", slides, None, voice, dur + 0.4, main_music))
     clock += dur + 0.4
 
     whoosh = ASSETS / "whoosh.wav"
@@ -655,8 +666,10 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         bg = imgs[0] if imgs else first_img
         card = work / f"card{n}.jpg"
         await asyncio.to_thread(card_file, bg, f"НОВОСТЬ {n}", story["headline"], "", card, story["mourning"])
+        # своя музыка у каждой новости — по её настроению (смерть — спокойная драма, хоррор — мрачная, …)
+        story_music = musiclib.pick(story["headline"], " ".join(story["lines"])) or main_music
         segments.append(await _segment(work, f"card{n}", [(card, CARD_SEC)], None,
-                                       whoosh if whoosh.exists() else None, CARD_SEC))
+                                       whoosh if whoosh.exists() else None, CARD_SEC, story_music))
         chapters.append((clock, story.get("chapter") or story["headline"].capitalize()))
         clock += CARD_SEC
         voice, starts, dur, voiced = await _voice(story["lines"], work / f"v{n}")
@@ -669,7 +682,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         slides = _even_slides(paths, starts, total)
         for t0, clip, length in await _graphics(work, n, story, starts, total, bg, tmdb_key):
             slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
-        segments.append(await _segment(work, f"story{n}", slides, over, voice, total))
+        segments.append(await _segment(work, f"story{n}", slides, over, voice, total, story_music))
         clock += total
 
     await daily._progress(84, "Финал выпуска")
@@ -680,17 +693,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
                             "КАКАЯ НОВОСТЬ УДИВИЛА ВАС БОЛЬШЕ ВСЕГО?", "Пишите в комментариях",
                             outro_card)
     tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
-    # под финальные фразы — не одна карточка 15 секунд, а быстрый повтор кадров всех новостей выпуска
-    recap = await asyncio.to_thread(save_slides, [imgs[0] for imgs in pictures if imgs], "recap")
-    head = min(4.0, dur + tail)
-    slides = [(outro_card, dur + tail)]
-    if recap and dur + tail - head >= 2.0 * min(len(recap), 3):
-        each = (dur + tail - head) / len(recap)
-        if each < 1.6:
-            recap = recap[: max(1, int((dur + tail - head) / 1.6))]
-            each = (dur + tail - head) / len(recap)
-        slides = [(outro_card, head)] + [(path, each) for path in recap]
-    segments.append(await _segment(work, "outro", slides, None, voice, dur + tail))
+    # финал — карточка с вопросом зрителям (повтор кадров выпуска автору не понравился)
+    segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail, main_music))
     chapters.append((clock, "Итоги и вопрос зрителям"))
     if OUTRO_CLIP.exists():  # «Спасибо, что смотрите!» и кнопка «Подписаться»
         try:
@@ -703,12 +707,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     await _concat(segments, body, work)
     for seg in segments:
         seg.unlink(missing_ok=True)
-    music = musiclib.pick("новости кино", " ".join(s["headline"] for s in stories)) or ASSETS / "music.mp3"
-    final = work / "episode.mp4"
-    await _run("ffmpeg", "-v", "error", "-y", "-i", str(body), "-stream_loop", "-1", "-i", str(music),
-               "-filter_complex", "[1:a]volume=-24dB[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=0,"
-               "volume=2[a]", "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-               "-movflags", "+faststart", str(final))
+    final = work / "episode.mp4"  # музыка уже в каждом куске (своя у каждой новости)
+    await _run("ffmpeg", "-v", "error", "-y", "-i", str(body), "-c", "copy", "-movflags", "+faststart", str(final))
     body.unlink(missing_ok=True)
     length = await _duration(final)
 
