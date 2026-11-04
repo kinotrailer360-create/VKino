@@ -7375,7 +7375,8 @@ async def stress_command(message: Message) -> None:
         chat_id = message.chat.id
         _run_job(lambda: stress_test(message.bot, chat_id, phrase[:400]))
         return
-    await message.answer(*await stress_menu())
+    text, kb = await stress_menu()
+    await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ud:"))
@@ -7391,7 +7392,8 @@ async def stress_buttons(callback: CallbackQuery) -> None:
         return
     if kind == "menu":
         await callback.answer()
-        await callback.message.answer(*await stress_menu())
+        text, kb = await stress_menu()
+        await callback.message.answer(text, reply_markup=kb)
         return
     if kind in STRESS_LABELS:
         await set_shorts_setting("stress_mode", kind)
@@ -11978,7 +11980,8 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action == "rt":
         await message.answer("🍅 Ищу свежие и ближайшие премьеры…")
-        await message.answer(*await rt_menu())
+        text, kb = await rt_menu()  # второй позиционный аргумент answer — не клавиатура
+        await message.answer(text, reply_markup=kb)
         return
     if action == "ac":
         await state.set_state(PostState.actor)
