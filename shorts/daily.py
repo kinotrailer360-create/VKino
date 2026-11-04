@@ -1168,6 +1168,7 @@ async def synthesize(lines: list[str], work: Path, pause: float | None = None, c
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     global tts_error, tts_note
     tts_error, tts_note = None, None
+    work.mkdir(parents=True, exist_ok=True)  # папку для фраз создаём здесь — вызывающий мог не создать
     speak = list(lines) if prepared else await spoken_lines(lines, careful)  # prepared — уже текст для голоса
     parts: list[Path] = [work / f"voice_{i}.mp3" for i in range(len(lines))]
     words: list[list[float]] = []
