@@ -7534,7 +7534,43 @@ async def ai_status_action(message: Message) -> None:
         except Exception as exc:
             rows.append(f"3. BeatAPI: ❌ {escape(_safe_err(exc)[:300])}")
         await wait.delete()
-    await message.answer("\n".join(rows))
+    await load_ai_mode()
+    u = shorts_ai.lumean_usage
+    modes = {"important": "только важное (сценарий выпуска, пост по ссылке) + запасной", "all": "всё подряд",
+             "off": "выключен для текстов"}
+    rows.append(f"\n💳 <b>Lumean для текстов</b>: {modes.get(shorts_ai.LUMEAN_MODE, shorts_ai.LUMEAN_MODE)}")
+    if u["date"] == date.today().isoformat() and u["calls"]:
+        top = ", ".join(f"{escape(t)} — {n}" for t, n in sorted(u["tasks"].items(), key=lambda kv: -kv[1])[:6])
+        tin, tout = f"{u['tokens_in']:,}".replace(",", " "), f"{u['tokens_out']:,}".replace(",", " ")
+        rows.append(f"Сегодня запросов к Lumean: {u['calls']} (токенов: {tin} на вход, {tout} на выход).\n"
+                    f"На что: {top}")
+    else:
+        rows.append("Сегодня запросов к Lumean не было (считается с последнего запуска бота).")
+    rows.append("Озвучка клоном голоса тоже идёт с баланса Lumean: выпуск на 6–8 минут — самое дорогое.")
+    await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
+        [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
+         _btn(("✅ " if shorts_ai.LUMEAN_MODE == "off" else "") + "🆓 Lumean: выкл", "aim:off")]]))
+
+
+async def load_ai_mode() -> None:
+    mode = await shorts_setting("lumean_mode") or "important"
+    shorts_ai.LUMEAN_MODE = mode if mode in ("important", "all", "off") else "important"
+
+
+@router.callback_query(F.data.startswith("aim:"))
+async def ai_mode_button(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    mode = (callback.data or "")[4:]
+    if mode not in ("important", "all", "off"):
+        await callback.answer()
+        return
+    await set_shorts_setting("lumean_mode", None if mode == "important" else mode)
+    shorts_ai.LUMEAN_MODE = mode
+    await callback.answer({"important": "Lumean — только для важного", "all": "Lumean — для всех текстов",
+                           "off": "Lumean для текстов выключен"}[mode], show_alert=True)
 
 
 @router.message(Command("ai"))
@@ -14027,6 +14063,10 @@ async def main() -> None:
         handler.addFilter(_RedactSecrets())
 
     await init_db()
+    try:
+        await load_ai_mode()
+    except Exception:  # noqa: BLE001
+        logging.exception("AI mode load failed")
     web_runner = await start_miniapp_server()
     provider_task = asyncio.create_task(
         video_provider_sync_loop()
