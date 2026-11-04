@@ -9779,7 +9779,8 @@ async def _media_frame(path: Path, work: Path) -> Image.Image | None:
         return None
 
 
-async def _check_media(files: list[Path], res: dict[str, Any], work: Path) -> list[Path]:
+async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
+                       notes: list[str] | None = None) -> list[Path]:
     """Фото и видео поста — только о той же новости: ИИ смотрит на каждое (до 4). Не подошло ничего — постер
     фильма или портрет человека из базы (TMDB), иначе пост без картинки (её можно добавить кнопкой)."""
     if not files:
@@ -9792,7 +9793,10 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path) -> li
             keep.append(path)
             continue
         img = await _media_frame(path, work)
-        fits = await shorts_ai.media_fits(GEMINI_API_KEY, img, news) if img else None
+        fits, seen = await shorts_ai.media_fits(GEMINI_API_KEY, img, news) if img else (None, "")
+        if notes is not None:  # автору под постом: что ИИ увидел на картинке и решил
+            notes.append(f"{'✅' if fits else '❌ убрал' if fits is False else '❔ не проверено'}"
+                         + (f": {seen}" if seen else ""))
         if fits is False:
             logging.info("Tg post: media %s rejected for %s", path.name, res.get("topic"))
             continue
@@ -9800,15 +9804,18 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path) -> li
     if keep:
         return keep
     url = None
-    try:
-        if res.get("film_en") or res.get("film"):
-            url = await shorts_daily.tmdb.poster_by_title(
-                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
-        if not url and (res.get("person_en") or res.get("person")):
+    try:  # новость о человеке (смерть, интервью) — его портрет, иначе постер фильма
+        if res.get("person_en") or res.get("person"):
             info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
             url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
+        if not url and (res.get("film_en") or res.get("film")):
+            url = await shorts_daily.tmdb.poster_by_title(
+                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
     except Exception as exc:  # noqa: BLE001
         logging.info("Tg post: replacement image failed: %s", exc)
+    if notes is not None:
+        notes.append("поставил портрет или постер из базы TMDB" if url else "подходящей картинки нет — пост без "
+                     "фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»")
     if not url:
         return []
     return await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix="repl")
@@ -10112,12 +10119,14 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             if len(files) < 2:
                 files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
                          await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
-            files = await _check_media(files, res, work)  # ИИ смотрит, о том ли картинка (Линк к новости DC)
+            checks: list[str] = []
+            files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
             caption = post_caption(res["post"], "#новости")
+            seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
                 await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
-                                 note=_sources_note(sources))
+                                 note=_sources_note(sources) + seen)
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return res["topic"] or "пост"
