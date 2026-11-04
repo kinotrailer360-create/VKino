@@ -103,36 +103,53 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
                        limit: int = 6) -> list[Image.Image]:
     """Картинки к новости: фото людей, кадры и постер фильма с TMDB, фото из постов-источников."""
     person = story.get("person_en") or story.get("person")
-    name = story.get("film_en") or story.get("film")
 
     async def person_urls() -> list[str]:
         if not person:
             return []
         try:
             info = await tmdb.person_by_name(tmdb_key, person)
-            return tmdb.profile_urls(info)[:2] if info else []
+            return tmdb.profile_urls(info)[:3 if story.get("mourning") else 2] if info else []
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: weekly person %s failed: %s", person, exc)
             return []
 
     async def film_urls() -> list[str]:
-        if not name:
+        """Кадры фильма или сериала — только при точном совпадении названия: «Джеймс Бонд» не должен дать
+        мультсериал «James Bond Jr.». Новинки, которых ещё нет на TMDB («Джуманджи: Великий побег»), ищем
+        по названию франшизы (до двоеточия)."""
+        names = [n for n in (story.get("film_en"), story.get("film")) if n]
+        if not names:
             return []
-        try:  # фильм или сериал — что ближе по названию (одноимённый фильм не должен перебить сериал)
-            films, shows = await asyncio.gather(tmdb.search_movie(tmdb_key, name), tmdb.search_tv(tmdb_key, name),
-                                                return_exceptions=True)
-            cands = [(r, "movie") for r in (films if isinstance(films, list) else [])[:3]] + \
+        tries = list(dict.fromkeys(names + [re.split(r"[:.—–-]", n)[0].strip() for n in names]))
+        for query in tries:
+            if len(query) < 3:
+                continue
+            try:
+                films, shows = await asyncio.gather(tmdb.search_movie(tmdb_key, query),
+                                                    tmdb.search_tv(tmdb_key, query), return_exceptions=True)
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: weekly film %s failed: %s", query, exc)
+                continue
+            cands = [(r, "movie") for r in (films if isinstance(films, list) else [])[:4]] + \
                     [(r, "tv") for r in (shows if isinstance(shows, list) else [])[:3]]
-            if not cands:
-                return []
-            names = [n for n in (story.get("film_en"), story.get("film")) if n]
-            best, kind = max(cands, key=lambda c: max(tmdb.similar(c[0]["title"], n) for n in names)
-                             + max(tmdb.similar(c[0].get("original") or "", n) for n in names) * 0.5)
-            out = await tmdb.backdrops(tmdb_key, kind, int(best["id"]), 3)
+
+            def score(c: tuple[dict[str, Any], str]) -> float:
+                return max(max(tmdb.similar(c[0].get("title") or "", q), tmdb.similar(c[0].get("original") or "", q))
+                           for q in (query, *names))
+
+            good = [c for c in cands if score(c) >= 0.93]
+            if not good:
+                continue
+            # из точных совпадений — самый популярный, фильм раньше сериала
+            best, kind = max(good, key=lambda c: (score(c), c[1] == "movie", c[0].get("popularity") or 0))
+            try:
+                out = await tmdb.backdrops(tmdb_key, kind, int(best["id"]), 3)
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: weekly backdrops %s failed: %s", query, exc)
+                out = []
             return out + ([best["poster"]] if best.get("poster") else [])
-        except Exception as exc:  # noqa: BLE001
-            log.info("shorts: weekly film %s failed: %s", name, exc)
-            return []
+        return []
 
     people, films = await asyncio.gather(person_urls(), film_urls())
     urls: list[str] = people + films
@@ -146,6 +163,14 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
                 continue  # ИИ дал номер поста не об этой новости — его фото не берём
             urls += [m["image"] for m in p.get("media") or [] if m.get("image")][:3] or (
                 [p["image"]] if p.get("image") else [])
+    if len(urls) < 2 and keys:  # мало картинок — фото из любых постов недели о том же (по имени или названию)
+        for p in posts:
+            text = _words(p.get("text") or "")
+            if any(k and all(w[:max(3, len(w) - 2)] in text for w in k.split()[:2]) for k in keys):
+                urls += [m["image"] for m in p.get("media") or [] if m.get("image")][:2] or (
+                    [p["image"]] if p.get("image") else [])
+            if len(urls) >= limit:
+                break
     wanted = list(dict.fromkeys(urls))[:limit + 3]  # с запасом на битые
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
         got = await asyncio.gather(*(_download(session, u, bool(story.get("mourning"))) for u in wanted))
@@ -396,7 +421,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     if not voiced:
         notes.append(daily.no_voice_note(voiced))
     intro_card = work / "intro_card.jpg"
-    await asyncio.to_thread(card_file, first_img, "KINOMIR360", "НОВОСТИ КИНО ЗА НЕДЕЛЮ", date_label, intro_card)
+    await asyncio.to_thread(card_file, first_img, "KINOMIR360", "НОВОСТИ КИНО", date_label, intro_card)
     chapters.append((0.0, "Вступление"))
     if INTRO_CLIP.exists():  # анимированная заставка с логотипом — самое начало выпуска
         try:
@@ -404,7 +429,17 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
             clock += await _duration(segments[-1])
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: weekly intro clip skipped: %s", exc)
-    segments.append(await _segment(work, "intro", [(intro_card, dur + 0.4)], None, voice, dur + 0.4))
+    # под приветствие и анонс — не одна заставка, а кадры главных новостей выпуска (что сегодня будет)
+    teaser = [imgs[0] for imgs in pictures[:4] if imgs]
+    teaser_paths = await asyncio.to_thread(save_slides, teaser, "teaser") if teaser else []
+    slides = [(intro_card, min(3.0, dur + 0.4))]
+    rest = dur + 0.4 - slides[0][1]
+    if teaser_paths and rest > 1.5:
+        each = rest / len(teaser_paths)
+        slides += [(path, each) for path in teaser_paths]
+    else:
+        slides = [(intro_card, dur + 0.4)]
+    segments.append(await _segment(work, "intro", slides, None, voice, dur + 0.4))
     clock += dur + 0.4
 
     whoosh = ASSETS / "whoosh.wav"
@@ -432,7 +467,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     await daily._progress(84, "Финал выпуска")
     voice, starts, dur, voiced = await _voice(script["outro"], work / "v_outro")
     outro_card = work / "outro_card.jpg"
-    await asyncio.to_thread(card_file, first_img, "ПОДПИШИСЬ — НОВЫЙ ВЫПУСК КАЖДОЕ ВОСКРЕСЕНЬЕ",
+    await asyncio.to_thread(card_file, first_img, "ПОДПИШИСЬ — НОВЫЕ ВЫПУСКИ ПО СРЕДАМ И ВОСКРЕСЕНЬЯМ",
                             "СПАСИБО, ЧТО СМОТРИТЕ!", "YouTube @kinomir360 · Telegram @KinoMir360", outro_card)
     tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
     segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail))
@@ -486,15 +521,15 @@ def build_seo(script: dict[str, Any], chapters: list[tuple[float, str]], date_la
     title = script.get("title") or (" / ".join(s["headline"] for s in script["stories"][:2]) + " / Новости кино")
     if len(title) > 100:
         title = title[:100].rsplit(" / ", 1)[0]
-    lines = [script.get("description") or f"Главные новости кино за неделю ({date_label}).", "",
+    lines = [script.get("description") or f"Главные новости кино ({date_label}).", "",
              "⏱ Таймкоды:"] + [f"{_clock(t)} {name}" for t, name in chapters]
     lines += ["", "Какая новость удивила вас больше всего? Пишите в комментариях 👇", "",
               f"📢 Telegram: {daily.TELEGRAM_URL}", f"▶️ YouTube: {daily.YOUTUBE_URL}", "",
               "#новостикино #кино #сериалы #kinomir360"]
     tags = script.get("tags") or ""
     base = "новости кино, кино новости, новости кино 2026, киноновости, фильмы, сериалы, KinoMir360"
-    pinned = ("Какая новость недели удивила вас больше всего? 👇\n\nНовый выпуск «Новости кино» — каждое "
-              "воскресенье. Подписывайтесь, чтобы не пропустить!")
+    pinned = ("Какая новость удивила вас больше всего? 👇\n\nНовые выпуски «Новости кино» — по средам и "
+              "воскресеньям. Подписывайтесь, чтобы не пропустить!")
     return {"title": title, "description": "\n".join(lines), "tags": f"{tags}, {base}".strip(", "),
             "pinned": pinned, "long": "1"}
 

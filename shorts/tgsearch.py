@@ -105,8 +105,10 @@ class _Posts(HTMLParser):
             self.buf.append(data)
 
 
-async def _fetch(session: aiohttp.ClientSession, channel: str, query: str = "") -> list[dict[str, Any]]:
-    async with session.get(URL.format(channel=channel), params={"q": query} if query else None) as resp:
+async def _fetch(session: aiohttp.ClientSession, channel: str, query: str = "",
+                 before: int = 0) -> list[dict[str, Any]]:
+    params = {"q": query} if query else {"before": str(before)} if before else None
+    async with session.get(URL.format(channel=channel), params=params) as resp:
         resp.raise_for_status()
         if "/s/" not in str(resp.url):  # закрытый канал или нет такого — t.me уводит на обычную страницу
             raise RuntimeError("канал закрытый или не найден")
@@ -115,18 +117,35 @@ async def _fetch(session: aiohttp.ClientSession, channel: str, query: str = "") 
     return parser.posts
 
 
-async def latest(channels: list[str], hours: float = 48, per_channel: int = 8) -> list[dict[str, Any]]:
-    """Свежие посты каналов (для новостей): [{"channel", "url", "text", "time", "image"}], новые первыми."""
+def _post_id(post: dict[str, Any]) -> int:
+    tail = str(post.get("url") or "").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
+async def latest(channels: list[str], hours: float = 48, per_channel: int = 8,
+                 pages: int = 1) -> list[dict[str, Any]]:
+    """Свежие посты каналов (для новостей): [{"channel", "url", "text", "time", "image"}], новые первыми.
+    pages > 1 — листаем назад (страница t.me/s — ~20 последних постов: у активного канала это сутки, а для
+    выпуска за неделю нужно глубже)."""
     since = time.time() - hours * 3600
     sem = asyncio.Semaphore(4)
 
     async def one(session: aiohttp.ClientSession, channel: str) -> list[dict[str, Any]]:
         async with sem:
-            try:
-                posts = await _fetch(session, channel)
-            except Exception as exc:  # noqa: BLE001
-                log.info("shorts: tg channel %s read failed: %s", channel, exc)
-                return []
+            posts: list[dict[str, Any]] = []
+            before = 0
+            for _ in range(max(1, pages)):
+                try:
+                    page = await _fetch(session, channel, before=before)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("shorts: tg channel %s read failed: %s", channel, exc)
+                    break
+                posts = page + posts
+                ids = [_post_id(p) for p in page if _post_id(p)]
+                times = [p["time"] for p in page if p["time"]]
+                if not ids or not times or min(times) < since:
+                    break
+                before = min(ids)
         fresh = [p for p in reversed(posts) if p["time"] >= since and len(p["text"]) >= 60]
         return [{**p, "channel": channel, "text": p["text"][:POST_MAX]} for p in fresh[:per_channel]]
 
