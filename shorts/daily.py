@@ -1005,10 +1005,45 @@ async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
         for i, text in zip(todo, fixed or []):
             texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
     out = [_speakable(pronounce.plain_russian(text)) for text in texts]
+    # на проверку автору — ударения ИИ и словаря (имена, редкие слова); от нейросети во всех словах — не шлём
     for text in out:
         for word in re.findall(rf"[\w{pronounce.STRESS}-]*{pronounce.STRESS}[\w{pronounce.STRESS}-]*", text):
             stressed[word] = stressed.get(word, 0) + 1
-    return out
+    return await _accent(out)
+
+
+def accent_url() -> str:
+    """Сервис ударений RUAccent: свой адрес из .env или контейнер accent (COMPOSE_PROFILES=accent)."""
+    url = os.getenv("ACCENT_URL", "").strip()
+    if url:
+        return url.rstrip("/")
+    profiles = {p.strip() for p in os.getenv("COMPOSE_PROFILES", "").split(",")}
+    return "http://accent:8000" if "accent" in profiles else ""
+
+
+accent_note = ""  # почему сервис ударений не сработал (для /voice и отчёта)
+
+
+async def _accent(texts: list[str]) -> list[str]:
+    """Ударения во всех обычных словах от нейросети RUAccent (если сервис включён). Не ответил — без них."""
+    global accent_note
+    url = accent_url()
+    if not url or not texts:
+        return texts
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+            async with session.post(f"{url}/accent",
+                                    json={"texts": [t.replace(pronounce.STRESS, "") for t in texts]}) as resp:
+                resp.raise_for_status()
+                got = (await resp.json()).get("texts") or []
+    except Exception as exc:  # noqa: BLE001
+        accent_note = f"сервис ударений не ответил: {str(exc)[:150] or type(exc).__name__}"
+        log.warning("shorts: accent service failed: %s", exc)
+        return texts
+    accent_note = ""
+    if len(got) != len(texts):
+        return texts
+    return [pronounce.merge_stress(t, str(a)) for t, a in zip(texts, got)]
 
 
 def _for_lumean(text: str) -> str:

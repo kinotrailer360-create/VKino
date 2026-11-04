@@ -13661,6 +13661,11 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
 
 async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, script: dict[str, Any],
                          pool: list[dict[str, Any]], label: str) -> None:
+    if not script.get("edited"):  # редактор-корректор: имена, склонение, грамматика, речевые ошибки
+        await _edit_quiet(status, "✍️ Редактор вычитывает текст выпуска: имена, падежи, грамматика, речевые ошибки…")
+        fixes = await shorts_ai.edit_episode(GEMINI_API_KEY, script)
+        if fixes is not None:
+            script["fixes"] = fixes
     if status and shorts_lock.locked():
         await _edit_quiet(status, "⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
     async with shorts_lock:
@@ -13725,6 +13730,15 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         await bot.send_message(chat_id, f"<b>{name}:</b>\n<pre>{escape(seo[key])}</pre>")
     if seo.get("warning"):
         await bot.send_message(chat_id, escape(seo["warning"]))
+    if script.get("fixes"):
+        rows, size = [], 0
+        for fix in script["fixes"][:30]:
+            row = f"• {escape(fix)}"
+            if size + len(row) > 3700:
+                break
+            rows.append(row)
+            size += len(row) + 1
+        await bot.send_message(chat_id, "✍️ <b>Редактор исправил в тексте:</b>\n" + "\n".join(rows))
     if seo.get("stress"):
         await bot.send_message(
             chat_id, "🗣 <b>Ударения, которые поставил ИИ</b> (знак после ударной гласной):\n"
