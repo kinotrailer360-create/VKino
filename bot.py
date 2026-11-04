@@ -51,6 +51,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
 from shorts import ai as shorts_ai
+from shorts import narrator as shorts_narrator
 from shorts import tgsearch as shorts_tgsearch
 from shorts import postcard as shorts_postcard
 from shorts import clips as shorts_clips
@@ -7762,6 +7763,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
         [_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")],
         [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
+        [_btn("🎙 Диктор: текст → проверка → озвучка", "pt:nar")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         [_btn("📝 Посты в Telegram-канал ▸", "pt:menu")],
         [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
@@ -9428,6 +9430,7 @@ post_lock = asyncio.Lock()
 
 
 class PostState(StatesGroup):
+    narrate = State()
     edit = State()
     link = State()
     actor = State()
@@ -11835,6 +11838,17 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                              "сюда." if action == "wvon" else "🔕 По средам и воскресеньям выпуск больше не собираю. Вручную — "
                              "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
         return
+    if action == "nar":
+        await state.set_state(PostState.narrate)
+        await message.answer(
+            "🎙 <b>Диктор</b>: пришли текст для озвучки сообщением или файлом .txt / .docx (до 20 000 знаков).\n\n"
+            "Бот проверит русский язык (имена, падежи, грамматика, речевые ошибки), подготовит версию для голоса "
+            "(числа словами, ударения) и пришлёт оба текста и список правок. Озвучка твоим голосом — отдельной "
+            "кнопкой, после того как посмотришь текст.\n\n<i>Передумал — /cancel</i>")
+        return
+    if action == "narv":
+        await narrator_voice(message)
+        return
     if action == "wvre":
         if weekly_busy:
             await message.answer("⏳ Выпуск уже собирается — пришлю, как будет готов.")
@@ -12075,6 +12089,121 @@ async def post_list_link(message: Message, state: FSMContext) -> None:
             await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(job)
+
+
+@router.message(Command("narrate"))
+async def narrate_command(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(PostState.narrate)
+    await message.answer("🎙 Пришли текст для озвучки сообщением или файлом .txt / .docx (до 20 000 знаков).\n"
+                         "<i>Передумал — /cancel</i>")
+
+
+@router.message(PostState.narrate, F.text & ~F.text.startswith("/") | F.document)
+async def narrate_text(message: Message, state: FSMContext) -> None:
+    """«Диктор»: текст → проверка русского языка → версия для голоса; озвучка — кнопкой."""
+    text = message.text or ""
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith((".txt", ".docx")) or (message.document.file_size or 0) > 5 * 1024 * 1024:
+            await message.answer("Нужен файл .txt или .docx до 5 МБ — или просто вставь текст сообщением.")
+            return
+        buf = io.BytesIO()
+        await message.bot.download(message.document.file_id, destination=buf)
+        data = buf.getvalue()
+        try:
+            text = shorts_narrator.read_docx(data) if name.endswith(".docx") else data.decode("utf-8", "ignore")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"Не прочитал файл: <code>{escape(str(exc)[:200])}</code>")
+            return
+    await state.clear()
+    if len(text.strip()) < 20:
+        await message.answer("Текст слишком короткий.")
+        return
+    wait = await message.answer(f"✍️ Проверяю текст ({len(text)} знаков): имена, падежи, грамматика, ударения… "
+                                "Обычно 1–3 минуты.")
+    chat_id = message.chat.id
+
+    async def narrate_job() -> None:
+        try:
+            await load_pronunciations()
+            res = await shorts_narrator.prepare(GEMINI_API_KEY, text)
+            await set_shorts_setting("narrator_last", json.dumps({"clean": res["clean"], "speech": res["speech"]},
+                                                                 ensure_ascii=False))
+            bot = message.bot
+            rows, size = [], 0
+            for fix in res["fixes"]:
+                row = f"• {escape(fix)}"
+                if size + len(row) > 3500:
+                    break
+                rows.append(row)
+                size += len(row) + 1
+            await bot.send_message(chat_id, "✍️ <b>Исправлено:</b>\n" + "\n".join(rows) if rows else
+                                   "✍️ Ошибок в тексте не нашёл.")
+            await bot.send_document(chat_id, BufferedInputFile(
+                shorts_narrator.as_text(res["clean"]).encode("utf-8"), filename="text_ispravlen.txt"),
+                caption="📄 Исправленный текст — для субтитров и публикации.")
+            chars = sum(len(x) for x in res["speech"])
+            await bot.send_document(chat_id, BufferedInputFile(
+                shorts_narrator.as_text(res["speech"]).encode("utf-8"), filename="text_dlya_golosa.txt"),
+                caption=f"🗣 Текст для голоса: числа словами, ударения (знак над гласной). {chars} знаков.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [_btn("🎙 Озвучить моим голосом", "pt:narv")]]))
+            if res["stressed"]:
+                await bot.send_message(chat_id, "Ударения в именах и редких словах — проверь: "
+                                       + escape(", ".join(res["stressed"])[:3000])
+                                       + "\nНеверное — <code>/say слово = словО</code>, потом пришли текст снова.")
+            await wait.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Narrator failed")
+            await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+
+    _run_job(narrate_job)
+
+
+async def narrator_voice(message: Message) -> None:
+    try:
+        saved = json.loads(await shorts_setting("narrator_last") or "{}")
+    except ValueError:
+        saved = {}
+    speech = saved.get("speech") or []
+    if not speech:
+        await message.answer("Сначала пришли текст: 🎬 Видео → «🎙 Диктор».")
+        return
+    status = await message.answer("🎙 Озвучиваю твоим голосом" + (" (жду, пока соберётся другой ролик)…"
+                                                                   if shorts_lock.locked() else "…"))
+    chat_id = message.chat.id
+
+    async def voice_job() -> None:
+        work = SHORTS_DIR / f"narr_{time.time_ns()}"
+        try:
+            async with shorts_lock:
+                await load_voice()
+                res = await shorts_narrator.voice(speech, work)
+                mp3 = work / "narration.mp3"
+                await shorts_weekly._run("ffmpeg", "-v", "error", "-y", "-i", str(res["file"]), "-c:a", "libmp3lame",
+                                         "-b:a", "192k", str(mp3))
+                bot = message.bot
+                note = f"\n💾 Из уже оплаченных: {res['hits']} из {res['total']} фраз." if res["hits"] else ""
+                await bot.send_audio(chat_id, FSInputFile(mp3, filename="ozvuchka.mp3"),
+                                     caption="🎙 Озвучка готова." + note + (f"\n{escape(res['note'][:300])}"
+                                                                          if res["note"] else ""),
+                                     request_timeout=600)
+                if res["issues"]:
+                    await bot.send_message(chat_id, "🎧 <b>Послушай эти места</b> — распознавание услышало не то, "
+                                           "что в тексте:\n" + escape("\n".join(
+                                               f"«{x['want']}» → «{x['got']}»" for x in res["issues"][:20]))
+                                           + "\n\nЕсли и правда неверно: <code>/say слово = как читать</code>, пришли "
+                                             "текст снова и озвучь — оплатятся только изменённые фразы.")
+            await status.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Narrator voice failed")
+            await status.edit_text(f"❌ Озвучка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    _run_job(voice_job)
 
 
 @router.message(PostState.digest, F.text, ~F.text.startswith("/"))
@@ -13735,6 +13864,11 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         await bot.send_message(chat_id, f"<b>{name}:</b>\n<pre>{escape(seo[key])}</pre>")
     if seo.get("warning"):
         await bot.send_message(chat_id, escape(seo["warning"]))
+    if seo.get("listen"):
+        await bot.send_message(chat_id, "🎧 <b>Послушай эти места</b> — распознавание услышало не то, что в тексте "
+                                        "(часто это искажённое имя или окончание):\n" + escape(seo["listen"][:3500])
+                               + "\n\nЕсли слово и правда звучит неверно — <code>/say слово = как читать</code> и "
+                                 "«🔁 Переозвучить»: заново оплатятся только эти фразы.")
     if seo.get("cache"):
         await bot.send_message(chat_id, f"💾 Озвучка: {seo['cache']} фраз взято из уже оплаченных — заново "
                                         "озвучено только новое и исправленное.")

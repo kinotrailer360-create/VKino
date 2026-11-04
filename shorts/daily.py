@@ -1157,12 +1157,12 @@ async def _edge_pieces(text: str, path: Path, stem: Path) -> tuple[list[float], 
     return words, lost
 
 
-async def synthesize(lines: list[str], work: Path, pause: float | None = None,
-                     careful: bool = False) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
+async def synthesize(lines: list[str], work: Path, pause: float | None = None, careful: bool = False,
+                     prepared: bool = False) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
     global tts_error, tts_note
     tts_error, tts_note = None, None
-    speak = await spoken_lines(lines, careful)
+    speak = list(lines) if prepared else await spoken_lines(lines, careful)  # prepared — уже текст для голоса
     parts: list[Path] = [work / f"voice_{i}.mp3" for i in range(len(lines))]
     words: list[list[float]] = []
     failed: list[int] = []
@@ -1264,7 +1264,10 @@ async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: 
         return
     for i, (text, part) in enumerate(zip(speak, parts)):
         try:
-            extra = _extra_words(text, await ai.transcribe_words(part.read_bytes()))
+            heard = await ai.transcribe_words(part.read_bytes())
+            extra = _extra_words(text, heard)
+            for want, got in _misheard(text, heard):  # контроль озвучки: что голос, похоже, сказал не так
+                voice_issues.append({"text": text, "want": want, "got": got})
         except Exception as exc:  # noqa: BLE001 — проверка не должна ломать сборку
             log.warning("shorts: voice check of phrase %d failed: %s", i + 1, exc)
             return
@@ -1278,6 +1281,31 @@ async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: 
                 redo.replace(part)
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: re-voicing phrase %d failed: %s", i + 1, exc)
+
+
+voice_issues: list[dict[str, str]] = []  # слова, которые распознавание услышало иначе (на проверку автору)
+
+
+def _misheard(expected: str, heard: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Слова текста, которые в готовой озвучке распознались иначе: [(как в тексте, как услышано)]. Это не всегда
+    ошибка голоса (распознавание путает имена), но именно эти места стоит послушать: искажённое имя, проглоченное
+    окончание, английское чтение. Короткие слова и расхождения в одну букву не считаем."""
+    from difflib import SequenceMatcher
+    want = [w for w in (re.sub(r"[^\w-]", "", x) for x in expected.replace(pronounce.STRESS, "").split()) if w]
+    got = [h["w"] for h in heard if _norm_word(h["w"])]
+    a, b = [_norm_word(w) for w in want], [_norm_word(w) for w in got]
+    out = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag not in ("replace", "delete"):
+            continue
+        src = " ".join(want[i1:i2])
+        dst = " ".join(got[j1:j2])
+        if len(src.replace(" ", "")) < 5 or any(ch.isdigit() for ch in src):
+            continue
+        if dst and SequenceMatcher(None, _norm_word(src), _norm_word(dst)).ratio() >= 0.85:
+            continue  # «режиссёры» / «режиссеры» — та же форма
+        out.append((src, dst or "—"))
+    return out[:3]
 
 
 def _norm_word(w: str) -> str:
