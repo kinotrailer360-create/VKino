@@ -1021,7 +1021,9 @@ voice_cache_hits = 0  # сколько фраз последней озвучк�
 
 
 def _voice_key(text: str, pause: float) -> Path:
-    raw = f"{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{pause:g}|{text}"
+    # настройки голоса тоже в ключе: сменили скорость или живость — фраза озвучивается заново
+    raw = (f"{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
+           f"{lumean.STYLE:g}|{pause:g}|{text}")
     return VOICE_CACHE / (hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".mp3")
 
 
@@ -1104,7 +1106,8 @@ async def _accent(texts: list[str]) -> list[str]:
 #   all   — ещё и во всех обычных словах по словарю ударений (ElevenLabs от этого сбивается: «сэйчес», «январт»);
 #   off   — без знаков, голос ставит ударения сам.
 STRESS_MODES = ("names", "all", "off")
-stress_mode = "off" if os.getenv("LUMEAN_STRESS", "1") == "0" else "names"
+# по умолчанию без знаков: в выпусках 4 ноября голос коверкал именно слова со знаком («Мэйть Тю», «войтить и»)
+stress_mode = "names" if os.getenv("LUMEAN_STRESS", "0") == "1" else "off"
 
 
 def _for_lumean(text: str) -> str:

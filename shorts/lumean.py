@@ -27,7 +27,11 @@ KEY = _env_key("LUMEAN_API_KEY")  # находит и имя, набранное
 SERVICE = os.getenv("LUMEAN_SERVICE", "elevenlabs").strip() or "elevenlabs"  # elevenlabs | fishaudio | cartesia
 VOICE_ID = os.getenv("LUMEAN_VOICE_ID", "").strip()
 MODEL = os.getenv("LUMEAN_MODEL", "eleven_multilingual_v2").strip()
-SPEED = float(os.getenv("LUMEAN_SPEED", "1.12"))  # 0.7..1.2; ~как +22% у голоса Microsoft
+SPEED = float(os.getenv("LUMEAN_SPEED", "1.2"))  # 0.7..1.2 (потолок ElevenLabs); автор просил на 5–10% быстрее 1.12
+# живость голоса: ниже stability — больше интонаций и эмоций (0.5 звучало ровно, «эмоций мало»); style —
+# насколько ярко передаётся манера голоса
+STABILITY = float(os.getenv("LUMEAN_STABILITY", "0.35"))
+STYLE = float(os.getenv("LUMEAN_STYLE", "0.3"))
 TEMPLATE_NAME = "KinoMir360 TTS"
 CLONE_SERVICES = ("fishaudio", "cartesia")
 PAUSE = 1.0  # сек тишины между фразами — по ним режем дорожку
@@ -122,7 +126,8 @@ def _config(service: str, voice: str) -> dict[str, Any]:
     return {"tts_settings": {
         "mode": "mode_v1", "model_id": MODEL, "voice_id": voice, "language_code": "ru",
         "advanced_voice_settings": True,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "use_speaker_boost": True,
+        "voice_settings": {"stability": min(max(STABILITY, 0.0), 1.0), "similarity_boost": 0.75,
+                           "style": min(max(STYLE, 0.0), 1.0), "use_speaker_boost": True,
                            "speed": min(max(SPEED, 0.7), 1.2)},
         "output_settings": {"audio_format": "mp3"},
     }}
