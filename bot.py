@@ -13730,6 +13730,9 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         await bot.send_message(chat_id, f"<b>{name}:</b>\n<pre>{escape(seo[key])}</pre>")
     if seo.get("warning"):
         await bot.send_message(chat_id, escape(seo["warning"]))
+    if seo.get("cache"):
+        await bot.send_message(chat_id, f"💾 Озвучка: {seo['cache']} фраз взято из уже оплаченных — заново "
+                                        "озвучено только новое и исправленное.")
     if script.get("fixes"):
         rows, size = [], 0
         for fix in script["fixes"][:30]:

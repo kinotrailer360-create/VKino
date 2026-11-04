@@ -27,7 +27,11 @@ services:
       RSSHUB_URL: ${RSSHUB_URL:-}
       # ударения для озвучки (RUAccent): работает, только если в .env есть accent в COMPOSE_PROFILES
       ACCENT_URL: ${ACCENT_URL:-}
+      # словарь ударений и кэш озвученных фраз — в томе, чтобы не скачивать и не оплачивать заново после обновлений
+      VKINO_DATA: /data
       COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
+    volumes:
+      - data:/data
     depends_on:
       db:
         condition: service_healthy
@@ -75,3 +79,4 @@ volumes:
   db:
   caddy:
   accent:
+  data:
