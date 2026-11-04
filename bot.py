@@ -7853,6 +7853,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
         [_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")],
         [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
+        [_btn("⏹ Остановить сборку", "pt:stop")],
         [_btn("🎙 Диктор: текст → проверка → озвучка", "pt:nar")],
         [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
         [_btn("📝 Посты в Telegram-канал ▸", "pt:menu")],
@@ -11947,6 +11948,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                              "сюда." if action == "wvon" else "🔕 По средам и воскресеньям выпуск больше не собираю. Вручную — "
                              "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
         return
+    if action == "stop":
+        await message.answer(await stop_jobs())
+        return
     if action == "nar":
         await state.set_state(PostState.narrate)
         await message.answer(
@@ -12199,6 +12203,29 @@ async def post_list_link(message: Message, state: FSMContext) -> None:
             await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
 
     _run_job(job)
+
+
+async def stop_jobs() -> str:
+    """Остановить всё, что бот сейчас собирает по кнопкам (ролики, выпуск, озвучка, посты): задачи отменяются,
+    ffmpeg внутри них завершается, очередь сборки освобождается. Клонирование голоса не трогаем — оно идёт
+    в Lumean и просто ждёт ответа."""
+    jobs = [t for t in shorts_jobs if not t.done() and "wait_ready" not in t.get_coro().__qualname__]
+    for task in jobs:
+        task.cancel()
+    if jobs:
+        await asyncio.wait(jobs, timeout=20)
+    await clear_running()
+    if not jobs:
+        return "Сейчас ничего не собирается."
+    return (f"⏹ Остановлено: {len(jobs)}. Уже озвученные фразы не пропадут — при следующей сборке "
+            "возьмутся из кэша (заново оплатится только недоозвученное).")
+
+
+@router.message(Command("stop"))
+async def stop_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer(await stop_jobs())
 
 
 @router.message(Command("narrate"))
@@ -14579,6 +14606,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
         BotCommand(command="stress", description="Ударения в озвучке: режим и сравнение на слух"),
+        BotCommand(command="stop", description="Остановить сборку ролика или выпуска"),
         BotCommand(command="narrate", description="Диктор: текст → проверка → озвучка"),
         BotCommand(command="feeds", description="Ленты новостей кино"),
         BotCommand(command="fast", description="Быстрые источники: Reddit, X, Deadline"),
