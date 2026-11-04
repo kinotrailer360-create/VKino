@@ -135,7 +135,7 @@ export const Intro: React.FC = () => {
           transform: `translateY(${interpolate(sub, [0, 1], [20, 0])}px)`,
         }}
       >
-        ГЛАВНОЕ ЗА НЕДЕЛЮ
+        ПРЕМЬЕРЫ · ТРЕЙЛЕРЫ · СЛУХИ
       </div>
       <Sequence from={6}>
         <Audio src={staticFile("whoosh.wav")} volume={0.6} />
@@ -168,7 +168,7 @@ export const Outro: React.FC = () => {
           СПАСИБО,<br />ЧТО <span style={{ color: GOLD }}>СМОТРИТЕ!</span>
         </div>
         <div style={{ marginTop: 26, fontFamily: "Montserrat", fontWeight: 600, fontSize: 44, color: "#E8E8E8", opacity: t2, transform: `translateX(${interpolate(t2, [0, 1], [60, 0])}px)` }}>
-          Новый выпуск — каждое воскресенье
+          Новые выпуски — по средам и воскресеньям
         </div>
         <div
           style={{

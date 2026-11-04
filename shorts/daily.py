@@ -968,7 +968,7 @@ async def say_to_file(text: str, path: Path) -> list[float]:
     lumean_error = "" if lumean.enabled() else "нет переменной LUMEAN_API_KEY"
     if lumean.enabled():
         try:
-            await lumean.synthesize([text.replace(pronounce.STRESS, "")], [path], path.parent)
+            await lumean.synthesize([_for_lumean(text)], [path], path.parent)
             last_engine = "lumean"
             return []
         except Exception as exc:  # noqa: BLE001
@@ -991,7 +991,8 @@ async def spoken_lines(lines: list[str]) -> list[str]:
     """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
     русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
     texts = [pronounce.dates(pronounce.apply(text)) for text in lines]  # даты — сразу в нужном падеже
-    todo = [i for i, text in enumerate(texts) if pronounce.needs_rewrite(text)]
+    # ИИ правит все фразы: числа и латиница — словами, а ещё ставит ударения в именах и редких словах
+    todo = list(range(len(texts)))
     if todo:
         try:  # не задерживаем сборку, если ИИ тормозит
             fixed = await asyncio.wait_for(ai.spoken_form([texts[i] for i in todo]), timeout=60)
@@ -1000,6 +1001,12 @@ async def spoken_lines(lines: list[str]) -> list[str]:
         for i, text in zip(todo, fixed or []):
             texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
     return [_speakable(pronounce.plain_russian(text)) for text in texts]
+
+
+def _for_lumean(text: str) -> str:
+    """Голос ElevenLabs (Lumean) понимает знак ударения U+0301 после гласной — оставляем (иначе «Глиноликий»,
+    «Айсмен» и имена звучат с чужим ударением). LUMEAN_STRESS=0 в .env — убирать знаки, как раньше."""
+    return text if os.getenv("LUMEAN_STRESS", "1") != "0" else text.replace(pronounce.STRESS, "")
 
 
 def _speakable(text: str) -> str:
@@ -1068,8 +1075,7 @@ async def synthesize(lines: list[str], work: Path,
     if lumean.enabled():
         # основной голос — ElevenLabs через Lumean; не вышло — как раньше, голос Microsoft
         try:
-            await lumean.synthesize([t.replace(pronounce.STRESS, "") for t in speak], parts, work,
-                                    pause or lumean.PAUSE)
+            await lumean.synthesize([_for_lumean(t) for t in speak], parts, work, pause or lumean.PAUSE)
             words = [[] for _ in speak]
             await _verify_parts(speak, parts, work, pause or lumean.PAUSE)
         except Exception as exc:  # noqa: BLE001
@@ -1172,7 +1178,7 @@ async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: 
         log.warning("shorts: phrase %d has extra words %s — re-voicing it", i + 1, extra)
         redo = work / f"voice_redo_{i}.mp3"
         try:
-            await lumean.synthesize([text.replace(pronounce.STRESS, "")], [redo], work, pause)
+            await lumean.synthesize([_for_lumean(text)], [redo], work, pause)
             if len(_extra_words(text, await ai.transcribe_words(redo.read_bytes()))) < len(extra):
                 redo.replace(part)
         except Exception as exc:  # noqa: BLE001

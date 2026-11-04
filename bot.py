@@ -202,6 +202,15 @@ if not DATABASE_URL:
 
 pool: asyncpg.Pool | None = None
 router = Router()
+
+
+@router.errors()
+async def quiet_not_modified(event: Any) -> bool | None:
+    """Нажали кнопку, а сообщение и так такое же («message is not modified») — это не ошибка, молчим."""
+    exc = getattr(event, "exception", None)
+    if isinstance(exc, TelegramBadRequest) and "not modified" in str(exc):
+        return True
+    return None
 contact_router = Router()  # ответы в переписке «написать админу» — раньше всех остальных обработчиков
 
 MAIN_MENU_LABELS = {
@@ -9481,7 +9490,26 @@ async def _mark_published(chat_id: int, first: int) -> None:
         await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
 
 
+_publishing: set[tuple[int, int]] = set()  # посты, которые публикуются прямо сейчас (двойное нажатие)
+
+
+class AlreadyPublishing(RuntimeError):
+    pass
+
+
 async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
+    """Обёртка: один и тот же пост не публикуется дважды одновременно (двойное нажатие, кнопка + расписание)."""
+    key = (chat_id, first)
+    if key in _publishing:
+        raise AlreadyPublishing("этот пост уже публикуется")
+    _publishing.add(key)
+    try:
+        await _publish_post(bot, chat_id, first)
+    finally:
+        _publishing.discard(key)
+
+
+async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
     """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?».
     Пост снимается с отложенной публикации (вышел сейчас — по расписанию повторно не выйдет) и помечается
     опубликованным (повторное нажатие спросит подтверждение)."""
@@ -11498,6 +11526,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if (kind == "p" or kind == "pf") and arg.isdigit():
         try:
             await publish_post(message.bot, chat_id, int(arg))
+        except AlreadyPublishing:
+            await callback.answer("⏳ Уже публикую — секунду")
+            return
         except Exception as exc:  # noqa: BLE001
             await callback.answer()
             await message.answer(f"❌ Не получилось опубликовать в {escape(POST_CHANNEL)}: "
@@ -11650,15 +11681,15 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action in ("wvon", "wvoff"):
         await set_shorts_setting("weekly_video", None if action == "wvon" else "off")
-        await message.answer("🔔 Каждое воскресенье в 10:00 (Екатеринбург) соберу выпуск «Новости кино» и пришлю "
-                             "сюда." if action == "wvon" else "🔕 По воскресеньям выпуск больше не собираю. Вручную — "
+        await message.answer("🔔 По средам и воскресеньям в 10:00 (Екатеринбург) соберу выпуск «Новости кино» и пришлю "
+                             "сюда." if action == "wvon" else "🔕 По средам и воскресеньям выпуск больше не собираю. Вручную — "
                              "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
         return
     if action == "wv":
         if weekly_busy:
             await message.answer("⏳ Выпуск уже собирается — пришлю, как будет готов.")
             return
-        status = await message.answer("🎞 Собираю выпуск «Новости кино» за неделю: 6–8 новостей, голос, картинки, "
+        status = await message.answer("🎞 Собираю выпуск «Новости кино» (новости с прошлого выпуска): 6–8 новостей, голос, картинки, "
                                       "заставки. Это 15–40 минут — пришлю, когда будет готово."
                                       + ("\n⏳ Сейчас собирается другой ролик — начну сразу после него."
                                          if shorts_lock.locked() else ""))
@@ -13324,7 +13355,7 @@ async def rt_title(message: Message, state: FSMContext) -> None:
 # --- еженедельный выпуск «Новости кино» для YouTube (воскресенье, 10:00 по Екатеринбургу)
 
 WEEKLY_TIMEOUT = 80 * 60  # выпуск на 8 минут собирается дольше шортса
-WEEKLY_DAY, WEEKLY_HOUR = 6, 10  # воскресенье, 10:00 (время автора)
+WEEKLY_DAYS, WEEKLY_HOUR = (2, 6), 10  # среда и воскресенье, 10:00 (время автора)
 
 
 def _spread_by_day(posts: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -13359,24 +13390,50 @@ async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | Non
         weekly_busy = False
 
 
+async def _edit_quiet(message: Message | None, text: str) -> None:
+    """Обновить строку статуса; «message is not modified» (тот же текст) и прочие сбои правки — не ошибка сборки."""
+    if message is None:
+        return
+    try:
+        await message.edit_text(text)
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc):
+            logging.info("Status edit failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Status edit failed: %s", exc)
+
+
 async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | None = None) -> None:
     # новости и сценарий — до очереди сборки: сеть и ИИ не держат шортсы, очередь только на монтаж
     today = datetime.now(MSK).date()
-    start = today - timedelta(days=6)
+    # выпуски по средам и воскресеньям: новости с прошлого выпуска (3–4 дня), но не меньше 3 и не больше 7 дней
+    last = float(await shorts_setting("weekly_video_at") or 0)
+    hours = min(168, max(72, (time.time() - last) / 3600 + 12)) if last else 168
+    start = (datetime.now(MSK) - timedelta(hours=hours)).date()
     months = shorts_daily.MONTHS
     label = (f"{start.day}–{today.day} {months[today.month - 1]}" if start.month == today.month else
              f"{start.day} {months[start.month - 1]} — {today.day} {months[today.month - 1]}")
+    period = "за неделю" if hours >= 120 else f"за последние {round(hours / 24)} дня"
+    next_day = "в воскресенье" if today.weekday() in (0, 1, 2, 3) else "в среду"
     own = POST_CHANNEL.lstrip("@").lower()
     channels = [c for c in await fact_channels() if c.lower() != own]
-    posts = await shorts_tgsearch.latest(channels, hours=168, per_channel=12)
+    pages = 2 if hours <= 96 else 4  # листаем каналы назад: страница — ~20 постов (у активного канала это сутки)
+    posts = await shorts_tgsearch.latest(channels, hours=hours, per_channel=80, pages=pages)
+    try:  # свой канал — то, что автор уже отобрал и опубликовал (там смерть Патрика Стюарта и т. п.)
+        mine = await shorts_tgsearch.latest([own], hours=hours, per_channel=40, pages=pages)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Weekly video: own channel read failed: %s", exc)
+        mine = []
     try:
-        fast = await shorts_fast.latest(await fast_feeds(), hours=168, per_feed=25, timeout=100)
+        fast = await shorts_fast.latest(await fast_feeds(), hours=hours, per_feed=25, timeout=100)
     except Exception as exc:  # noqa: BLE001
         logging.info("Weekly video: fast sources failed: %s", exc)
         fast = []
-    pool = _spread_by_day(posts, 80) + _spread_by_day(fast, 60)  # вся неделя, а не последние сутки
+    for p in mine:
+        p["label"] = "НАШ КАНАЛ (уже опубликовано — важные новости)"
+    pool = mine[:30] + _spread_by_day(posts, 80) + _spread_by_day(fast, 50)  # все дни, а не последние сутки
     if len(pool) < 10:
-        raise RuntimeError("за неделю почти нет новостей в источниках — проверь каналы (/channels) и /fast")
+        raise RuntimeError("за эти дни почти нет новостей в источниках — проверь каналы (/channels) и /fast")
     listing, size = [], 0
     for i, p in enumerate(pool, 1):
         text = re.sub(r"\s+", " ", p["text"])[:450]
@@ -13386,12 +13443,12 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
         listing.append(row)
         size += len(row)
     if status:
-        await status.edit_text("🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
+        await _edit_quiet(status, "🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
     script = None
     for attempt in range(3):  # Gemini упёрся в минутный лимит — ждём и пробуем снова, а не бросаем выпуск
         script = await shorts_ai.write_weekly_episode(
             GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
-            await shorts_setting("weekly_last") or "")
+            await shorts_setting("weekly_last") or "", period=period, next_day=next_day)
         if script:
             break
         wait = re.search(r"снова через (\d+) мин", shorts_ai.last_error or "")
@@ -13399,12 +13456,12 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
             break
         mins = int(wait.group(1)) + 1
         if status:
-            await status.edit_text(f"⏳ ИИ сейчас на минутном лимите — подожду {mins} мин и продолжу сценарий выпуска…")
+            await _edit_quiet(status, f"⏳ ИИ сейчас на минутном лимите — подожду {mins} мин и продолжу сценарий выпуска…")
         await asyncio.sleep(mins * 60)
     if not script:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
     if status and shorts_lock.locked():
-        await status.edit_text("⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
+        await _edit_quiet(status, "⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
     async with shorts_lock:
         await load_pronunciations()
         await load_voice()
@@ -13453,7 +13510,7 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                  "загружу полное качество, название, описание с таймкодами, теги и обложку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
-            [_btn("🔕 Не собирать по воскресеньям" if on else "🔔 Собирать по воскресеньям в 10:00",
+            [_btn("🔕 Не собирать по ср и вс" if on else "🔔 Собирать по ср и вс в 10:00",
                   "pt:wvoff" if on else "pt:wvon")]]))
     for name, key in (("Название", "title"), ("Описание", "description"), ("Теги", "tags"),
                       ("Закреплённый комментарий", "pinned")):
@@ -13478,7 +13535,7 @@ async def weekly_video_job(bot: Bot) -> None:
     admins = sorted(ADMIN_IDS)
     status = None
     try:
-        status = await bot.send_message(admins[0], "🎞 Воскресенье — собираю выпуск «Новости кино» для YouTube "
+        status = await bot.send_message(admins[0], "🎞 Собираю выпуск «Новости кино» для YouTube по расписанию "
                                                    "(15–40 минут)…")
         await make_weekly_video(bot, admins, status)
         await status.delete()
@@ -13486,7 +13543,7 @@ async def weekly_video_job(bot: Bot) -> None:
         logging.exception("Weekly video failed")
         # упал (сбой ИИ, сети, перезапуск) — ещё одна попытка через полчаса, но не больше двух за воскресенье
         now = datetime.now(POST_TZ)
-        week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
+        week = now.date().isoformat()  # попытки — на этот день выпуска
         tries = await shorts_setting("weekly_video_tries") or ""
         n = int(tries.split(":")[1]) if tries.startswith(week + ":") else 0
         retry = n < 1 and "уже собирается" not in str(exc)
@@ -13518,13 +13575,14 @@ async def growth_loop(bot: Bot) -> None:
                 await favorites_alerts(bot)
             now = datetime.now(POST_TZ)
             week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
-            if (now.weekday() == WEEKLY_DAY and now.hour >= WEEKLY_HOUR and ADMIN_IDS
+            today_key = now.date().isoformat()  # выпуск в каждый из дней (среда, воскресенье) — по одному
+            if (now.weekday() in WEEKLY_DAYS and now.hour >= WEEKLY_HOUR and ADMIN_IDS
                     and await shorts_setting("weekly_video") != "off"
-                    and await shorts_setting("weekly_video_done") != week
+                    and await shorts_setting("weekly_video_done") != today_key
                     and time.time() - float(await shorts_setting("weekly_video_at") or 0) > 20 * 3600
                     and time.time() > float(await shorts_setting("weekly_video_retry_at") or 0)
                     and not weekly_busy):
-                await set_shorts_setting("weekly_video_done", week)
+                await set_shorts_setting("weekly_video_done", today_key)
                 _run_job(lambda: weekly_video_job(bot))
             if (now.weekday() == 4 and now.hour >= 18 and await shorts_setting("digest") != "off"
                     and await shorts_setting("digest_done") != week):
