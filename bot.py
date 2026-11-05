@@ -12583,16 +12583,18 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
             if len(files) < 2:
                 files = await shorts_tgsearch.download_media(
                     [{"video": s["video"]} for s in sources if s.get("video")], work, limit=1, prefix="link")
-            if not files and res["trailer"] and res["film"]:
-                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work,
-                                                     _season_of(res["post"]), fresh=True)
-                files = [trailer] if trailer else []
             yt = next((u for u in urls if re.search(r"youtube\.com/watch|youtu\.be/|youtube\.com/shorts", u)), "")
-            if not files and yt:  # ссылка на YouTube (новый трейлер студии) — сам ролик, раз русского ещё нет
+            if not files and yt:  # ссылка на YouTube (новый трейлер студии) — именно этот ролик
                 try:
                     files = [await asyncio.wait_for(shorts_clips.download_trailer(yt, work / "youtube.mp4"), 300)]
                 except Exception as exc:  # noqa: BLE001 — YouTube бывает не отдаёт видео серверу: тогда обложка
                     logging.info("Link post: YouTube video %s failed: %s", yt, exc)
+            # Rutube — только если ссылка не на YouTube: новый трейлер выходит сначала там, а на Rutube за те же
+            # две недели может найтись предыдущий трейлер того же фильма
+            if not files and not yt and res["trailer"] and res["film"]:
+                trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work,
+                                                     _season_of(res["post"]), fresh=True)
+                files = [trailer] if trailer else []
             if not files:
                 files = await shorts_tgsearch.download_media(
                     [{"image": s["image"]} for s in sources if s.get("image")], work, limit=1, prefix="img")
