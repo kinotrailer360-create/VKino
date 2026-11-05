@@ -4,8 +4,9 @@
 --check  только проверить токен и доступ (ничего не создаёт).
 
 Кампания создаётся только в сетях (поиск выключен), недельный бюджет 1000 ₽,
-стратегия «максимум кликов». Объявления отправляются на модерацию, а сама кампания
-ставится на паузу — включает её владелец в интерфейсе Директа.
+стратегия «максимум кликов». Кампания сначала ставится на паузу, и только после этого объявления уходят на
+модерацию; если паузу поставить нельзя — остаётся черновиком без модерации.
+Включает кампанию владелец в интерфейсе Директа.
 """
 from __future__ import annotations
 
@@ -95,23 +96,30 @@ def main() -> None:
     cid = ids(camp, "AddResults")[0]
     print("📣 Кампания:", cid)
 
-    grp = call("adgroups", "add", {"AdGroups": [{"Name": "Кино — РФ", "CampaignId": cid, "RegionIds": [225]}]})
-    gid = ids(grp, "AddResults")[0]
-    ids(call("keywords", "add", {"Keywords": [{"Keyword": k, "AdGroupId": gid} for k in KEYWORDS]}), "AddResults")
-    print("🔑 Ключевые фразы и автотаргетинг добавлены")
-
-    ads = call("ads", "add", {"Ads": [{"AdGroupId": gid, "TextAd": {
-        "Title": t, "Title2": t2, "Text": txt, "Href": HREF, "Mobile": "NO", "AdImageHash": hashes[img]}}
-        for t, t2, txt, img in ADS]})
-    ad_ids = ids(ads, "AddResults")
+    # В группе не больше 3 объявлений (ошибка 7001), поэтому делим их на группы по 2.
+    ad_ids = []
+    for n, chunk in enumerate((ADS[:2], ADS[2:]), 1):
+        grp = call("adgroups", "add", {"AdGroups": [{"Name": f"Кино — РФ {n}", "CampaignId": cid, "RegionIds": [225]}]})
+        gid = ids(grp, "AddResults")[0]
+        ids(call("keywords", "add", {"Keywords": [{"Keyword": k, "AdGroupId": gid} for k in KEYWORDS]}), "AddResults")
+        ads = call("ads", "add", {"Ads": [{"AdGroupId": gid, "TextAd": {
+            "Title": t, "Title2": t2, "Text": txt, "Href": HREF, "Mobile": "NO", "AdImageHash": hashes[img]}}
+            for t, t2, txt, img in chunk]})
+        ad_ids += ids(ads, "AddResults")
+    print("🔑 Группы, ключевые фразы и автотаргетинг добавлены")
     print("🧾 Объявления:", ad_ids)
-    call("ads", "moderate", {"SelectionCriteria": {"Ids": ad_ids}})
-    print("🛂 Отправлены на модерацию")
+    # Сначала пауза, и только потом модерация: на общем счёте могут быть деньги,
+    # и одобренная, но не остановленная кампания сразу начала бы тратить бюджет.
     try:
-        call("campaigns", "suspend", {"SelectionCriteria": {"Ids": [cid]}})
+        ids(call("campaigns", "suspend", {"SelectionCriteria": {"Ids": [cid]}}), "SuspendResults")
         print("⏸ Кампания на паузе")
-    except SystemExit as e:  # черновик до модерации иногда нельзя остановить — денег всё равно не тратит
+    except SystemExit as e:
         print("ℹ️ Паузу поставить не удалось:", e)
+        print("⚠️ Объявления НЕ отправлены на модерацию — кампания оставлена черновиком (не показывается).")
+        print(f"Кампания №{cid}: https://direct.yandex.ru/dna/grid/campaigns?ulogin={LOGIN}")
+        return
+    ids(call("ads", "moderate", {"SelectionCriteria": {"Ids": ad_ids}}), "ModerateResults")
+    print("🛂 Отправлены на модерацию")
     print(f"Готово: https://direct.yandex.ru/dna/grid/campaigns?ulogin={LOGIN}")
 
 
