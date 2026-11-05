@@ -12587,6 +12587,12 @@ async def _make_link_post(message: Message, urls: list[str], note: str, text: st
                 trailer = await _rutube_post_trailer([res["film"], res["film_en"]], work,
                                                      _season_of(res["post"]), fresh=True)
                 files = [trailer] if trailer else []
+            yt = next((u for u in urls if re.search(r"youtube\.com/watch|youtu\.be/|youtube\.com/shorts", u)), "")
+            if not files and yt:  # ссылка на YouTube (новый трейлер студии) — сам ролик, раз русского ещё нет
+                try:
+                    files = [await asyncio.wait_for(shorts_clips.download_trailer(yt, work / "youtube.mp4"), 300)]
+                except Exception as exc:  # noqa: BLE001 — YouTube бывает не отдаёт видео серверу: тогда обложка
+                    logging.info("Link post: YouTube video %s failed: %s", yt, exc)
             if not files:
                 files = await shorts_tgsearch.download_media(
                     [{"image": s["image"]} for s in sources if s.get("image")], work, limit=1, prefix="img")

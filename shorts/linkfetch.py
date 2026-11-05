@@ -81,4 +81,12 @@ async def fetch(url: str) -> dict[str, Any]:
         raise RuntimeError("на странице не нашлось текста")
     return {"url": url, "title": parser.meta.get("og:title", ""), "text": text,
             "image": parser.meta.get("og:image") or parser.meta.get("twitter:image") or None,
-            "video": parser.meta.get("og:video:url") or parser.meta.get("og:video") or None}
+            "video": _direct_video(parser.meta.get("og:video:url") or parser.meta.get("og:video") or "")}
+
+
+def _direct_video(url: str) -> str | None:
+    """og:video годится, только если это сам файл (.mp4 и т. п.): у YouTube, Vimeo и многих сайтов там адрес
+    встроенного проигрывателя — страница, а не видео (в посте выходил пустой ролик 0:00)."""
+    if not url or re.search(r"youtube\.com|youtu\.be|vimeo\.com|rutube\.ru|vk\.com|dailymotion", url, re.I):
+        return None
+    return url if re.search(r"\.(?:mp4|m4v|mov|webm)(?:\?|$)", url, re.I) else None

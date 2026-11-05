@@ -249,6 +249,9 @@ async def download_media(posts: list[dict[str, Any]], work: Path, limit: int = 8
                     data = b"".join(chunks)
                 if len(data) > MEDIA_MAX or len(data) < 2000:
                     continue
+                if data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html", b"<?xml", b"{")):
+                    log.info("shorts: tg media %s is a web page, not a file — skipped", url[:80])
+                    continue  # ссылка на страницу проигрывателя (YouTube embed), а не на сам файл: пустое «видео»
                 path = work / f"{prefix}{len(out)}{ext}"
                 path.write_bytes(data)
                 out.append(path)
