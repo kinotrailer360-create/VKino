@@ -67,6 +67,7 @@ from shorts import music as shorts_music
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
+from shorts import direct_stats
 from shorts import copycat as shorts_copycat
 from shorts import dub as shorts_dub
 from shorts import lore as shorts_lore
@@ -7143,6 +7144,64 @@ async def shorts_daily_loop(
         except Exception:
             logging.exception("Shorts loop error")
         await asyncio.sleep(60)
+
+
+DIRECT_REPORT_HOUR = int(os.getenv("DIRECT_REPORT_HOUR", "10"))  # МСК
+
+
+async def direct_report_text(bot: Bot, remember: bool) -> str:
+    """Отчёт Директа + прирост подписчиков канала с прошлого отчёта."""
+    try:
+        subs = await bot.get_chat_member_count(POST_CHANNEL)
+    except Exception:  # noqa: BLE001 — бот не админ канала
+        subs = None
+    before_raw = await shorts_setting("direct_subs")
+    before = int(before_raw) if before_raw and before_raw.isdigit() else None
+    text = await direct_stats.daily_text(subs, before)
+    if remember and subs is not None:
+        await set_shorts_setting("direct_subs", str(subs))
+    return text
+
+
+async def direct_report_loop(bot: Bot) -> None:
+    """Каждый день в DIRECT_REPORT_HOUR по Москве — статистика рекламы в Директе админам."""
+    while True:
+        try:
+            now = datetime.now(MSK)
+            today = now.date().isoformat()
+            if (direct_stats.token() and now.hour >= DIRECT_REPORT_HOUR
+                    and await shorts_setting("direct_last_run") != today):
+                await set_shorts_setting("direct_last_run", today)
+                try:
+                    text = await direct_report_text(bot, remember=True)
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("Direct report failed")
+                    text = f"❌ Отчёт Директа не собрался: <code>{escape(_safe_err(exc)[:500])}</code>"
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin_id, text, disable_web_page_preview=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.exception("Direct report loop error")
+        await asyncio.sleep(300)
+
+
+@router.message(Command("direct"))
+async def direct_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    if not direct_stats.token():
+        await message.answer("Нет YANDEX_DIRECT_TOKEN в переменных окружения бота.")
+        return
+    status = await message.answer("⏳ Собираю статистику Директа…")
+    try:
+        text = await direct_report_text(message.bot, remember=False)
+    except Exception as exc:  # noqa: BLE001
+        text = f"❌ <code>{escape(_safe_err(exc)[:500])}</code>"
+    await status.edit_text(text, disable_web_page_preview=True)
 
 
 @router.message(Command("short"))
@@ -14865,6 +14924,7 @@ async def sub_check(callback: CallbackQuery) -> None:
 async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
+        BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="shorts", description="🎬 Панель шортсов (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
@@ -14943,6 +15003,7 @@ async def main() -> None:
         shorts_daily_loop(bot)
     )
     posts_task = asyncio.create_task(posts_auto_loop(bot))
+    direct_task = asyncio.create_task(direct_report_loop(bot))  # статистика рекламы в Директе
     growth_task = asyncio.create_task(growth_loop(bot))  # уведомления из избранного, подборка недели, выпуск
 
     dp = Dispatcher()
@@ -14978,6 +15039,7 @@ async def main() -> None:
         shorts_task.cancel()
         posts_task.cancel()
         growth_task.cancel()
+        direct_task.cancel()
         commands_task.cancel()
 
         try:
