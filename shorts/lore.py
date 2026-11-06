@@ -29,7 +29,6 @@ from .daily import (
     ROOT,
     SAVE_AND_SUBSCRIBE,
     TELEGRAM_URL,
-    YOUTUBE_URL,
     ShortResult,
     Theme,
     _progress,
@@ -188,7 +187,6 @@ def build_news_seo(script: dict[str, Any]) -> dict[str, str]:
         desc += [tags_line, ""]
     desc += ["Светлая память. Какая роль запомнилась вам больше всего? Пишите в комментариях 👇" if mourning
              else "Что думаешь? Пиши в комментариях 👇", "",
-             f"📺 YouTube: {YOUTUBE_URL}",
              f"✈️ Telegram: {TELEGRAM_URL} — новости кино каждый день"]
     tags: list[str] = []
     name, en = script["name"], script.get("en") or ""
@@ -219,7 +217,6 @@ def build_lore_seo(script: dict[str, Any]) -> dict[str, str]:
     desc = [f"{name} — история персонажа за минуту 🎬", ""]
     desc += [" ".join(script["lines"][:2])[:300], "",
              "А ты знал его историю? Пиши в комментариях 👇", "",
-             f"📺 YouTube: {YOUTUBE_URL}",
              f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
              f"Источник: {script.get('url', 'Википедия')}"]
     tags: list[str] = []
@@ -270,7 +267,9 @@ def _frame_ready(img: Image.Image, limit: int = 2400) -> Image.Image:
 
 
 async def make_lore(work: Path, script: dict[str, Any], music: Path | None = None,
-                    user_media: list[Path] | None = None, gemini_key: str = "") -> ShortResult:
+                    user_media: list[Path] | None = None, gemini_key: str = "",
+                    user_pins: dict[int, int] | None = None) -> ShortResult:
+    """user_pins — своя картинка (номер в user_media) -> фраза (с 1), к которой автор её подписал."""
     lines = script["lines"]
     news = script.get("kind") == "news"
     mourning = news and is_mourning(script)
@@ -283,6 +282,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
 
     await _progress(40, "Картинки")
     pool: list[tuple[str, Image.Image]] = []  # (файл, миниатюра для ИИ)
+    user_at: dict[int, int] = {}  # номер своей картинки -> её место в pool
     for n, path in enumerate(user_media or []):
         try:
             img = _frame_ready(Image.open(path))
@@ -292,6 +292,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         out = work / f"luser{n}.jpg"
         img.save(out, quality=90)
         img.thumbnail((480, 480))
+        user_at[n] = len(pool)
         pool.append((out.name, img))
     own = len(pool)
     if len(pool) < len(lines):  # своих не хватает — добираем картинками из статьи
@@ -333,6 +334,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 img.thumbnail((480, 480))
                 pinned[i] = len(pool)
                 pool.append((out.name, img))
+    for n, line in (user_pins or {}).items():  # подпись автора важнее кадра, найденного ботом
+        if n in user_at and 1 <= line <= len(lines):
+            pinned[line - 1] = user_at[n]
     if not pool:
         raise RuntimeError("нет ни одной картинки: пришли свои (страницы комиксов, кадры) кнопкой «📎»")
 

@@ -38,7 +38,8 @@ MIN_RATING = 6.0  # ниже — рейтинг не показываем, он 
 SKIP_RATING = 5.5  # ниже — фильм в подборку не берём
 
 YOUTUBE_URL = "https://youtube.com/@kinomir360"
-TELEGRAM_URL = "https://t.me/KinoMir360"
+# в описании YouTube ссылки ставить нельзя (у канала нет такого права) — адрес Telegram без https://
+TELEGRAM_URL = "t.me/KinoMir360"
 
 # По дням недели (пн..вс)
 SCHEDULE = ["online", "cinema", "facts_new", "genre", "news", "upcoming", "facts"]
@@ -853,7 +854,6 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         f"Главные новости кино на {day} 🎬", "",
         *[f"{i}. {it.title} ({it.source})" for i, (it, _) in enumerate(chosen, 1)], "",
         "Какая новость удивила больше всего? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#новостикино #кино #KinoMir360",
     ])
@@ -1529,7 +1529,6 @@ def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
     description = "\n".join([
         f"{theme.hook} — сохрани, чтобы не потерять! 🍿", "", *rows, "",
         "Какой посмотришь первым? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         " ".join(hashtags),
     ])
@@ -1555,7 +1554,6 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
         f"{n} {_facts_word(n)} о {kind} «{t}»" + (f" ({year})" if year else "") + " — сохрани! 🍿", "",
         *[f"{i}. {f}" for i, f in enumerate(facts, 1)], "",
         "Какой факт удивил тебя больше всего? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#фактыокино #кино #KinoMir360",
     ])
@@ -1580,7 +1578,6 @@ def build_review_seo(film: dict[str, Any], points: list[str]) -> dict[str, str]:
         f"«{t}»" + (f" ({year})" if year else "") + " — стоит ли смотреть? Короткий обзор 🎬", "",
         *[f"• {p}" for p in points], "",
         "А ты посмотришь? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#обзорфильма #кино #KinoMir360",
     ])
@@ -1604,7 +1601,6 @@ def build_rumors_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
         f"Что известно о {kind} «{t}»" + (f" ({year})" if year else "") + " — главные новости и слухи 🔥", "",
         *[f"{i}. {f}" for i, f in enumerate(facts, 1)], "",
         "Ждёшь премьеру? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#новостикино #слухи #KinoMir360",
     ])
@@ -2195,7 +2191,6 @@ def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]]
         *[f"{len(films) - i}. {t}" + (f" ({str(f.get('release_date'))[:4]})" if f.get("release_date") else "")
           for i, (t, f) in enumerate(zip(names, films))], "",
         "А какой фильм твой любимый? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#деньрождения #кино #KinoMir360",
     ])
