@@ -15008,15 +15008,15 @@ async def sub_check(callback: CallbackQuery) -> None:
 async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
+        BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
-        BotCommand(command="shorts", description="🎬 Панель шортсов (кнопки)"),
+        BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
         BotCommand(command="lore", description="Шортс «история персонажа»: /lore Доктор Дум"),
         BotCommand(command="mylist", description="Своя подборка: тема и список фильмов"),
         BotCommand(command="ai", description="Проверить ИИ: Gemini, Groq, BeatAPI"),
-        BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
