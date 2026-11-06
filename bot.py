@@ -11906,14 +11906,23 @@ async def youtube_button(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     message = callback.message
-    first = (callback.data or "")[3:]
+    first, again = (callback.data or "")[3:], False
+    if first.startswith("again:"):  # «загрузить ещё раз» после предупреждения о повторе
+        first, again = first[6:], True
     if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
         await message.answer(YT_SETUP, disable_web_page_preview=True)
         return
     video = READY_DIR / f"{message.chat.id}_{first}.mp4"
     seo_file = video.with_suffix(".json")
+    done_file = video.with_suffix(".yt")  # ссылка на уже загруженный ролик — от двойной загрузки
     if not video.exists() or not seo_file.exists():
         await message.answer(f"Файла этого шортса уже нет на сервере (храню {READY_DAYS} дня). Собери ролик заново.")
+        return
+    if done_file.exists() and not again:
+        await message.answer(
+            f"⚠️ Этот ролик уже загружен на YouTube: {done_file.read_text().strip()}\nЗагрузить ещё раз (будет дубль)?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("▶️ Да, ещё раз", f"yt:again:{first}")]]),
+            disable_web_page_preview=True)
         return
     if yt_lock.locked():
         await message.answer("⏳ Уже идёт загрузка на YouTube — подожди минуту.")
@@ -11935,6 +11944,10 @@ async def youtube_button(callback: CallbackQuery) -> None:
                                             if long else "▶️ Загружаю шортс на YouTube…")
                 res = await shorts_yt.upload(token, video, seo)
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                try:
+                    done_file.write_text(link)
+                except OSError:
+                    logging.info("YouTube: upload mark not saved")
                 thumb_note = ""
                 cover = video.with_suffix(".jpg")
                 if long and cover.exists():
