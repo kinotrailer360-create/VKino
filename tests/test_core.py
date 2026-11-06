@@ -104,3 +104,16 @@ def test_diary_year_stats_and_card() -> None:
     assert [r["title"] for r in st["best"]] == ["Интерстеллар", "Дюна: Часть вторая"]
     png = diary.year_card("Зритель", 2026, st, [None, None], "t.me/VKino_360bot")
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_kinodl_clues_and_answers() -> None:
+    from shorts import kinodl
+
+    film = {"name": "Интерстеллар", "enName": "Interstellar", "year": 2014, "genres": [{"name": "фантастика"}],
+            "persons": [{"name": "Кристофер Нолан", "enProfession": "director"}],
+            "shortDescription": "Интерстеллар — экспедиция через червоточину."}
+    clues = kinodl.clues(film)
+    assert len(clues) == 5 and "Интерстеллар" not in clues[4]
+    assert kinodl.is_correct("интерстелар", film) and kinodl.is_correct("Interstellar", film)
+    assert not kinodl.is_correct("Начало", film)
+    assert kinodl.share_line("06.11", 3, True).endswith("3/6")

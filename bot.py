@@ -61,6 +61,7 @@ from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
 from shorts import netsafe
 from shorts import diary as shorts_diary
+from shorts import kinodl as shorts_kinodl
 from shorts.postmedia import DIGEST_MARKERS, _focused, _is_digest, _mentions_title, _title_words  # noqa: F401
 from shorts import usage as shorts_usage
 from shorts import news as shorts_news
@@ -239,6 +240,7 @@ MAIN_MENU_LABELS = {
     "🧩 Викторина дня",
     "📔 Кинодневник",
     "👥 Выбрать вдвоём",
+    "🎬 Кинодл — угадай фильм",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
     "✉️ Написать админу",
@@ -249,6 +251,7 @@ class SearchState(StatesGroup):
     query = State()
     describe = State()
     follow = State()
+    kinodl = State()
 
 
 class ShortsState(StatesGroup):
@@ -945,6 +948,22 @@ async def init_db() -> None:
                 word TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (user_id, word)
+            );
+
+            CREATE TABLE IF NOT EXISTS kinodl_day (
+                day DATE PRIMARY KEY,
+                film_id BIGINT NOT NULL,
+                film JSONB NOT NULL,
+                frame TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS kinodl_plays (
+                day DATE NOT NULL,
+                user_id BIGINT NOT NULL,
+                tries INT NOT NULL DEFAULT 0,
+                solved BOOLEAN NOT NULL DEFAULT FALSE,
+                done BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY (day, user_id)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3435,6 +3454,7 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
+            [KeyboardButton(text="🎬 Кинодл — угадай фильм")],
             [KeyboardButton(text="📔 Кинодневник"), KeyboardButton(text="👥 Выбрать вдвоём")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
             [KeyboardButton(text="✉️ Написать админу")],
@@ -3991,6 +4011,11 @@ async def cmd_start(
                              reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
         await duo_show(message.bot, message.chat.id, message.from_user.id, arg[4:], None)
         return
+    if arg == "kinodl":
+        await message.answer("🎬 Кинодл — фильм дня за 6 подсказок 👇",
+                             reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
+        await kinodl_menu(message, state)
+        return
     if arg == "quiz":  # кнопка из поста «Знатоки месяца»
         await message.answer("🧩 Викторина дня — жми кнопку в меню или держи кадр 👇",
                              reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
@@ -4086,10 +4111,13 @@ async def do_search(
             "🎁 Пригласить друга": "referral_menu",
             "📔 Кинодневник": "diary_menu",
             "👥 Выбрать вдвоём": "duo_new",
+            "🎬 Кинодл — угадай фильм": "kinodl_menu",
         }
         handler_name = target_handlers.get(query)
         handler = globals().get(handler_name or "")
-        if callable(handler):
+        if handler_name == "kinodl_menu":  # игре нужно состояние — ждёт ответы сообщениями
+            await kinodl_menu(message, state)
+        elif callable(handler):
             await handler(message)
         else:
             await message.answer(
@@ -15214,6 +15242,141 @@ async def quiz_leaders(limit: int = 10) -> list[Any]:
 
 def _who(r: Any) -> str:
     return escape("@" + r["username"] if r["username"] else (r["first_name"] or "зритель"))
+
+
+# --- «Кинодл»: фильм дня за 6 подсказок, серия побед
+
+kinodl_lock = asyncio.Lock()
+
+
+async def kinodl_today() -> dict[str, Any] | None:
+    today = datetime.now(POST_TZ).date()
+    async with kinodl_lock:
+        row = await db().fetchrow("SELECT * FROM kinodl_day WHERE day=$1", today)
+        if row:
+            film = row["film"] if isinstance(row["film"], dict) else json.loads(row["film"])
+            return {"day": today, "film": film, "frame": row["frame"]}
+        used = {int(r["film_id"]) for r in await db().fetch(
+            "SELECT film_id FROM kinodl_day WHERE day > CURRENT_DATE - 365")}
+        for pick in [f for f in await _popular_films(pages=20) if int(f["id"]) not in used][:5]:
+            try:
+                film = await kp._get(f"/movie/{pick['id']}")
+            except Exception:  # noqa: BLE001
+                continue
+            if not film.get("persons") or not shorts_kinodl.titles(film):
+                continue
+            keep = {k: film.get(k) for k in ("id", "name", "alternativeName", "enName", "names", "year", "genres",
+                                             "countries", "persons", "rating", "movieLength", "seriesLength",
+                                             "shortDescription", "description", "slogan", "isSeries", "poster")}
+            keep["persons"] = [p for p in film.get("persons") or [] if p.get("enProfession") in ("director", "actor")][:8]
+            frame = None
+            try:
+                backdrops, _ = await shorts_daily.tmdb.images(TMDB_API_KEY, film, limit=3)
+                frame = backdrops[0] if backdrops else None
+            except Exception:  # noqa: BLE001
+                pass
+            await db().execute("INSERT INTO kinodl_day(day, film_id, film, frame) VALUES($1, $2, $3, $4)",
+                               today, int(film["id"]), json.dumps(keep, ensure_ascii=False), frame)
+            return {"day": today, "film": keep, "frame": frame}
+    return None
+
+
+async def _kinodl_streak(user_id: int) -> int:
+    days = [r["day"] for r in await db().fetch(
+        "SELECT day FROM kinodl_plays WHERE user_id=$1 AND solved ORDER BY day DESC LIMIT 400", user_id)]
+    streak, expect = 0, datetime.now(POST_TZ).date()
+    for d in days:
+        if d == expect or (streak == 0 and d == expect - timedelta(days=1)):
+            streak += 1
+            expect = d - timedelta(days=1)
+        else:
+            break
+    return streak
+
+
+@router.message(Command("kinodl"))
+@router.message(F.text == "🎬 Кинодл — угадай фильм")
+async def kinodl_menu(message: Message, state: FSMContext | None = None) -> None:
+    await remember(message)
+    game = await kinodl_today()
+    if not game:
+        await message.answer("Фильм дня ещё не готов — загляни через минуту 🙂")
+        return
+    uid = message.from_user.id
+    play = await db().fetchrow("SELECT * FROM kinodl_plays WHERE day=$1 AND user_id=$2", game["day"], uid)
+    if play and play["done"]:
+        await _kinodl_finish(message, game, play["tries"], play["solved"], again=True)
+        return
+    tries = play["tries"] if play else 0
+    if state is not None:
+        await state.set_state(SearchState.kinodl)
+    await _kinodl_clues(message, game, tries, intro=not play)
+
+
+async def _kinodl_clues(message: Message, game: dict[str, Any], tries: int, intro: bool = False) -> None:
+    clue_list = shorts_kinodl.clues(game["film"])
+    shown = clue_list[:min(tries + 1, len(clue_list))]
+    head = ("🎬 <b>Кинодл</b> — угадай фильм дня за 6 подсказок. Пиши название сообщением; каждая ошибка "
+            "открывает новую подсказку.\n\n" if intro else "")
+    text = head + "\n".join(escape(c) for c in shown) + f"\n\nПопытка {tries + 1} из {shorts_kinodl.MAX_TRIES} ✍️"
+    if tries + 1 >= shorts_kinodl.MAX_TRIES and game.get("frame"):
+        try:
+            await message.answer_photo(game["frame"], caption=text[:1024])
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    await message.answer(text)
+
+
+async def _kinodl_finish(message: Message, game: dict[str, Any], tries: int, solved: bool,
+                         again: bool = False) -> None:
+    film = game["film"]
+    title = shorts_kinodl.titles(film)[0]
+    streak = await _kinodl_streak(message.from_user.id if message.from_user else 0)
+    day = game["day"].strftime("%d.%m")
+    share = shorts_kinodl.share_line(day, tries, solved)
+    link = f"{await _bot_link(message.bot)}?start=kinodl"
+    text = ((f"🎉 Угадал с {tries}-й попытки! Это «{escape(title)}» ({film.get('year') or ''})."
+             if solved else f"😔 Это был «{escape(title)}» ({film.get('year') or ''})."))
+    if again:
+        text = "✅ Сегодня ты уже сыграл. " + text
+    text += (f"\n🔥 Серия побед: <b>{streak}</b>" if streak else "") + "\nНовый фильм — завтра!\n\n" \
+        f"Поделись без спойлера:\n<code>{escape(share)}</code>\n{link}"
+    await message.answer(text, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Открыть карточку фильма", callback_data=f"open:{film['id']}")],
+        [InlineKeyboardButton(text="📤 Позвать друга играть", url="https://t.me/share/url?url=" + quote(link)
+                              + "&text=" + quote(share))]]))
+
+
+@router.message(SearchState.kinodl, F.text, ~F.text.startswith("/"))
+async def kinodl_guess(message: Message, state: FSMContext) -> None:
+    guess = (message.text or "").strip()
+    if guess in MAIN_MENU_LABELS:
+        await state.clear()
+        await do_search(message, state)  # переход в другой раздел меню
+        return
+    game = await kinodl_today()
+    if not game:
+        await state.clear()
+        return
+    uid = message.from_user.id
+    play = await db().fetchrow("SELECT * FROM kinodl_plays WHERE day=$1 AND user_id=$2", game["day"], uid)
+    if play and play["done"]:
+        await state.clear()
+        await _kinodl_finish(message, game, play["tries"], play["solved"], again=True)
+        return
+    tries = (play["tries"] if play else 0) + 1
+    solved = shorts_kinodl.is_correct(guess, game["film"])
+    done = solved or tries >= shorts_kinodl.MAX_TRIES
+    await db().execute("""INSERT INTO kinodl_plays(day, user_id, tries, solved, done) VALUES($1, $2, $3, $4, $5)
+                          ON CONFLICT(day, user_id) DO UPDATE SET tries=$3, solved=$4, done=$5""",
+                       game["day"], uid, tries, solved, done)
+    if done:
+        await state.clear()
+        await _kinodl_finish(message, game, tries, solved)
+        return
+    await message.answer("❌ Не то. Новая подсказка 👇")
+    await _kinodl_clues(message, game, tries)
 
 
 # --- «Выбрать вдвоём»: двое отмечают одни и те же фильмы, бот показывает совпадения
