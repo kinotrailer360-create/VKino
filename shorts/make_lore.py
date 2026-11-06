@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from .make_short import (
     FPS,
@@ -51,6 +51,66 @@ class PanSlide:
         return self.img.crop((x, y, x + W, y + H))
 
 
+class ClipSlide:
+    """Отрезок трейлера (уже 1080×1920, 30 к/с, без звука): кадры читаются из ffmpeg по ходу монтажа, в памяти —
+    только текущий. Кончился отрезок — держим последний кадр (на время перехода к следующей картинке)."""
+
+    def __init__(self, path: Path):
+        self.proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"fps={FPS},scale={W}:{H}",
+                                      "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.idx = -1
+        self.last = Image.new("RGB", (W, H))
+
+    def frame(self, t: float, dur: float) -> Image.Image:
+        want = int(max(t, 0.0) * FPS)
+        size = W * H * 3
+        while self.idx < want and self.proc.stdout:
+            buf = self.proc.stdout.read(size)
+            if len(buf) < size:
+                self.proc.stdout = None  # конец отрезка
+                break
+            self.last = Image.frombytes("RGB", (W, H), buf)
+            self.idx += 1
+        return self.last
+
+    def close(self) -> None:
+        self.proc.kill()
+        self.proc.wait()
+
+
+def _label_image(text: str, font_path: Path) -> Image.Image:
+    """Крупная надпись на экране: жёлтая плашка, тёмный текст, до двух строк."""
+    size = 74
+    font = ImageFont.truetype(str(font_path), size)
+    probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    words, lines = text.split(), []
+    while True:
+        lines, cur = [], ""
+        for w in words:
+            test = f"{cur} {w}".strip()
+            if probe.textlength(test, font=font) <= W - 160:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+        if len(lines) <= 2 or size <= 50:
+            break
+        size -= 6
+        font = ImageFont.truetype(str(font_path), size)
+    lines = [ln for ln in lines[:2] if ln]
+    widths = [probe.textlength(ln, font=font) for ln in lines]
+    line_h = int(size * 1.18)
+    box_w, box_h = int(max(widths)) + 70, line_h * len(lines) + 34
+    img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, box_w - 1, box_h - 1), radius=22, fill=(255, 196, 61, 240))
+    for k, ln in enumerate(lines):
+        d.text((box_w // 2, 17 + k * line_h + line_h // 2), ln, font=font, fill=(14, 14, 18), anchor="mm")
+    return img
+
+
 def render(cfg: dict, base: Path) -> Path:
     def p(x):
         return (base / x).resolve()
@@ -64,17 +124,23 @@ def render(cfg: dict, base: Path) -> Path:
     total = speech_end + outro_len
     ends = [s["start"] for s in slides[1:]] + [speech_end]
 
-    loaded: dict[int, PanSlide] = {}
+    loaded: dict[int, PanSlide | ClipSlide] = {}
 
-    def slide(k: int) -> PanSlide:
+    def slide(k: int) -> PanSlide | ClipSlide:
         if k not in loaded:
             for old in [j for j in loaded if j < k - 1]:
-                loaded.pop(old)
-            # чередуем направление: вниз, вверх — чтобы монтаж не казался однообразным
-            loaded[k] = PanSlide(p(slides[k]["image"]), reverse=k % 3 == 2)
+                gone = loaded.pop(old)
+                if isinstance(gone, ClipSlide):
+                    gone.close()
+            if slides[k].get("clip"):  # отрезок трейлера
+                loaded[k] = ClipSlide(p(slides[k]["clip"]))
+            else:  # чередуем направление: вниз, вверх — чтобы монтаж не казался однообразным
+                loaded[k] = PanSlide(p(slides[k]["image"]), reverse=k % 3 == 2)
         return loaded[k]
 
-    outro = OutroSlide(cfg, p(slides[0]["image"]), logo)
+    outro = OutroSlide(cfg, p(cfg.get("outro_image") or slides[0]["image"]), logo)
+    labels = [(float(lb["start"]), float(lb["end"]), _label_image(lb["text"], cfg["fonts"]["head"]))
+              for lb in cfg.get("labels") or [] if str(lb.get("text") or "").strip()]
     captions = WordCaptions(cfg, cfg.get("words") or [], cfg.get("word_y", H // 2 + 120))
     wm_w = 150
     wm = logo.resize((wm_w, round(logo.height * wm_w / logo.width)), Image.LANCZOS)
@@ -117,6 +183,12 @@ def render(cfg: dict, base: Path) -> Path:
                 prev = slide(k - 1).frame(t - slides[k - 1]["start"], ends[k - 1] - slides[k - 1]["start"])
                 img = Image.blend(prev, img, ease_out((t - slides[k]["start"]) / XFADE))
             img.paste(wm, (W - wm_w - 36, 40), wm)
+            for start, end, lab in labels:  # надпись на экране: появляется с фразой, держится до её конца
+                if start <= t < end:
+                    pop = min(1.0, (t - start) / 0.18)
+                    y = 230 - round(40 * (1 - ease_out(pop)))
+                    img.paste(lab, ((W - lab.width) // 2, y), lab)
+                    break
             captions.draw(img, t)
         try:
             enc.stdin.write(img.tobytes())
@@ -125,6 +197,9 @@ def render(cfg: dict, base: Path) -> Path:
         if f % (FPS * 2) == 0:  # бот читает эти строки и двигает полоску загрузки
             print(f"PROGRESS {f / n_frames:.3f}  {t:5.1f}/{total:.1f} c", flush=True)
     enc.stdin.close()
+    for sl in loaded.values():
+        if isinstance(sl, ClipSlide):
+            sl.close()
     if enc.wait():
         raise encoder_failed()
     log.close()

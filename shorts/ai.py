@@ -1024,6 +1024,31 @@ async def guess_films(key: str, description: str) -> list[dict[str, Any]]:
     return out[:3]
 
 
+async def screen_labels(key: str, lines: list[str], title: str = "") -> list[str]:
+    """Крупные надписи на экране шортса — по одной на фразу озвучки: 2–4 слова КАПСОМ, цепляют и не повторяют
+    фразу дословно («ЗАБУДЬТЕ ПРО ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ»). Пусто — у фразы без надписи."""
+    if not available(key) or not lines:
+        return []
+    listing = "\n".join(f"{k}. {ln}" for k, ln in enumerate(lines, 1))
+    prompt = (
+        "Ты монтажёр YouTube Shorts о кино. К каждой фразе озвучки придумай крупную надпись на экране: 2–4 слова "
+        "КАПСОМ, до 26 символов, цепляет и дополняет голос, а не повторяет фразу целиком. Примеры: «ЗАБУДЬТЕ ПРО "
+        "ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ», «НАПРЯЖЕНИЕ ДО КОНЦА», «МОЯ ОЦЕНКА: 8/10». Без спойлеров. "
+        "К проходной фразе можно дать пустую строку. Ровно столько надписей, сколько фраз, по порядку."
+        + (f" Ролик: {title}." if title else "")
+        + '\n\nОтветь только JSON: {"labels": ["…", "…"]}\n\nФРАЗЫ:\n' + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: screen labels failed: %s", exc)
+        return []
+    raw = data.get("labels") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = [re.sub(r"\s+", " ", str(x or "")).strip().strip("«»\"").upper()[:30] for x in raw]
+    return (out + [""] * len(lines))[:len(lines)]
+
+
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
                           today: str = "", n: int = 5, only: bool = False, hint: str = "") -> dict[str, Any] | None:
     """Пост-подборка для Telegram-канала в стиле POST_STYLE. ИИ сам выбирает n фильмов из всех источников:

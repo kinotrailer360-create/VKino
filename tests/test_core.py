@@ -117,3 +117,14 @@ def test_kinodl_clues_and_answers() -> None:
     assert kinodl.is_correct("интерстелар", film) and kinodl.is_correct("Interstellar", film)
     assert not kinodl.is_correct("Начало", film)
     assert kinodl.share_line("06.11", 3, True).endswith("3/6")
+
+
+def test_review_score_and_montage_table() -> None:
+    from shorts import lore
+
+    assert lore.review_score(["Начало", "Мой вердикт: крепкая восьмёрка из десяти."]) == {"line": 1, "value": "8"}
+    assert lore.review_score(["Оценка 7,5/10"]) == {"line": 0, "value": "7.5"}
+    assert lore.review_score(["Без оценки"]) is None
+    plan = ("| Время | Что показываем | Текст на экране |\n|---|---|---|\n"
+            "| 0–4 сек. | Самый эффектный кадр | ЗАБУДЬТЕ ПРО ЙОВОВИЧ! |\n")
+    assert lore.parse_script(plan)["screens"] == []  # план монтажа не читается вслух
