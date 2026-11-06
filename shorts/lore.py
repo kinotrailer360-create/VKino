@@ -424,3 +424,121 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     if notes:
         result.seo["warning"] = "\n".join(notes)
     return result
+
+
+# ---------------------------------------------------------------- свой сценарий (озвучка как есть)
+
+TIME_CELL = re.compile(r"^\s*\d{1,3}\s*[–—-]\s*\d{1,3}\s*(?:с|сек)?\s*$")
+
+
+def split_scripts(text: str) -> list[tuple[str, str]]:
+    """Файл с несколькими сценариями («## Shorts 1 — …», «## Shorts 2 — …») → [(название, текст)]. Один
+    сценарий — один элемент."""
+    parts = re.split(r"^#{1,3}\s+(.+)$", text, flags=re.M)
+    if len(parts) < 3:
+        return [("Свой сценарий", text)]
+    out = [(head.strip()[:60], body) for head, body in zip(parts[1::2], parts[2::2])
+           if parse_script(body)["screens"]]  # раздел со сценарием — с таблицей; вступление файла — мимо
+    if not out:
+        out = [(head.strip()[:60], body) for head, body in zip(parts[1::2], parts[2::2])
+               if len(parse_script(body)["lines"]) >= 3]
+    return out or [("Свой сценарий", text)]
+
+
+def parse_script(text: str) -> dict[str, Any]:
+    """Сценарий автора: таблица «Время | Голос | На экране» (из нее — колонка голоса, а подсказки к кадрам —
+    из «на экране») или просто фраза на строку. Заголовок — строка «Заголовок: …». Текст не переписываем."""
+    title = ""
+    m = re.search(r"\*{0,2}Заголовок:?\*{0,2}:?\s*(.+)", text)
+    if m:
+        title = re.sub(r"\s*#\w+", "", m.group(1)).strip(" *")
+    lines: list[str] = []
+    screens: list[str] = []
+    for row in text.splitlines():
+        if row.count("|") >= 3:
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            if len(cells) >= 2 and TIME_CELL.match(cells[0]) and cells[1]:
+                lines.append(cells[1])
+                screens.append(cells[2] if len(cells) > 2 else "")
+    if not lines:  # без таблицы: каждая непустая строка без разметки — фраза
+        for row in text.splitlines():
+            row = row.strip()
+            if not row or row.startswith(("#", "**", "---", "|", ">", "~", "- ")) or row.lower().startswith("формула"):
+                continue
+            lines.append(re.sub(r"^\s*\d+[.)]\s*", "", row))
+    return {"title": title, "lines": [ln for ln in lines if len(ln) >= 3][:20], "screens": screens}
+
+
+def _quoted(text: str) -> list[str]:
+    """Названия в «ёлочках» по порядку (вложенные кавычки «„…“» тоже)."""
+    names = re.findall(r"[«„]([^«»„“]{2,60})[»“]", text)
+    out: list[str] = []
+    for n in names:
+        n = n.strip(" .,!?")
+        if (not n or len(n) < 3 or not any(ch.isalpha() for ch in n) or n.lower() in ("сериал", "фильм", "мультфильм")
+                or (n.upper() == n and any(ch.isalpha() for ch in n))):
+            continue  # «5 ФИЛЬМОВ ДО 18.12», «2019», «сериал» — надписи и плашки на экране, а не названия
+        if n.lower() not in {x.lower() for x in out}:
+            out.append(n)
+    return out
+
+
+async def _film_backdrops(tmdb_key: str, name: str, n: int = 3) -> list[str]:
+    """Кадры фильма или сериала по названию (русскому или оригинальному): самый похожий и популярный."""
+    try:
+        films, shows = await asyncio.gather(tmdb.search_movie(tmdb_key, name), tmdb.search_tv(tmdb_key, name),
+                                            return_exceptions=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: own script search %s failed: %s", name, exc)
+        return []
+    cands = [(r, "movie") for r in (films if isinstance(films, list) else [])[:4]] + \
+            [(r, "tv") for r in (shows if isinstance(shows, list) else [])[:3]]
+
+    def score(c: tuple[dict[str, Any], str]) -> float:
+        r = c[0]
+        titles = [r.get("title") or "", r.get("original") or ""]
+        if any(name.lower() in t.lower() for t in titles if t):  # «Философский камень» в «Гарри Поттер и …»
+            return max(0.9, *(tmdb.similar(t, name) for t in titles))
+        return max(tmdb.similar(t, name) for t in titles)
+
+    good = [c for c in cands if score(c) >= 0.6]
+    if not good:
+        return []
+    best, kind = max(good, key=lambda c: (round(score(c), 1), c[0].get("popularity") or 0))
+    try:
+        urls = await tmdb.backdrops(tmdb_key, kind, int(best["id"]), n)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: own script backdrops %s failed: %s", name, exc)
+        urls = []
+    return urls + ([best["poster"]] if best.get("poster") else [])
+
+
+async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, Any]:
+    """Шортс по готовому сценарию автора: фразы — как есть, кадры — фильмов и сериалов из «ёлочек» (по порядку
+    сценария), к фразе с названием — кадр этого фильма."""
+    parsed = parse_script(text)
+    lines = parsed["lines"]
+    if len(lines) < 2:
+        raise RuntimeError("не нашёл фраз: пришли сценарий таблицей «Время | Голос | На экране» или фразу на строку")
+    films = _quoted(" ".join(lines + parsed["screens"]))[:10]
+    # франшиза из заголовка раздела («Shorts 3 — Гарри Поттер (сериал HBO)») — ещё и её кадры
+    topic = re.sub(r"\(.*?\)", "", heading.split("—", 1)[-1]).strip(" «»") if "—" in heading else ""
+    if topic and topic.lower() not in {f.lower() for f in films}:
+        films.append(topic)
+    found = await asyncio.gather(*(_film_backdrops(tmdb_key, f) for f in films)) if tmdb_key else []
+    images: list[str] = []
+    fixed: list[dict[str, Any]] = []
+    for film, urls in zip(films, found):
+        if not urls:
+            continue
+        images += urls[1:]
+        line = next((i for i, (ln, sc) in enumerate(zip(lines, parsed["screens"] + [""] * len(lines)))
+                     if film.lower() in (ln + " " + sc).lower()), None)
+        if line is not None and all(f["line"] != line + 1 for f in fixed):
+            fixed.append({"line": line + 1, "keys": [film.lower()], "url": urls[0], "mode": "photo", "who": film})
+        else:
+            images.insert(0, urls[0])
+    title = parsed["title"] or (films[0] if films else lines[0][:60])
+    return {"kind": "news", "fixed": fixed, "name": title, "en": "", "title": title, "lines": lines,
+            "hashtags": [], "films": films, "article": "сценарий автора", "url": "",
+            "images": list(dict.fromkeys(images))[:MAX_IMAGES]}

@@ -276,6 +276,7 @@ class CustomState(StatesGroup):
 
 
 class LoreState(StatesGroup):
+    own = State()
     news = State()
     name = State()
     hook = State()
@@ -7926,6 +7927,7 @@ def shorts_menu() -> InlineKeyboardMarkup:
         [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
         [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
         [_btn("📰 Своя новость: вставлю текст", "lo:news")],
+        [_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
         [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
         # поиск с подсказками прямо при наборе (inline-режим бота)
         [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
@@ -12859,6 +12861,9 @@ async def lore_generate(message: Message, state: FSMContext) -> None:
     if data.get("lore_kind") == "news":
         await news_generate(message, state)
         return
+    if data.get("lore_kind") == "own":
+        await own_generate(message, state)
+        return
     wait = await message.answer("✍️ Читаю Википедию и пишу сценарий, обычно до минуты…")
     try:
         script = await shorts_lore.write_script(data["lore_name"], data.get("lore_hook") or "", GEMINI_API_KEY)
@@ -12942,6 +12947,55 @@ async def lore_command(message: Message, state: FSMContext) -> None:
         await lore_ask_name(message, state)
 
 
+@router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
+async def own_script_text(message: Message, state: FSMContext) -> None:
+    """«🎬 Свой сценарий»: текст или файл .md/.txt; несколько сценариев в файле — кнопки выбора."""
+    text = message.text or ""
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith((".md", ".txt")) or (message.document.file_size or 0) > 1024 * 1024:
+            await message.answer("Нужен файл .md или .txt до 1 МБ — или вставь сценарий сообщением.")
+            return
+        buf = io.BytesIO()
+        await message.bot.download(message.document.file_id, destination=buf)
+        text = buf.getvalue().decode("utf-8", "ignore")
+    scripts = shorts_lore.split_scripts(text)
+    if not any(len(shorts_lore.parse_script(body)["lines"]) >= 2 for _, body in scripts):
+        await message.answer("Не нашёл фраз. Пришли таблицей «Время | Голос | На экране» или фразу на строку.")
+        return
+    await state.set_state(None)
+    await state.update_data(own_scripts=scripts[:10], own_pick=0, lore_kind="own", lore_name="Свой сценарий",
+                            lore_hook="", lore_script=None, lore_media=[])
+    if len(scripts) == 1:
+        await own_generate(message, state)
+        return
+    await message.answer("В файле несколько сценариев — какой собрать?", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[_btn(f"🎬 {head[:50]}", f"lo:ownpick:{k}")] for k, (head, _) in enumerate(scripts[:10])]))
+
+
+async def own_generate(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    scripts = data.get("own_scripts") or []
+    k = int(data.get("own_pick") or 0)
+    if not 0 <= k < len(scripts):
+        await message.answer("Сценарий потерялся — пришли заново: «🎬 Свой сценарий».")
+        return
+    head, body = scripts[k]
+    wait = await message.answer(f"🎬 «{escape(head)}»: подбираю кадры к фильмам из сценария…")
+    try:
+        script = await shorts_lore.write_own(body, TMDB_API_KEY, head)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Own script failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>")
+        return
+    await wait.delete()
+    await state.update_data(lore_name=script["name"], lore_script=script)
+    await show_lore(message, state)
+    if len(script.get("images") or []) + len(script.get("fixed") or []) < len(script["lines"]):
+        await message.answer(f"🖼 Кадров нашлось меньше, чем фраз ({len(script.get('images') or [])}) — добавь свои "
+                             "кнопкой «📎 Добавить свои картинки», иначе картинки будут повторяться.")
+
+
 @router.message(LoreState.news, F.text, ~F.text.startswith("/"))
 async def news_text(message: Message, state: FSMContext) -> None:
     text = message.text or ""
@@ -13016,6 +13070,25 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action == "news":
         await news_ask_text(message, state)
+        return
+    if action == "own":
+        await state.clear()
+        await state.set_state(LoreState.own)
+        await message.answer(
+            "🎬 <b>Свой сценарий</b>\n\nПришли готовый сценарий шортса сообщением или файлом .md / .txt — "
+            "таблицей «Время | Голос | На экране» или просто фраза на строку. Голосом прочитаю фразы как есть, "
+            "ничего не переписывая; кадры подберу к фильмам и сериалам, названным в «ёлочках». Если в файле "
+            "несколько сценариев — дам выбрать. Дальше можно поправить текст и добавить свои картинки.\n\n"
+            "<i>Передумал — /cancel</i>")
+        return
+    if action.startswith("ownpick:") and action[8:].isdigit():
+        scripts = data.get("own_scripts") or []
+        k = int(action[8:])
+        if not 0 <= k < len(scripts):
+            await message.answer("Список устарел — пришли сценарий заново: «🎬 Свой сценарий».")
+            return
+        await state.update_data(own_pick=k)
+        await own_generate(message, state)
         return
     if action == "cancel":
         await state.clear()
