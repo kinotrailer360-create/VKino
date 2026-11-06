@@ -70,6 +70,13 @@ if [ ! -f /etc/cron.d/vkino-update ]; then
   chmod 644 /etc/cron.d/vkino-update
 fi
 
+# ночной бэкап базы (deploy/backup.sh): 14 дней на сервере, раз в неделю копия админу в Telegram
+if [ ! -f /etc/cron.d/vkino-backup ]; then
+  echo "== Включаю ночной бэкап базы"
+  echo "47 3 * * * root /bin/bash $DIR/deploy/backup.sh >> /var/log/vkino-backup.log 2>&1" > /etc/cron.d/vkino-backup
+  chmod 644 /etc/cron.d/vkino-backup
+fi
+
 echo "== Собираю и запускаю бота (первый раз 5–10 минут)"
 docker compose up -d --build
 docker image prune -f >/dev/null

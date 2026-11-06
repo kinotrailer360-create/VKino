@@ -304,6 +304,19 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
         raise AIError(f"Gemini не ответил за {budget} с") from None
 
 
+def _until_quota_reset() -> float:
+    """Секунды до сброса дневного лимита бесплатного Gemini (полночь по тихоокеанскому времени): раньше бот
+    каждые 30 минут снова получал отказ и терял время; не больше 24 ч, не меньше паузы QUOTA_PAUSE."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    try:
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:  # noqa: BLE001 — нет базы часовых поясов: как раньше
+        return QUOTA_PAUSE
+    reset = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+    return max(QUOTA_PAUSE, min((reset - now).total_seconds(), 86400))
+
+
 async def _ask_keys(key: str, parts: list[dict[str, Any]], search: bool) -> Any:
     global last_key_no
     keys = gemini_keys(key)
@@ -354,7 +367,7 @@ async def _ask_key(key: str, parts: list[dict[str, Any]], search: bool, wait_min
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
             kind, _ = _quota(status, data)
             if kind:  # лимит этого ключа: на день — пауза 30 мин, в минуту — 1 мин; пробуем другой ключ
-                _quota_until[(key, search)] = time.monotonic() + (QUOTA_PAUSE if kind == "day" else 60)
+                _quota_until[(key, search)] = time.monotonic() + (_until_quota_reset() if kind == "day" else 60)
                 value = _quota_value(data)
                 raise QuotaError(f"лимит {'на день' if kind == 'day' else 'в минуту'} ({model}"
                                  + (f", разрешено {value}" if value else "") + ")")

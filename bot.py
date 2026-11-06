@@ -14814,6 +14814,19 @@ async def weekly_video_job(bot: Bot) -> None:
                 pass
 
 
+ALIVE_FILE = Path("/tmp/vkino_alive")
+
+
+async def heartbeat() -> None:
+    """Раз в 30 с отмечает, что цикл бота работает (healthcheck Docker; не обновляется — бот завис или упал)."""
+    while True:
+        try:
+            ALIVE_FILE.touch()
+        except OSError:
+            pass
+        await asyncio.sleep(30)
+
+
 async def growth_loop(bot: Bot) -> None:
     """Раз в 10 минут: уведомления из избранного (раз в 3 часа), подборка недели (пятница, 18:00 Екб)."""
     last_alerts = last_rt = last_clean = last_yt = 0.0
@@ -15349,12 +15362,14 @@ async def main() -> None:
             await asyncio.sleep(min(5 * attempt, 60))
 
     logging.info("VKino started")
+    heartbeat_task = asyncio.create_task(heartbeat())  # «бот жив» — по нему автообновление решает, откатывать ли
 
     try:
         await dp.start_polling(bot)
     finally:
         global stopping
         stopping = True
+        heartbeat_task.cancel()
         provider_task.cancel()
         blender_task.cancel()
         reminder_task.cancel()
