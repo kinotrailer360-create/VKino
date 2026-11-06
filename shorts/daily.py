@@ -814,8 +814,9 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     theme = Theme("news", "НОВОСТИ", "НОВОСТИ КИНО", f"Главные новости кино на {day}", title, [])
     result = ShortResult(work / "short.mp4", cover_path, theme,
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
-    if ai.last_error:
-        result.seo["warning"] = f"⚠️ ИИ не пересказал новости: {ai.last_error}"
+    if not retold:  # пересказа нет — в ролике заголовки как есть; ошибка Gemini при удачном запасном ИИ — не повод
+        result.seo["warning"] = (f"⚠️ ИИ не пересказал новости (в ролике заголовки как есть): "
+                                 f"{ai.last_error or 'ИИ не ответил'}")
     if not voiced or tts_note:
         result.seo["warning"] = no_voice_note(voiced)
     return result

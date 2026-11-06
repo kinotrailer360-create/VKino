@@ -1067,6 +1067,7 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
             return None
         try:
             data = await _with_reserve(key, [{"text": prompt}, *pics], prompt, (images or [None])[0], premium)
+            last_error = None  # запасной ИИ ответил — сбой Gemini с поиском больше не причина для тревоги
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)[:300]
             log.warning("shorts: post failed: %s", exc)
