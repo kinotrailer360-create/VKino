@@ -69,6 +69,12 @@ if [ ! -f /etc/cron.d/vkino-update ]; then
   echo "*/5 * * * * root /bin/bash $DIR/deploy/autoupdate.sh >> /var/log/vkino-update.log 2>&1" > /etc/cron.d/vkino-update
   chmod 644 /etc/cron.d/vkino-update
 fi
+# автообновление с проверкой здоровья и откатом (deploy/update.sh) вместо старого autoupdate.sh
+if [ -f "$DIR/deploy/update.sh" ] && grep -q 'autoupdate.sh' /etc/cron.d/vkino-update 2>/dev/null; then
+  echo "== Автообновление: теперь с проверкой и откатом"
+  echo "*/5 * * * * root /bin/bash $DIR/deploy/update.sh >> /var/log/vkino-update.log 2>&1" > /etc/cron.d/vkino-update
+  chmod 644 /etc/cron.d/vkino-update
+fi
 
 # ночной бэкап базы (deploy/backup.sh): 14 дней на сервере, раз в неделю копия админу в Telegram
 if [ ! -f /etc/cron.d/vkino-backup ]; then

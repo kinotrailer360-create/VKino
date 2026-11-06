@@ -10,9 +10,6 @@ flock -n 9 || exit 0  # прошлое обновление ещё идёт
 
 git fetch -q origin main 2>/dev/null || exit 0
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && exit 0
-# эту версию уже откатывали (бот с ней не запустился) — ждём следующую
-BAD=/var/lib/vkino-bad-commit
-[ -f "$BAD" ] && [ "$(cat "$BAD")" = "$(git rev-parse origin/main)" ] && exit 0
 
 cd "$DIR/deploy"
 # идёт сборка ролика — перезапуск её оборвёт; попробуем через 5 минут
@@ -30,34 +27,11 @@ fi
 rm -f "$since"
 
 old=$(git -C "$DIR" rev-parse --short HEAD)
-old_full=$(git -C "$DIR" rev-parse HEAD)
 echo "$(date '+%F %T') обновляю с $old"
-
-# бот здоров: контейнер работает, не перезапускается и healthcheck «healthy» (бот раз в 30 с отмечается)
-healthy() {
-  local cid restarts state
-  cid=$(docker compose ps -q bot 2>/dev/null) || return 1
-  [ -n "$cid" ] || return 1
-  restarts=$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || echo 99)
-  for _ in $(seq 1 24); do  # до 4 минут
-    state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null)
-    [ "$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || echo 99)" = "$restarts" ] || return 1
-    [ "$state" = "healthy" ] && return 0
-    [ "$state" = "none" ] && [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = "true" ] && sleep 60 && return 0
-    sleep 10
-  done
-  return 1
-}
-
-if bash "$DIR/deploy/install.sh" >/tmp/vkino-update.out 2>&1 && healthy; then
+if bash "$DIR/deploy/install.sh" >/tmp/vkino-update.out 2>&1; then
   status="✅ Бот обновлён автоматически"
 else
-  # новая версия не запустилась — возвращаем прошлую, чтобы канал не остался без бота
-  git -C "$DIR" rev-parse origin/main > "$BAD"
-  echo "$(date '+%F %T') новая версия не запустилась — откатываю на $old" >> /tmp/vkino-update.out
-  git -C "$DIR" reset -q --hard "$old_full"
-  (cd "$DIR/deploy" && docker compose up -d --build bot) >>/tmp/vkino-update.out 2>&1 || true
-  status="❌ Обновление не запустилось — вернул прошлую версию ($old), бот работает. Напиши ИИ-помощнику: «обновление откатилось»; подробности: tail -80 /var/log/vkino-update.log"
+  status="❌ Автообновление не удалось — подробности: tail -50 /var/log/vkino-update.log"
 fi
 cat /tmp/vkino-update.out
 new=$(git -C "$DIR" rev-parse --short HEAD)
