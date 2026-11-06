@@ -9944,6 +9944,7 @@ async def _unqueue(chat_id: int, first: int) -> bool:
 async def _mark_published(chat_id: int, first: int) -> None:
     meta = await _json_setting("posts_meta", {})
     key = f"{chat_id}:{first}"
+    shorts_usage.record("tg_posts")  # для недельного отчёта
     if key in meta:
         meta[key]["published"] = int(time.time())
         await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
@@ -12000,6 +12001,7 @@ async def youtube_button(callback: CallbackQuery) -> None:
                 hidden = await shorts_setting("yt_privacy") == "unlisted"
                 res = await shorts_yt.upload(token, video, seo, "unlisted" if hidden else "public")
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                shorts_usage.record("yt_long" if long else "yt_shorts")  # для недельного отчёта
                 try:
                     done_file.write_text(link)
                 except OSError:
@@ -14893,6 +14895,60 @@ async def weekly_video_job(bot: Bot) -> None:
                 pass
 
 
+async def weekly_admin_report() -> str:
+    """Отчёт админу по понедельникам: подписчики бота, что делали, что вышло, сколько потрачено, план недели."""
+    async def q(sql: str) -> int:
+        try:
+            return int(await db().fetchval(sql) or 0)
+        except Exception:  # noqa: BLE001 — нет таблицы и т. п.
+            return 0
+
+    new_users = await q("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'")
+    active = await q("SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '7 days'")
+    total = await q("SELECT COUNT(*) FROM users")
+    searches = await q("SELECT COUNT(*) FROM search_history WHERE searched_at > NOW() - INTERVAL '7 days'")
+    diary_n = await q("SELECT COUNT(*) FROM diary WHERE watched_at > NOW() - INTERVAL '7 days'")
+    quiz_n = await q("SELECT COUNT(*) FROM quiz_answers WHERE created_at > NOW() - INTERVAL '7 days'")
+    favs = await q("SELECT COUNT(*) FROM favorites WHERE created_at > NOW() - INTERVAL '7 days'")
+    try:
+        top = await db().fetch("""SELECT lower(query) q, COUNT(*) n FROM search_history
+            WHERE searched_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 2 DESC LIMIT 5""")
+    except Exception:  # noqa: BLE001
+        top = []
+    u = shorts_usage.summary(7)
+    lines = [
+        "📊 <b>Неделя KinoMir360</b>", "",
+        f"👥 Бот: новых <b>{new_users}</b>, заходили <b>{active}</b>, всего <b>{total}</b>",
+        f"🔎 Поисков {searches} · ❤️ в избранное {favs} · 📔 в кинодневник {diary_n} · 🧩 ответов в викторине {quiz_n}",
+        f"📢 Постов в канал: <b>{int(u.get('tg_posts', 0))}</b> · ▶️ на YouTube: шортсов "
+        f"<b>{int(u.get('yt_shorts', 0))}</b>, выпусков <b>{int(u.get('yt_long', 0))}</b>",
+        f"💳 Расходы: ИИ Lumean {int(u.get('llm_calls', 0))} запр., озвучка {int(u.get('tts_chars', 0)):,} симв., "
+        f"музыка {int(u.get('music_tracks', 0))} тр.".replace(",", " "),
+    ]
+    if top:
+        lines.append("🔥 Чаще искали: " + ", ".join(f"{escape(r['q'][:30])} ({r['n']})" for r in top))
+    try:
+        soon = (await kp.upcoming_releases(False, limit=20, days_ahead=8))[:6]
+    except Exception:  # noqa: BLE001
+        soon = []
+    lines += ["", "🗓 <b>План недели</b>",
+              "• среда и воскресенье — выпуск «Новости кино» (соберётся сам)",
+              "• пятница 18:00 — подборка недели подписчикам бота"]
+    if soon:
+        lines.append("• премьеры недели — повод для постов и шортсов: "
+                     + ", ".join(f"«{escape(kp.title(f))}»" for f in soon))
+    if top:
+        lines.append(f"• подписчики ищут «{escape(top[0]['q'][:40])}» — можно сделать пост или шортс")
+    return "\n".join(lines)
+
+
+@router.message(Command("report"))
+async def report_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer(await weekly_admin_report(), disable_web_page_preview=True)
+
+
 ALIVE_FILE = Path("/tmp/vkino_alive")
 
 
@@ -14942,6 +14998,15 @@ async def growth_loop(bot: Bot) -> None:
                     and not weekly_busy):
                 await set_shorts_setting("weekly_video_done", today_key)
                 _run_job(lambda: weekly_video_job(bot))
+            if (now.weekday() == 0 and now.hour >= 10 and ADMIN_IDS
+                    and await shorts_setting("admin_report_done") != week):
+                await set_shorts_setting("admin_report_done", week)
+                try:
+                    report = await weekly_admin_report()
+                    for admin_id in ADMIN_IDS:
+                        await bot.send_message(admin_id, report, disable_web_page_preview=True)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Weekly admin report failed")
             if (now.weekday() == 4 and now.hour >= 18 and await shorts_setting("digest") != "off"
                     and await shorts_setting("digest_done") != week):
                 await set_shorts_setting("digest_done", week)
@@ -15443,6 +15508,7 @@ async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
         BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
+        BotCommand(command="report", description="📊 Отчёт за неделю и план"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
