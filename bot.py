@@ -276,6 +276,7 @@ class CustomState(StatesGroup):
 
 
 class LoreState(StatesGroup):
+    own = State()
     news = State()
     name = State()
     hook = State()
@@ -3336,52 +3337,16 @@ async def premiere_reminder_loop(
 
 
 def admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить фильм",
-                    callback_data="admin:add:movie",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить серию",
-                    callback_data="admin:add:episode",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 Источники",
-                    callback_data="admin:list",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎬 Видео: шортсы и YouTube",
-                    callback_data="sh:menu",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Посты в Telegram-канал",
-                    callback_data="pt:menu",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📈 Статистика бота",
-                    callback_data="st:home",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Закрыть",
-                    callback_data="admin:cancel",
-                )
-            ],
-        ]
-    )
+    """Админка: Telegram-канал и YouTube — отдельными ветками, чтобы кнопки не смешивались."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Telegram-канал: посты ▸", callback_data="pt:menu")],
+        [InlineKeyboardButton(text="▶️ YouTube и видео: шортсы, выпуски ▸", callback_data="sh:menu")],
+        [InlineKeyboardButton(text="📈 Статистика бота", callback_data="st:home")],
+        [InlineKeyboardButton(text="➕ Фильм", callback_data="admin:add:movie"),
+         InlineKeyboardButton(text="➕ Серия", callback_data="admin:add:episode"),
+         InlineKeyboardButton(text="📋 Источники", callback_data="admin:list")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin:cancel")],
+    ])
 
 
 def premiere_date(item: dict[str, Any]) -> date | None:
@@ -7908,38 +7873,64 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
+SHORTS_SECTIONS: dict[str, tuple[str, str]] = {  # раздел меню YouTube → (кнопка, заголовок)
+    "shorts": ("🎞 Шортсы: готовые темы", "🎞 <b>Шортсы</b> — бот сам находит фильмы и новости, ролик за 2–5 минут."),
+    "long": ("📺 Длинные видео 16:9", "📺 <b>Длинные видео для YouTube</b> — выпуск «Новости кино», обзоры, перевод "
+                                    "трейлеров."),
+    "own": ("✍️ По моему тексту и сценарию", "✍️ <b>По твоему материалу</b> — свой текст, сценарий, подборка, "
+                                          "история персонажа."),
+    "facts": ("💡 Факты о фильме", "💡 <b>Факты о фильме</b> — шортс «5 фактов»: новое, классика или выбери фильм."),
+    "tools": ("🛠 Инструменты", "🛠 <b>Инструменты</b> — диктор, скачать видео, остановить сборку."),
+}
+
+
 def shorts_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
-        [_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")],
-        [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
-        [_btn("⏹ Остановить сборку", "pt:stop")],
-        [_btn("🎙 Диктор: текст → проверка → озвучка", "pt:nar")],
-        [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
-        [_btn("📝 Посты в Telegram-канал ▸", "pt:menu")],
-        [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
-        [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
-        *[[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")] for k in holidays_now(datetime.now(MSK).date())],
-        [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
-        [_btn("🎉 Шортс к празднику ▸", "sh:hol")],
-        [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
-        [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
-        [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
-        [_btn("📰 Своя новость: вставлю текст", "lo:news")],
-        [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
-        # поиск с подсказками прямо при наборе (inline-режим бота)
-        [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
-        [_btn("✍️ Факты: ввести название", "sh:ask:facts"), _btn("🔎 Факты: интернет или свой текст", "fx:start")],
-        [_btn("⚙️ Настройки ▸", "sh:settings")],
-        [_btn("⬅️ В админку", "admin:home")],
-    ])
+    """YouTube и видео — по разделам, как посты: не один длинный список кнопок."""
+    rows = [[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")]
+            for k in holidays_now(datetime.now(MSK).date())]
+    rows += [[_btn("🎬 Шортс: тема дня", "sh:go:"), _btn("🎞 Выпуск «Новости кино»", "pt:wv")]]
+    rows += [[_btn(SHORTS_SECTIONS[k][0] + " ▸", f"sh:sec:{k}")] for k in ("shorts", "long", "own", "facts")]
+    rows += [[_btn(SHORTS_SECTIONS["tools"][0] + " ▸", "sh:sec:tools"), _btn("⚙️ Настройки ▸", "sh:settings")],
+             [_btn("⬅️ В админку", "admin:home")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def shorts_section(name: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if name == "shorts":
+        rows = [[_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
+                [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+                [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
+                [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
+                [_btn("🎉 Шортс к празднику ▸", "sh:hol")]]
+    elif name == "long":
+        rows = [[_btn("🎞 Выпуск «Новости кино» (8 мин)", "pt:wv")],
+                [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
+                [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")]]
+    elif name == "own":
+        rows = [[_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
+                [_btn("📰 Своя новость: вставлю текст", "lo:news")],
+                [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
+                [_btn("📖 История персонажа", "lo:start")]]
+    elif name == "facts":
+        rows = [[_btn("💡 Новое (с 2015)", "sh:go:facts_new"), _btn("📼 Классика", "sh:go:facts_old")],
+                [_btn("🎲 Случайный фильм", "sh:go:facts")],
+                # поиск с подсказками прямо при наборе (inline-режим бота)
+                [InlineKeyboardButton(text="🔎 Найти фильм/сериал", switch_inline_query_current_chat="")],
+                [_btn("✍️ Ввести название", "sh:ask:facts"), _btn("🔎 Интернет или свой текст", "fx:start")]]
+    elif name == "tools":
+        rows = [[_btn("🎙 Диктор: текст → проверка → озвучка", "pt:nar")],
+                [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
+                [_btn("⏹ Остановить сборку", "pt:stop")]]
+    rows.append([_btn("⬅️ YouTube и видео", "sh:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def shorts_genres_menu() -> InlineKeyboardMarkup:
     rows = [[_btn(g.capitalize(), f"sh:go:genre:{g}") for g in SHORTS_GENRES[k:k + 2]]
             for k in range(0, len(SHORTS_GENRES), 2)]
     rows.append([_btn("🎲 Случайный жанр", "sh:go:genre")])
-    rows.append([_btn("⬅️ Назад", "sh:menu")])
+    rows.append([_btn("⬅️ Назад", "sh:sec:shorts")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -8059,9 +8050,9 @@ async def voice_preview_action(message: Message, voice_id: str) -> None:
 
 
 SHORTS_MENU_TEXT = (
-    "🎬 <b>Видео KinoMir360: шортсы и YouTube</b>\n\n"
-    "Нажми тему — ролик соберётся за 2–5 минут и придёт сюда вместе с SEO для YouTube и TikTok.\n"
-    "Каждый день в 8:00 по Москве ролик приходит сам."
+    "▶️ <b>YouTube и видео KinoMir360</b>\n\n"
+    "Выбери раздел. Ролик приходит сюда вместе с SEO для YouTube и TikTok; шортс дня — сам в 8:00 по Москве, "
+    "выпуск «Новости кино» — по средам и воскресеньям. Посты в Telegram — в админке, «📢 Telegram-канал»."
 )
 
 SHORTS_ASKS = {
@@ -8122,8 +8113,10 @@ async def shorts_panel(
     if data == "sh:menu":
         await state.clear()
         await show(SHORTS_MENU_TEXT, shorts_menu())
+    elif data.startswith("sh:sec:") and data[7:] in SHORTS_SECTIONS:
+        await show(SHORTS_SECTIONS[data[7:]][1], shorts_section(data[7:]))
     elif data == "sh:hol":
-        await show("🎉 <b>Шортс к празднику</b> — выбери праздник:", holidays_menu("sh:hol:", "sh:menu"))
+        await show("🎉 <b>Шортс к празднику</b> — выбери праздник:", holidays_menu("sh:hol:", "sh:sec:shorts"))
     elif data.startswith("sh:hol:") and data[7:] in HOLIDAYS:
         await holiday_short(message, state, data[7:])
     elif data == "sh:genres":
@@ -10218,7 +10211,8 @@ def posts_menu() -> InlineKeyboardMarkup:
              for a, b in (("news", "lists"), ("dates", "fun"))]
     rows.append([_btn(POST_SECTIONS["promo"][0] + " ▸", "pt:sec:promo")])
     rows.append([_btn("🗓 Автоплан постов", "pt:plan"), _btn("🔔 Авто-новости 30 мин", "pt:auto")])
-    rows.append([_btn("🎬 Видео для YouTube и шортсы ▸", "sh:menu")])
+    rows.append([_btn("🎬 Трейлеры студий с YouTube (уведомления)", "ytr:list")])
+    rows.append([_btn("⬅️ В админку", "admin:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -12090,7 +12084,8 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                              "постеры — фирменными карточками.", reply_markup=style_menu())
         return
     if action in ("menu", "home"):
-        text = "📝 <b>Посты в Telegram-канал</b>\n\nВыбери раздел. Видео для YouTube и шортсы — кнопка внизу."
+        text = ("📢 <b>Telegram-канал: посты</b>\n\nВыбери раздел. Видео для YouTube — в админке, «▶️ YouTube и "
+                "видео».")
         if action == "home":  # «⬅️ Все разделы» из раздела — меняем то же сообщение
             try:
                 await message.edit_text(text, reply_markup=posts_menu())
@@ -12124,7 +12119,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await set_shorts_setting("weekly_video", None if action == "wvon" else "off")
         await message.answer("🔔 По средам и воскресеньям в 10:00 (Екатеринбург) соберу выпуск «Новости кино» и пришлю "
                              "сюда." if action == "wvon" else "🔕 По средам и воскресеньям выпуск больше не собираю. Вручную — "
-                             "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
+                             "▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
         return
     if action == "stop":
         await message.answer(await stop_jobs())
@@ -12484,7 +12479,7 @@ async def narrator_voice(message: Message) -> None:
         saved = {}
     speech = saved.get("speech") or []
     if not speech:
-        await message.answer("Сначала пришли текст: 🎬 Видео → «🎙 Диктор».")
+        await message.answer("Сначала пришли текст: ▶️ YouTube и видео → 🛠 Инструменты → «🎙 Диктор».")
         return
     status = await message.answer("🎙 Озвучиваю твоим голосом" + (" (жду, пока соберётся другой ролик)…"
                                                                    if shorts_lock.locked() else "…"))
@@ -12859,6 +12854,9 @@ async def lore_generate(message: Message, state: FSMContext) -> None:
     if data.get("lore_kind") == "news":
         await news_generate(message, state)
         return
+    if data.get("lore_kind") == "own":
+        await own_generate(message, state)
+        return
     wait = await message.answer("✍️ Читаю Википедию и пишу сценарий, обычно до минуты…")
     try:
         script = await shorts_lore.write_script(data["lore_name"], data.get("lore_hook") or "", GEMINI_API_KEY)
@@ -12942,6 +12940,55 @@ async def lore_command(message: Message, state: FSMContext) -> None:
         await lore_ask_name(message, state)
 
 
+@router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
+async def own_script_text(message: Message, state: FSMContext) -> None:
+    """«🎬 Свой сценарий»: текст или файл .md/.txt; несколько сценариев в файле — кнопки выбора."""
+    text = message.text or ""
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith((".md", ".txt")) or (message.document.file_size or 0) > 1024 * 1024:
+            await message.answer("Нужен файл .md или .txt до 1 МБ — или вставь сценарий сообщением.")
+            return
+        buf = io.BytesIO()
+        await message.bot.download(message.document.file_id, destination=buf)
+        text = buf.getvalue().decode("utf-8", "ignore")
+    scripts = shorts_lore.split_scripts(text)
+    if not any(len(shorts_lore.parse_script(body)["lines"]) >= 2 for _, body in scripts):
+        await message.answer("Не нашёл фраз. Пришли таблицей «Время | Голос | На экране» или фразу на строку.")
+        return
+    await state.set_state(None)
+    await state.update_data(own_scripts=scripts[:10], own_pick=0, lore_kind="own", lore_name="Свой сценарий",
+                            lore_hook="", lore_script=None, lore_media=[])
+    if len(scripts) == 1:
+        await own_generate(message, state)
+        return
+    await message.answer("В файле несколько сценариев — какой собрать?", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[_btn(f"🎬 {head[:50]}", f"lo:ownpick:{k}")] for k, (head, _) in enumerate(scripts[:10])]))
+
+
+async def own_generate(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    scripts = data.get("own_scripts") or []
+    k = int(data.get("own_pick") or 0)
+    if not 0 <= k < len(scripts):
+        await message.answer("Сценарий потерялся — пришли заново: «🎬 Свой сценарий».")
+        return
+    head, body = scripts[k]
+    wait = await message.answer(f"🎬 «{escape(head)}»: подбираю кадры к фильмам из сценария…")
+    try:
+        script = await shorts_lore.write_own(body, TMDB_API_KEY, head)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Own script failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>")
+        return
+    await wait.delete()
+    await state.update_data(lore_name=script["name"], lore_script=script)
+    await show_lore(message, state)
+    if len(script.get("images") or []) + len(script.get("fixed") or []) < len(script["lines"]):
+        await message.answer(f"🖼 Кадров нашлось меньше, чем фраз ({len(script.get('images') or [])}) — добавь свои "
+                             "кнопкой «📎 Добавить свои картинки», иначе картинки будут повторяться.")
+
+
 @router.message(LoreState.news, F.text, ~F.text.startswith("/"))
 async def news_text(message: Message, state: FSMContext) -> None:
     text = message.text or ""
@@ -13016,6 +13063,25 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action == "news":
         await news_ask_text(message, state)
+        return
+    if action == "own":
+        await state.clear()
+        await state.set_state(LoreState.own)
+        await message.answer(
+            "🎬 <b>Свой сценарий</b>\n\nПришли готовый сценарий шортса сообщением или файлом .md / .txt — "
+            "таблицей «Время | Голос | На экране» или просто фраза на строку. Голосом прочитаю фразы как есть, "
+            "ничего не переписывая; кадры подберу к фильмам и сериалам, названным в «ёлочках». Если в файле "
+            "несколько сценариев — дам выбрать. Дальше можно поправить текст и добавить свои картинки.\n\n"
+            "<i>Передумал — /cancel</i>")
+        return
+    if action.startswith("ownpick:") and action[8:].isdigit():
+        scripts = data.get("own_scripts") or []
+        k = int(action[8:])
+        if not 0 <= k < len(scripts):
+            await message.answer("Список устарел — пришли сценарий заново: «🎬 Свой сценарий».")
+            return
+        await state.update_data(own_pick=k)
+        await own_generate(message, state)
         return
     if action == "cancel":
         await state.clear()
@@ -13943,6 +14009,11 @@ async def yt_trailer_buttons(callback: CallbackQuery) -> None:
         return
     _, kind, arg = ((callback.data or "") + "::").split(":")[:3]
     message = callback.message
+    if kind == "list":
+        await callback.answer()
+        wait = await message.answer("🎬 Смотрю свежие трейлеры на каналах студий…")
+        await wait.edit_text(await trailers_overview(), disable_web_page_preview=True)
+        return
     if kind in ("off", "on"):
         await set_shorts_setting("yt_trailers", None if kind == "on" else "off")
         await callback.answer("Готово")
@@ -14008,19 +14079,24 @@ async def trailers_command(message: Message) -> None:
         await set_shorts_setting("yt_channels", json.dumps(mine, ensure_ascii=False))
         await message.answer(f"✅ Канал «{escape(name)}» убран.")
         return
-    on = await shorts_setting("yt_trailers") != "off"
     wait = await message.answer("🎬 Смотрю свежие трейлеры на каналах студий…")
+    await wait.edit_text(await trailers_overview(), disable_web_page_preview=True)
+
+
+async def trailers_overview() -> str:
+    """Свежие трейлеры с YouTube-каналов студий и как управлять уведомлениями (/trailers и кнопка в меню)."""
+    mine = await _json_setting("yt_channels", {})
+    on = await shorts_setting("yt_trailers") != "off"
     found = await shorts_yttrailers.latest(hours=72, extra=mine)
     rows = [f"• {escape(v['studio'])}: <a href=\"{v['url']}\">{escape(v['title'][:80])}</a>" for v in found[:15]]
-    await wait.edit_text(
+    return (
         f"🎬 <b>Трейлеры с YouTube-каналов студий</b> — {'включены ✅' if on else 'выключены ❌'} (проверка раз в "
         f"30 минут, с 8 до 23).\nКаналы: {escape(', '.join(shorts_yttrailers.STUDIOS))}."
         + (f"\nТвои каналы: {escape(', '.join(mine))}." if mine else "") + "\n\nЗа 3 дня:\n"
         + ("\n".join(rows) if rows else "новых трейлеров нет")
         + "\n\n<code>/trailers add ссылка на канал</code> — добавить свой канал (трейлеры любой студии)\n"
           "<code>/trailers del Название</code> — убрать свой канал\n"
-          "<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать",
-        disable_web_page_preview=True)
+          "<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать")
 
 
 async def rt_watch(bot: Bot) -> None:
@@ -14495,7 +14571,7 @@ async def weekly_video_job(bot: Bot) -> None:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
                                                  "</code>\n" + ("Попробую ещё раз через 30 минут. " if retry else "")
-                                       + "Собрать вручную — 🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
+                                       + "Собрать вручную — ▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
 
