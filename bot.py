@@ -58,6 +58,7 @@ from shorts import postcard as shorts_postcard
 from shorts import clips as shorts_clips
 from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
+from shorts import netsafe
 from shorts import news as shorts_news
 from shorts import fastnews as shorts_fast
 from shorts import rt as shorts_rt
@@ -9250,6 +9251,8 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
     """Своя подборка из любого текста или из картинок автора: ИИ вытаскивает тему, фильмы и фразы для озвучки,
     бот находит фильмы на Кинопоиске (не нашёл — ищет настоящее название в интернете) и сразу собирает ролик."""
     await load_fact_channels()
+    if images is None:  # пересланный пост: постер со списком фильмов пришёл фото, а текст — подписью
+        images = await _state_photos(message, state) or None
     wait = await message.answer(("🤖 ИИ узнаёт фильмы на картинках" if images else "🤖 ИИ разбирает текст")
                                 + " и ищет о них всё: Кинопоиск, интернет, Telegram-каналы. Обычно 1–2 минуты…")
     try:
@@ -9446,17 +9449,8 @@ PHOTOS_WAIT = 15  # сек: успеть дослать фото или текс
 
 async def custom_from_photos(message: Message, state: FSMContext) -> None:
     """Своя подборка без текста: ИИ узнаёт фильмы на присланных фото; сами фото идут в ролик."""
-    media = (await state.get_data()).get("cs_media") or []
     await state.set_state(None)  # сразу: кнопка и автозапуск не должны собрать ролик дважды
-    images: list[Image.Image] = []
-    for item in media:
-        if item["ext"] == ".mp4":
-            continue
-        try:
-            buf = await message.bot.download(item["file_id"], destination=io.BytesIO())
-            images.append(Image.open(buf).convert("RGB"))
-        except Exception:
-            logging.exception("Custom: photo download failed")
+    images = await _state_photos(message, state)
     if not images:
         await state.set_state(CustomState.text)
         await message.answer("Не вижу фото — пришли картинки или вставь текст подборки.")
@@ -9469,7 +9463,52 @@ async def custom_text(message: Message, state: FSMContext) -> None:
     await custom_text_go(message, state, _typed(message))
 
 
+async def _web_images(urls: list[str], limit: int = 10) -> list[Image.Image]:
+    """Картинки поста по ссылкам (до 15 МБ каждая); битые пропускаем."""
+    out: list[Image.Image] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for url in urls[:limit]:
+            try:
+                raw = await netsafe.fetch(session, url, 15 * 1024 * 1024)
+                out.append(Image.open(io.BytesIO(raw)).convert("RGB"))
+            except Exception as exc:  # noqa: BLE001
+                logging.info("Custom: post image %s skipped: %s", url[:80], exc)
+    return out
+
+
+async def _state_photos(message: Message, state: FSMContext) -> list[Image.Image]:
+    """Фото, присланные в «Своей подборке» (пересланный пост с постером, альбом)."""
+    images: list[Image.Image] = []
+    for item in (await state.get_data()).get("cs_media") or []:
+        if item["ext"] == ".mp4":
+            continue
+        try:
+            buf = await message.bot.download(item["file_id"], destination=io.BytesIO())
+            images.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("Custom: photo download failed")
+    return images
+
+
 async def custom_text_go(message: Message, state: FSMContext, text: str) -> None:
+    link = shorts_linkfetch.TG_POST.search(text)
+    if link and len(text.strip()) - len(link.group(0)) < 40 and shorts_ai.available(GEMINI_API_KEY):
+        # ссылка на пост Telegram: берём его текст и картинки (список фильмов часто только на постере)
+        await state.set_state(None)
+        wait = await message.answer("🔗 Открываю пост…")
+        try:
+            post = await shorts_linkfetch.fetch(link.group(0))
+        except Exception as exc:  # noqa: BLE001
+            await state.set_state(CustomState.text)
+            await wait.edit_text(f"❌ Пост не открылся: <code>{escape(_safe_err(exc)[:300])}</code>\n"
+                                 "Перешли сам пост боту или пришли скриншот.")
+            return
+        urls = [m["image"] for m in post.get("media") or [] if m.get("image")] or (
+            [post["image"]] if post.get("image") else [])
+        images = await _web_images(urls)
+        await wait.delete()
+        await custom_from_post(message, state, post.get("text") or "", images or None)
+        return
     if _free_text(text) and shorts_ai.available(GEMINI_API_KEY):
         await state.set_state(None)
         await custom_from_post(message, state, text)
@@ -12309,22 +12348,35 @@ async def make_digest_post(bot: Bot, chat_id: int, topic: str) -> None:
                      what=f"Сводка готова: {len(posts)} постов из {len(used)} каналов")
 
 
-async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str]) -> None:
-    """«🔗 Подборка по ссылке или тексту»: фильмы ровно из источника автора → пост-подборка с карточками."""
+async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
+                              photos: list[Image.Image] | None = None) -> None:
+    """«🔗 Подборка по ссылке или тексту»: фильмы ровно из источника автора → пост-подборка с карточками.
+    Список часто только на постере — картинки поста (и присланные фото) тоже показываем ИИ."""
     texts = []
+    image_urls: list[str] = []
     for url in urls:
         try:
             src = await shorts_linkfetch.fetch(url)
             texts.append(f"{src['title']}\n{src['text']}")
+            image_urls += [m["image"] for m in src.get("media") or [] if m.get("image")] or (
+                [src["image"]] if src.get("image") else [])
         except Exception as exc:  # noqa: BLE001
             logging.info("List link %s failed: %s", url, exc)
     rest = URL_RE.sub("", raw).strip()
     if rest:
         texts.append(rest)
     material = "\n\n".join(t for t in texts if t.strip())
-    if len(material) < 20:
+    images = list(photos or []) + await _web_images(list(dict.fromkeys(image_urls)), 8)
+    if len(material) < 20 and not images:
         raise RuntimeError("не получилось прочитать ссылку — вставь список фильмов текстом")
-    plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
+    try:
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
+    except shorts_ai.AIError:
+        if not images:
+            raise
+        plan = None  # в тексте фильмов нет — читаем постеры
+    if images and (plan is None or len(plan.get("films") or []) < 3):
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, 10, images[:8])
     films = plan.get("films") or []
     if len(films) < 2:
         raise RuntimeError("в источнике не нашлось списка фильмов")
@@ -12355,10 +12407,17 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str])
 async def post_list_link(message: Message, state: FSMContext) -> None:
     await state.clear()
     raw = message.text or message.caption or ""
+    photos: list[Image.Image] = []
+    if message.photo:  # пересланный пост с постером или скриншот списка
+        try:
+            buf = await message.bot.download(message.photo[-1].file_id, destination=io.BytesIO())
+            photos.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("List link: photo download failed")
     urls = list(dict.fromkeys(
         [u.rstrip(").,»\"'") for u in URL_RE.findall(raw)]
         + [e.url for e in (message.entities or message.caption_entities or []) if e.type == "text_link" and e.url]))[:3]
-    if not urls and len(raw) < 20:
+    if not urls and len(raw) < 20 and not photos:
         await message.answer("Не вижу ни ссылки, ни списка. Нажми «🔗 Подборка по ссылке» и пришли ещё раз.")
         return
     if post_lock.locked():
@@ -12370,7 +12429,7 @@ async def post_list_link(message: Message, state: FSMContext) -> None:
     async def job() -> None:
         try:
             async with post_lock:
-                await make_link_list_post(message.bot, chat_id, raw, urls)
+                await make_link_list_post(message.bot, chat_id, raw, urls, photos)
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("List-by-link post failed")
@@ -12566,6 +12625,13 @@ async def post_from_link(message: Message, state: FSMContext) -> None:
     """«🔗 Пост по ссылке»: ссылки (сайты, посты каналов), пересланный пост или текст → пост в стиле канала."""
     await state.clear()
     raw = message.text or message.caption or ""
+    photos: list[Image.Image] = []
+    if message.photo:  # пересланный пост с постером или скриншот списка
+        try:
+            buf = await message.bot.download(message.photo[-1].file_id, destination=io.BytesIO())
+            photos.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("List link: photo download failed")
     urls = list(dict.fromkeys(
         [u.rstrip(").,»\"'") for u in URL_RE.findall(raw)]
         + [e.url for e in (message.entities or message.caption_entities or []) if e.type == "text_link" and e.url]))[:5]
