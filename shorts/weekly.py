@@ -756,7 +756,7 @@ def build_seo(script: dict[str, Any], chapters: list[tuple[float, str]], date_la
     lines = [script.get("description") or f"Главные новости кино ({date_label}).", "",
              "⏱ Таймкоды:"] + [f"{_clock(t)} {name}" for t, name in chapters]
     lines += ["", "Какая новость удивила вас больше всего? Пишите в комментариях 👇", "",
-              f"📢 Telegram: {daily.TELEGRAM_URL}", f"▶️ YouTube: {daily.YOUTUBE_URL}", "",
+              f"📢 Telegram: {daily.TELEGRAM_URL}", "",
               "#новостикино #кино #сериалы #kinomir360"]
     tags = script.get("tags") or ""
     base = "новости кино, кино новости, новости кино 2026, киноновости, фильмы, сериалы, KinoMir360"

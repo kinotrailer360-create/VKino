@@ -6954,7 +6954,7 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     ):
         await bot.send_message(
             chat_id,
-            f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>",
+            f"<b>{label}:</b>\n<pre>{escape(shorts_yt.no_links(seo[key]) if key == 'description' else seo[key])}</pre>",
         )
     await bot.send_message(
         chat_id,
@@ -9701,8 +9701,9 @@ def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboar
     rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
             [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")],
             [_btn("🖼 Заменить или добавить фото/видео", f"pt:m:{first}")]]
-    if yt:  # шортс — загрузка на YouTube одной кнопкой
-        rows.insert(1, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
+    if yt:  # шортс: YouTube — первой кнопкой, а публикация в канал подписана явно, чтобы не перепутать
+        rows[0] = [_btn(f"✈️ Только в Telegram-канал {POST_CHANNEL}", f"pt:p:{first}")]
+        rows.insert(0, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
     if more:
         rows.append([_btn("🔄 Ещё такой же", more), _btn("📝 Другие посты", "pt:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -12908,17 +12909,20 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             music = await custom_music(bot, work)
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "история персонажа"}))
             files: list[Path] = []
+            pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
                     await bot.download(item["file_id"], destination=path)
+                    if item.get("line"):
+                        pins[len(files)] = int(item["line"])
                     files.append(path)
                 except Exception:
                     logging.exception("Lore: user file download failed")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             result = await asyncio.wait_for(shorts_lore.make_lore(
-                work, data["lore_script"], music, files, GEMINI_API_KEY), timeout=LORE_TIMEOUT)
+                work, data["lore_script"], music, files, GEMINI_API_KEY, pins), timeout=LORE_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
@@ -13047,9 +13051,15 @@ async def lore_media(message: Message, state: FSMContext) -> None:
         if len(media) >= LORE_MEDIA_MAX:
             await message.answer(f"Хватит: уже {LORE_MEDIA_MAX} картинок. Нажми «✅ Готово».")
             return
-        media.append({"file_id": file.file_id, "ext": ext})
+        # подпись-число под картинкой — номер фразы: «4» — картинка встанет именно к фразе 4
+        num = re.fullmatch(r"\s*№?\s*(\d{1,2})\s*", message.caption or "")
+        item = {"file_id": file.file_id, "ext": ext}
+        if num:
+            item["line"] = int(num.group(1))
+        media.append(item)
         await state.update_data(lore_media=media)
-    await message.answer(f"📎 Принято: {len(media)}", reply_markup=InlineKeyboardMarkup(
+    note = f" — к фразе {item['line']}" if item.get("line") else ""
+    await message.answer(f"📎 Принято: {len(media)}{note}", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[_btn("✅ Готово", "lo:media_done")]]))
 
 
@@ -13106,8 +13116,9 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(LoreState.media)
         await message.answer(
             "📎 Присылай картинки — страницы комиксов, кадры, арты, по одной или альбомом (до 24). "
-            "ИИ поставит каждую к подходящей фразе, камера проедет по странице сверху вниз. "
-            "Файлы до 20 МБ.",
+            "ИИ поставит каждую к подходящей фразе, камера проедет по странице сверху вниз.\n\n"
+            "📌 Чтобы картинка встала к определённой фразе, подпиши под ней номер фразы цифрой "
+            "(например <b>4</b>). Файлы до 20 МБ.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "lo:media_done")], [_btn("🗑 Убрать все мои картинки", "lo:media_clear")]]))
     elif action in ("media_done", "media_clear"):

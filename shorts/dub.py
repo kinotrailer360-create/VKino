@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ai, daily, lumean, pronounce
-from .daily import TELEGRAM_URL, YOUTUBE_URL, _duration, _progress, _run
+from .daily import TELEGRAM_URL, _duration, _progress, _run
 
 log = logging.getLogger("shorts")
 
@@ -324,7 +324,6 @@ def build_dub_seo(title: str, source_url: str, voices: dict[str, dict[str, str]]
     if source_url:
         lines += [f"Оригинал: {source_url}", ""]
     lines += ["Как вам перевод? Пишите в комментариях 👇", "",
-              f"📺 YouTube: {YOUTUBE_URL}",
               f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
               "#трейлер #трейлернарусском #переводтрейлера #кино #KinoMir360"]
     tags = [t for t in [f"{name.lower()} трейлер", f"{name.lower()} трейлер на русском", name.lower(),
