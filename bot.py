@@ -10141,6 +10141,26 @@ def _repeats(words: set[str], stories: list[dict[str, Any]], english: bool = Fal
     return False
 
 
+DIGEST_MARKERS = ("дайджест", "главные новости", "главное за", "за сегодня", "за неделю", "за день",
+                  "другие новости", "также стало известно", "коротко о", "новости дня", "что нового",
+                  "итоги недели", "подборка новостей", "news roundup", "in case you missed", "this week in")
+
+
+def _is_digest(text: str) -> bool:
+    """Сборный пост канала: несколько новостей и одна общая картинка — она почти всегда от другой новости
+    (к посту о «I Play Rocky» пришёл постер «Мстителей» из такого дайджеста). Признаки: слова «дайджест»,
+    «главное за неделю»; 3+ пункта списка; 5+ разных названий в «ёлочках»."""
+    low = (text or "").lower()
+    if any(m in low for m in DIGEST_MARKERS):
+        return True
+    items = re.findall(r"(?m)^\s*(?:\d{1,2}[.)]|[•▪️➖➡️🔹🔸◾️—–-])\s*\S", text or "")
+    if len(items) >= 3:
+        return True
+    titles = {t.strip().lower() for t in re.findall(r"«([^«»]{2,60})»", text or "")
+              if not re.match(r"(?i)оскар|золот|эмми|сезар|ник[аи]\b", t.strip())}  # премии — не новости
+    return len(titles) >= 5
+
+
 def _title_words(text: str) -> str:
     """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
     return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
@@ -10239,6 +10259,11 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             return len(hits) >= 2 and bool(_shared(names_ru | names_en, words))
 
         same = [p for p in same if related(p)]
+        # фото и видео сборных постов (дайджестов) не берём: их картинка обычно от другой новости
+        digests = [p for p in same if _is_digest(p.get("text") or "")]
+        if digests:
+            logging.info("Tg post: %d digest source(s) skipped for media", len(digests))
+            same = [p for p in same if p not in digests]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -10262,7 +10287,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                     # пост именно об этой новости: фильм назван в начале поста и есть общее имя с новостью —
                     # иначе брали видео из подборки, где фильм лишь упомянут (к посту об «Обсессии» Карри
                     # Баркера пришёл ролик «From director Zack Snyder»)
-                    found = [p for p in found if related(p) and any(
+                    found = [p for p in found if related(p) and not _is_digest(p["text"]) and any(
                         _mentions_title(n, _title_words(p["text"][:250])) for n in names)] if names else []
                     with_media = [p for p in found if p.get("video") or p.get("image")]
                 except Exception as exc:  # noqa: BLE001
