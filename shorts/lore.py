@@ -289,7 +289,8 @@ async def _trailer_url(film: dict[str, Any]) -> str | None:
 
 
 async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], durs: list[float], skip: set[int],
-                         gemini_key: str) -> tuple[dict[int, tuple[str, float]], str]:
+                         gemini_key: str, repeats: set[int] | None = None,
+                         stills_out: dict[int, str] | None = None) -> tuple[dict[int, tuple[str, float]], str]:
     """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
     фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото). Отрезки уже
     1080×1920 без звука. ({фраза: (файл, длина)}, пояснение автору)."""
@@ -337,6 +338,21 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
                 log.info("shorts: trailer cut %s failed: %s", i, err.decode(errors="ignore")[-200:])
                 continue
             out[i] = (name, length)
+        # фразы, где фото повторилось бы (кадров у фильма мало), — стоп-кадр из ещё не взятого момента трейлера
+        if stills_out is not None:
+            spare = [c for c in range(len(frames)) if c not in used]
+            for i in sorted((repeats or set()) - set(out)):
+                if not spare:
+                    break
+                c = spare.pop(len(spare) // 2)
+                name = f"tstill{i}.jpg"
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-v", "error", "-y", "-ss", f"{frames[c][0]:.2f}", "-i", str(src), "-frames:v", "1",
+                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920", "-q:v", "3",
+                    str(work / name), stderr=asyncio.subprocess.PIPE)
+                await proc.communicate()
+                if proc.returncode == 0 and (work / name).exists():
+                    stills_out[i] = name
         return out, "" if out else "🎞 Трейлер скачался, но отрезки не вырезались — в ролике кадры."
     except Exception as exc:  # noqa: BLE001 — без трейлера ролик всё равно собирается из кадров
         log.warning("shorts: own script trailer failed: %s", exc)
@@ -491,10 +507,25 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         # отрезки трейлера под фразы: кроме фраз со своими картинками автора и с карточкой оценки
         skip = {line - 1 for line in (user_pins or {}).values()} | ({int(score["line"])} if score else set())
         await _progress(44, "Трейлер: подбираю отрезки")
-        got, note = await _trailer_clips(work, tfilm, lines, durs, skip, gemini_key)
+        seen: set[str] = set()
+        repeats: set[int] = set()
+        for i, sl in enumerate(slides):  # фото, которое уже было выше по ролику, — повтор
+            if sl["image"] in seen and i not in skip:
+                repeats.add(i)
+            seen.add(sl["image"])
+        score_line = int(score["line"]) if score else -1
+        if score_line >= 0 and durs[score_line] > 6:
+            repeats.add(score_line)  # длинная финальная фраза: после карточки оценки — ещё кадр фильма
+        stills: dict[int, str] = {}
+        got, note = await _trailer_clips(work, tfilm, lines, durs, skip, gemini_key, repeats, stills)
         if note:
             clip_notes.append(note)
         extra = []
+        for i, name in stills.items():
+            if i == score_line:  # карточка оценки — первые 4 с фразы, дальше кадр фильма
+                extra.append({"start": round(starts[i] + 4.0, 3), "image": name})
+            else:
+                slides[i]["image"] = name
         for i, (name, length) in got.items():
             image = slides[i]["image"]
             slides[i] = {"start": starts[i], "clip": name}
@@ -504,7 +535,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     labels: list[dict[str, Any]] = []
     if news and gemini_key and script.get("kind_own"):
         texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
-        labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts) if t]
+        labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts)
+                  if t and not (score and i == int(score["line"]))]  # на карточке оценки надпись уже есть
 
     cfg = {
         "output": "short.mp4",
@@ -517,6 +549,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "slides": slides,
         "labels": labels,
         "outro_image": pool[order[0]][0],
+        # свой сценарий: короткая концовка — долгий статичный финал роняет досмотр шортса
+        "outro_len": 2.0 if script.get("kind_own") else 3.5,
         "words": words,
         "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
         "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
@@ -764,13 +798,16 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
         if not urls:
             missing.append(said.get(film, film))
             continue
-        images += urls[1:]
+        # кадры упомянутых мимоходом фильмов («режиссёр «Варвара»») — только к их фразе, а не по всему ролику
+        main_like = not years or said.get(film, film).lower() in years
+        if main_like:
+            images += urls[1:]
         key = said.get(film, film).lower()
         line = next((i for i, (ln, sc) in enumerate(zip(lines, parsed["screens"] + [""] * len(lines)))
                      if key in (ln + " " + sc).lower()), None)
         if line is not None and all(f["line"] != line + 1 for f in fixed):
             fixed.append({"line": line + 1, "keys": [key], "url": urls[0], "mode": "photo", "who": film})
-        else:
+        elif main_like:
             images.insert(0, urls[0])
     # год после названия нужен только для поиска фильма — вслух и в субтитрах его нет:
     # «Обители зла» (2026) → «Обители зла»
@@ -781,7 +818,15 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
     main = next((metas[f] for f in films if metas.get(f) and said.get(f, f).lower() in years), None) or next(
         (metas[f] for f in films if metas.get(f)), None)
     trailer_film = {**main, "names": [n for n in films if metas.get(n) is main]} if main else None
+    score = review_score(lines)
+    if main and not parsed["title"]:
+        # название ролика — официальное из базы, а не форма из фразы («Обители зла» → «Обитель зла»)
+        canon = str(main.get("title") or title)
+        year_tag = f" ({main['year']})" if str(main.get("year") or "").isdigit() else ""
+        title = f"«{canon}»{year_tag}" + (f" — рецензия без спойлеров, {score['value']}/10" if score
+                                          else " — что нужно знать")
+    name = str(main.get("title")) if main and main.get("title") else title
     return {"kind": "news", "kind_own": True, "fixed": fixed, "trailer_film": trailer_film,
-            "score": review_score(lines), "name": title, "en": "", "title": title, "lines": lines,
+            "score": score, "name": name, "en": "", "title": title, "lines": lines,
             "hashtags": [], "films": films, "article": "сценарий автора", "url": "", "missing": missing,
             "images": list(dict.fromkeys(images))[:MAX_IMAGES]}
