@@ -9967,22 +9967,7 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
         return keep
     # непроверенная картинка часто из сборного поста канала (к новости о «I Play Rocky» пришёл постер
     # «Мстителей» соседней новости) — надёжнее постер или портрет из базы по названию
-    urls: list[str] = []
-    # новость о человеке (смерть, интервью, роль) — его портрет и рядом постер фильма («кто озвучит Дума» —
-    # актёр и «Мстители»); иначе только постер
-    try:
-        if res.get("person_en") or res.get("person"):
-            info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
-            urls += (shorts_daily.tmdb.profile_urls(info) or [])[:1] if info else []
-    except Exception as exc:  # noqa: BLE001
-        logging.info("Tg post: replacement portrait failed: %s", exc)
-    try:
-        if res.get("film_en") or res.get("film"):
-            poster = await shorts_daily.tmdb.poster_by_title(
-                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
-            urls += [poster] if poster else []
-    except Exception as exc:  # noqa: BLE001
-        logging.info("Tg post: replacement poster failed: %s", exc)
+    urls = await _tmdb_media_urls(res)
     if not urls and unsure:
         if notes is not None:
             notes.append("⚠️ ИИ не проверил картинку, замены в базе нет — оставил как есть, проверь глазами")
@@ -9994,6 +9979,26 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
     if not urls:
         return []
     return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
+
+
+async def _tmdb_media_urls(res: dict[str, Any]) -> list[str]:
+    """Картинки из базы фильмов по названию — точно «те»: портрет человека из новости (смерть, интервью,
+    роль) и рядом постер фильма («кто озвучит Дума» — актёр и «Мстители»)."""
+    urls: list[str] = []
+    try:
+        if res.get("person_en") or res.get("person"):
+            info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
+            urls += (shorts_daily.tmdb.profile_urls(info) or [])[:1] if info else []
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: tmdb portrait failed: %s", exc)
+    try:
+        if res.get("film_en") or res.get("film"):
+            poster = await shorts_daily.tmdb.poster_by_title(
+                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += [poster] if poster else []
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: tmdb poster failed: %s", exc)
+    return urls
 
 
 async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
@@ -10161,6 +10166,28 @@ def _is_digest(text: str) -> bool:
     return len(titles) >= 5
 
 
+def _focused(text: str, names: list[str]) -> bool:
+    """Пост целиком об этой новости, а не сборный: наше название в начале поста (первые ~220 знаков), первое
+    название в «ёлочках» — наше, чужих не больше трёх (упоминания вроде «Рокки», «Зелёной книги» допустимы).
+    Только из таких постов берём фото и видео."""
+    if _is_digest(text):
+        return False
+    if not names:
+        return True
+    if not any(_mentions_title(n, _title_words(text[:220])) for n in names):
+        return False
+    quoted = [_title_words(t) for t in re.findall(r"«([^«»\n]{2,60})»", text or "")
+              if t.strip()[:1].isupper() and len(t.split()) <= 6]
+    quoted = [t for t in quoted if t and not re.match(r"оскар|золот|эмми|сезар", t)]
+
+    def ours(t: str) -> bool:
+        return any(_mentions_title(n, t) or _mentions_title(t, n) for n in names)
+
+    if quoted and not ours(quoted[0]):
+        return False  # первым назван другой фильм — пост не о нашей новости («перенесли «Мстителей», а ещё…»)
+    return len({t for t in quoted if not ours(t)}) <= 3
+
+
 def _title_words(text: str) -> str:
     """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
     return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
@@ -10260,9 +10287,10 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
 
         same = [p for p in same if related(p)]
         # фото и видео сборных постов (дайджестов) не берём: их картинка обычно от другой новости
-        digests = [p for p in same if _is_digest(p.get("text") or "")]
+        # и только из постов целиком об этой новости: название в начале, других фильмов не больше одного
+        digests = [p for p in same if not _focused(p.get("text") or "", names)]
         if digests:
-            logging.info("Tg post: %d digest source(s) skipped for media", len(digests))
+            logging.info("Tg post: %d digest/off-topic source(s) skipped for media", len(digests))
             same = [p for p in same if p not in digests]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
@@ -10287,8 +10315,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                     # пост именно об этой новости: фильм назван в начале поста и есть общее имя с новостью —
                     # иначе брали видео из подборки, где фильм лишь упомянут (к посту об «Обсессии» Карри
                     # Баркера пришёл ролик «From director Zack Snyder»)
-                    found = [p for p in found if related(p) and not _is_digest(p["text"]) and any(
-                        _mentions_title(n, _title_words(p["text"][:250])) for n in names)] if names else []
+                    found = [p for p in found if related(p) and _focused(p["text"], names)] if names else []
                     with_media = [p for p in found if p.get("video") or p.get("image")]
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: media search skipped: %s", exc)
@@ -10320,7 +10347,19 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                 files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
                          await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
             checks: list[str] = []
-            files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
+            db_files: list[Path] = []
+            # режим «фото из базы фильмов»: постер/портрет TMDB вместо фото из постов (кроме новостей о трейлере
+            # с самим трейлером); в базе ничего — как обычно, фото из новости с проверкой ИИ
+            if await shorts_setting("post_media") == "db" and not (res["trailer"] and files
+                                                                   and files[0].suffix == ".mp4"):
+                db_urls = await _tmdb_media_urls(res)
+                db_files = await shorts_tgsearch.download_media(
+                    [{"image": u} for u in db_urls], work, limit=2, prefix="db") if db_urls else []
+            if db_files:
+                files = db_files
+                checks.append("режим «фото из базы фильмов»: постер/портрет TMDB")
+            else:
+                files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
             caption = post_caption(res["post"], "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
             for chat_id in chat_ids:
@@ -10370,7 +10409,8 @@ def posts_section(name: str) -> InlineKeyboardMarkup:
                 [_btn("⚡ Инсайды и слухи раньше всех (Reddit, X, Deadline)", "pt:fast")],
                 [_btn("🔗 Пост по ссылке или тексту", "pt:lk")],
                 [_btn("🧩 Сводка по теме из всех каналов", "pt:dg")],
-                [_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")]]
+                [_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")],
+                [_btn("🖼 Откуда брать фото к новостям", "pt:pmode")]]
     elif name == "lists":
         keys = list(LIST_POSTS)
         rows = [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
@@ -12384,6 +12424,22 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 await wait.edit_text(f"❌ Подборка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
 
         _run_job(list_job)
+        return
+    if action in ("pmode", "pmode:live", "pmode:db"):
+        if action != "pmode":
+            await set_shorts_setting("post_media", "db" if action == "pmode:db" else None)
+        db = await shorts_setting("post_media") == "db"
+        await message.answer(
+            "🖼 <b>Фото к новостям</b>\n\n"
+            f"{'⚪️' if db else '🟢'} <b>Из новости</b> — фото и видео из поста-источника (кадры со съёмок, ролики, "
+            "альбомы), если ИИ подтвердил, что они о той же новости; иначе постер из базы фильмов.\n"
+            f"{'🟢' if db else '⚪️'} <b>Из базы фильмов</b> — всегда постер фильма и портрет человека из базы TMDB: "
+            "чужих фото почти не бывает, но меньше живых кадров и видео. Видео трейлера к новости о трейлере "
+            "остаётся.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn(("✅ " if not db else "") + "Из новости", "pt:pmode:live"),
+                 _btn(("✅ " if db else "") + "Из базы фильмов", "pt:pmode:db")],
+                [_btn("⬅️ Назад", "pt:sec:news")]]))
         return
     if action == "auto":
         on = await shorts_setting("posts_auto") != "on"
