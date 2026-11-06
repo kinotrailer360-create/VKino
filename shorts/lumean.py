@@ -279,10 +279,50 @@ async def _run(*cmd: str) -> str:
     return out.decode(errors="ignore") + err.decode(errors="ignore")
 
 
-async def _speech_spans(path: Path, parts: int, pause: float = PAUSE) -> list[tuple[float, float]]:
-    """Отрезки речи: режем по parts-1 самым длинным паузам (наши {{pause}} между фразами)."""
+def _pick_cuts(silences: list[tuple[float, float]], weights: list[float], total: float,
+               pause: float) -> list[tuple[float, float]]:
+    """Какие паузы — наши границы фраз. Не просто самые длинные: у ElevenLabs пауза на тире или точке внутри
+    фразы («Пятый — «Мстители: Финал». Здесь…») бывает не короче нашей, и тогда весь звук съезжает на фразу.
+    Ищем набор пауз, при котором длина каждого куска ближе всего к ожидаемой по длине текста фразы, а пауза
+    короче нашей {{pause}} — штраф."""
+    n, m = len(weights), len(silences)
+    rate = max(total - (n - 1) * pause, total * 0.5) / max(sum(weights), 1.0)
+    want = [w * rate + pause for w in weights]  # от середины паузы до середины следующей
+    mids = [(s + e) / 2 for s, e in silences]
+
+    def penalty(j: int) -> float:
+        dur = silences[j][1] - silences[j][0]
+        return 6 * max(0.0, pause * 0.9 - dur)
+
+    inf = float("inf")
+    cost = [[inf] * m for _ in range(n - 1)]
+    back = [[-1] * m for _ in range(n - 1)]
+    for j in range(m):
+        cost[0][j] = abs(mids[j] - (want[0] - pause / 2)) + penalty(j)
+    for k in range(1, n - 1):
+        for j in range(k, m):
+            best, arg = inf, -1
+            for i in range(k - 1, j):
+                c = cost[k - 1][i]
+                if c < inf:
+                    c += abs(mids[j] - mids[i] - want[k])
+                    if c < best:
+                        best, arg = c, i
+            if arg >= 0:
+                cost[k][j], back[k][j] = best + penalty(j), arg
+    last = n - 2
+    end = min(range(last, m), key=lambda j: cost[last][j] + abs(total - mids[j] - (want[-1] - pause / 2)))
+    picked = [end]
+    for k in range(last, 0, -1):
+        picked.append(back[k][picked[-1]])
+    return [silences[j] for j in reversed(picked)]
+
+
+async def _speech_spans(path: Path, parts: int, pause: float = PAUSE,
+                        weights: list[float] | None = None) -> list[tuple[float, float]]:
+    """Отрезки речи: режем по parts-1 паузам (наши {{pause}} между фразами), сверяясь с длиной фраз."""
     log_text = await _run("ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
-                          "-af", f"silencedetect=noise=-38dB:d={pause * 0.6:.2f}", "-f", "null", "-")
+                          "-af", f"silencedetect=noise=-38dB:d={min(pause * 0.6, 0.25):.2f}", "-f", "null", "-")
     starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", log_text)]
     ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", log_text)]
     total = float((await _run("ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -290,7 +330,10 @@ async def _speech_spans(path: Path, parts: int, pause: float = PAUSE) -> list[tu
     silences = [(s, e) for s, e in zip(starts, ends) if 0.05 < s and e < total - 0.05]  # не края дорожки
     if len(silences) < parts - 1:
         raise LumeanError(f"не удалось разрезать озвучку на фразы ({len(silences)} пауз из {parts - 1})")
-    cuts = sorted(sorted(silences, key=lambda se: se[1] - se[0], reverse=True)[:parts - 1])
+    if weights and len(weights) == parts:
+        cuts = _pick_cuts(silences, weights, total, pause)
+    else:
+        cuts = sorted(sorted(silences, key=lambda se: se[1] - se[0], reverse=True)[:parts - 1])
     bounds = [0.0] + [x for s, e in cuts for x in (s, e)] + [total]
     return [(bounds[2 * i], bounds[2 * i + 1]) for i in range(parts)]
 
@@ -307,7 +350,8 @@ async def synthesize(lines: list[str], parts: list[Path], work: Path, pause: flo
     timeout = aiohttp.ClientTimeout(total=wait + 60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         await _order_audio(session, text, full, wait, service, voice)
-    spans = [(0.0, 0.0)] if len(lines) == 1 else await _speech_spans(full, len(lines), pause)
+    spans = [(0.0, 0.0)] if len(lines) == 1 else await _speech_spans(
+        full, len(lines), pause, [float(len(re.sub(r"\{\{.*?\}\}|[^\w]", "", ln)) or 1) for ln in lines])
     for (start, end), part in zip(spans, parts):
         cut = ["-ss", f"{start:.3f}", "-to", f"{end:.3f}"] if end > start else []
         await _run("ffmpeg", "-v", "error", "-y", "-i", str(full), *cut,
