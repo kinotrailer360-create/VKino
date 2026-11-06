@@ -241,6 +241,7 @@ MAIN_MENU_LABELS = {
     "📔 Кинодневник",
     "👥 Выбрать вдвоём",
     "🎬 Кинодл — угадай фильм",
+    "🔮 Прогноз уикенда",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
     "✉️ Написать админу",
@@ -964,6 +965,22 @@ async def init_db() -> None:
                 solved BOOLEAN NOT NULL DEFAULT FALSE,
                 done BOOLEAN NOT NULL DEFAULT FALSE,
                 PRIMARY KEY (day, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS predict_round (
+                week TEXT PRIMARY KEY,
+                options JSONB NOT NULL,
+                winner INT,
+                winner_title TEXT,
+                settled BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS predict_votes (
+                week TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                choice INT NOT NULL,
+                PRIMARY KEY (week, user_id)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3454,7 +3471,7 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
-            [KeyboardButton(text="🎬 Кинодл — угадай фильм")],
+            [KeyboardButton(text="🎬 Кинодл — угадай фильм"), KeyboardButton(text="🔮 Прогноз уикенда")],
             [KeyboardButton(text="📔 Кинодневник"), KeyboardButton(text="👥 Выбрать вдвоём")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
             [KeyboardButton(text="✉️ Написать админу")],
@@ -4112,6 +4129,7 @@ async def do_search(
             "📔 Кинодневник": "diary_menu",
             "👥 Выбрать вдвоём": "duo_new",
             "🎬 Кинодл — угадай фильм": "kinodl_menu",
+            "🔮 Прогноз уикенда": "predict_menu",
         }
         handler_name = target_handlers.get(query)
         handler = globals().get(handler_name or "")
@@ -15155,6 +15173,18 @@ async def growth_loop(bot: Bot) -> None:
                     and not weekly_busy):
                 await set_shorts_setting("weekly_video_done", today_key)
                 _run_job(lambda: weekly_video_job(bot))
+            # прогноз уикенда: пятница–суббота — открыть (ИИ ищет кандидатов), понедельник после 12:00 — итоги
+            if (now.weekday() in (4, 5) and now.hour >= 11 and await shorts_setting("predict_open_try") != week
+                    and not await db().fetchval("SELECT 1 FROM predict_round WHERE week=$1", week)):
+                if time.time() > float(await shorts_setting("predict_open_retry") or 0):
+                    # ИИ не нашёл кандидатов — следующая попытка через 2 часа; в субботу вечером — сдаёмся
+                    await set_shorts_setting("predict_open_retry", str(time.time() + 2 * 3600))
+                    if now.weekday() == 5 and now.hour >= 18:
+                        await set_shorts_setting("predict_open_try", week)
+                    await predict_open(week)
+            if now.weekday() == 0 and now.hour >= 12:
+                prev = (now - timedelta(days=7)).isocalendar()
+                await predict_settle(bot, f"{prev[0]}-{prev[1]}")
             if (now.weekday() == 0 and now.hour >= 10 and ADMIN_IDS
                     and await shorts_setting("admin_report_done") != week):
                 await set_shorts_setting("admin_report_done", week)
@@ -15242,6 +15272,127 @@ async def quiz_leaders(limit: int = 10) -> list[Any]:
 
 def _who(r: Any) -> str:
     return escape("@" + r["username"] if r["username"] else (r["first_name"] or "зритель"))
+
+
+# --- «🔮 Прогноз уикенда»: кто возглавит прокат; итоги в понедельник по реальным сборам
+
+def _week_key(when: datetime | None = None) -> str:
+    iso = (when or datetime.now(POST_TZ)).isocalendar()
+    return f"{iso[0]}-{iso[1]}"
+
+
+async def predict_open(week: str) -> bool:
+    today = datetime.now(MSK).date()
+    try:
+        films = await shorts_ai.weekend_candidates(
+            GEMINI_API_KEY, f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    except Exception:  # noqa: BLE001
+        logging.exception("Predict: candidates failed")
+        films = []
+    if len(films) < 3:
+        return False
+    await db().execute("INSERT INTO predict_round(week, options) VALUES($1, $2) ON CONFLICT DO NOTHING",
+                       week, json.dumps(films, ensure_ascii=False))
+    return True
+
+
+def _pname(f: dict[str, Any]) -> str:
+    return f.get("ru") or f.get("en") or "?"
+
+
+async def predict_settle(bot: Bot, week: str) -> None:
+    row = await db().fetchrow("SELECT * FROM predict_round WHERE week=$1 AND NOT settled", week)
+    if not row:
+        return
+    if time.time() < float(await shorts_setting("predict_settle_retry") or 0):
+        return
+    await set_shorts_setting("predict_settle_retry", str(time.time() + 3 * 3600))  # ИИ не ответил — через 3 ч
+    options = row["options"] if isinstance(row["options"], list) else json.loads(row["options"])
+    today = datetime.now(MSK).date()
+    res = await shorts_ai.box_office_post(GEMINI_API_KEY,
+                                          f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    if not res or not res["films"]:
+        return
+    top = res["films"][0]
+    winner = next((k for k, f in enumerate(options) if any(
+        shorts_daily.tmdb.similar(a, b) >= 0.7 for a in (f.get("ru"), f.get("en")) if a
+        for b in (top.get("ru"), top.get("en")) if b)), -1)
+    await db().execute("UPDATE predict_round SET settled=TRUE, winner=$2, winner_title=$3 WHERE week=$1",
+                       week, winner, _pname(top))
+    votes = await db().fetch("SELECT user_id, choice FROM predict_votes WHERE week=$1", week)
+    for v in votes:
+        right = int(v["choice"]) == winner
+        text = (f"🔮 Итоги прогноза уикенда: первое место — «{escape(_pname(top))}»"
+                + (f" ({escape(top['gross'])})" if top.get("gross") else "") + ".\n"
+                + ("🎯 Ты угадал! +1 очко в таблице прогнозистов." if right else "Не угадал — в эту пятницу новый шанс!"))
+        try:
+            await bot.send_message(int(v["user_id"]), text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏆 Таблица прогнозистов", callback_data="pv:top")]]))
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.05)
+
+
+@router.message(F.text == "🔮 Прогноз уикенда")
+async def predict_menu(message: Message) -> None:
+    await remember(message)
+    week = _week_key()
+    row = await db().fetchrow("SELECT * FROM predict_round WHERE week=$1", week)
+    top_btn = [InlineKeyboardButton(text="🏆 Таблица прогнозистов", callback_data="pv:top")]
+    if not row:
+        await message.answer("🔮 <b>Прогноз уикенда</b>\n\nКаждую пятницу угадываем, какой фильм заработает "
+                             "больше всех в мировом прокате за выходные. Итоги — в понедельник, за верный прогноз "
+                             "очко в таблице. Новый прогноз откроется в пятницу! 🍿",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[top_btn]))
+        return
+    options = row["options"] if isinstance(row["options"], list) else json.loads(row["options"])
+    mine = await db().fetchval("SELECT choice FROM predict_votes WHERE week=$1 AND user_id=$2", week,
+                               message.from_user.id)
+    if mine is not None or row["settled"] or datetime.now(POST_TZ).weekday() not in (4, 5, 6):
+        text = "🔮 <b>Прогноз уикенда</b>\n\n"
+        if mine is not None:
+            text += f"Твой выбор: «{escape(_pname(options[int(mine)]))}». "
+        text += (f"Победил «{escape(row['winner_title'] or '')}»." if row["settled"]
+                 else "Итоги — в понедельник днём, пришлю сюда.")
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[top_btn]))
+        return
+    await message.answer(
+        "🔮 <b>Прогноз уикенда</b>\n\nКакой фильм заработает больше всех в мировом прокате за эти выходные? "
+        "Итоги в понедельник — за верный ответ очко в таблице 🏆",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎬 {_pname(f)}"[:64], callback_data=f"pv:v:{k}")]
+            for k, f in enumerate(options)] + [top_btn]))
+
+
+@router.callback_query(F.data.startswith("pv:"))
+async def predict_buttons(callback: CallbackQuery) -> None:
+    action = (callback.data or "")[3:]
+    if action == "top":
+        await callback.answer()
+        rows = await db().fetch("""SELECT v.user_id, COUNT(*) pts, MAX(u.username) username, MAX(u.first_name) first_name
+            FROM predict_votes v JOIN predict_round r ON r.week = v.week AND r.settled AND r.winner = v.choice
+            LEFT JOIN users u ON u.user_id = v.user_id GROUP BY v.user_id ORDER BY pts DESC LIMIT 10""")
+        medals = ["🥇", "🥈", "🥉"] + [f"{k}." for k in range(4, 11)]
+        text = ("🏆 <b>Лучшие прогнозисты</b>\n\n" + "\n".join(f"{medals[k]} {_who(r)} — {r['pts']}"
+                                                              for k, r in enumerate(rows))) if rows else \
+            "🏆 Таблица пока пустая — первые итоги в понедельник."
+        if callback.message:
+            await callback.message.answer(text)
+        return
+    if action.startswith("v:") and action[2:].isdigit():
+        week = _week_key()
+        if datetime.now(POST_TZ).weekday() not in (4, 5, 6):
+            await callback.answer("Прогноз уже закрыт — итоги в понедельник", show_alert=True)
+            return
+        await db().execute("""INSERT INTO predict_votes(week, user_id, choice) VALUES($1, $2, $3)
+                              ON CONFLICT(week, user_id) DO UPDATE SET choice=EXCLUDED.choice""",
+                           week, callback.from_user.id, int(action[2:]))
+        await callback.answer("Принято! Итоги в понедельник 🔮")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("✅ Прогноз принят. В понедельник пришлю, кто победил в прокате.")
+        return
+    await callback.answer()
 
 
 # --- «Кинодл»: фильм дня за 6 подсказок, серия побед

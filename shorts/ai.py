@@ -1221,6 +1221,20 @@ async def box_office_post(key: str, today: str) -> dict[str, Any] | None:
     return {"post": post, "films": films[:8]} if post and len(films) >= 3 else None
 
 
+async def weekend_candidates(key: str, today: str) -> list[dict[str, Any]]:
+    """Прогноз уикенда: 4 фильма, которые реально могут возглавить мировой прокат в эти выходные (премьеры
+    недели и лидеры прошлого уикенда) — по свежим данным из Google. [{"ru", "en", "year"}]."""
+    prompt = (f"Сегодня {today}. Найди в Google, какие фильмы идут в кинотеатрах в эти выходные: премьеры этой "
+              "недели и лидеры прошлого уикенда по мировым (или североамериканским) сборам. Выбери 4 фильма, "
+              "которые реально могут занять первое место по сборам за эти выходные (не заведомо слабые). "
+              "Названия — как в российском прокате, если есть, и оригинальные."
+              '\n\nОтветь только JSON: {"films": [{"ru": "название по-русски", "en": "оригинальное", '
+              '"year": 2026}]}')
+    data = await _post_json(key, prompt, need_search=True, verify=False,
+                            query=f"box office weekend preview {today} new releases opening weekend")
+    return _films_from(data or {})[:4]
+
+
 async def week_digest_post(key: str, posts: str, own: str, today: str) -> dict[str, Any] | None:
     """Итоги недели в кино по постам Telegram-каналов за 7 дней (и вышедшему в своём канале).
     {"post", "films": [{"ru", "en", "year"}]} или None."""
