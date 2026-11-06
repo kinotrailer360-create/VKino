@@ -12844,6 +12844,9 @@ async def news_generate(message: Message, state: FSMContext) -> None:
     await wait.delete()
     await state.update_data(lore_name=script["name"], lore_script=script)
     await show_lore(message, state)
+    if script.get("missing"):
+        await message.answer("🔎 Не нашёл на TMDB кадров к: " + ", ".join(f"«{escape(m)}»" for m in script["missing"])
+                             + ". К этим фразам встанут общие кадры — свои добавь кнопкой «📎 Добавить свои картинки».")
     if len(script.get("images") or []) < 6:
         await message.answer(f"🖼 Нашёл только {len(script.get('images') or [])} фото — добавь свои кнопкой "
                              "«📎 Добавить свои картинки», иначе картинки будут повторяться.")

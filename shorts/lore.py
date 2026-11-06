@@ -486,12 +486,22 @@ def _quoted(text: str) -> list[str]:
 async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False) -> list[str]:
     """Кадры фильма или сериала по названию (русскому или оригинальному): самый похожий и популярный.
     tv — в сценарии сказано, что это сериал («второй сезон «Локи»», плашка «сериал»): сериал впереди."""
-    try:
-        films, shows = await asyncio.gather(tmdb.search_movie(tmdb_key, name), tmdb.search_tv(tmdb_key, name),
-                                            return_exceptions=True)
-    except Exception as exc:  # noqa: BLE001
-        log.info("shorts: own script search %s failed: %s", name, exc)
-        return []
+    films: Any = None
+    shows: Any = None
+    for attempt in range(2):  # TMDB изредка отвечает ошибкой на пачку запросов подряд — повторяем один раз
+        if attempt:
+            await asyncio.sleep(1.5)
+        if not isinstance(films, list):
+            films = await asyncio.gather(tmdb.search_movie(tmdb_key, name), return_exceptions=True)
+            films = films[0]
+        if not isinstance(shows, list):
+            shows = await asyncio.gather(tmdb.search_tv(tmdb_key, name), return_exceptions=True)
+            shows = shows[0]
+        if isinstance(films, list) and isinstance(shows, list):
+            break
+    for what, res in (("movie", films), ("tv", shows)):
+        if not isinstance(res, list):
+            log.warning("shorts: own script %s search %r failed: %s", what, name, res)
     cands = [(r, "movie") for r in (films if isinstance(films, list) else [])[:4]] + \
             [(r, "tv") for r in (shows if isinstance(shows, list) else [])[:3]]
 
@@ -543,11 +553,19 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
         return any(low in (ln + " " + sc).lower() and re.search(r"сезон|сериал", (ln + " " + sc).lower())
                    for ln, sc in zip(lines, parsed["screens"] + [""] * len(lines)))
 
-    found = await asyncio.gather(*(_film_backdrops(tmdb_key, f, tv=is_tv(f)) for f in films)) if tmdb_key else []
+    gate = asyncio.Semaphore(3)  # не залпом: по 3 названия одновременно
+
+    async def look(film: str) -> list[str]:
+        async with gate:
+            return await _film_backdrops(tmdb_key, film, tv=is_tv(film))
+
+    found = await asyncio.gather(*(look(f) for f in films)) if tmdb_key else []
     images: list[str] = []
     fixed: list[dict[str, Any]] = []
+    missing: list[str] = []
     for film, urls in zip(films, found):
         if not urls:
+            missing.append(said.get(film, film))
             continue
         images += urls[1:]
         key = said.get(film, film).lower()
@@ -559,5 +577,5 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
             images.insert(0, urls[0])
     title = parsed["title"] or (films[0] if films else lines[0][:60])
     return {"kind": "news", "fixed": fixed, "name": title, "en": "", "title": title, "lines": lines,
-            "hashtags": [], "films": films, "article": "сценарий автора", "url": "",
+            "hashtags": [], "films": films, "article": "сценарий автора", "url": "", "missing": missing,
             "images": list(dict.fromkeys(images))[:MAX_IMAGES]}
