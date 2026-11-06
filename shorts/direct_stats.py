@@ -81,6 +81,12 @@ async def daily_text(subs_now: int | None = None, subs_before: int | None = None
         n = lambda v: f"{v:,.0f}".replace(",", " ")  # noqa: E731
         lines.append(f"<b>{title}:</b> показы {n(imp)} · клики {n(clk)} · CTR {ctr} · "
                      f"расход {_rub(cost)} · клик {cpc}")
+    if len({r["CampaignName"] for r in week_rows}) > 1:  # несколько кампаний — сравнение за 7 дней
+        lines.append("\n<b>По кампаниям за 7 дней:</b>")
+        for r in sorted(week_rows, key=lambda r: _num(r["Cost"]), reverse=True):
+            clk, cost = _num(r["Clicks"]), _num(r["Cost"])
+            cpc = _rub(cost / clk) if clk else "—"
+            lines.append(f"• {escape(r['CampaignName'])}: {clk:.0f} кл. · {_rub(cost)} · клик {cpc}")
     if subs_now is not None:
         lines.append(f"\n👥 Подписчиков: <b>{subs_now}</b>")
         if subs_before is not None:
