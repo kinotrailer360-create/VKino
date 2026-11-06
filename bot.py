@@ -251,6 +251,7 @@ class ShortsState(StatesGroup):
     trailer_query = State()
     feed_url = State()
     music_file = State()
+    music_own = State()
     clone_audio = State()
     fact_channels = State()
     fact_channels_add = State()
@@ -8178,6 +8179,18 @@ async def shorts_panel(
         await show(*await music_library_menu())
     elif data.startswith("sh:mlib:"):
         await music_make_action(message, data[len("sh:mlib:"):])
+    elif data == "sh:mown":
+        await show("➕ <b>Свои треки</b>\n\nК какому настроению добавить? Потом пришли mp3 — можно несколько "
+                   "подряд. Бесплатная музыка: mixkit.co, pixabay.com/music, Фонотека YouTube "
+                   "(в YouTube Studio → «Фонотека»).", music_own_menu())
+    elif data.startswith("sh:mown:") and data[8:] in shorts_music.MOODS:
+        await state.set_state(ShortsState.music_own)
+        await state.update_data(music_mood=data[8:])
+        await message.answer(f"🎵 Пришли трек для «{shorts_music.MOODS[data[8:]][0]}» файлом mp3 (до 20 МБ). "
+                             "Можно несколько подряд.\n\n<i>Передумал — /cancel</i>")
+    elif data == "sh:mownclr":
+        await set_shorts_setting("music_own", None)
+        await message.answer("🗑 Свои треки убраны — снова играют треки Lumean.")
     elif data == "sh:clone":
         await show(*await shorts_clone_menu())
     elif data == "sh:clone_off":
@@ -8344,7 +8357,9 @@ music_lock = asyncio.Lock()
 
 async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
     lib = await music_library()
-    rows = [f"{label}: {len(lib.get(m) or [])} тр." for m, (label, _, _) in shorts_music.MOODS.items()]
+    own = await _music_json("music_own")
+    rows = [f"{label}: {len(lib.get(m) or [])} тр." + (" (свои)" if own.get(m) else "")
+            for m, (label, _, _) in shorts_music.MOODS.items()]
     missing = [m for m in shorts_music.MOODS if not lib.get(m)]
     custom = await shorts_setting("music_file_id")
     text = (
@@ -8353,6 +8368,8 @@ async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
         "комедия — весёлая, новости — бодрая. Трек 30 с плавно склеен до ~2 минут.\n\n"
         + "\n".join(rows)
         + f"\n\n💰 Каждый трек оплачивается в Lumean отдельно (по {MUSIC_VARIANTS} трека на настроение)."
+        + "\n➕ Или добавь свои треки — бесплатные с mixkit.co, pixabay.com/music, Фонотеки YouTube: "
+        "скачай mp3 и пришли боту. Свои играют вместо треков Lumean."
         + ("\n⚠️ Сейчас стоит своя музыка — она важнее библиотеки. Чтобы играла библиотека, нажми "
            "«↩️ Стандартная» в настройках." if custom else "")
     )
@@ -8362,6 +8379,9 @@ async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
     moods = list(shorts_music.MOODS.items())
     for k in range(0, len(moods), 2):
         buttons.append([_btn(f"🔄 {label}", f"sh:mlib:{m}") for m, (label, _, _) in moods[k:k + 2]])
+    buttons.append([_btn("➕ Свои треки (Mixkit и др.)", "sh:mown")])
+    if own:
+        buttons.append([_btn("🗑 Убрать все свои треки", "sh:mownclr")])
     buttons.append([_btn("⬅️ Назад", "sh:settings")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -8432,12 +8452,60 @@ async def music_make_job(message: Message, status: Message, moods: list[str]) ->
 
 
 async def music_library() -> dict[str, list[str]]:
-    """Треки Lumean по настроениям: {настроение: [file_id в Telegram]}."""
+    """Треки по настроениям: {настроение: [file_id в Telegram]}. Свои треки автора (Mixkit и т. п.) важнее
+    треков Lumean: у настроения, куда автор добавил свои, играют только они."""
+    lib, own = await _music_json("music_lib"), await _music_json("music_own")
+    return {m: own.get(m) or lib.get(m) or [] for m in shorts_music.MOODS if own.get(m) or lib.get(m)}
+
+
+async def _music_json(key: str) -> dict[str, list[str]]:
     try:
-        lib = json.loads(await shorts_setting("music_lib") or "{}")
+        lib = json.loads(await shorts_setting(key) or "{}")
     except ValueError:
         return {}
     return {m: [str(f) for f in ids] for m, ids in lib.items() if m in shorts_music.MOODS and isinstance(ids, list)}
+
+
+OWN_TRACKS_MAX = 10  # своих треков на одно настроение
+
+
+def music_own_menu() -> InlineKeyboardMarkup:
+    moods = list(shorts_music.MOODS.items())
+    rows = [[_btn(label, f"sh:mown:{m}") for m, (label, _, _) in moods[k:k + 2]] for k in range(0, len(moods), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows + [[_btn("⬅️ Назад", "sh:mlib")]])
+
+
+@router.message(ShortsState.music_own, F.audio | F.document)
+async def music_own_file(message: Message, state: FSMContext) -> None:
+    """Свой трек в библиотеку настроения (скачанный с Mixkit, Pixabay, YouTube Audio Library…)."""
+    media = message.audio or message.document
+    mood = (await state.get_data()).get("music_mood")
+    if mood not in shorts_music.MOODS:
+        await state.clear()
+        await message.answer("Начни заново: Настройки → «🎼 Музыка под настроение» → «➕ Свои треки».")
+        return
+    name = str(getattr(media, "file_name", "") or "").lower()
+    if message.document and not (str(media.mime_type or "").startswith("audio/") or name.endswith(
+            (".mp3", ".m4a", ".wav", ".ogg", ".aac", ".flac"))):
+        await message.answer("Это не аудио — пришли трек файлом mp3 (или m4a, wav).")
+        return
+    if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("⚠️ Файл больше 20 МБ — бот не может его скачать. Пришли mp3 поменьше.")
+        return
+    async with music_lock:
+        own = await _music_json("music_own")
+        ids = own.get(mood) or []
+        if len(ids) >= OWN_TRACKS_MAX:
+            await message.answer(f"Хватит: у настроения уже {OWN_TRACKS_MAX} своих треков.")
+            return
+        ids.append(media.file_id)
+        own[mood] = ids
+        await set_shorts_setting("music_own", json.dumps(own))
+    label = shorts_music.MOODS[mood][0]
+    await message.answer(
+        f"✅ {label}: своих треков {len(ids)}. Теперь у этого настроения играют только твои треки "
+        "(вперемешку). Пришли ещё или нажми «Готово».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✅ Готово", "sh:mlib")]]))
 
 
 async def sync_music_library(bot: Bot) -> None:
@@ -9896,22 +9964,29 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
         keep.append(path)
     if keep:
         return keep
-    url = None
-    try:  # новость о человеке (смерть, интервью) — его портрет, иначе постер фильма
+    urls: list[str] = []
+    # новость о человеке (смерть, интервью, роль) — его портрет и рядом постер фильма («кто озвучит Дума» —
+    # актёр и «Мстители»); иначе только постер
+    try:
         if res.get("person_en") or res.get("person"):
             info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
-            url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
-        if not url and (res.get("film_en") or res.get("film")):
-            url = await shorts_daily.tmdb.poster_by_title(
-                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += (shorts_daily.tmdb.profile_urls(info) or [])[:1] if info else []
     except Exception as exc:  # noqa: BLE001
-        logging.info("Tg post: replacement image failed: %s", exc)
+        logging.info("Tg post: replacement portrait failed: %s", exc)
+    try:
+        if res.get("film_en") or res.get("film"):
+            poster = await shorts_daily.tmdb.poster_by_title(
+                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += [poster] if poster else []
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: replacement poster failed: %s", exc)
     if notes is not None:
-        notes.append("поставил портрет или постер из базы TMDB" if url else "подходящей картинки нет — пост без "
-                     "фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»")
-    if not url:
+        notes.append({2: "поставил портрет человека и постер фильма из базы TMDB",
+                      1: "поставил портрет или постер из базы TMDB"}.get(len(urls), "подходящей картинки нет — пост "
+                     "без фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»"))
+    if not urls:
         return []
-    return await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix="repl")
+    return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
 
 
 async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
