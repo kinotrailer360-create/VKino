@@ -295,6 +295,55 @@ def theme_for(key: str | None, today: date) -> Theme:
                  [f"лучшие {plural}", plural, "что посмотреть", "подборка фильмов", "топ фильмов"])
 
 
+def _is_russian(doc: dict[str, Any]) -> bool:
+    return any(str(c.get("name") or "") in ("Россия", "СССР") for c in doc.get("countries") or [])
+
+
+async def _foreign_online(fetch: Fetch, since: date, until: date) -> list[dict[str, Any]]:
+    """Зарубежные фильмы и сериалы, вышедшие онлайн за период (по TMDB: цифровые релизы США и свежие серии), —
+    карточками Кинопоиска (русское название, рейтинг, актёры). На Кинопоиске «онлайн-премьеры» — это в основном
+    российские онлайн-кинотеатры, и подборка выходила целиком из российских фильмов."""
+    key = os.getenv("TMDB_API_KEY", "").strip()
+    if not key:
+        return []
+    try:
+        films, shows = await asyncio.gather(tmdb.movies_digital(key, since.isoformat(), until.isoformat(), 10),
+                                            tmdb.tv_aired(key, since.isoformat(), until.isoformat(), 6),
+                                            return_exceptions=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: foreign online failed: %s", exc)
+        return []
+    found: list[dict[str, Any]] = []
+    for item in [*(films if isinstance(films, list) else []), *(shows if isinstance(shows, list) else [])]:
+        name = item.get("original") or item.get("name") or ""
+        year = int(item.get("year") or 0)
+        if not name:
+            continue
+        try:
+            data = await fetch("/movie/search", query=name, page=1, limit=5)
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: KP search %s failed: %s", name, exc)
+            continue
+        for d in data.get("docs") or []:
+            titles = [t for t in (str(d.get(k) or "") for k in ("alternativeName", "enName", "name")) if t]
+            if not d.get("id") or not titles or _is_russian(d):
+                continue
+            if year and abs(int(d.get("year") or 0) - year) > 1:
+                continue
+            if max(tmdb.similar(name, t) for t in titles) >= 0.85:
+                found.append(d)
+                break
+    return found
+
+
+def _mix(foreign: list[dict[str, Any]], local: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Зарубежные и российские через одну — подборка не из одних российских и не из одних голливудских."""
+    out: list[dict[str, Any]] = []
+    for k in range(max(len(foreign), len(local))):
+        out += [x[k] for x in (foreign, local) if k < len(x)]
+    return out
+
+
 async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int]) -> list[dict[str, Any]]:
     common = {"sortField": "votes.kp", "sortType": "-1", "notNullFields": "name"}
     if theme.key == "online":
@@ -303,12 +352,14 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         docs += await _query(fetch, isSeries="true",
                              **{"premiere.world": _range(today - timedelta(days=30), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
+        docs = _mix(await _foreign_online(fetch, today - timedelta(days=30), today), docs)
     elif theme.key == "fresh":  # вышло в цифре (фильмы) или стартовало (сериалы) за последние 10 дней
         docs = await _query(fetch, isSeries="false",
                             **{"premiere.digital": _range(today - timedelta(days=10), today)}, **common)
         docs += await _query(fetch, isSeries="true",
                              **{"premiere.world": _range(today - timedelta(days=10), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
+        docs = _mix(await _foreign_online(fetch, today - timedelta(days=14), today), docs)
     elif theme.key == "cinema":  # год — отсекаем повторный прокат старых фильмов
         docs = await _query(fetch, isSeries="false", year=f"{today.year - 1}-{today.year + 1}",
                             **{"premiere.russia": _range(today - timedelta(days=35), today)}, **common)
