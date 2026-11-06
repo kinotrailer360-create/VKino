@@ -22,6 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
+from . import usage as usage_log
 from . import websearch
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -97,6 +98,8 @@ def _count_lumean(data: Any) -> None:
     task = next((f.function for f in inspect.stack()[1:12] if f.function not in skip
                  and f.filename.endswith(("ai.py", "daily.py", "weekly.py", "bot.py"))), "?")
     lumean_usage["tasks"][task] = lumean_usage["tasks"].get(task, 0) + 1
+    usage_log.record("llm_calls", 1, task)
+    usage_log.record("llm_tokens", int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0))
 
 
 _lumean_model = ""
@@ -301,6 +304,19 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
         raise AIError(f"Gemini не ответил за {budget} с") from None
 
 
+def _until_quota_reset() -> float:
+    """Секунды до сброса дневного лимита бесплатного Gemini (полночь по тихоокеанскому времени): раньше бот
+    каждые 30 минут снова получал отказ и терял время; не больше 24 ч, не меньше паузы QUOTA_PAUSE."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    try:
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:  # noqa: BLE001 — нет базы часовых поясов: как раньше
+        return QUOTA_PAUSE
+    reset = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+    return max(QUOTA_PAUSE, min((reset - now).total_seconds(), 86400))
+
+
 async def _ask_keys(key: str, parts: list[dict[str, Any]], search: bool) -> Any:
     global last_key_no
     keys = gemini_keys(key)
@@ -351,7 +367,7 @@ async def _ask_key(key: str, parts: list[dict[str, Any]], search: bool, wait_min
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
             kind, _ = _quota(status, data)
             if kind:  # лимит этого ключа: на день — пауза 30 мин, в минуту — 1 мин; пробуем другой ключ
-                _quota_until[(key, search)] = time.monotonic() + (QUOTA_PAUSE if kind == "day" else 60)
+                _quota_until[(key, search)] = time.monotonic() + (_until_quota_reset() if kind == "day" else 60)
                 value = _quota_value(data)
                 raise QuotaError(f"лимит {'на день' if kind == 'day' else 'в минуту'} ({model}"
                                  + (f", разрешено {value}" if value else "") + ")")
@@ -955,6 +971,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         '"film": "название фильма или сериала по-русски или пусто", "film_en": "оригинальное название или пусто", '
         '"person": "главный человек новости по-русски или пусто", "person_en": "его имя латиницей или пусто", '
         '"trailer": true или false (true — если новость: вышел трейлер или тизер), '
+        '"status": "official" (объявила студия, сервис или сам человек), "reported" (сообщают Deadline, Variety, '
+        'THR и другие издания со ссылкой на источники) или "rumor" (инсайдер, слух, не подтверждено), '
         '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
     )
     data = await _post_json(key, rules + "\n\nПОСТЫ:\n" + listing)  # Google → сильная модель → фактчекер
@@ -974,7 +992,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
             "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
-            "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true"}
+            "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true",
+            "status": str(data.get("status") or "").strip().lower()}
 
 
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,

@@ -393,8 +393,72 @@ def _latin_word(m: re.Match[str]) -> str:
     return out[:1].upper() + out[1:] if word[:1].isupper() else out
 
 
+_ORD_SUFFIX = {"й": "nom", "ый": "nom", "ой": "nom", "ий": "nom", "го": "gen", "ого": "gen", "его": "gen",
+               "му": "dat", "ому": "dat", "ему": "dat", "м": "prep", "ом": "prep", "ем": "prep", "ым": "ins",
+               "е": "neut", "ое": "neut", "ье": "neut"}
+_UNITS = {"тыс": ("тысяча", "тысячи", "тысяч", "тысячи"), "млн": ("миллион", "миллиона", "миллионов", "миллиона"),
+          "млрд": ("миллиард", "миллиарда", "миллиардов", "миллиарда"),
+          "трлн": ("триллион", "триллиона", "триллионов", "триллиона")}
+_MONEY = {"$": "долларов", "€": "евро", "₽": "рублей", "£": "фунтов"}
+
+
+def _ord_word(n: int, suffix: str) -> str | None:
+    """1-й → «первый», 2-го → «второго», 3-я → «третья», 90-х → «девяностых»."""
+    suffix = suffix.lower()
+    if suffix in _ORD_SUFFIX:
+        return ordinal(n, _ORD_SUFFIX[suffix])
+    base = ordinal(n)
+    stem, end = base[:-2], base[-2:]
+    if suffix in ("я", "ая", "ья"):
+        return stem + ("ья" if end == "ий" else "ая")
+    if suffix in ("ю", "ую", "ью"):
+        return stem + ("ью" if end == "ий" else "ую")
+    if suffix in ("х", "ых", "их"):
+        return stem + ("их" if end == "ий" else "ых")
+    if suffix in ("ми", "ыми"):
+        return stem + ("ими" if end == "ий" else "ыми")
+    return None
+
+
+def numbers(text: str) -> str:
+    """Числа по смыслу, до общего «цифры словами»: порядковые с окончанием («1-й сезон» → «первый сезон»,
+    «в 90-х» → «в девяностых»), сокращения сумм («12 млн» → «двенадцать миллионов», «1,5 млрд» → «полтора
+    миллиарда»), валюта («$75 млн» → «семьдесят пять миллионов долларов»)."""
+    def ord_repl(m: re.Match[str]) -> str:
+        word = _ord_word(int(m.group(1)), m.group(2))
+        return word if word else m.group(0)
+
+    text = re.sub(r"(?<![\d.,])(\d{1,4})-(й|ый|ой|ий|го|ого|его|му|ому|ему|м|ом|ем|ым|е|ое|ье|я|ая|ья|ю|ую|ью|х|ых|их|"
+                  r"ми|ыми)(?![А-Яа-яЁё])", ord_repl, text)
+    # валюта перед числом: «$75 млн» → «75 млн $» (знак уйдёт в слово после единицы)
+    text = re.sub(r"([$€₽£])\s?(\d[\d  ]*(?:[.,]\d+)?)(\s?(?:тыс|млн|млрд|трлн)\.?)?",
+                  lambda m: f"{m.group(2)}{m.group(3) or ''} {_MONEY[m.group(1)]}", text)
+
+    def unit_repl(m: re.Match[str]) -> str:
+        whole, frac, unit = m.group(1).replace(" ", "").replace(" ", ""), m.group(2), m.group(3).lower()
+        one, few, many, gen = _UNITS[unit]
+        n = int(whole)
+        fem = unit == "тыс"
+        if frac:
+            if frac in ("5", "50"):
+                half = ("полторы" if fem else "полтора") if n == 1 else f"{number_words(n)} с половиной"
+                if n == 2 and fem:
+                    half = "две с половиной"
+                return f"{half} {gen if n == 1 else (few if n in (2, 3, 4) else many)}" if n != 1 else f"{half} {gen}"
+            return f"{number_words(n)} целых {number_words(int(frac))} десятых {gen}" if len(frac) == 1 else \
+                f"{number_words(n)} целых {number_words(int(frac))} сотых {gen}"
+        words = number_words(n)
+        if fem:
+            words = re.sub(r"\bодин$", "одна", re.sub(r"\bдва$", "две", words))
+        return f"{words} {plural(n, one, few, many)}"
+
+    return re.sub(r"(?<![\d.,])(\d{1,3}(?:[  ]\d{3})*|\d+)(?:[.,](\d{1,2}))?\s?(тыс|млн|млрд|трлн)\.?(?![А-Яа-яЁё])",
+                  unit_repl, text, flags=re.I)
+
+
 def plain_russian(text: str) -> str:
     """Что осталось после ИИ: цифры — словами, латиница — русскими буквами (грубо, но читаемо)."""
+    text = numbers(text)
     text = re.sub(r"(?<=[A-Za-zА-Яа-яЁё])(?=\d)|(?<=\d)(?=[A-Za-zА-Яа-яЁё]{2})", " ", text)  # «Mir360» → «Mir 360»
     text = re.sub(r"(?<![\w.,])(\d{1,3}(?:[  ]\d{3})+|\d+)(?:[.,](\d{1,2})(?!\d))?(?:\s?(%))?", _number, text)
     return re.sub(r"[A-Za-z]+", _latin_word, text)

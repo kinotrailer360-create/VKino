@@ -59,6 +59,8 @@ from shorts import clips as shorts_clips
 from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
 from shorts import netsafe
+from shorts.postmedia import DIGEST_MARKERS, _focused, _is_digest, _mentions_title, _title_words  # noqa: F401
+from shorts import usage as shorts_usage
 from shorts import news as shorts_news
 from shorts import fastnews as shorts_fast
 from shorts import rt as shorts_rt
@@ -7709,6 +7711,18 @@ async def ai_status_action(message: Message) -> None:
     else:
         rows.append("Сегодня запросов к Lumean не было (считается с последнего запуска бота).")
     rows.append("Озвучка клоном голоса тоже идёт с баланса Lumean: выпуск на 6–8 минут — самое дорогое.")
+    rows.append("\n📊 <b>Расходы (сохраняются и после обновлений)</b>")
+    for label, days in (("Сегодня", 1), ("7 дней", 7), ("30 дней", 30)):
+        s = shorts_usage.summary(days)
+        rows.append(f"{label}: ИИ Lumean — {int(s.get('llm_calls', 0))} запр. "
+                    f"({int(s.get('llm_tokens', 0)):,} ток.), озвучка — {int(s.get('tts_chars', 0)):,} симв. "
+                    f"({int(s.get('tts_orders', 0))} заказ.), музыка — {int(s.get('music_tracks', 0))} тр."
+                    .replace(",", " "))
+    week = shorts_usage.summary(7)["tasks"]
+    if week:
+        rows.append("ИИ за 7 дней на что: " + ", ".join(
+            f"{escape(t)} — {n}" for t, n in sorted(week.items(), key=lambda kv: -kv[1])[:6]))
+    rows.append("Цену символа и запроса смотри в кабинете Lumean — так можно посчитать стоимость ролика.")
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
@@ -7939,8 +7953,10 @@ def shorts_genres_menu() -> InlineKeyboardMarkup:
 async def shorts_settings_menu() -> InlineKeyboardMarkup:
     clips_on = await shorts_setting("clips") != "off"
     mode = await shorts_setting("sub_mode") or "soft"
+    hidden = await shorts_setting("yt_privacy") == "unlisted"
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn(f"🔒 Подписка на канал: {SUB_MODES.get(mode, mode)}", "sh:sub")],
+        [_btn("▶️ На YouTube: " + ("сначала скрыто (проверю права) 🔐" if hidden else "сразу открыто 🌍"), "sh:ytpriv")],
         [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
         [_btn("🎼 Музыка Lumean под настроение ▸", "sh:mlib")],
@@ -8156,6 +8172,15 @@ async def shorts_panel(
         _sub_mode = (0.0, new)
         await show("⚙️ <b>Настройки шортсов</b>\n\n🔒 Обязательная подписка на канал: "
                    f"<b>{SUB_MODES[new]}</b>", await shorts_settings_menu())
+    elif data == "sh:ytpriv":
+        hidden = await shorts_setting("yt_privacy") == "unlisted"
+        await set_shorts_setting("yt_privacy", None if hidden else "unlisted")
+        await show("⚙️ <b>Настройки шортсов</b>", await shorts_settings_menu())
+        if not hidden:
+            await message.answer(
+                "🔐 Теперь ролики загружаются на YouTube <b>по ссылке</b> (не видны подписчикам). Открой YouTube "
+                "Studio → ролик → вкладка «Проверки»: если нет претензий по авторским правам, поставь «Открытый "
+                "доступ». Так меньше риск страйка или блокировки монетизации.")
     elif data == "sh:clips":
         off = await shorts_setting("clips") == "off"
         await set_shorts_setting("clips", None if off else "off")
@@ -10146,62 +10171,6 @@ def _repeats(words: set[str], stories: list[dict[str, Any]], english: bool = Fal
     return False
 
 
-DIGEST_MARKERS = ("дайджест", "главные новости", "главное за", "за сегодня", "за неделю", "за день",
-                  "другие новости", "также стало известно", "коротко о", "новости дня", "что нового",
-                  "итоги недели", "подборка новостей", "news roundup", "in case you missed", "this week in")
-
-
-def _is_digest(text: str) -> bool:
-    """Сборный пост канала: несколько новостей и одна общая картинка — она почти всегда от другой новости
-    (к посту о «I Play Rocky» пришёл постер «Мстителей» из такого дайджеста). Признаки: слова «дайджест»,
-    «главное за неделю»; 3+ пункта списка; 5+ разных названий в «ёлочках»."""
-    low = (text or "").lower()
-    if any(m in low for m in DIGEST_MARKERS):
-        return True
-    items = re.findall(r"(?m)^\s*(?:\d{1,2}[.)]|[•▪️➖➡️🔹🔸◾️—–-])\s*\S", text or "")
-    if len(items) >= 3:
-        return True
-    titles = {t.strip().lower() for t in re.findall(r"«([^«»]{2,60})»", text or "")
-              if not re.match(r"(?i)оскар|золот|эмми|сезар|ник[аи]\b", t.strip())}  # премии — не новости
-    return len(titles) >= 5
-
-
-def _focused(text: str, names: list[str]) -> bool:
-    """Пост целиком об этой новости, а не сборный: наше название в начале поста (первые ~220 знаков), первое
-    название в «ёлочках» — наше, чужих не больше трёх (упоминания вроде «Рокки», «Зелёной книги» допустимы).
-    Только из таких постов берём фото и видео."""
-    if _is_digest(text):
-        return False
-    if not names:
-        return True
-    if not any(_mentions_title(n, _title_words(text[:220])) for n in names):
-        return False
-    quoted = [_title_words(t) for t in re.findall(r"«([^«»\n]{2,60})»", text or "")
-              if t.strip()[:1].isupper() and len(t.split()) <= 6]
-    quoted = [t for t in quoted if t and not re.match(r"оскар|золот|эмми|сезар", t)]
-
-    def ours(t: str) -> bool:
-        return any(_mentions_title(n, t) or _mentions_title(t, n) for n in names)
-
-    if quoted and not ours(quoted[0]):
-        return False  # первым назван другой фильм — пост не о нашей новости («перенесли «Мстителей», а ещё…»)
-    return len({t for t in quoted if not ours(t)}) <= 3
-
-
-def _title_words(text: str) -> str:
-    """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
-    return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
-
-
-def _mentions_title(name: str, text: str) -> bool:
-    """Название есть в тексте — с учётом падежей: каждое слово названия по основе («левиафана», «мстителей»)."""
-    if name in text:
-        return True
-    words = [w for w in name.split() if len(w) >= 3]
-    hits = [w[:max(3, len(w) - 2)] in text for w in words]
-    return bool(words) and hits[0] and sum(hits) * 2 >= len(words)
-
-
 async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
     """Пост в стиле канала автора по самой интересной свежей новости, с фото или видео из источника.
     mode: "tg" — Telegram-каналы за сутки (кроме своего); "fast" — быстрые зарубежные источники (Reddit,
@@ -10362,6 +10331,13 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                 files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
             caption = post_caption(res["post"], "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
+            # достоверность — автору под постом: слух в канале должен звучать как слух
+            status = {"official": "✅ официально (студия, сервис или сам человек)",
+                      "reported": "📰 сообщают издания (Deadline, Variety и др.)",
+                      "rumor": "🕵️ СЛУХ — не подтверждено; в посте должно быть видно, что это слух"}.get(
+                res.get("status") or "")
+            if status:
+                seen += f"\n\n🏷 Достоверность: {status}"
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
                 await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
@@ -11906,14 +11882,23 @@ async def youtube_button(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     message = callback.message
-    first = (callback.data or "")[3:]
+    first, again = (callback.data or "")[3:], False
+    if first.startswith("again:"):  # «загрузить ещё раз» после предупреждения о повторе
+        first, again = first[6:], True
     if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
         await message.answer(YT_SETUP, disable_web_page_preview=True)
         return
     video = READY_DIR / f"{message.chat.id}_{first}.mp4"
     seo_file = video.with_suffix(".json")
+    done_file = video.with_suffix(".yt")  # ссылка на уже загруженный ролик — от двойной загрузки
     if not video.exists() or not seo_file.exists():
         await message.answer(f"Файла этого шортса уже нет на сервере (храню {READY_DAYS} дня). Собери ролик заново.")
+        return
+    if done_file.exists() and not again:
+        await message.answer(
+            f"⚠️ Этот ролик уже загружен на YouTube: {done_file.read_text().strip()}\nЗагрузить ещё раз (будет дубль)?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("▶️ Да, ещё раз", f"yt:again:{first}")]]),
+            disable_web_page_preview=True)
         return
     if yt_lock.locked():
         await message.answer("⏳ Уже идёт загрузка на YouTube — подожди минуту.")
@@ -11933,8 +11918,13 @@ async def youtube_button(callback: CallbackQuery) -> None:
                 long = bool(seo.get("long"))
                 wait = await message.answer("▶️ Загружаю выпуск на YouTube (большой файл — до 10–15 минут)…"
                                             if long else "▶️ Загружаю шортс на YouTube…")
-                res = await shorts_yt.upload(token, video, seo)
+                hidden = await shorts_setting("yt_privacy") == "unlisted"
+                res = await shorts_yt.upload(token, video, seo, "unlisted" if hidden else "public")
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                try:
+                    done_file.write_text(link)
+                except OSError:
+                    logging.info("YouTube: upload mark not saved")
                 thumb_note = ""
                 cover = video.with_suffix(".jpg")
                 if long and cover.exists():
@@ -11945,7 +11935,12 @@ async def youtube_button(callback: CallbackQuery) -> None:
                         thumb_note = ("\n\n🖼 Обложку YouTube не принял (своя обложка доступна только подтверждённым "
                                       "каналам: YouTube Studio → Настройки → Канал → Доступ к функциям). Поставь её "
                                       "вручную — она выше в чате.")
-                if res["privacy"] == "public":
+                if hidden and res["privacy"] == "unlisted":
+                    await wait.edit_text(
+                        f"🔐 {'Выпуск' if long else 'Шортс'} загружен <b>по ссылке</b>: {link}{thumb_note}\n\n"
+                        "Проверь в YouTube Studio → ролик → «Проверки» (авторские права). Всё чисто — «Доступ» → "
+                        "«Открытый».")
+                elif res["privacy"] == "public":
                     await wait.edit_text(f"✅ {'Выпуск' if long else 'Шортс'} на YouTube: {link}{thumb_note}")
                 else:
                     await wait.edit_text(
@@ -14819,6 +14814,19 @@ async def weekly_video_job(bot: Bot) -> None:
                 pass
 
 
+ALIVE_FILE = Path("/tmp/vkino_alive")
+
+
+async def heartbeat() -> None:
+    """Раз в 30 с отмечает, что цикл бота работает (healthcheck Docker; не обновляется — бот завис или упал)."""
+    while True:
+        try:
+            ALIVE_FILE.touch()
+        except OSError:
+            pass
+        await asyncio.sleep(30)
+
+
 async def growth_loop(bot: Bot) -> None:
     """Раз в 10 минут: уведомления из избранного (раз в 3 часа), подборка недели (пятница, 18:00 Екб)."""
     last_alerts = last_rt = last_clean = last_yt = 0.0
@@ -15354,12 +15362,14 @@ async def main() -> None:
             await asyncio.sleep(min(5 * attempt, 60))
 
     logging.info("VKino started")
+    heartbeat_task = asyncio.create_task(heartbeat())  # «бот жив» — по нему автообновление решает, откатывать ли
 
     try:
         await dp.start_polling(bot)
     finally:
         global stopping
         stopping = True
+        heartbeat_task.cancel()
         provider_task.cancel()
         blender_task.cancel()
         reminder_task.cancel()
