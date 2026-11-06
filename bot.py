@@ -9701,8 +9701,9 @@ def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboar
     rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
             [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")],
             [_btn("🖼 Заменить или добавить фото/видео", f"pt:m:{first}")]]
-    if yt:  # шортс — загрузка на YouTube одной кнопкой
-        rows.insert(1, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
+    if yt:  # шортс: YouTube — первой кнопкой, а публикация в канал подписана явно, чтобы не перепутать
+        rows[0] = [_btn(f"✈️ Только в Telegram-канал {POST_CHANNEL}", f"pt:p:{first}")]
+        rows.insert(0, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
     if more:
         rows.append([_btn("🔄 Ещё такой же", more), _btn("📝 Другие посты", "pt:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
