@@ -10166,6 +10166,28 @@ def _is_digest(text: str) -> bool:
     return len(titles) >= 5
 
 
+def _focused(text: str, names: list[str]) -> bool:
+    """Пост целиком об этой новости, а не сборный: наше название в начале поста (первые ~220 знаков), первое
+    название в «ёлочках» — наше, чужих не больше трёх (упоминания вроде «Рокки», «Зелёной книги» допустимы).
+    Только из таких постов берём фото и видео."""
+    if _is_digest(text):
+        return False
+    if not names:
+        return True
+    if not any(_mentions_title(n, _title_words(text[:220])) for n in names):
+        return False
+    quoted = [_title_words(t) for t in re.findall(r"«([^«»\n]{2,60})»", text or "")
+              if t.strip()[:1].isupper() and len(t.split()) <= 6]
+    quoted = [t for t in quoted if t and not re.match(r"оскар|золот|эмми|сезар", t)]
+
+    def ours(t: str) -> bool:
+        return any(_mentions_title(n, t) or _mentions_title(t, n) for n in names)
+
+    if quoted and not ours(quoted[0]):
+        return False  # первым назван другой фильм — пост не о нашей новости («перенесли «Мстителей», а ещё…»)
+    return len({t for t in quoted if not ours(t)}) <= 3
+
+
 def _title_words(text: str) -> str:
     """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
     return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
@@ -10265,9 +10287,10 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
 
         same = [p for p in same if related(p)]
         # фото и видео сборных постов (дайджестов) не берём: их картинка обычно от другой новости
-        digests = [p for p in same if _is_digest(p.get("text") or "")]
+        # и только из постов целиком об этой новости: название в начале, других фильмов не больше одного
+        digests = [p for p in same if not _focused(p.get("text") or "", names)]
         if digests:
-            logging.info("Tg post: %d digest source(s) skipped for media", len(digests))
+            logging.info("Tg post: %d digest/off-topic source(s) skipped for media", len(digests))
             same = [p for p in same if p not in digests]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
@@ -10292,8 +10315,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                     # пост именно об этой новости: фильм назван в начале поста и есть общее имя с новостью —
                     # иначе брали видео из подборки, где фильм лишь упомянут (к посту об «Обсессии» Карри
                     # Баркера пришёл ролик «From director Zack Snyder»)
-                    found = [p for p in found if related(p) and not _is_digest(p["text"]) and any(
-                        _mentions_title(n, _title_words(p["text"][:250])) for n in names)] if names else []
+                    found = [p for p in found if related(p) and _focused(p["text"], names)] if names else []
                     with_media = [p for p in found if p.get("video") or p.get("image")]
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: media search skipped: %s", exc)
