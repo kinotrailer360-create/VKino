@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from .make_short import (
     FPS,
@@ -49,6 +49,41 @@ class PanSlide:
         else:  # широкая — вбок
             x, y = round(self.dx * k), self.dy // 2
         return self.img.crop((x, y, x + W, y + H))
+
+
+FIT_H = 860  # высота широкого кадра в вертикальном ролике: почти весь кадр 16:9 виден, по бокам срезано немного
+
+
+class FitSlide:
+    """Широкий кадр (16:9) — целиком по центру, сверху и снизу его же размытая копия; камера медленно наезжает
+    (до +6 %). Раньше широкий кадр растягивался на весь экран 9:16: от него оставалась узкая середина, а камера
+    быстро ехала вбок — «фото бегают, главного в кадре мало»."""
+
+    ZOOM = 0.06
+
+    def __init__(self, path: Path, reverse: bool):
+        img = Image.open(path).convert("RGB")
+        bg = img.copy()
+        s = max(W / bg.width, H / bg.height)
+        bg = bg.resize((round(bg.width * s) + 1, round(bg.height * s) + 1), Image.LANCZOS)
+        bg = bg.crop(((bg.width - W) // 2, (bg.height - H) // 2, (bg.width - W) // 2 + W, (bg.height - H) // 2 + H))
+        self.bg = ImageEnhance.Brightness(bg.filter(ImageFilter.GaussianBlur(28))).enhance(0.55)
+        top = max(W / img.width, FIT_H / img.height) * (1 + self.ZOOM)
+        self.fg = img.resize((round(img.width * top) + 1, round(img.height * top) + 1), Image.LANCZOS)
+        self.reverse = reverse
+
+    def frame(self, t: float, dur: float) -> Image.Image:
+        k = min(max(t / max(dur, 0.1), 0.0), 1.0)
+        k = k * k * (3 - 2 * k)
+        z = 1 + self.ZOOM * ((1 - k) if self.reverse else k)  # плавный наезд (или отъезд)
+        scale = z / (1 + self.ZOOM)
+        fw, fh = round(self.fg.width * scale), round(self.fg.height * scale)
+        fg = self.fg.resize((fw, fh), Image.BILINEAR)
+        cw, ch = min(W, fw), min(FIT_H, fh)
+        fg = fg.crop(((fw - cw) // 2, (fh - ch) // 2, (fw - cw) // 2 + cw, (fh - ch) // 2 + ch))
+        img = self.bg.copy()
+        img.paste(fg, ((W - cw) // 2, (H - ch) // 2))
+        return img
 
 
 class ClipSlide:
@@ -134,8 +169,12 @@ def render(cfg: dict, base: Path) -> Path:
                     gone.close()
             if slides[k].get("clip"):  # отрезок трейлера
                 loaded[k] = ClipSlide(p(slides[k]["clip"]))
-            else:  # чередуем направление: вниз, вверх — чтобы монтаж не казался однообразным
-                loaded[k] = PanSlide(p(slides[k]["image"]), reverse=k % 3 == 2)
+            else:
+                path = p(slides[k]["image"])
+                with Image.open(path) as probe:
+                    wide = probe.width > probe.height * 1.05
+                # широкий кадр — целиком с размытым фоном; высокий (постер, страница комикса) — едет камера
+                loaded[k] = (FitSlide if wide else PanSlide)(path, reverse=k % 3 == 2)
         return loaded[k]
 
     outro = OutroSlide(cfg, p(cfg.get("outro_image") or slides[0]["image"]), logo)

@@ -329,8 +329,11 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
             name = f"tclip{i}.mp4"
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frames[c][0] - 1.0):.2f}", "-i", str(src),
-                "-t", f"{length:.2f}", "-an", "-vf",
-                f"scale={1080}:{1920}:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
+                "-t", f"{length:.2f}", "-an", "-filter_complex",
+                # кадр трейлера почти целиком по центру (как широкие фото), сверху и снизу — его размытая копия
+                "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+                "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
+                "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2", str(work / name),
                 stderr=asyncio.subprocess.PIPE)
             _, err = await proc.communicate()
@@ -348,7 +351,7 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
                 name = f"tstill{i}.jpg"
                 proc = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-v", "error", "-y", "-ss", f"{frames[c][0]:.2f}", "-i", str(src), "-frames:v", "1",
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920", "-q:v", "3",
+                    "-vf", "scale=1600:-2", "-q:v", "3",  # широкий стоп-кадр — рендер покажет его целиком
                     str(work / name), stderr=asyncio.subprocess.PIPE)
                 await proc.communicate()
                 if proc.returncode == 0 and (work / name).exists():
