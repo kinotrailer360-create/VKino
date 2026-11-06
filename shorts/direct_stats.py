@@ -73,7 +73,7 @@ async def daily_text(subs_now: int | None = None, subs_before: int | None = None
         return (sum(_num(r["Impressions"]) for r in rows), sum(_num(r["Clicks"]) for r in rows),
                 sum(_num(r["Cost"]) for r in rows))
 
-    lines = ["📊 <b>Реклама KinoMir360 в РСЯ</b>", ""]
+    lines = ["📊 <b>Реклама KinoMir360 в Яндекс Директе</b>", ""]
     for title, rows in ((f"Вчера ({y:%d.%m})", day_rows), ("За 7 дней", week_rows)):
         imp, clk, cost = total(rows)
         ctr = f"{clk / imp * 100:.2f}%" if imp else "—"
