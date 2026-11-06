@@ -59,3 +59,35 @@ def test_own_script_table_is_read_as_is() -> None:
     assert parsed["lines"][0].startswith("Без этих пяти")
     assert parsed["title"] == "5 фильмов"
     assert lore._quoted(" ".join(parsed["lines"] + parsed["screens"])) == ["Судный день", "Мстители: Финал"]
+
+
+def test_numbers_for_voice() -> None:
+    from shorts import pronounce as p
+
+    def say(t: str) -> str:
+        return p.plain_russian(p.dates(t))
+
+    assert say("1-й сезон") == "первый сезон"
+    assert say("в 90-х") == "в девяностых"
+    assert say("в 3-м сезоне") == "в третьем сезоне"
+    assert say("3-я часть") == "третья часть"
+    assert say("12 млн долларов") == "двенадцать миллионов долларов"
+    assert say("$75 млн") == "семьдесят пять миллионов долларов"
+    assert say("1,5 млрд рублей") == "полтора миллиарда рублей"
+    assert say("2 тыс зрителей") == "две тысячи зрителей"
+    assert say("75%") == "семьдесят пять процентов"
+
+
+def test_post_media_only_from_focused_posts() -> None:
+    from shorts.postmedia import _focused, _is_digest, _title_words
+
+    names = [_title_words("I Play Rocky")]
+    digest = ("🎬 Главное за день:\n\n🔹 «Мстители: Судный день» перенесли.\n\n🔹 Вышел трейлер «I Play Rocky».\n\n"
+              "🔹 «Дюна 3» — первые кадры.")
+    single = "🥊 «I Play Rocky» выйдет в мае: фильм о том, как Сталлоне пробивал «Рокки». Режиссёр «Зелёной книги»."
+    other_first = ("Marvel перенесли «Мстители: Судный день» на декабрь, а «Дюна 3» получила дату. Ещё стало "
+                   "известно, что «I Play Rocky» выйдет в мае.")
+    assert _is_digest(digest)
+    assert not _focused(digest, names)
+    assert _focused(single, names)
+    assert not _focused(other_first, names)

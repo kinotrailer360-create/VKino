@@ -20,6 +20,7 @@ from typing import Any
 
 import aiohttp
 
+from . import usage
 from .ai import _env_key
 
 API = os.getenv("LUMEAN_API_URL", "https://api.lumean.app/api/public").rstrip("/")
@@ -252,6 +253,9 @@ async def _download(session: aiohttp.ClientSession, path: str, out: Path) -> Pat
 
 async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT,
                        service: str | None = None, voice: str | None = None) -> Path:
+    # учёт расходов: озвучка оплачивается по символам (паузы {{pause=…}} — не текст)
+    usage.record("tts_chars", len(re.sub(r"\{\{[^}]*\}\}", "", text).strip()))
+    usage.record("tts_orders")
     order = await _call(session, "POST", "/orders", json={
         "template_id": await _template_id(session, service, voice), "input_text": text, "name": "KinoMir360 short"})
     return await _download(session, (await _wait_files(session, order, wait))[0], out)
@@ -261,6 +265,7 @@ async def make_music(prompt: str, out_dir: Path, name: str, variants: int = 2, w
     """Инструментальный трек по описанию (музыка Lumean, без шаблона): variants файлов по 30 с.
     Цена — за каждый вариант, от длины не зависит."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    usage.record("music_tracks", variants)
     timeout = aiohttp.ClientTimeout(total=wait + 120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         order = await _call(session, "POST", "/orders", json={"task_type": "music", "name": f"KinoMir360 {name}",
