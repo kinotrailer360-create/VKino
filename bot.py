@@ -248,6 +248,7 @@ MAIN_MENU_LABELS = {
 class SearchState(StatesGroup):
     query = State()
     describe = State()
+    follow = State()
 
 
 class ShortsState(StatesGroup):
@@ -937,6 +938,13 @@ async def init_db() -> None:
                 idx INT NOT NULL,
                 liked BOOLEAN NOT NULL,
                 PRIMARY KEY (id, user_id, idx)
+            );
+
+            CREATE TABLE IF NOT EXISTS follows (
+                user_id BIGINT NOT NULL,
+                word TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, word)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -5702,19 +5710,116 @@ async def favorites_menu(
         message.from_user.id
     )
 
+    follow_btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🔔 Подписки на франшизы и людей", callback_data="fl:menu")]])
     if not rows:
         await message.answer(
-            "В избранном пока пусто ❤️"
+            "В избранном пока пусто ❤️\n\nА ещё можно подписаться на франшизу или человека (Marvel, Нолан, "
+            "«Ведьмак») — новости канала о них придут сюда.",
+            reply_markup=follow_btn,
         )
         return
 
+    markup = stored_keyboard(rows, "❤️")
+    markup.inline_keyboard.append(follow_btn.inline_keyboard[0])
     await message.answer(
         "❤️ Твоё избранное:",
-        reply_markup=stored_keyboard(
-            rows,
-            "❤️",
-        ),
+        reply_markup=markup,
     )
+
+
+# --- подписки на франшизы и людей: новости канала о них — в личку
+
+FOLLOW_MAX = 15
+FOLLOW_DAILY = 6  # не больше стольких новостей по подпискам одному человеку в день
+_follow_sent: dict[tuple[int, str], int] = {}
+
+
+def _follow_menu_markup(words: list[str]) -> InlineKeyboardMarkup:
+    # в callback_data — номер, а не слово: кириллица быстро упирается в лимит Telegram 64 байта
+    rows = [[InlineKeyboardButton(text=f"❌ {w}"[:64], callback_data=f"fl:del:{k}")] for k, w in enumerate(words)]
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="fl:add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("fl:"))
+async def follow_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    uid, action = callback.from_user.id, (callback.data or "")[3:]
+    if action.startswith("del:") and action[4:].isdigit():
+        current = [r["word"] for r in await db().fetch(
+            "SELECT word FROM follows WHERE user_id=$1 ORDER BY created_at", uid)]
+        if int(action[4:]) < len(current):
+            await db().execute("DELETE FROM follows WHERE user_id=$1 AND word=$2", uid, current[int(action[4:])])
+    if action == "add":
+        await state.set_state(SearchState.follow)
+        if callback.message:
+            await callback.message.answer("✍️ Напиши франшизу, фильм или человека — одно на сообщение. Например: "
+                                          "<code>Marvel</code>, <code>Нолан</code>, <code>Ведьмак</code>.")
+        return
+    words = [r["word"] for r in await db().fetch("SELECT word FROM follows WHERE user_id=$1 ORDER BY created_at",
+                                                 uid)]
+    if callback.message:
+        await callback.message.answer(
+            "🔔 <b>Подписки</b>\n\nКогда в канале " + escape(POST_CHANNEL) + " выйдет новость о том, на что ты "
+            "подписан, бот пришлёт её сюда.\n\n" + ("Сейчас: " + ", ".join(escape(w) for w in words) if words
+                                                     else "Пока подписок нет."),
+            reply_markup=_follow_menu_markup(words))
+
+
+@router.message(SearchState.follow, F.text, ~F.text.startswith("/"))
+async def follow_add(message: Message, state: FSMContext) -> None:
+    word = re.sub(r"\s+", " ", (message.text or "").strip().strip("«»\"'"))[:40]
+    await state.clear()
+    if word in MAIN_MENU_LABELS or len(word) < 2:
+        await message.answer("Подписка не добавлена.", reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        return
+    count = await db().fetchval("SELECT COUNT(*) FROM follows WHERE user_id=$1", message.from_user.id)
+    if count >= FOLLOW_MAX:
+        await message.answer(f"Можно до {FOLLOW_MAX} подписок — убери лишнее в «❤️ Избранное» → «🔔 Подписки».")
+        return
+    await db().execute("INSERT INTO follows(user_id, word) VALUES($1, $2) ON CONFLICT DO NOTHING",
+                       message.from_user.id, word)
+    await message.answer(f"🔔 Подписка на «{escape(word)}» есть! Новости канала об этом придут сюда.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="➕ Ещё подписка", callback_data="fl:add")],
+                             [InlineKeyboardButton(text="🔔 Мои подписки", callback_data="fl:menu")]]))
+
+
+def _follow_hit(word: str, text: str) -> bool:
+    """Слово подписки в тексте поста — с учётом падежей («Нолана», «Marvel’s»): по основе каждого слова."""
+    low = text.lower().replace("ё", "е")
+    parts = [p for p in re.findall(r"[\wа-яё]+", word.lower().replace("ё", "е")) if len(p) >= 2]
+    return bool(parts) and all(re.search(rf"(?<![\wа-яё]){re.escape(p[:max(3, len(p) - 2)])}", low) for p in parts)
+
+
+@router.channel_post()
+async def channel_post_follows(message: Message) -> None:
+    """Пост вышел в нашем канале — тем, кто подписан на его тему, пересылаем (не больше FOLLOW_DAILY в день)."""
+    if not message.chat.username or f"@{message.chat.username}".lower() != POST_CHANNEL.lower():
+        return
+    text = message.text or message.caption or ""
+    if len(text) < 20:
+        return
+    rows = await db().fetch("SELECT user_id, word FROM follows")
+    hits: dict[int, str] = {}
+    for r in rows:
+        if int(r["user_id"]) not in hits and _follow_hit(r["word"], text):
+            hits[int(r["user_id"])] = r["word"]
+    today = datetime.now(MSK).date().isoformat()
+    for uid, word in hits.items():
+        key = (uid, today)
+        if _follow_sent.get(key, 0) >= FOLLOW_DAILY:
+            continue
+        _follow_sent[key] = _follow_sent.get(key, 0) + 1
+        try:
+            await message.bot.send_message(uid, f"🔔 Новость по подписке «{escape(word)}»:")
+            await message.bot.forward_message(uid, message.chat.id, message.message_id)
+        except Exception:  # noqa: BLE001 — человек заблокировал бота и т. п.
+            pass
+        await asyncio.sleep(0.05)
+    for old in [k for k in _follow_sent if k[1] != today]:
+        _follow_sent.pop(old, None)
 
 
 @router.message(F.text == "🕘 История")
