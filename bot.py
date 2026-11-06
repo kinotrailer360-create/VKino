@@ -12369,6 +12369,10 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     message, action = callback.message, (callback.data or "")[3:]
     chat_id = message.chat.id
     kind, _, arg = action.partition(":")
+    if kind == "wvcut" and arg.isdigit():  # выпуск → вертикальные шортсы по новостям
+        await callback.answer()
+        _run_job(lambda: episode_cuts_job(message.bot, chat_id, int(arg)))
+        return
     if kind == "p" and arg.isdigit():  # опубликовать сейчас
         done = (await _post_meta(chat_id, int(arg))).get("published")
         if done:
@@ -14996,6 +15000,7 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                  "загружу полное качество, название, описание с таймкодами, теги и обложку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
+            [_btn("✂️ Нарезать на шортсы (по новости)", f"pt:wvcut:{msg.message_id}")],
             [_btn("🔁 Переозвучить и перемонтировать", "pt:wvre")],
             [_btn("🔕 Не собирать по ср и вс" if on else "🔔 Собирать по ср и вс в 10:00",
                   "pt:wvoff" if on else "pt:wvon")]]))
@@ -15027,6 +15032,55 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                      f"{escape(seo['stress'][:3500])}\n\nУслышал неверное ударение — исправь: ударную гласную пиши "
                      "заглавной, например <code>/say обитель = обИтель</code>. Потом жми «🔁 Переозвучить и "
                      "перемонтировать» — выпуск соберётся с тем же текстом заново.")
+
+
+async def episode_cuts_job(bot: Bot, chat_id: int, first: int) -> None:
+    """«✂️ Нарезать на шортсы»: каждая новость выпуска — вертикальный шортс 9:16 с заголовком (озвучка, графика и
+    музыка уже есть — новых трат нет). Каждый шортс — с кнопками «Загрузить на YouTube» и «В канал»."""
+    video = READY_DIR / f"{chat_id}_{first}.mp4"
+    seo_file = video.with_suffix(".json")
+    if not video.exists() or not seo_file.exists():
+        await bot.send_message(chat_id, f"Файла выпуска уже нет на сервере (храню {READY_DAYS} дня).")
+        return
+    seo = json.loads(seo_file.read_text())
+    cuts = json.loads(seo.get("cuts") or "[]")
+    if not cuts:
+        await bot.send_message(chat_id, "В этом выпуске нет разметки по новостям (собран до обновления) — "
+                                        "нарезка будет у следующих выпусков.")
+        return
+    if shorts_lock.locked():
+        await bot.send_message(chat_id, "⏳ Сейчас собирается другой ролик — нажми «✂️ Нарезать» через пару минут.")
+        return
+    status = await bot.send_message(chat_id, f"✂️ Режу выпуск на {len(cuts)} шортсов…")
+    work = SHORTS_DIR / f"cuts_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    done = 0
+    try:
+        async with shorts_lock:
+            for k, (start, end, headline) in enumerate(cuts, 1):
+                try:
+                    await status.edit_text(f"✂️ Шортс {k} из {len(cuts)}: {escape(headline[:60])}")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    out = await shorts_weekly.vertical_cut(video, float(start), float(end), headline,
+                                                           work / f"cut{k}.mp4")
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("Episode cut %s failed", k)
+                    await bot.send_message(chat_id, f"❌ Шортс {k} не собрался: <code>{escape(_safe_err(exc)[:200])}</code>")
+                    continue
+                cut_seo = shorts_weekly.cut_seo(headline, seo)
+                sent = await bot.send_video(chat_id, FSInputFile(out, filename=f"kinomir360_news_{k}.mp4"),
+                                            caption=post_caption(f"🎬 {headline}"), width=1080, height=1920,
+                                            supports_streaming=True, request_timeout=300)
+                keep_for_upload(chat_id, sent.message_id, SimpleNamespace(video=out, seo=cut_seo))
+                await offer_post(bot, chat_id, [sent.message_id], "caption", what=f"Шортс {k}: {cut_seo['title']}",
+                                 extra={"yt": True})
+                done += 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await status.edit_text(f"✅ Готово: {done} шортсов из выпуска. Под каждым — «▶️ Загрузить на YouTube». "
+                           "Совет: выкладывай по 1–2 в день, а не все сразу.")
 
 
 rt_watch_busy = asyncio.Lock()
