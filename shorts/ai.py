@@ -2029,7 +2029,8 @@ async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | No
         "Ответь только JSON: {\"seen\": \"что на картинке и какие надписи, до 12 слов\", \"fits\": true или "
         "false}\n\nНОВОСТЬ:\n" + post[:1200])
     try:
-        data = await _with_reserve(key, [{"text": prompt}, _thumb(image, 768)], prompt, image)
+        # сильная модель первой: слабая запасная пропускала чужие постеры («Мстители» к новости о «Рокки»)
+        data = await _with_reserve(key, [{"text": prompt}, _thumb(image, 768)], prompt, image, premium=True)
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI media_fits failed: %s", exc)
         return None, ""

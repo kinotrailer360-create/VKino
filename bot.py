@@ -9949,9 +9949,10 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
     news = f"{res['post'][:900]}\nФильм/сериал: {res.get('film') or '—'} ({res.get('film_en') or '—'}). " \
            f"Человек: {res.get('person') or '—'} ({res.get('person_en') or '—'})."
     keep: list[Path] = []
+    unsure: list[Path] = []  # ИИ не ответил (лимит, сбой) — такой картинке не верим, если есть замена из базы
     for k, path in enumerate(files):
         if k >= 2:  # остальные кадры альбома — из того же поста; лимит Gemini на день не тратим
-            keep.append(path)
+            (keep if keep else unsure).append(path)
             continue
         img = await _media_frame(path, work)
         fits, seen = await shorts_ai.media_fits(GEMINI_API_KEY, img, news) if img else (None, "")
@@ -9961,9 +9962,11 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
         if fits is False:
             logging.info("Tg post: media %s rejected for %s", path.name, res.get("topic"))
             continue
-        keep.append(path)
+        (keep if fits else unsure).append(path)
     if keep:
         return keep
+    # непроверенная картинка часто из сборного поста канала (к новости о «I Play Rocky» пришёл постер
+    # «Мстителей» соседней новости) — надёжнее постер или портрет из базы по названию
     urls: list[str] = []
     # новость о человеке (смерть, интервью, роль) — его портрет и рядом постер фильма («кто озвучит Дума» —
     # актёр и «Мстители»); иначе только постер
@@ -9980,6 +9983,10 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
             urls += [poster] if poster else []
     except Exception as exc:  # noqa: BLE001
         logging.info("Tg post: replacement poster failed: %s", exc)
+    if not urls and unsure:
+        if notes is not None:
+            notes.append("⚠️ ИИ не проверил картинку, замены в базе нет — оставил как есть, проверь глазами")
+        return unsure
     if notes is not None:
         notes.append({2: "поставил портрет человека и постер фильма из базы TMDB",
                       1: "поставил портрет или постер из базы TMDB"}.get(len(urls), "подходящей картинки нет — пост "
