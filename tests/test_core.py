@@ -91,3 +91,16 @@ def test_post_media_only_from_focused_posts() -> None:
     assert not _focused(digest, names)
     assert _focused(single, names)
     assert not _focused(other_first, names)
+
+
+def test_diary_year_stats_and_card() -> None:
+    from shorts import diary
+
+    rows = [{"title": "Интерстеллар", "score": 10, "genres": "фантастика, драма", "year_released": 2014},
+            {"title": "Дюна: Часть вторая", "score": 9, "genres": "фантастика", "year_released": 2024},
+            {"title": "Без оценки", "score": 0, "genres": "драма", "year_released": 2010}]
+    st = diary.stats(rows)
+    assert st["count"] == 3 and st["avg"] == 9.5 and st["genre"] in ("фантастика", "драма")
+    assert [r["title"] for r in st["best"]] == ["Интерстеллар", "Дюна: Часть вторая"]
+    png = diary.year_card("Зритель", 2026, st, [None, None], "t.me/VKino_360bot")
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"

@@ -59,6 +59,7 @@ from shorts import clips as shorts_clips
 from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
 from shorts import netsafe
+from shorts import diary as shorts_diary
 from shorts.postmedia import DIGEST_MARKERS, _focused, _is_digest, _mentions_title, _title_words  # noqa: F401
 from shorts import usage as shorts_usage
 from shorts import news as shorts_news
@@ -235,6 +236,7 @@ MAIN_MENU_LABELS = {
     "ℹ️ О VKino",
     "🎯 Подобрать фильм",
     "🧩 Викторина дня",
+    "📔 Кинодневник",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
     "✉️ Написать админу",
@@ -905,6 +907,18 @@ async def init_db() -> None:
                 user_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (chat_id, message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS diary (
+                user_id BIGINT NOT NULL,
+                movie_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                score SMALLINT NOT NULL DEFAULT 0,
+                genres TEXT NOT NULL DEFAULT '',
+                year_released INT,
+                poster TEXT,
+                watched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, movie_id)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3395,6 +3409,7 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
+            [KeyboardButton(text="📔 Кинодневник")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
             [KeyboardButton(text="✉️ Написать админу")],
             [
@@ -3592,6 +3607,7 @@ def card_keyboard(
     if not is_upcoming(item):  # оценка для «Топа по версии подписчиков»
         rows.append([InlineKeyboardButton(text="👍 Понравилось", callback_data=f"rate:{movie_id}:1"),
                      InlineKeyboardButton(text="👎 Не моё", callback_data=f"rate:{movie_id}:-1")])
+        rows.append([InlineKeyboardButton(text="✅ Посмотрел — в кинодневник", callback_data=f"dia:w:{movie_id}")])
     rows.append(
         [
             InlineKeyboardButton(
@@ -4034,6 +4050,7 @@ async def do_search(
             "🎯 Подобрать фильм": "rq_menu",
             "🧩 Викторина дня": "quiz_day_menu",
             "🎁 Пригласить друга": "referral_menu",
+            "📔 Кинодневник": "diary_menu",
         }
         handler_name = target_handlers.get(query)
         handler = globals().get(handler_name or "")
@@ -14941,6 +14958,110 @@ async def quiz_leaders(limit: int = 10) -> list[Any]:
 
 def _who(r: Any) -> str:
     return escape("@" + r["username"] if r["username"] else (r["first_name"] or "зритель"))
+
+
+# --- кинодневник подписчика и «Мой год в кино»
+
+def _diary_score_markup(movie_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(n), callback_data=f"dia:s:{movie_id}:{n}") for n in range(1, 6)],
+        [InlineKeyboardButton(text=str(n), callback_data=f"dia:s:{movie_id}:{n}") for n in range(6, 11)],
+        [InlineKeyboardButton(text="Без оценки", callback_data=f"dia:s:{movie_id}:0")]])
+
+
+@router.message(F.text == "📔 Кинодневник")
+async def diary_menu(message: Message) -> None:
+    await remember(message)
+    uid, year = message.from_user.id, datetime.now(MSK).year
+    rows = await db().fetch("SELECT title, score, watched_at FROM diary WHERE user_id=$1 ORDER BY watched_at DESC",
+                            uid)
+    this_year = [r for r in rows if r["watched_at"].astimezone(MSK).year == year]
+    if not rows:
+        await message.answer(
+            "📔 <b>Кинодневник</b>\n\nОтмечай, что посмотрел, и ставь оценку — кнопка «✅ Посмотрел» в карточке "
+            "любого фильма. В конце года бот соберёт твою карточку «Мой год в кино»: сколько фильмов, любимый "
+            "жанр и лучшее за год. 🍿\n\nНайди фильм: «🔎 Найти фильм или сериал».")
+        return
+    lines = [f"{'⭐ ' + str(r['score']) + '/10' if r['score'] else '✅'} {escape(r['title'])}" for r in rows[:15]]
+    await message.answer(
+        f"📔 <b>Кинодневник</b>\n\nЗа {year} год: <b>{len(this_year)}</b> · всего: <b>{len(rows)}</b>\n\n"
+        + "\n".join(lines) + ("\n…" if len(rows) > 15 else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎉 Мой {year} в кино", callback_data="dia:y")],
+            [InlineKeyboardButton(text="🗑 Убрать последнюю запись", callback_data="dia:undo")]]))
+
+
+@router.callback_query(F.data.startswith("dia:"))
+async def diary_buttons(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    uid = callback.from_user.id
+    if parts[1] == "w" and len(parts) == 3 and parts[2].isdigit():
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("⭐ Как тебе? Оцени от 1 до 10:", reply_markup=_diary_score_markup(int(parts[2])))
+        return
+    if parts[1] == "s" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+        movie_id, score = int(parts[2]), max(0, min(10, int(parts[3])))
+        try:
+            item = await kp.details(movie_id)
+        except Exception:  # noqa: BLE001
+            item = {}
+        genres = ", ".join(str(g.get("name")) for g in (item.get("genres") or []) if isinstance(g, dict))[:120]
+        year = item.get("year") if str(item.get("year") or "").isdigit() else None
+        title = kp.title(item) if item else (await db().fetchval(
+            "SELECT title FROM history WHERE user_id=$1 AND movie_id=$2 LIMIT 1", uid, movie_id) or "Фильм")
+        await db().execute(
+            """INSERT INTO diary(user_id, movie_id, title, score, genres, year_released, poster)
+               VALUES($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT(user_id, movie_id) DO UPDATE SET score=EXCLUDED.score, watched_at=NOW()""",
+            uid, movie_id, title, score, genres, int(year) if year else None, kp.poster(item) if item else None)
+        if score:  # оценка дневника — и в «Топ по версии подписчиков»
+            await db().execute(
+                """INSERT INTO ratings(user_id, movie_id, title, value) VALUES($1, $2, $3, $4)
+                   ON CONFLICT(user_id, movie_id) DO UPDATE SET value=EXCLUDED.value, created_at=NOW()""",
+                uid, movie_id, title, 1 if score >= 6 else -1)
+        n = await db().fetchval("SELECT COUNT(*) FROM diary WHERE user_id=$1 AND watched_at >= $2", uid,
+                                datetime(datetime.now(MSK).year, 1, 1, tzinfo=MSK))
+        await callback.answer("Записал в кинодневник ✅")
+        if callback.message:
+            await callback.message.edit_text(
+                f"✅ «{escape(title)}» в кинодневнике" + (f" — {score}/10" if score else "")
+                + f". В этом году: <b>{n}</b>. Все записи — кнопка «📔 Кинодневник».")
+        return
+    if parts[1] == "undo":
+        await db().execute("""DELETE FROM diary WHERE (user_id, movie_id) IN (
+            SELECT user_id, movie_id FROM diary WHERE user_id=$1 ORDER BY watched_at DESC LIMIT 1)""", uid)
+        await callback.answer("Убрал последнюю запись")
+        return
+    if parts[1] == "y":
+        await callback.answer()
+        year = datetime.now(MSK).year
+        rows = [dict(r) for r in await db().fetch(
+            "SELECT title, score, genres, year_released, poster FROM diary WHERE user_id=$1 AND watched_at >= $2",
+            uid, datetime(year, 1, 1, tzinfo=MSK))]
+        if not callback.message:
+            return
+        if not rows:
+            await callback.message.answer("В этом году в дневнике пока пусто — отмечай фильмы кнопкой «✅ Посмотрел».")
+            return
+        st = shorts_diary.stats(rows)
+        posters: list[bytes | None] = []
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            for r in st["best"]:
+                try:
+                    posters.append(await netsafe.fetch(session, r["poster"], 8 * 1024 * 1024) if r.get("poster")
+                                   else None)
+                except Exception:  # noqa: BLE001
+                    posters.append(None)
+        link = (await _bot_link(callback.bot)).replace("https://", "")
+        name = callback.from_user.first_name or ""
+        png = await asyncio.to_thread(shorts_diary.year_card, name, year, st, posters, link)
+        await callback.message.answer_photo(
+            BufferedInputFile(png, filename=f"my_{year}_in_cinema.png"),
+            caption=f"🎉 Твой {year} в кино! Перешли друзьям — пусть тоже посчитают свой 🍿\n"
+                    f"Кинодневник ведётся здесь: {link}")
+        return
+    await callback.answer()
 
 
 @router.message(F.text == "🧩 Викторина дня")
