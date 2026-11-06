@@ -290,9 +290,9 @@ async def _trailer_url(film: dict[str, Any]) -> str | None:
 
 async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], durs: list[float], skip: set[int],
                          gemini_key: str) -> tuple[dict[int, tuple[str, float]], str]:
-    """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к каждой
-    фразе; фразам без явной пары — следующие неиспользованные моменты (это всё равно кадры этого фильма).
-    Отрезки уже 1080×1920 без звука. ({фраза: (файл, длина)}, пояснение автору)."""
+    """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
+    фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото). Отрезки уже
+    1080×1920 без звука. ({фраза: (файл, длина)}, пояснение автору)."""
     tdir = work / "trailer"
     tdir.mkdir(exist_ok=True)
     want = [i for i in range(len(lines)) if i not in skip]
@@ -306,21 +306,24 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
         if not frames:
             return {}, "🎞 Не удалось нарезать кадры трейлера — в ролике кадры и постеры."
         thumbs = [Image.open(path).convert("RGB") for _, path in frames]
-        choices = await ai.match_images(gemini_key, [lines[i] for i in want], thumbs) or [-1] * len(want)
+        choices = await ai.match_images(gemini_key, [lines[i] for i in want], thumbs)
         used: set[int] = set()
-        order = [c if 0 <= c < len(frames) else -1 for c in choices]
+        if choices:
+            # комбинированный ролик: видео — там, где в трейлере есть момент под фразу, остальное — фото
+            order = [c if 0 <= c < len(frames) else -1 for c in choices]
+        else:
+            # ИИ не ответил — чередуем: фраза с отрезком, фраза с фото (моменты — по ходу трейлера)
+            step = max(1, len(frames) // max(1, (len(want) + 1) // 2))
+            order = [(k // 2) * step % len(frames) if k % 2 == 0 else -1 for k in range(len(want))]
         for k, c in enumerate(order):
             if c in used:
                 order[k] = -1
             elif c >= 0:
                 used.add(c)
-        spare = [c for c in range(len(frames)) if c not in used]
         out: dict[int, tuple[str, float]] = {}
         for i, c in zip(want, order):
             if c < 0:
-                if not spare:
-                    continue
-                c = spare.pop(len(spare) // 2) if len(spare) > 2 else spare.pop(0)
+                continue  # у этой фразы остаётся фото
             length = round(min(CLIP_MAX, max(1.2, durs[i])), 2)
             name = f"tclip{i}.mp4"
             proc = await asyncio.create_subprocess_exec(
