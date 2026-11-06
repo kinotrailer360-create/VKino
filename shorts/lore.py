@@ -753,6 +753,12 @@ async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False
     return urls + ([best["poster"]] if best.get("poster") else [])
 
 
+def _stem_key(name: str) -> str:
+    """Название без падежа: «Обители зла» и «Обитель зла» → «обите зла» — один фильм в разных формах."""
+    words = re.findall(r"[0-9a-zа-яё]+", name.lower().replace("ё", "е"))
+    return " ".join(w[:max(4, len(w) - 2)] for w in words)
+
+
 async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, Any]:
     """Шортс по готовому сценарию автора: фразы — как есть, кадры — фильмов и сериалов из «ёлочек» (по порядку
     сценария), к фразе с названием — кадр этого фильма."""
@@ -784,15 +790,33 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
     # год рядом с названием: «Обитель зла» (2026) или «Обитель зла» 2026 года — нужен именно этот фильм
     years = {m.group(1).strip().lower(): int(m.group(2)) for m in re.finditer(
         r"«([^«»]{2,60})»\s*\(?\s*((?:19|20)\d\d)", " ".join([heading, parsed["title"], text]))}
+    # год — к фильму в любом падеже: «Обители зла» (2026) относится и к «Обитель зла» в конце сценария
+    years_stem = {_stem_key(k): v for k, v in years.items()}
+
+    def year_of(film: str) -> int | None:
+        return years.get(said.get(film, film).lower()) or years_stem.get(_stem_key(said.get(film, film)))
+
+    # одно название в разных падежах ищем один раз — лучше форму без падежа (её база знает)
+    by_stem: dict[str, str] = {}
+    for f in films:
+        by_stem.setdefault(_stem_key(f), f)
+    forms: dict[str, list[str]] = {}
+    for f in films:
+        forms.setdefault(by_stem[_stem_key(f)], []).append(f)
 
     metas: dict[str, dict[str, Any]] = {}
 
     async def look(film: str) -> list[str]:
         async with gate:
             metas[film] = {}
-            return await _film_backdrops(tmdb_key, film, tv=is_tv(film), year=years.get(said.get(film, film).lower()),
-                                         meta=metas[film])
+            urls = []
+            for form in forms.get(film, [film]):  # «Обители зла» не нашлась — пробуем «Обитель зла» из текста
+                urls = await _film_backdrops(tmdb_key, form, tv=is_tv(film), year=year_of(film), meta=metas[film])
+                if urls:
+                    break
+            return urls
 
+    films = list(forms)
     found = await asyncio.gather(*(look(f) for f in films)) if tmdb_key else []
     images: list[str] = []
     fixed: list[dict[str, Any]] = []
@@ -802,12 +826,13 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
             missing.append(said.get(film, film))
             continue
         # кадры упомянутых мимоходом фильмов («режиссёр «Варвара»») — только к их фразе, а не по всему ролику
-        main_like = not years or said.get(film, film).lower() in years
+        main_like = not years or year_of(film) is not None
         if main_like:
             images += urls[1:]
         key = said.get(film, film).lower()
+        keys = [k.lower() for k in forms.get(film, [film])] + [key]
         line = next((i for i, (ln, sc) in enumerate(zip(lines, parsed["screens"] + [""] * len(lines)))
-                     if key in (ln + " " + sc).lower()), None)
+                     if any(k in (ln + " " + sc).lower() for k in keys)), None)
         if line is not None and all(f["line"] != line + 1 for f in fixed):
             fixed.append({"line": line + 1, "keys": [key], "url": urls[0], "mode": "photo", "who": film})
         elif main_like:
@@ -818,8 +843,16 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
     title = parsed["title"] or (films[0] if films else lines[0][:60])
     # главный фильм ролика (рецензия, новость): с годом рядом с названием, иначе первый найденный — из его
     # трейлера бот возьмёт отрезки под фразы, его постер — на карточку оценки
-    main = next((metas[f] for f in films if metas.get(f) and said.get(f, f).lower() in years), None) or next(
-        (metas[f] for f in films if metas.get(f)), None)
+    # главный фильм: с годом рядом с названием; иначе — упомянутый чаще всех (в любом падеже), а не первый попавшийся
+    # («режиссёр «Варвара»» мимоходом не должен стать главным фильмом рецензии на «Обитель зла»)
+    def mentions(f: str) -> int:  # в скольких фразах назван фильм (в любом падеже)
+        stems = _stem_key(said.get(f, f)).split()
+        return sum(1 for ln in lines if stems and all(w in ln.lower().replace("ё", "е") for w in stems))
+
+    with_meta = [f for f in films if metas.get(f)]
+    main_name = next((f for f in with_meta if year_of(f) is not None), None) or (
+        max(with_meta, key=lambda f: (mentions(f), -films.index(f))) if with_meta else None)
+    main = metas[main_name] if main_name else None
     trailer_film = {**main, "names": [n for n in films if metas.get(n) is main]} if main else None
     score = review_score(lines)
     if main and not parsed["title"]:

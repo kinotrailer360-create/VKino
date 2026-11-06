@@ -130,3 +130,27 @@ def test_review_score_and_montage_table() -> None:
     plan = ("| Время | Что показываем | Текст на экране |\n|---|---|---|\n"
             "| 0–4 сек. | Самый эффектный кадр | ЗАБУДЬТЕ ПРО ЙОВОВИЧ! |\n")
     assert lore.parse_script(plan)["screens"] == []  # план монтажа не читается вслух
+
+
+def test_own_script_main_film_any_case() -> None:
+    import asyncio
+
+    from shorts import lore
+
+    async def fake(key, name, n=3, tv=False, year=None, meta=None):
+        db = {"Обитель зла": "2026", "Варвар": "2022"}
+        if name in db and meta is not None:
+            meta.update(kind="movie", id=len(name), title=name, poster="P", year=db[name])
+            return ["B" + name]
+        return []
+
+    real = lore._film_backdrops
+    lore._film_backdrops = fake
+    try:
+        text = ("Забудьте всё об «Обители зла» с Миллой.\nЗа камерой режиссёр «Варвар».\n"
+                "Мой вердикт: 8/10. А вы посмотрели новую «Обитель зла»?")
+        script = asyncio.run(lore.write_own(text, "k"))
+    finally:
+        lore._film_backdrops = real
+    assert script["trailer_film"]["title"] == "Обитель зла"  # не «Варвар», упомянутый мимоходом
+    assert lore._stem_key("Обители зла") == lore._stem_key("Обитель зла")
