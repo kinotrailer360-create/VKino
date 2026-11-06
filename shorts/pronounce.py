@@ -424,6 +424,13 @@ def numbers(text: str) -> str:
     """Числа по смыслу, до общего «цифры словами»: порядковые с окончанием («1-й сезон» → «первый сезон»,
     «в 90-х» → «в девяностых»), сокращения сумм («12 млн» → «двенадцать миллионов», «1,5 млрд» → «полтора
     миллиарда»), валюта («$75 млн» → «семьдесят пять миллионов долларов»)."""
+    # оценка: «8/10» → «восемь из десяти», «7,5/10» → «семь с половиной из десяти»
+    def score_repl(m: re.Match[str]) -> str:
+        whole, half = int(m.group(1)), bool(m.group(2))
+        return f"{number_words(whole)}{' с половиной' if half else ''} из {'десяти' if m.group(3) == '10' else 'пяти'}"
+
+    text = re.sub(r"(?<![\d.,])(\d{1,2})(?:[.,](5))?\s*/\s*(10|5)(?!\d)", score_repl, text)
+
     def ord_repl(m: re.Match[str]) -> str:
         word = _ord_word(int(m.group(1)), m.group(2))
         return word if word else m.group(0)

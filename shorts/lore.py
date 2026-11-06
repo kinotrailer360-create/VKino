@@ -772,6 +772,9 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
             fixed.append({"line": line + 1, "keys": [key], "url": urls[0], "mode": "photo", "who": film})
         else:
             images.insert(0, urls[0])
+    # год после названия нужен только для поиска фильма — вслух и в субтитрах его нет:
+    # «Обители зла» (2026) → «Обители зла»
+    lines = [re.sub(r"(»)\s*\(\s*(?:19|20)\d\d\s*(?:г\.?|года?)?\s*\)", r"\1", ln) for ln in lines]
     title = parsed["title"] or (films[0] if films else lines[0][:60])
     # главный фильм ролика (рецензия, новость): с годом рядом с названием, иначе первый найденный — из его
     # трейлера бот возьмёт отрезки под фразы, его постер — на карточку оценки

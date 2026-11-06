@@ -76,6 +76,8 @@ def test_numbers_for_voice() -> None:
     assert say("1,5 млрд рублей") == "полтора миллиарда рублей"
     assert say("2 тыс зрителей") == "две тысячи зрителей"
     assert say("75%") == "семьдесят пять процентов"
+    assert say("Оценка 8/10") == "Оценка восемь из десяти"
+    assert say("7,5/10") == "семь с половиной из десяти"
 
 
 def test_post_media_only_from_focused_posts() -> None:
