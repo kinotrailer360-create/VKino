@@ -159,6 +159,7 @@ class AIError(RuntimeError):
 
 
 last_error: str | None = None  # причина последнего сбоя — бот показывает её админу
+last_engine = ""  # кто ответил в последний раз: gemini / lumean / reserve (слабые запасные: Groq, BeatAPI)
 
 
 def _thumb(img: Image.Image, size: int = 448) -> dict[str, Any]:
@@ -466,10 +467,14 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
     blind = image is None and any("inline_data" in p for p in gemini_parts)
     lumean_first = lumean_llm_on() and not blind and (premium or LUMEAN_MODE == "all")
 
+    global last_engine
+
     async def ask_lumean() -> Any:
+        global last_engine
         try:
             result = await asyncio.wait_for(_ask_lumean(prompt, image), RESERVE_BUDGET + 60)
             log.info("shorts: Lumean LLM answered")
+            last_engine = "lumean"
             return result
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc) or "Lumean ИИ не ответил")
@@ -482,7 +487,9 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             return result
     if key:
         try:
-            return await _ask(key, gemini_parts)
+            result = await _ask(key, gemini_parts)
+            last_engine = "gemini"
+            return result
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
             log.warning("shorts: Gemini failed: %s", exc)
@@ -490,6 +497,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         try:
             result = await asyncio.wait_for(_ask_reserve(prompt, image), RESERVE_BUDGET)
             log.info("shorts: reserve AI (%s) answered", RESERVE_MODEL)
+            last_engine = "reserve"
             return result
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc) or f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
@@ -502,6 +510,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         try:
             result = await asyncio.wait_for(_ask_beat(prompt, image), RESERVE_BUDGET)
             log.info("shorts: BeatAPI (%s) answered", _beat_model or BEAT_MODEL)
+            last_engine = "reserve"
             return result
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc) or f"BeatAPI не ответил за {RESERVE_BUDGET} с")
@@ -708,6 +717,8 @@ async def proofread(key: str, texts: list[str]) -> list[str]:
     attempts = []
     if key:
         attempts.append(("Gemini", lambda: _ask(key, [{"text": prompt}])))
+    if lumean_llm_on():  # Gemini на лимите — сильная модель: слабые запасные пишут по-русски коряво (на озвучку)
+        attempts.append(("Lumean", lambda: _ask_lumean(prompt)))
     if BEAT_KEY:
         async def beat_gemini() -> Any:
             free = await beat_free_models()
@@ -823,7 +834,7 @@ async def retell_news(key: str, items: list[tuple[str, str, str]]) -> list[str] 
         "в том же порядке.\n\n" + listing
     )
     try:
-        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
         texts = [str(t).strip() for t in data["texts"]]
     except Exception as exc:  # noqa: BLE001
         global last_error
@@ -866,8 +877,8 @@ async def pick_news(key: str, items: list[tuple[str, str, str]], n: int = 5) -> 
             log.warning("shorts: news editor with search failed: %s", exc)
     if data is None:
         prompt = rules + " Используй только факты из заголовков и подробностей.\n\n" + listing
-        try:
-            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        try:  # текст пойдёт в озвучку шортса: без Gemini — сильная модель Lumean, а не слабые запасные
+            data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
         except Exception as exc:  # noqa: BLE001
             global last_error
             last_error = str(exc)[:300]
@@ -1067,6 +1078,7 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
             return None
         try:
             data = await _with_reserve(key, [{"text": prompt}, *pics], prompt, (images or [None])[0], premium)
+            last_error = None  # запасной ИИ ответил — сбой Gemini с поиском больше не причина для тревоги
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)[:300]
             log.warning("shorts: post failed: %s", exc)
