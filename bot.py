@@ -9964,22 +9964,29 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
         keep.append(path)
     if keep:
         return keep
-    url = None
-    try:  # новость о человеке (смерть, интервью) — его портрет, иначе постер фильма
+    urls: list[str] = []
+    # новость о человеке (смерть, интервью, роль) — его портрет и рядом постер фильма («кто озвучит Дума» —
+    # актёр и «Мстители»); иначе только постер
+    try:
         if res.get("person_en") or res.get("person"):
             info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
-            url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
-        if not url and (res.get("film_en") or res.get("film")):
-            url = await shorts_daily.tmdb.poster_by_title(
-                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += (shorts_daily.tmdb.profile_urls(info) or [])[:1] if info else []
     except Exception as exc:  # noqa: BLE001
-        logging.info("Tg post: replacement image failed: %s", exc)
+        logging.info("Tg post: replacement portrait failed: %s", exc)
+    try:
+        if res.get("film_en") or res.get("film"):
+            poster = await shorts_daily.tmdb.poster_by_title(
+                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += [poster] if poster else []
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: replacement poster failed: %s", exc)
     if notes is not None:
-        notes.append("поставил портрет или постер из базы TMDB" if url else "подходящей картинки нет — пост без "
-                     "фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»")
-    if not url:
+        notes.append({2: "поставил портрет человека и постер фильма из базы TMDB",
+                      1: "поставил портрет или постер из базы TMDB"}.get(len(urls), "подходящей картинки нет — пост "
+                     "без фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»"))
+    if not urls:
         return []
-    return await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix="repl")
+    return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
 
 
 async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
