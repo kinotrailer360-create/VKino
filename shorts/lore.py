@@ -13,6 +13,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageEnhance, ImageOps
 
-from . import ai, daily, pronounce, tmdb
+from . import ai, clips, daily, pronounce, tmdb
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -266,6 +267,116 @@ def _frame_ready(img: Image.Image, limit: int = 2400) -> Image.Image:
     return img
 
 
+CLIP_MAX = 3.5  # сек: отрезок трейлера на фразу — коротко (меньше риска Content ID), дальше кадр
+
+
+async def _trailer_url(film: dict[str, Any]) -> str | None:
+    """Официальный трейлер с YouTube по карточке TMDB (точно этот фильм), иначе — Rutube по названию и году."""
+    try:
+        url = await tmdb.youtube_trailer(os.getenv("TMDB_API_KEY", "").strip(), film.get("kind") or "movie",
+                                         int(film["id"]))
+        if url:
+            return url
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: tmdb trailer failed: %s", exc)
+    try:
+        found = await clips.rutube_trailer([n for n in [film.get("title"), *(film.get("names") or [])] if n],
+                                           int(film["year"]) if str(film.get("year") or "").isdigit() else None)
+        return found["url"] if found else None
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: rutube trailer failed: %s", exc)
+        return None
+
+
+async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], durs: list[float], skip: set[int],
+                         gemini_key: str) -> tuple[dict[int, tuple[str, float]], str]:
+    """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
+    фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото). Отрезки уже
+    1080×1920 без звука. ({фраза: (файл, длина)}, пояснение автору)."""
+    tdir = work / "trailer"
+    tdir.mkdir(exist_ok=True)
+    want = [i for i in range(len(lines)) if i not in skip]
+    try:
+        url = await _trailer_url(film)
+        if not url:
+            return {}, "🎞 Трейлер фильма не нашёлся — в ролике кадры и постеры."
+        src = await clips.download_full(url, tdir)
+        total = await daily._duration(src)
+        frames = await clips.sample_frames(src, tdir, duration=total, limit=30)
+        if not frames:
+            return {}, "🎞 Не удалось нарезать кадры трейлера — в ролике кадры и постеры."
+        thumbs = [Image.open(path).convert("RGB") for _, path in frames]
+        choices = await ai.match_images(gemini_key, [lines[i] for i in want], thumbs)
+        used: set[int] = set()
+        if choices:
+            # комбинированный ролик: видео — там, где в трейлере есть момент под фразу, остальное — фото
+            order = [c if 0 <= c < len(frames) else -1 for c in choices]
+        else:
+            # ИИ не ответил — чередуем: фраза с отрезком, фраза с фото (моменты — по ходу трейлера)
+            step = max(1, len(frames) // max(1, (len(want) + 1) // 2))
+            order = [(k // 2) * step % len(frames) if k % 2 == 0 else -1 for k in range(len(want))]
+        for k, c in enumerate(order):
+            if c in used:
+                order[k] = -1
+            elif c >= 0:
+                used.add(c)
+        out: dict[int, tuple[str, float]] = {}
+        for i, c in zip(want, order):
+            if c < 0:
+                continue  # у этой фразы остаётся фото
+            length = round(min(CLIP_MAX, max(1.2, durs[i])), 2)
+            name = f"tclip{i}.mp4"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frames[c][0] - 1.0):.2f}", "-i", str(src),
+                "-t", f"{length:.2f}", "-an", "-vf",
+                f"scale={1080}:{1920}:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2", str(work / name),
+                stderr=asyncio.subprocess.PIPE)
+            _, err = await proc.communicate()
+            if proc.returncode:
+                log.info("shorts: trailer cut %s failed: %s", i, err.decode(errors="ignore")[-200:])
+                continue
+            out[i] = (name, length)
+        return out, "" if out else "🎞 Трейлер скачался, но отрезки не вырезались — в ролике кадры."
+    except Exception as exc:  # noqa: BLE001 — без трейлера ролик всё равно собирается из кадров
+        log.warning("shorts: own script trailer failed: %s", exc)
+        return {}, f"🎞 Трейлер не скачался ({type(exc).__name__}) — в ролике кадры и постеры."
+    finally:
+        import shutil
+        shutil.rmtree(tdir, ignore_errors=True)
+
+
+async def _score_card(poster_url: str, value: str, out: Path) -> Path:
+    """Финальная карточка рецензии: постер на размытом фоне и «МОЯ ОЦЕНКА 8/10»."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers={"User-Agent": USER_AGENT}) as s:
+        async with s.get(poster_url) as resp:
+            resp.raise_for_status()
+            raw = await resp.read()
+
+    def draw() -> None:
+        from PIL import ImageDraw, ImageFilter
+
+        from .cards import _font
+        poster = Image.open(io.BytesIO(raw)).convert("RGB")
+        w, h = 1080, 1920
+        bg = ImageOps.fit(poster, (w, h)).filter(ImageFilter.GaussianBlur(40))
+        bg = ImageEnhance.Brightness(bg).enhance(0.45)
+        pw = 640
+        p = poster.resize((pw, round(poster.height * pw / poster.width)))
+        if p.height > 960:
+            p = p.crop((0, 0, pw, 960))
+        bg.paste(p, ((w - pw) // 2, 330))
+        d = ImageDraw.Draw(bg)
+        y = 330 + p.height + 70
+        d.text((w // 2, y), "МОЯ ОЦЕНКА", font=_font("Montserrat.ttf", 56, "Bold"), fill="white", anchor="mm")
+        d.text((w // 2, y + 150), f"{value}/10", font=_font("Oswald.ttf", 190, "Bold"), fill=(255, 196, 61),
+               anchor="mm", stroke_width=4, stroke_fill=(0, 0, 0))
+        bg.save(out, quality=93)
+
+    await asyncio.to_thread(draw)
+    return out
+
+
 async def make_lore(work: Path, script: dict[str, Any], music: Path | None = None,
                     user_media: list[Path] | None = None, gemini_key: str = "",
                     user_pins: dict[int, int] | None = None) -> ShortResult:
@@ -365,6 +476,35 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         used.add(c)
         order.append(c)
     slides = [{"start": starts[i], "image": pool[order[i]][0]} for i in range(len(lines))]
+    durs = [((starts[i + 1] if i + 1 < len(starts) else starts[i] + float(spans[i]["speech"]) + 0.3) - starts[i])
+            for i in range(len(lines))]
+    clip_notes: list[str] = []
+    score = script.get("score") if news else None
+    tfilm = script.get("trailer_film") if news else None
+    if score and tfilm and tfilm.get("poster"):  # рецензия: карточка «МОЯ ОЦЕНКА 8/10» на фразе с оценкой
+        try:
+            card = await _score_card(tfilm["poster"], str(score["value"]), work / "score.jpg")
+            slides[int(score["line"])]["image"] = card.name
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: score card failed: %s", exc)
+    if tfilm and gemini_key:
+        # отрезки трейлера под фразы: кроме фраз со своими картинками автора и с карточкой оценки
+        skip = {line - 1 for line in (user_pins or {}).values()} | ({int(score["line"])} if score else set())
+        await _progress(44, "Трейлер: подбираю отрезки")
+        got, note = await _trailer_clips(work, tfilm, lines, durs, skip, gemini_key)
+        if note:
+            clip_notes.append(note)
+        extra = []
+        for i, (name, length) in got.items():
+            image = slides[i]["image"]
+            slides[i] = {"start": starts[i], "clip": name}
+            if durs[i] > length + 0.8:  # длинная фраза: после отрезка — кадр, а не стоп-кадр
+                extra.append({"start": round(starts[i] + length, 3), "image": image})
+        slides = sorted(slides + extra, key=lambda sl: sl["start"])
+    labels: list[dict[str, Any]] = []
+    if news and gemini_key and script.get("kind_own"):
+        texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
+        labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts) if t]
 
     cfg = {
         "output": "short.mp4",
@@ -375,6 +515,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "logo": str(ASSETS / "logo.png"),
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
         "slides": slides,
+        "labels": labels,
+        "outro_image": pool[order[0]][0],
         "words": words,
         "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
         "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
@@ -425,6 +567,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                      "ролик выйдет ярче — кнопка «📎 Свои картинки».")
     if not voiced or daily.tts_note:
         notes.append(daily.no_voice_note(voiced))
+    notes += clip_notes
     if notes:
         result.seo["warning"] = "\n".join(notes)
     return result
@@ -432,7 +575,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
 
 # ---------------------------------------------------------------- свой сценарий (озвучка как есть)
 
-TIME_CELL = re.compile(r"^\s*\d{1,3}\s*[–—-]\s*\d{1,3}\s*(?:с|сек)?\s*$")
+TIME_CELL = re.compile(r"^\s*\d{1,3}\s*[–—-]\s*\d{1,3}\s*(?:с|сек)?\.?\s*$")
 
 
 def split_scripts(text: str) -> list[tuple[str, str]]:
@@ -458,12 +601,21 @@ def parse_script(text: str) -> dict[str, Any]:
         title = re.sub(r"\s*#\w+", "", m.group(1)).strip(" *")
     lines: list[str] = []
     screens: list[str] = []
+    voice_col = 1  # таблица «Время | Голос | На экране»; если колонки «Голос» нет — это план монтажа, не текст
+    plan_only = False
     for row in text.splitlines():
         if row.count("|") >= 3:
             cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            if len(cells) >= 2 and TIME_CELL.match(cells[0]) and cells[1]:
-                lines.append(cells[1])
-                screens.append(cells[2] if len(cells) > 2 else "")
+            low = [c.lower() for c in cells]
+            if low and "врем" in low[0]:  # строка заголовков таблицы
+                found = next((k for k, c in enumerate(low) if "голос" in c or "текст диктора" in c or "voice" in c),
+                             None)
+                plan_only = found is None
+                voice_col = found or 1
+                continue
+            if len(cells) > voice_col and TIME_CELL.match(cells[0]) and cells[voice_col] and not plan_only:
+                lines.append(cells[voice_col])
+                screens.append(" ".join(c for k, c in enumerate(cells[1:], 1) if k != voice_col))
     if not lines:  # без таблицы: каждая непустая строка без разметки — фраза
         for row in text.splitlines():
             row = row.strip()
@@ -471,6 +623,31 @@ def parse_script(text: str) -> dict[str, Any]:
                 continue
             lines.append(re.sub(r"^\s*\d+[.)]\s*", "", row))
     return {"title": title, "lines": [ln for ln in lines if len(ln) >= 3][:20], "screens": screens}
+
+
+_SCORE_WORDS = {"единиц": 1, "двойк": 2, "тройк": 3, "четвёрк": 4, "четверк": 4, "пятёрк": 5, "пятерк": 5,
+                "шестёрк": 6, "шестерк": 6, "семёрк": 7, "семерк": 7, "восьмёрк": 8, "восьмерк": 8,
+                "девятк": 9, "десятк": 10}
+_SCORE_NUM = {"одну": 1, "один": 1, "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7,
+              "восемь": 8, "девять": 9, "десять": 10}
+
+
+def review_score(lines: list[str]) -> dict[str, Any] | None:
+    """Оценка автора в сценарии рецензии: «8/10», «8 из 10», «крепкая восьмёрка из десяти», «восемь из десяти».
+    {"line": номер фразы (с 0), "value": 8} — для финальной карточки «МОЯ ОЦЕНКА 8/10»."""
+    for i in range(len(lines) - 1, -1, -1):
+        low = lines[i].lower()
+        m = re.search(r"(?<!\d)(10|[1-9](?:[.,]5)?)\s*(?:/|из)\s*10\b", low)
+        if m:
+            return {"line": i, "value": m.group(1).replace(",", ".")}
+        if "из десяти" in low or "из 10" in low or "оценк" in low:
+            for stem, v in _SCORE_WORDS.items():
+                if stem in low:
+                    return {"line": i, "value": str(v)}
+            m = re.search(r"\b(" + "|".join(_SCORE_NUM) + r")\s+из\s+десяти", low)
+            if m:
+                return {"line": i, "value": str(_SCORE_NUM[m.group(1)])}
+    return None
 
 
 def _quoted(text: str) -> list[str]:
@@ -487,7 +664,8 @@ def _quoted(text: str) -> list[str]:
     return out
 
 
-async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False) -> list[str]:
+async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False, year: int | None = None,
+                          meta: dict[str, Any] | None = None) -> list[str]:
     """Кадры фильма или сериала по названию (русскому или оригинальному): самый похожий и популярный.
     tv — в сценарии сказано, что это сериал («второй сезон «Локи»», плашка «сериал»): сериал впереди."""
     films: Any = None
@@ -517,12 +695,19 @@ async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False
         # чужом названии («Симпсоны: Добро, Барт и Локи») — не он
         if len(name.split()) >= 2 and any(name.lower() in t.lower() for t in titles if t):
             best = max(best, 0.9)
-        return best + (0.05 if tv and c[1] == "tv" else 0)
+        bonus = 0.05 if tv and c[1] == "tv" else 0.0
+        got = str(r.get("year") or "")[:4]
+        if year and got.isdigit():  # «Обитель зла» (2026) — а не фильмы 2002–2016 с тем же названием
+            bonus += 0.3 if abs(int(got) - year) <= 1 else -0.3
+        return best + bonus
 
     good = [c for c in cands if score(c) >= 0.6]
     if not good:
         return []
     best, kind = max(good, key=lambda c: (round(score(c), 1), c[0].get("popularity") or 0))
+    if meta is not None:  # какой фильм нашли — для трейлера и карточки оценки
+        meta.update(kind=kind, id=int(best["id"]), title=best.get("title") or name, poster=best.get("poster"),
+                    year=str(best.get("year") or "")[:4])
     try:
         urls = await tmdb.backdrops(tmdb_key, kind, int(best["id"]), n)
     except Exception as exc:  # noqa: BLE001
@@ -559,9 +744,17 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
 
     gate = asyncio.Semaphore(3)  # не залпом: по 3 названия одновременно
 
+    # год рядом с названием: «Обитель зла» (2026) или «Обитель зла» 2026 года — нужен именно этот фильм
+    years = {m.group(1).strip().lower(): int(m.group(2)) for m in re.finditer(
+        r"«([^«»]{2,60})»\s*\(?\s*((?:19|20)\d\d)", " ".join([heading, parsed["title"], text]))}
+
+    metas: dict[str, dict[str, Any]] = {}
+
     async def look(film: str) -> list[str]:
         async with gate:
-            return await _film_backdrops(tmdb_key, film, tv=is_tv(film))
+            metas[film] = {}
+            return await _film_backdrops(tmdb_key, film, tv=is_tv(film), year=years.get(said.get(film, film).lower()),
+                                         meta=metas[film])
 
     found = await asyncio.gather(*(look(f) for f in films)) if tmdb_key else []
     images: list[str] = []
@@ -580,6 +773,12 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
         else:
             images.insert(0, urls[0])
     title = parsed["title"] or (films[0] if films else lines[0][:60])
-    return {"kind": "news", "fixed": fixed, "name": title, "en": "", "title": title, "lines": lines,
+    # главный фильм ролика (рецензия, новость): с годом рядом с названием, иначе первый найденный — из его
+    # трейлера бот возьмёт отрезки под фразы, его постер — на карточку оценки
+    main = next((metas[f] for f in films if metas.get(f) and said.get(f, f).lower() in years), None) or next(
+        (metas[f] for f in films if metas.get(f)), None)
+    trailer_film = {**main, "names": [n for n in films if metas.get(n) is main]} if main else None
+    return {"kind": "news", "kind_own": True, "fixed": fixed, "trailer_film": trailer_film,
+            "score": review_score(lines), "name": title, "en": "", "title": title, "lines": lines,
             "hashtags": [], "films": films, "article": "сценарий автора", "url": "", "missing": missing,
             "images": list(dict.fromkeys(images))[:MAX_IMAGES]}

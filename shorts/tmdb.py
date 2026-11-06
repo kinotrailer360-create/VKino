@@ -542,3 +542,21 @@ async def top_movies(key: str, name: str, n: int = 6) -> tuple[str, list[dict[st
     return str(info.get("name") or name), [
         {"title": str(c.get("title") or c.get("original_title") or ""), "year": str(c.get("release_date"))[:4],
          "poster": f"{IMG}w342{c['poster_path']}" if c.get("poster_path") else None} for c in films]
+
+
+async def youtube_trailer(key: str, kind: str, tmdb_id: int) -> str | None:
+    """Официальный трейлер фильма/сериала на YouTube по его id на TMDB: свежий, сначала русский, потом английский.
+    (Rutube бывает со старым трейлером — у TMDB трейлер привязан к карточке именно этого фильма.)"""
+    if not key:
+        return None
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for lang in ("ru-RU", "en-US"):
+            data = await _get(session, key, f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}/videos", language=lang)
+            vids = [v for v in data.get("results") or [] if v.get("site") == "YouTube" and v.get("key")
+                    and v.get("type") in ("Trailer", "Teaser")]
+            vids.sort(key=lambda v: str(v.get("published_at") or ""), reverse=True)
+            vids.sort(key=lambda v: v.get("type") != "Trailer")
+            if vids:
+                return f"https://www.youtube.com/watch?v={vids[0]['key']}"
+    return None

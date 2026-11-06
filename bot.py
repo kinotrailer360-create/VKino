@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -59,6 +60,8 @@ from shorts import clips as shorts_clips
 from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
 from shorts import netsafe
+from shorts import diary as shorts_diary
+from shorts import kinodl as shorts_kinodl
 from shorts.postmedia import DIGEST_MARKERS, _focused, _is_digest, _mentions_title, _title_words  # noqa: F401
 from shorts import usage as shorts_usage
 from shorts import news as shorts_news
@@ -235,6 +238,10 @@ MAIN_MENU_LABELS = {
     "ℹ️ О VKino",
     "🎯 Подобрать фильм",
     "🧩 Викторина дня",
+    "📔 Кинодневник",
+    "👥 Выбрать вдвоём",
+    "🎬 Кинодл — угадай фильм",
+    "🔮 Прогноз уикенда",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
     "✉️ Написать админу",
@@ -243,6 +250,9 @@ MAIN_MENU_LABELS = {
 
 class SearchState(StatesGroup):
     query = State()
+    describe = State()
+    follow = State()
+    kinodl = State()
 
 
 class ShortsState(StatesGroup):
@@ -905,6 +915,72 @@ async def init_db() -> None:
                 user_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (chat_id, message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS diary (
+                user_id BIGINT NOT NULL,
+                movie_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                score SMALLINT NOT NULL DEFAULT 0,
+                genres TEXT NOT NULL DEFAULT '',
+                year_released INT,
+                poster TEXT,
+                watched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, movie_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS duo (
+                id TEXT PRIMARY KEY,
+                creator BIGINT NOT NULL,
+                films JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS duo_votes (
+                id TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                idx INT NOT NULL,
+                liked BOOLEAN NOT NULL,
+                PRIMARY KEY (id, user_id, idx)
+            );
+
+            CREATE TABLE IF NOT EXISTS follows (
+                user_id BIGINT NOT NULL,
+                word TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, word)
+            );
+
+            CREATE TABLE IF NOT EXISTS kinodl_day (
+                day DATE PRIMARY KEY,
+                film_id BIGINT NOT NULL,
+                film JSONB NOT NULL,
+                frame TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS kinodl_plays (
+                day DATE NOT NULL,
+                user_id BIGINT NOT NULL,
+                tries INT NOT NULL DEFAULT 0,
+                solved BOOLEAN NOT NULL DEFAULT FALSE,
+                done BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY (day, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS predict_round (
+                week TEXT PRIMARY KEY,
+                options JSONB NOT NULL,
+                winner INT,
+                winner_title TEXT,
+                settled BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS predict_votes (
+                week TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                choice INT NOT NULL,
+                PRIMARY KEY (week, user_id)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3395,6 +3471,8 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
+            [KeyboardButton(text="🎬 Кинодл — угадай фильм"), KeyboardButton(text="🔮 Прогноз уикенда")],
+            [KeyboardButton(text="📔 Кинодневник"), KeyboardButton(text="👥 Выбрать вдвоём")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
             [KeyboardButton(text="✉️ Написать админу")],
             [
@@ -3592,6 +3670,7 @@ def card_keyboard(
     if not is_upcoming(item):  # оценка для «Топа по версии подписчиков»
         rows.append([InlineKeyboardButton(text="👍 Понравилось", callback_data=f"rate:{movie_id}:1"),
                      InlineKeyboardButton(text="👎 Не моё", callback_data=f"rate:{movie_id}:-1")])
+        rows.append([InlineKeyboardButton(text="✅ Посмотрел — в кинодневник", callback_data=f"dia:w:{movie_id}")])
     rows.append(
         [
             InlineKeyboardButton(
@@ -3943,6 +4022,17 @@ async def cmd_start(
     if arg == "contact":  # ссылка «связь с админом» (?start=contact) — например, из закрепа канала
         await contact_ask(message, state)
         return
+    if arg.startswith("duo_") and message.from_user:  # друг позвал выбрать фильм вместе
+        await message.answer("👥 Друг зовёт выбрать фильм вместе! Отмечай 👍 то, что готов смотреть, — "
+                             "в конце покажу совпадения.",
+                             reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        await duo_show(message.bot, message.chat.id, message.from_user.id, arg[4:], None)
+        return
+    if arg == "kinodl":
+        await message.answer("🎬 Кинодл — фильм дня за 6 подсказок 👇",
+                             reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
+        await kinodl_menu(message, state)
+        return
     if arg == "quiz":  # кнопка из поста «Знатоки месяца»
         await message.answer("🧩 Викторина дня — жми кнопку в меню или держи кадр 👇",
                              reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
@@ -3979,7 +4069,9 @@ async def ask_search(
     await remember(message)
     await state.set_state(SearchState.query)
     await message.answer(
-        "Напиши название фильма или сериала 👇"
+        "Напиши название фильма или сериала 👇\n\n<i>Не помнишь название? Опиши сюжет — найду по описанию.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤔 Не помню название — опишу сюжет", callback_data="fd:ask")]]),
     )
 
 
@@ -4034,10 +4126,16 @@ async def do_search(
             "🎯 Подобрать фильм": "rq_menu",
             "🧩 Викторина дня": "quiz_day_menu",
             "🎁 Пригласить друга": "referral_menu",
+            "📔 Кинодневник": "diary_menu",
+            "👥 Выбрать вдвоём": "duo_new",
+            "🎬 Кинодл — угадай фильм": "kinodl_menu",
+            "🔮 Прогноз уикенда": "predict_menu",
         }
         handler_name = target_handlers.get(query)
         handler = globals().get(handler_name or "")
-        if callable(handler):
+        if handler_name == "kinodl_menu":  # игре нужно состояние — ждёт ответы сообщениями
+            await kinodl_menu(message, state)
+        elif callable(handler):
             await handler(message)
         else:
             await message.answer(
@@ -4072,9 +4170,15 @@ async def do_search(
         return
 
     if not items:
+        if len(query.split()) >= 5:  # похоже на описание сюжета, а не на название
+            await state.clear()
+            await find_by_description(message, query)
+            return
         await message.answer(
             "Ничего не нашёл 😕 "
-            "Попробуй другое название."
+            "Попробуй другое название — или опиши сюжет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🤔 Опишу сюжет", callback_data="fd:ask")]]),
         )
         return
 
@@ -4084,6 +4188,59 @@ async def do_search(
         "Вот что нашёл:",
         reply_markup=results_keyboard(items),
     )
+
+
+@router.callback_query(F.data == "fd:ask")
+async def describe_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(SearchState.describe)
+    if callback.message:
+        await callback.message.answer(
+            "🤔 Опиши, что помнишь: сюжет, сцены, актёров, примерный год. Например: «фильм, где мужик застрял в "
+            "одном дне и каждый раз просыпается под одну песню».")
+
+
+@router.message(SearchState.describe, F.text, ~F.text.startswith("/"))
+async def describe_text(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if text in MAIN_MENU_LABELS:
+        await state.clear()
+        await message.answer("Поиск по описанию закрыт.", reply_markup=main_menu())
+        return
+    await state.clear()
+    await find_by_description(message, text)
+
+
+async def find_by_description(message: Message, text: str) -> None:
+    """Фильм по описанию сюжета: ИИ называет до 3 вариантов, бот находит их в каталоге и даёт карточки."""
+    if len(text) < 15:
+        await message.answer("Маловато 🙂 Опиши подробнее: что происходит, кто играет, когда примерно вышел.")
+        return
+    wait = await message.answer("🔎 Вспоминаю фильм по описанию…")
+    guesses = await shorts_ai.guess_films(GEMINI_API_KEY, text)
+    found: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for g in guesses:
+        for q in [x for x in (g["ru"], g["en"]) if x]:
+            try:
+                items = await kp.search(q, limit=5)
+            except Exception:  # noqa: BLE001
+                items = []
+            year = g.get("year")
+            hit = next((it for it in items if not year or abs(int(it.get("year") or 0) - year) <= 1), None)
+            if hit and all(int(hit["id"]) != int(f["id"]) for f in found):
+                found.append(hit)
+                notes.append(f"• «{escape(kp.title(hit))}»" + (f" ({hit.get('year')})" if hit.get("year") else "")
+                             + (f" — {escape(g['why'])}" if g.get("why") else ""))
+                break
+    await wait.delete()
+    if not found:
+        await message.answer("😕 Не узнал фильм по описанию. Попробуй добавить детали: актёров, страну, год, "
+                             "запоминающуюся сцену.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [InlineKeyboardButton(text="🤔 Описать ещё раз", callback_data="fd:ask")]]))
+        return
+    await message.answer("🎯 Похоже, это:\n" + "\n".join(notes) + "\n\nНажми, чтобы открыть карточку 👇",
+                         reply_markup=results_keyboard(found))
 
 
 @router.callback_query(F.data.startswith("open:"))
@@ -5599,19 +5756,116 @@ async def favorites_menu(
         message.from_user.id
     )
 
+    follow_btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🔔 Подписки на франшизы и людей", callback_data="fl:menu")]])
     if not rows:
         await message.answer(
-            "В избранном пока пусто ❤️"
+            "В избранном пока пусто ❤️\n\nА ещё можно подписаться на франшизу или человека (Marvel, Нолан, "
+            "«Ведьмак») — новости канала о них придут сюда.",
+            reply_markup=follow_btn,
         )
         return
 
+    markup = stored_keyboard(rows, "❤️")
+    markup.inline_keyboard.append(follow_btn.inline_keyboard[0])
     await message.answer(
         "❤️ Твоё избранное:",
-        reply_markup=stored_keyboard(
-            rows,
-            "❤️",
-        ),
+        reply_markup=markup,
     )
+
+
+# --- подписки на франшизы и людей: новости канала о них — в личку
+
+FOLLOW_MAX = 15
+FOLLOW_DAILY = 6  # не больше стольких новостей по подпискам одному человеку в день
+_follow_sent: dict[tuple[int, str], int] = {}
+
+
+def _follow_menu_markup(words: list[str]) -> InlineKeyboardMarkup:
+    # в callback_data — номер, а не слово: кириллица быстро упирается в лимит Telegram 64 байта
+    rows = [[InlineKeyboardButton(text=f"❌ {w}"[:64], callback_data=f"fl:del:{k}")] for k, w in enumerate(words)]
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="fl:add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("fl:"))
+async def follow_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    uid, action = callback.from_user.id, (callback.data or "")[3:]
+    if action.startswith("del:") and action[4:].isdigit():
+        current = [r["word"] for r in await db().fetch(
+            "SELECT word FROM follows WHERE user_id=$1 ORDER BY created_at", uid)]
+        if int(action[4:]) < len(current):
+            await db().execute("DELETE FROM follows WHERE user_id=$1 AND word=$2", uid, current[int(action[4:])])
+    if action == "add":
+        await state.set_state(SearchState.follow)
+        if callback.message:
+            await callback.message.answer("✍️ Напиши франшизу, фильм или человека — одно на сообщение. Например: "
+                                          "<code>Marvel</code>, <code>Нолан</code>, <code>Ведьмак</code>.")
+        return
+    words = [r["word"] for r in await db().fetch("SELECT word FROM follows WHERE user_id=$1 ORDER BY created_at",
+                                                 uid)]
+    if callback.message:
+        await callback.message.answer(
+            "🔔 <b>Подписки</b>\n\nКогда в канале " + escape(POST_CHANNEL) + " выйдет новость о том, на что ты "
+            "подписан, бот пришлёт её сюда.\n\n" + ("Сейчас: " + ", ".join(escape(w) for w in words) if words
+                                                     else "Пока подписок нет."),
+            reply_markup=_follow_menu_markup(words))
+
+
+@router.message(SearchState.follow, F.text, ~F.text.startswith("/"))
+async def follow_add(message: Message, state: FSMContext) -> None:
+    word = re.sub(r"\s+", " ", (message.text or "").strip().strip("«»\"'"))[:40]
+    await state.clear()
+    if word in MAIN_MENU_LABELS or len(word) < 2:
+        await message.answer("Подписка не добавлена.", reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        return
+    count = await db().fetchval("SELECT COUNT(*) FROM follows WHERE user_id=$1", message.from_user.id)
+    if count >= FOLLOW_MAX:
+        await message.answer(f"Можно до {FOLLOW_MAX} подписок — убери лишнее в «❤️ Избранное» → «🔔 Подписки».")
+        return
+    await db().execute("INSERT INTO follows(user_id, word) VALUES($1, $2) ON CONFLICT DO NOTHING",
+                       message.from_user.id, word)
+    await message.answer(f"🔔 Подписка на «{escape(word)}» есть! Новости канала об этом придут сюда.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="➕ Ещё подписка", callback_data="fl:add")],
+                             [InlineKeyboardButton(text="🔔 Мои подписки", callback_data="fl:menu")]]))
+
+
+def _follow_hit(word: str, text: str) -> bool:
+    """Слово подписки в тексте поста — с учётом падежей («Нолана», «Marvel’s»): по основе каждого слова."""
+    low = text.lower().replace("ё", "е")
+    parts = [p for p in re.findall(r"[\wа-яё]+", word.lower().replace("ё", "е")) if len(p) >= 2]
+    return bool(parts) and all(re.search(rf"(?<![\wа-яё]){re.escape(p[:max(3, len(p) - 2)])}", low) for p in parts)
+
+
+@router.channel_post()
+async def channel_post_follows(message: Message) -> None:
+    """Пост вышел в нашем канале — тем, кто подписан на его тему, пересылаем (не больше FOLLOW_DAILY в день)."""
+    if not message.chat.username or f"@{message.chat.username}".lower() != POST_CHANNEL.lower():
+        return
+    text = message.text or message.caption or ""
+    if len(text) < 20:
+        return
+    rows = await db().fetch("SELECT user_id, word FROM follows")
+    hits: dict[int, str] = {}
+    for r in rows:
+        if int(r["user_id"]) not in hits and _follow_hit(r["word"], text):
+            hits[int(r["user_id"])] = r["word"]
+    today = datetime.now(MSK).date().isoformat()
+    for uid, word in hits.items():
+        key = (uid, today)
+        if _follow_sent.get(key, 0) >= FOLLOW_DAILY:
+            continue
+        _follow_sent[key] = _follow_sent.get(key, 0) + 1
+        try:
+            await message.bot.send_message(uid, f"🔔 Новость по подписке «{escape(word)}»:")
+            await message.bot.forward_message(uid, message.chat.id, message.message_id)
+        except Exception:  # noqa: BLE001 — человек заблокировал бота и т. п.
+            pass
+        await asyncio.sleep(0.05)
+    for old in [k for k in _follow_sent if k[1] != today]:
+        _follow_sent.pop(old, None)
 
 
 @router.message(F.text == "🕘 История")
@@ -9865,6 +10119,7 @@ async def _unqueue(chat_id: int, first: int) -> bool:
 async def _mark_published(chat_id: int, first: int) -> None:
     meta = await _json_setting("posts_meta", {})
     key = f"{chat_id}:{first}"
+    shorts_usage.record("tg_posts")  # для недельного отчёта
     if key in meta:
         meta[key]["published"] = int(time.time())
         await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
@@ -11921,6 +12176,7 @@ async def youtube_button(callback: CallbackQuery) -> None:
                 hidden = await shorts_setting("yt_privacy") == "unlisted"
                 res = await shorts_yt.upload(token, video, seo, "unlisted" if hidden else "public")
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                shorts_usage.record("yt_long" if long else "yt_shorts")  # для недельного отчёта
                 try:
                     done_file.write_text(link)
                 except OSError:
@@ -12113,6 +12369,10 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     message, action = callback.message, (callback.data or "")[3:]
     chat_id = message.chat.id
     kind, _, arg = action.partition(":")
+    if kind == "wvcut" and arg.isdigit():  # выпуск → вертикальные шортсы по новостям
+        await callback.answer()
+        _run_job(lambda: episode_cuts_job(message.bot, chat_id, int(arg)))
+        return
     if kind == "p" and arg.isdigit():  # опубликовать сейчас
         done = (await _post_meta(chat_id, int(arg))).get("published")
         if done:
@@ -13215,7 +13475,15 @@ async def own_generate(message: Message, state: FSMContext) -> None:
     await wait.delete()
     await state.update_data(lore_name=script["name"], lore_script=script)
     await show_lore(message, state)
-    if len(script.get("images") or []) + len(script.get("fixed") or []) < len(script["lines"]):
+    film = script.get("trailer_film")
+    if film:
+        await message.answer(
+            f"🎞 При сборке бот сам возьмёт официальный трейлер «{escape(str(film.get('title') or ''))}»"
+            + (f" ({film['year']})" if film.get("year") else "") + ", подберёт к каждой фразе отрезок 2–3 с (без "
+            "звука трейлера), добавит крупные надписи на экран"
+            + (f" и финальную карточку «МОЯ ОЦЕНКА {script['score']['value']}/10»" if script.get("score") else "")
+            + ". Свои картинки — только если хочешь заменить что-то (подпиши номер фразы).")
+    elif len(script.get("images") or []) + len(script.get("fixed") or []) < len(script["lines"]):
         await message.answer(f"🖼 Кадров нашлось меньше, чем фраз ({len(script.get('images') or [])}) — добавь свои "
                              "кнопкой «📎 Добавить свои картинки», иначе картинки будут повторяться.")
 
@@ -14740,6 +15008,7 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                  "загружу полное качество, название, описание с таймкодами, теги и обложку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
+            [_btn("✂️ Нарезать на шортсы (по новости)", f"pt:wvcut:{msg.message_id}")],
             [_btn("🔁 Переозвучить и перемонтировать", "pt:wvre")],
             [_btn("🔕 Не собирать по ср и вс" if on else "🔔 Собирать по ср и вс в 10:00",
                   "pt:wvoff" if on else "pt:wvon")]]))
@@ -14771,6 +15040,55 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                      f"{escape(seo['stress'][:3500])}\n\nУслышал неверное ударение — исправь: ударную гласную пиши "
                      "заглавной, например <code>/say обитель = обИтель</code>. Потом жми «🔁 Переозвучить и "
                      "перемонтировать» — выпуск соберётся с тем же текстом заново.")
+
+
+async def episode_cuts_job(bot: Bot, chat_id: int, first: int) -> None:
+    """«✂️ Нарезать на шортсы»: каждая новость выпуска — вертикальный шортс 9:16 с заголовком (озвучка, графика и
+    музыка уже есть — новых трат нет). Каждый шортс — с кнопками «Загрузить на YouTube» и «В канал»."""
+    video = READY_DIR / f"{chat_id}_{first}.mp4"
+    seo_file = video.with_suffix(".json")
+    if not video.exists() or not seo_file.exists():
+        await bot.send_message(chat_id, f"Файла выпуска уже нет на сервере (храню {READY_DAYS} дня).")
+        return
+    seo = json.loads(seo_file.read_text())
+    cuts = json.loads(seo.get("cuts") or "[]")
+    if not cuts:
+        await bot.send_message(chat_id, "В этом выпуске нет разметки по новостям (собран до обновления) — "
+                                        "нарезка будет у следующих выпусков.")
+        return
+    if shorts_lock.locked():
+        await bot.send_message(chat_id, "⏳ Сейчас собирается другой ролик — нажми «✂️ Нарезать» через пару минут.")
+        return
+    status = await bot.send_message(chat_id, f"✂️ Режу выпуск на {len(cuts)} шортсов…")
+    work = SHORTS_DIR / f"cuts_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    done = 0
+    try:
+        async with shorts_lock:
+            for k, (start, end, headline) in enumerate(cuts, 1):
+                try:
+                    await status.edit_text(f"✂️ Шортс {k} из {len(cuts)}: {escape(headline[:60])}")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    out = await shorts_weekly.vertical_cut(video, float(start), float(end), headline,
+                                                           work / f"cut{k}.mp4")
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("Episode cut %s failed", k)
+                    await bot.send_message(chat_id, f"❌ Шортс {k} не собрался: <code>{escape(_safe_err(exc)[:200])}</code>")
+                    continue
+                cut_seo = shorts_weekly.cut_seo(headline, seo)
+                sent = await bot.send_video(chat_id, FSInputFile(out, filename=f"kinomir360_news_{k}.mp4"),
+                                            caption=post_caption(f"🎬 {headline}"), width=1080, height=1920,
+                                            supports_streaming=True, request_timeout=300)
+                keep_for_upload(chat_id, sent.message_id, SimpleNamespace(video=out, seo=cut_seo))
+                await offer_post(bot, chat_id, [sent.message_id], "caption", what=f"Шортс {k}: {cut_seo['title']}",
+                                 extra={"yt": True})
+                done += 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await status.edit_text(f"✅ Готово: {done} шортсов из выпуска. Под каждым — «▶️ Загрузить на YouTube». "
+                           "Совет: выкладывай по 1–2 в день, а не все сразу.")
 
 
 rt_watch_busy = asyncio.Lock()
@@ -14812,6 +15130,60 @@ async def weekly_video_job(bot: Bot) -> None:
                                        + "Собрать вручную — ▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
+
+
+async def weekly_admin_report() -> str:
+    """Отчёт админу по понедельникам: подписчики бота, что делали, что вышло, сколько потрачено, план недели."""
+    async def q(sql: str) -> int:
+        try:
+            return int(await db().fetchval(sql) or 0)
+        except Exception:  # noqa: BLE001 — нет таблицы и т. п.
+            return 0
+
+    new_users = await q("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'")
+    active = await q("SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '7 days'")
+    total = await q("SELECT COUNT(*) FROM users")
+    searches = await q("SELECT COUNT(*) FROM search_history WHERE searched_at > NOW() - INTERVAL '7 days'")
+    diary_n = await q("SELECT COUNT(*) FROM diary WHERE watched_at > NOW() - INTERVAL '7 days'")
+    quiz_n = await q("SELECT COUNT(*) FROM quiz_answers WHERE created_at > NOW() - INTERVAL '7 days'")
+    favs = await q("SELECT COUNT(*) FROM favorites WHERE created_at > NOW() - INTERVAL '7 days'")
+    try:
+        top = await db().fetch("""SELECT lower(query) q, COUNT(*) n FROM search_history
+            WHERE searched_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 2 DESC LIMIT 5""")
+    except Exception:  # noqa: BLE001
+        top = []
+    u = shorts_usage.summary(7)
+    lines = [
+        "📊 <b>Неделя KinoMir360</b>", "",
+        f"👥 Бот: новых <b>{new_users}</b>, заходили <b>{active}</b>, всего <b>{total}</b>",
+        f"🔎 Поисков {searches} · ❤️ в избранное {favs} · 📔 в кинодневник {diary_n} · 🧩 ответов в викторине {quiz_n}",
+        f"📢 Постов в канал: <b>{int(u.get('tg_posts', 0))}</b> · ▶️ на YouTube: шортсов "
+        f"<b>{int(u.get('yt_shorts', 0))}</b>, выпусков <b>{int(u.get('yt_long', 0))}</b>",
+        f"💳 Расходы: ИИ Lumean {int(u.get('llm_calls', 0))} запр., озвучка {int(u.get('tts_chars', 0)):,} симв., "
+        f"музыка {int(u.get('music_tracks', 0))} тр.".replace(",", " "),
+    ]
+    if top:
+        lines.append("🔥 Чаще искали: " + ", ".join(f"{escape(r['q'][:30])} ({r['n']})" for r in top))
+    try:
+        soon = (await kp.upcoming_releases(False, limit=20, days_ahead=8))[:6]
+    except Exception:  # noqa: BLE001
+        soon = []
+    lines += ["", "🗓 <b>План недели</b>",
+              "• среда и воскресенье — выпуск «Новости кино» (соберётся сам)",
+              "• пятница 18:00 — подборка недели подписчикам бота"]
+    if soon:
+        lines.append("• премьеры недели — повод для постов и шортсов: "
+                     + ", ".join(f"«{escape(kp.title(f))}»" for f in soon))
+    if top:
+        lines.append(f"• подписчики ищут «{escape(top[0]['q'][:40])}» — можно сделать пост или шортс")
+    return "\n".join(lines)
+
+
+@router.message(Command("report"))
+async def report_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer(await weekly_admin_report(), disable_web_page_preview=True)
 
 
 ALIVE_FILE = Path("/tmp/vkino_alive")
@@ -14863,6 +15235,27 @@ async def growth_loop(bot: Bot) -> None:
                     and not weekly_busy):
                 await set_shorts_setting("weekly_video_done", today_key)
                 _run_job(lambda: weekly_video_job(bot))
+            # прогноз уикенда: пятница–суббота — открыть (ИИ ищет кандидатов), понедельник после 12:00 — итоги
+            if (now.weekday() in (4, 5) and now.hour >= 11 and await shorts_setting("predict_open_try") != week
+                    and not await db().fetchval("SELECT 1 FROM predict_round WHERE week=$1", week)):
+                if time.time() > float(await shorts_setting("predict_open_retry") or 0):
+                    # ИИ не нашёл кандидатов — следующая попытка через 2 часа; в субботу вечером — сдаёмся
+                    await set_shorts_setting("predict_open_retry", str(time.time() + 2 * 3600))
+                    if now.weekday() == 5 and now.hour >= 18:
+                        await set_shorts_setting("predict_open_try", week)
+                    await predict_open(week)
+            if now.weekday() == 0 and now.hour >= 12:
+                prev = (now - timedelta(days=7)).isocalendar()
+                await predict_settle(bot, f"{prev[0]}-{prev[1]}")
+            if (now.weekday() == 0 and now.hour >= 10 and ADMIN_IDS
+                    and await shorts_setting("admin_report_done") != week):
+                await set_shorts_setting("admin_report_done", week)
+                try:
+                    report = await weekly_admin_report()
+                    for admin_id in ADMIN_IDS:
+                        await bot.send_message(admin_id, report, disable_web_page_preview=True)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Weekly admin report failed")
             if (now.weekday() == 4 and now.hour >= 18 and await shorts_setting("digest") != "off"
                     and await shorts_setting("digest_done") != week):
                 await set_shorts_setting("digest_done", week)
@@ -14941,6 +15334,486 @@ async def quiz_leaders(limit: int = 10) -> list[Any]:
 
 def _who(r: Any) -> str:
     return escape("@" + r["username"] if r["username"] else (r["first_name"] or "зритель"))
+
+
+# --- «🔮 Прогноз уикенда»: кто возглавит прокат; итоги в понедельник по реальным сборам
+
+def _week_key(when: datetime | None = None) -> str:
+    iso = (when or datetime.now(POST_TZ)).isocalendar()
+    return f"{iso[0]}-{iso[1]}"
+
+
+async def predict_open(week: str) -> bool:
+    today = datetime.now(MSK).date()
+    try:
+        films = await shorts_ai.weekend_candidates(
+            GEMINI_API_KEY, f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    except Exception:  # noqa: BLE001
+        logging.exception("Predict: candidates failed")
+        films = []
+    if len(films) < 3:
+        return False
+    await db().execute("INSERT INTO predict_round(week, options) VALUES($1, $2) ON CONFLICT DO NOTHING",
+                       week, json.dumps(films, ensure_ascii=False))
+    return True
+
+
+def _pname(f: dict[str, Any]) -> str:
+    return f.get("ru") or f.get("en") or "?"
+
+
+async def predict_settle(bot: Bot, week: str) -> None:
+    row = await db().fetchrow("SELECT * FROM predict_round WHERE week=$1 AND NOT settled", week)
+    if not row:
+        return
+    if time.time() < float(await shorts_setting("predict_settle_retry") or 0):
+        return
+    await set_shorts_setting("predict_settle_retry", str(time.time() + 3 * 3600))  # ИИ не ответил — через 3 ч
+    options = row["options"] if isinstance(row["options"], list) else json.loads(row["options"])
+    today = datetime.now(MSK).date()
+    res = await shorts_ai.box_office_post(GEMINI_API_KEY,
+                                          f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    if not res or not res["films"]:
+        return
+    top = res["films"][0]
+    winner = next((k for k, f in enumerate(options) if any(
+        shorts_daily.tmdb.similar(a, b) >= 0.7 for a in (f.get("ru"), f.get("en")) if a
+        for b in (top.get("ru"), top.get("en")) if b)), -1)
+    await db().execute("UPDATE predict_round SET settled=TRUE, winner=$2, winner_title=$3 WHERE week=$1",
+                       week, winner, _pname(top))
+    votes = await db().fetch("SELECT user_id, choice FROM predict_votes WHERE week=$1", week)
+    for v in votes:
+        right = int(v["choice"]) == winner
+        text = (f"🔮 Итоги прогноза уикенда: первое место — «{escape(_pname(top))}»"
+                + (f" ({escape(top['gross'])})" if top.get("gross") else "") + ".\n"
+                + ("🎯 Ты угадал! +1 очко в таблице прогнозистов." if right else "Не угадал — в эту пятницу новый шанс!"))
+        try:
+            await bot.send_message(int(v["user_id"]), text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏆 Таблица прогнозистов", callback_data="pv:top")]]))
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.05)
+
+
+@router.message(F.text == "🔮 Прогноз уикенда")
+async def predict_menu(message: Message) -> None:
+    await remember(message)
+    week = _week_key()
+    row = await db().fetchrow("SELECT * FROM predict_round WHERE week=$1", week)
+    top_btn = [InlineKeyboardButton(text="🏆 Таблица прогнозистов", callback_data="pv:top")]
+    if not row:
+        await message.answer("🔮 <b>Прогноз уикенда</b>\n\nКаждую пятницу угадываем, какой фильм заработает "
+                             "больше всех в мировом прокате за выходные. Итоги — в понедельник, за верный прогноз "
+                             "очко в таблице. Новый прогноз откроется в пятницу! 🍿",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[top_btn]))
+        return
+    options = row["options"] if isinstance(row["options"], list) else json.loads(row["options"])
+    mine = await db().fetchval("SELECT choice FROM predict_votes WHERE week=$1 AND user_id=$2", week,
+                               message.from_user.id)
+    if mine is not None or row["settled"] or datetime.now(POST_TZ).weekday() not in (4, 5, 6):
+        text = "🔮 <b>Прогноз уикенда</b>\n\n"
+        if mine is not None:
+            text += f"Твой выбор: «{escape(_pname(options[int(mine)]))}». "
+        text += (f"Победил «{escape(row['winner_title'] or '')}»." if row["settled"]
+                 else "Итоги — в понедельник днём, пришлю сюда.")
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[top_btn]))
+        return
+    await message.answer(
+        "🔮 <b>Прогноз уикенда</b>\n\nКакой фильм заработает больше всех в мировом прокате за эти выходные? "
+        "Итоги в понедельник — за верный ответ очко в таблице 🏆",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎬 {_pname(f)}"[:64], callback_data=f"pv:v:{k}")]
+            for k, f in enumerate(options)] + [top_btn]))
+
+
+@router.callback_query(F.data.startswith("pv:"))
+async def predict_buttons(callback: CallbackQuery) -> None:
+    action = (callback.data or "")[3:]
+    if action == "top":
+        await callback.answer()
+        rows = await db().fetch("""SELECT v.user_id, COUNT(*) pts, MAX(u.username) username, MAX(u.first_name) first_name
+            FROM predict_votes v JOIN predict_round r ON r.week = v.week AND r.settled AND r.winner = v.choice
+            LEFT JOIN users u ON u.user_id = v.user_id GROUP BY v.user_id ORDER BY pts DESC LIMIT 10""")
+        medals = ["🥇", "🥈", "🥉"] + [f"{k}." for k in range(4, 11)]
+        text = ("🏆 <b>Лучшие прогнозисты</b>\n\n" + "\n".join(f"{medals[k]} {_who(r)} — {r['pts']}"
+                                                              for k, r in enumerate(rows))) if rows else \
+            "🏆 Таблица пока пустая — первые итоги в понедельник."
+        if callback.message:
+            await callback.message.answer(text)
+        return
+    if action.startswith("v:") and action[2:].isdigit():
+        week = _week_key()
+        if datetime.now(POST_TZ).weekday() not in (4, 5, 6):
+            await callback.answer("Прогноз уже закрыт — итоги в понедельник", show_alert=True)
+            return
+        await db().execute("""INSERT INTO predict_votes(week, user_id, choice) VALUES($1, $2, $3)
+                              ON CONFLICT(week, user_id) DO UPDATE SET choice=EXCLUDED.choice""",
+                           week, callback.from_user.id, int(action[2:]))
+        await callback.answer("Принято! Итоги в понедельник 🔮")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("✅ Прогноз принят. В понедельник пришлю, кто победил в прокате.")
+        return
+    await callback.answer()
+
+
+# --- «Кинодл»: фильм дня за 6 подсказок, серия побед
+
+kinodl_lock = asyncio.Lock()
+
+
+async def kinodl_today() -> dict[str, Any] | None:
+    today = datetime.now(POST_TZ).date()
+    async with kinodl_lock:
+        row = await db().fetchrow("SELECT * FROM kinodl_day WHERE day=$1", today)
+        if row:
+            film = row["film"] if isinstance(row["film"], dict) else json.loads(row["film"])
+            return {"day": today, "film": film, "frame": row["frame"]}
+        used = {int(r["film_id"]) for r in await db().fetch(
+            "SELECT film_id FROM kinodl_day WHERE day > CURRENT_DATE - 365")}
+        for pick in [f for f in await _popular_films(pages=20) if int(f["id"]) not in used][:5]:
+            try:
+                film = await kp._get(f"/movie/{pick['id']}")
+            except Exception:  # noqa: BLE001
+                continue
+            if not film.get("persons") or not shorts_kinodl.titles(film):
+                continue
+            keep = {k: film.get(k) for k in ("id", "name", "alternativeName", "enName", "names", "year", "genres",
+                                             "countries", "persons", "rating", "movieLength", "seriesLength",
+                                             "shortDescription", "description", "slogan", "isSeries", "poster")}
+            keep["persons"] = [p for p in film.get("persons") or [] if p.get("enProfession") in ("director", "actor")][:8]
+            frame = None
+            try:
+                backdrops, _ = await shorts_daily.tmdb.images(TMDB_API_KEY, film, limit=3)
+                frame = backdrops[0] if backdrops else None
+            except Exception:  # noqa: BLE001
+                pass
+            await db().execute("INSERT INTO kinodl_day(day, film_id, film, frame) VALUES($1, $2, $3, $4)",
+                               today, int(film["id"]), json.dumps(keep, ensure_ascii=False), frame)
+            return {"day": today, "film": keep, "frame": frame}
+    return None
+
+
+async def _kinodl_streak(user_id: int) -> int:
+    days = [r["day"] for r in await db().fetch(
+        "SELECT day FROM kinodl_plays WHERE user_id=$1 AND solved ORDER BY day DESC LIMIT 400", user_id)]
+    streak, expect = 0, datetime.now(POST_TZ).date()
+    for d in days:
+        if d == expect or (streak == 0 and d == expect - timedelta(days=1)):
+            streak += 1
+            expect = d - timedelta(days=1)
+        else:
+            break
+    return streak
+
+
+@router.message(Command("kinodl"))
+@router.message(F.text == "🎬 Кинодл — угадай фильм")
+async def kinodl_menu(message: Message, state: FSMContext | None = None) -> None:
+    await remember(message)
+    game = await kinodl_today()
+    if not game:
+        await message.answer("Фильм дня ещё не готов — загляни через минуту 🙂")
+        return
+    uid = message.from_user.id
+    play = await db().fetchrow("SELECT * FROM kinodl_plays WHERE day=$1 AND user_id=$2", game["day"], uid)
+    if play and play["done"]:
+        await _kinodl_finish(message, game, play["tries"], play["solved"], again=True)
+        return
+    tries = play["tries"] if play else 0
+    if state is not None:
+        await state.set_state(SearchState.kinodl)
+    await _kinodl_clues(message, game, tries, intro=not play)
+
+
+async def _kinodl_clues(message: Message, game: dict[str, Any], tries: int, intro: bool = False) -> None:
+    clue_list = shorts_kinodl.clues(game["film"])
+    shown = clue_list[:min(tries + 1, len(clue_list))]
+    head = ("🎬 <b>Кинодл</b> — угадай фильм дня за 6 подсказок. Пиши название сообщением; каждая ошибка "
+            "открывает новую подсказку.\n\n" if intro else "")
+    text = head + "\n".join(escape(c) for c in shown) + f"\n\nПопытка {tries + 1} из {shorts_kinodl.MAX_TRIES} ✍️"
+    if tries + 1 >= shorts_kinodl.MAX_TRIES and game.get("frame"):
+        try:
+            await message.answer_photo(game["frame"], caption=text[:1024])
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    await message.answer(text)
+
+
+async def _kinodl_finish(message: Message, game: dict[str, Any], tries: int, solved: bool,
+                         again: bool = False) -> None:
+    film = game["film"]
+    title = shorts_kinodl.titles(film)[0]
+    streak = await _kinodl_streak(message.from_user.id if message.from_user else 0)
+    day = game["day"].strftime("%d.%m")
+    share = shorts_kinodl.share_line(day, tries, solved)
+    link = f"{await _bot_link(message.bot)}?start=kinodl"
+    text = ((f"🎉 Угадал с {tries}-й попытки! Это «{escape(title)}» ({film.get('year') or ''})."
+             if solved else f"😔 Это был «{escape(title)}» ({film.get('year') or ''})."))
+    if again:
+        text = "✅ Сегодня ты уже сыграл. " + text
+    text += (f"\n🔥 Серия побед: <b>{streak}</b>" if streak else "") + "\nНовый фильм — завтра!\n\n" \
+        f"Поделись без спойлера:\n<code>{escape(share)}</code>\n{link}"
+    await message.answer(text, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Открыть карточку фильма", callback_data=f"open:{film['id']}")],
+        [InlineKeyboardButton(text="📤 Позвать друга играть", url="https://t.me/share/url?url=" + quote(link)
+                              + "&text=" + quote(share))]]))
+
+
+@router.message(SearchState.kinodl, F.text, ~F.text.startswith("/"))
+async def kinodl_guess(message: Message, state: FSMContext) -> None:
+    guess = (message.text or "").strip()
+    if guess in MAIN_MENU_LABELS:
+        await state.clear()
+        await do_search(message, state)  # переход в другой раздел меню
+        return
+    game = await kinodl_today()
+    if not game:
+        await state.clear()
+        return
+    uid = message.from_user.id
+    play = await db().fetchrow("SELECT * FROM kinodl_plays WHERE day=$1 AND user_id=$2", game["day"], uid)
+    if play and play["done"]:
+        await state.clear()
+        await _kinodl_finish(message, game, play["tries"], play["solved"], again=True)
+        return
+    tries = (play["tries"] if play else 0) + 1
+    solved = shorts_kinodl.is_correct(guess, game["film"])
+    done = solved or tries >= shorts_kinodl.MAX_TRIES
+    await db().execute("""INSERT INTO kinodl_plays(day, user_id, tries, solved, done) VALUES($1, $2, $3, $4, $5)
+                          ON CONFLICT(day, user_id) DO UPDATE SET tries=$3, solved=$4, done=$5""",
+                       game["day"], uid, tries, solved, done)
+    if done:
+        await state.clear()
+        await _kinodl_finish(message, game, tries, solved)
+        return
+    await message.answer("❌ Не то. Новая подсказка 👇")
+    await _kinodl_clues(message, game, tries)
+
+
+# --- «Выбрать вдвоём»: двое отмечают одни и те же фильмы, бот показывает совпадения
+
+DUO_FILMS = 12
+
+
+@router.message(F.text == "👥 Выбрать вдвоём")
+async def duo_new(message: Message) -> None:
+    await remember(message)
+    wait = await message.answer("🎬 Собираю 12 хороших фильмов…")
+    films: list[dict[str, Any]] = []
+    try:
+        for _ in range(2):
+            for f in await _popular_films(pages=15):
+                if len(films) < DUO_FILMS and all(int(f["id"]) != x["id"] for x in films):
+                    films.append({"id": int(f["id"]), "title": shorts_daily._title(f), "year": f.get("year"),
+                                  "poster": shorts_daily._poster_url(f), "rating": shorts_daily._best_rating(f)[0],
+                                  "genres": ", ".join(str(g.get("name")) for g in (f.get("genres") or [])[:2]
+                                                      if isinstance(g, dict))})
+    except Exception:  # noqa: BLE001
+        logging.exception("Duo: films failed")
+    if len(films) < 6:
+        await wait.edit_text("Не получилось собрать фильмы — попробуй через минуту.")
+        return
+    duo_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    await db().execute("INSERT INTO duo(id, creator, films) VALUES($1, $2, $3)", duo_id, message.from_user.id,
+                       json.dumps(films, ensure_ascii=False))
+    link = f"{await _bot_link(message.bot)}?start=duo_{duo_id}"
+    await wait.edit_text(
+        f"👥 <b>Выбираем вдвоём</b>\n\n1. Отправь другу ссылку: {link}\n2. Каждый отмечает 👍 или 👎 одни и те "
+        f"же {len(films)} фильмов.\n3. Бот покажет фильмы, которые понравились обоим. 🍿\n\nНачинай 👇",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="📤 Отправить другу", url=f"https://t.me/share/url?url={quote(link)}&text="
+            + quote("Давай выберем фильм на вечер вместе 🍿"))]]))
+    await duo_show(message.bot, message.chat.id, message.from_user.id, duo_id, None)
+
+
+async def duo_show(bot: Bot, chat_id: int, user_id: int, duo_id: str, msg: Message | None) -> None:
+    """Следующий фильм, который этот участник ещё не отметил; все отмечены — итог."""
+    row = await db().fetchrow("SELECT films FROM duo WHERE id=$1", duo_id)
+    if not row:
+        await bot.send_message(chat_id, "Эта ссылка устарела — начни заново: «👥 Выбрать вдвоём».")
+        return
+    films = row["films"] if isinstance(row["films"], list) else json.loads(row["films"])
+    done = {int(r["idx"]) for r in await db().fetch("SELECT idx FROM duo_votes WHERE id=$1 AND user_id=$2",
+                                                    duo_id, user_id)}
+    left = [k for k in range(len(films)) if k not in done]
+    if not left:
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        await duo_result(bot, duo_id, user_id)
+        return
+    k = left[0]
+    f = films[k]
+    caption = (f"<b>{escape(f['title'])}</b>" + (f" ({f['year']})" if f.get("year") else "")
+               + (f"\n⭐ {f['rating']:.1f}" if f.get("rating") else "") + (f" · {escape(f['genres'])}" if f.get("genres")
+               else "") + f"\n\n{len(films) - len(left) + 1} из {len(films)}")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👎 Не хочу", callback_data=f"duo:v:{duo_id}:{k}:0"),
+        InlineKeyboardButton(text="👍 Буду смотреть", callback_data=f"duo:v:{duo_id}:{k}:1")]])
+    if msg and f.get("poster"):
+        try:
+            await msg.edit_media(InputMediaPhoto(media=f["poster"], caption=caption), reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001 — не вышло заменить: пришлём новым сообщением
+            pass
+    if f.get("poster"):
+        try:
+            await bot.send_photo(chat_id, f["poster"], caption=caption, reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    await bot.send_message(chat_id, caption, reply_markup=markup)
+
+
+async def duo_result(bot: Bot, duo_id: str, user_id: int) -> None:
+    row = await db().fetchrow("SELECT films, creator FROM duo WHERE id=$1", duo_id)
+    films = row["films"] if isinstance(row["films"], list) else json.loads(row["films"])
+    votes = await db().fetch("SELECT user_id, idx, liked FROM duo_votes WHERE id=$1", duo_id)
+    users: dict[int, dict[int, bool]] = {}
+    for v in votes:
+        users.setdefault(int(v["user_id"]), {})[int(v["idx"])] = bool(v["liked"])
+    finished = [u for u, d in users.items() if len(d) >= len(films)]
+    if len(finished) < 2:
+        await bot.send_message(user_id, "✅ Готово! Ждём, пока друг отметит фильмы, — пришлю совпадения сюда. 👥")
+        return
+    common = [k for k in range(len(films)) if all(users[u].get(k) for u in finished)]
+    if common:
+        text = "🎉 <b>Совпадения!</b> Эти фильмы понравились вам обоим:\n\n" + "\n".join(
+            f"• {escape(films[k]['title'])}" + (f" ({films[k]['year']})" if films[k].get("year") else "") for k in common)
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=f"🎬 {films[k]['title']}"[:64], callback_data=f"open:{films[k]['id']}")] for k in common[:8]])
+    else:
+        text = "😅 Совпадений нет — вкусы разные. Попробуйте ещё раз: «👥 Выбрать вдвоём» даст новые фильмы."
+        markup = None
+    for u in finished:  # итог — всем, кто уже закончил (второму — сразу, первому — когда закончил второй)
+        if u == user_id or len(finished) == 2:
+            try:
+                await bot.send_message(u, text, reply_markup=markup)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+@router.callback_query(F.data.startswith("duo:"))
+async def duo_buttons(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    if len(parts) != 5 or parts[1] != "v" or not parts[3].isdigit():
+        await callback.answer()
+        return
+    await callback.answer()
+    await db().execute("""INSERT INTO duo_votes(id, user_id, idx, liked) VALUES($1, $2, $3, $4)
+                          ON CONFLICT(id, user_id, idx) DO UPDATE SET liked=EXCLUDED.liked""",
+                       parts[2], callback.from_user.id, int(parts[3]), parts[4] == "1")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await duo_show(callback.bot, chat_id, callback.from_user.id, parts[2], callback.message)
+
+
+# --- кинодневник подписчика и «Мой год в кино»
+
+def _diary_score_markup(movie_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(n), callback_data=f"dia:s:{movie_id}:{n}") for n in range(1, 6)],
+        [InlineKeyboardButton(text=str(n), callback_data=f"dia:s:{movie_id}:{n}") for n in range(6, 11)],
+        [InlineKeyboardButton(text="Без оценки", callback_data=f"dia:s:{movie_id}:0")]])
+
+
+@router.message(F.text == "📔 Кинодневник")
+async def diary_menu(message: Message) -> None:
+    await remember(message)
+    uid, year = message.from_user.id, datetime.now(MSK).year
+    rows = await db().fetch("SELECT title, score, watched_at FROM diary WHERE user_id=$1 ORDER BY watched_at DESC",
+                            uid)
+    this_year = [r for r in rows if r["watched_at"].astimezone(MSK).year == year]
+    if not rows:
+        await message.answer(
+            "📔 <b>Кинодневник</b>\n\nОтмечай, что посмотрел, и ставь оценку — кнопка «✅ Посмотрел» в карточке "
+            "любого фильма. В конце года бот соберёт твою карточку «Мой год в кино»: сколько фильмов, любимый "
+            "жанр и лучшее за год. 🍿\n\nНайди фильм: «🔎 Найти фильм или сериал».")
+        return
+    lines = [f"{'⭐ ' + str(r['score']) + '/10' if r['score'] else '✅'} {escape(r['title'])}" for r in rows[:15]]
+    await message.answer(
+        f"📔 <b>Кинодневник</b>\n\nЗа {year} год: <b>{len(this_year)}</b> · всего: <b>{len(rows)}</b>\n\n"
+        + "\n".join(lines) + ("\n…" if len(rows) > 15 else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎉 Мой {year} в кино", callback_data="dia:y")],
+            [InlineKeyboardButton(text="🗑 Убрать последнюю запись", callback_data="dia:undo")]]))
+
+
+@router.callback_query(F.data.startswith("dia:"))
+async def diary_buttons(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    uid = callback.from_user.id
+    if parts[1] == "w" and len(parts) == 3 and parts[2].isdigit():
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("⭐ Как тебе? Оцени от 1 до 10:", reply_markup=_diary_score_markup(int(parts[2])))
+        return
+    if parts[1] == "s" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+        movie_id, score = int(parts[2]), max(0, min(10, int(parts[3])))
+        try:
+            item = await kp.details(movie_id)
+        except Exception:  # noqa: BLE001
+            item = {}
+        genres = ", ".join(str(g.get("name")) for g in (item.get("genres") or []) if isinstance(g, dict))[:120]
+        year = item.get("year") if str(item.get("year") or "").isdigit() else None
+        title = kp.title(item) if item else (await db().fetchval(
+            "SELECT title FROM history WHERE user_id=$1 AND movie_id=$2 LIMIT 1", uid, movie_id) or "Фильм")
+        await db().execute(
+            """INSERT INTO diary(user_id, movie_id, title, score, genres, year_released, poster)
+               VALUES($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT(user_id, movie_id) DO UPDATE SET score=EXCLUDED.score, watched_at=NOW()""",
+            uid, movie_id, title, score, genres, int(year) if year else None, kp.poster(item) if item else None)
+        if score:  # оценка дневника — и в «Топ по версии подписчиков»
+            await db().execute(
+                """INSERT INTO ratings(user_id, movie_id, title, value) VALUES($1, $2, $3, $4)
+                   ON CONFLICT(user_id, movie_id) DO UPDATE SET value=EXCLUDED.value, created_at=NOW()""",
+                uid, movie_id, title, 1 if score >= 6 else -1)
+        n = await db().fetchval("SELECT COUNT(*) FROM diary WHERE user_id=$1 AND watched_at >= $2", uid,
+                                datetime(datetime.now(MSK).year, 1, 1, tzinfo=MSK))
+        await callback.answer("Записал в кинодневник ✅")
+        if callback.message:
+            await callback.message.edit_text(
+                f"✅ «{escape(title)}» в кинодневнике" + (f" — {score}/10" if score else "")
+                + f". В этом году: <b>{n}</b>. Все записи — кнопка «📔 Кинодневник».")
+        return
+    if parts[1] == "undo":
+        await db().execute("""DELETE FROM diary WHERE (user_id, movie_id) IN (
+            SELECT user_id, movie_id FROM diary WHERE user_id=$1 ORDER BY watched_at DESC LIMIT 1)""", uid)
+        await callback.answer("Убрал последнюю запись")
+        return
+    if parts[1] == "y":
+        await callback.answer()
+        year = datetime.now(MSK).year
+        rows = [dict(r) for r in await db().fetch(
+            "SELECT title, score, genres, year_released, poster FROM diary WHERE user_id=$1 AND watched_at >= $2",
+            uid, datetime(year, 1, 1, tzinfo=MSK))]
+        if not callback.message:
+            return
+        if not rows:
+            await callback.message.answer("В этом году в дневнике пока пусто — отмечай фильмы кнопкой «✅ Посмотрел».")
+            return
+        st = shorts_diary.stats(rows)
+        posters: list[bytes | None] = []
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            for r in st["best"]:
+                try:
+                    posters.append(await netsafe.fetch(session, r["poster"], 8 * 1024 * 1024) if r.get("poster")
+                                   else None)
+                except Exception:  # noqa: BLE001
+                    posters.append(None)
+        link = (await _bot_link(callback.bot)).replace("https://", "")
+        name = callback.from_user.first_name or ""
+        png = await asyncio.to_thread(shorts_diary.year_card, name, year, st, posters, link)
+        await callback.message.answer_photo(
+            BufferedInputFile(png, filename=f"my_{year}_in_cinema.png"),
+            caption=f"🎉 Твой {year} в кино! Перешли друзьям — пусть тоже посчитают свой 🍿\n"
+                    f"Кинодневник ведётся здесь: {link}")
+        return
+    await callback.answer()
 
 
 @router.message(F.text == "🧩 Викторина дня")
@@ -15260,6 +16133,7 @@ async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
         BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
+        BotCommand(command="report", description="📊 Отчёт за неделю и план"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),

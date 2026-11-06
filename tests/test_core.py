@@ -91,3 +91,40 @@ def test_post_media_only_from_focused_posts() -> None:
     assert not _focused(digest, names)
     assert _focused(single, names)
     assert not _focused(other_first, names)
+
+
+def test_diary_year_stats_and_card() -> None:
+    from shorts import diary
+
+    rows = [{"title": "Интерстеллар", "score": 10, "genres": "фантастика, драма", "year_released": 2014},
+            {"title": "Дюна: Часть вторая", "score": 9, "genres": "фантастика", "year_released": 2024},
+            {"title": "Без оценки", "score": 0, "genres": "драма", "year_released": 2010}]
+    st = diary.stats(rows)
+    assert st["count"] == 3 and st["avg"] == 9.5 and st["genre"] in ("фантастика", "драма")
+    assert [r["title"] for r in st["best"]] == ["Интерстеллар", "Дюна: Часть вторая"]
+    png = diary.year_card("Зритель", 2026, st, [None, None], "t.me/VKino_360bot")
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_kinodl_clues_and_answers() -> None:
+    from shorts import kinodl
+
+    film = {"name": "Интерстеллар", "enName": "Interstellar", "year": 2014, "genres": [{"name": "фантастика"}],
+            "persons": [{"name": "Кристофер Нолан", "enProfession": "director"}],
+            "shortDescription": "Интерстеллар — экспедиция через червоточину."}
+    clues = kinodl.clues(film)
+    assert len(clues) == 5 and "Интерстеллар" not in clues[4]
+    assert kinodl.is_correct("интерстелар", film) and kinodl.is_correct("Interstellar", film)
+    assert not kinodl.is_correct("Начало", film)
+    assert kinodl.share_line("06.11", 3, True).endswith("3/6")
+
+
+def test_review_score_and_montage_table() -> None:
+    from shorts import lore
+
+    assert lore.review_score(["Начало", "Мой вердикт: крепкая восьмёрка из десяти."]) == {"line": 1, "value": "8"}
+    assert lore.review_score(["Оценка 7,5/10"]) == {"line": 0, "value": "7.5"}
+    assert lore.review_score(["Без оценки"]) is None
+    plan = ("| Время | Что показываем | Текст на экране |\n|---|---|---|\n"
+            "| 0–4 сек. | Самый эффектный кадр | ЗАБУДЬТЕ ПРО ЙОВОВИЧ! |\n")
+    assert lore.parse_script(plan)["screens"] == []  # план монтажа не читается вслух

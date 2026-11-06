@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -597,6 +598,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     total_n = len(stories)
     segments: list[Path] = []
     chapters: list[tuple[float, str]] = []
+    cuts: list[list[Any]] = []  # [начало, конец, заголовок] каждой новости — для «✂️ Нарезать на шортсы»
     clock = 0.0
     notes: list[str] = []
     first_img: Image.Image | None = None
@@ -670,6 +672,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         story_music = musiclib.pick(story["headline"], " ".join(story["lines"])) or main_music
         segments.append(await _segment(work, f"card{n}", [(card, CARD_SEC)], None,
                                        whoosh if whoosh.exists() else None, CARD_SEC, story_music))
+        story_start = clock
         chapters.append((clock, story.get("chapter") or story["headline"].capitalize()))
         clock += CARD_SEC
         voice, starts, dur, voiced = await _voice(story["lines"], work / f"v{n}")
@@ -684,6 +687,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
             slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
         segments.append(await _segment(work, f"story{n}", slides, over, voice, total, story_music))
         clock += total
+        cuts.append([round(story_start, 2), round(clock, 2), story["headline"]])  # для нарезки на шортсы
 
     await daily._progress(84, "Финал выпуска")
     voice, starts, dur, voiced = await _voice(script["outro"], work / "v_outro")
@@ -735,6 +739,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     cover = work / "cover.jpg"
     await asyncio.to_thread(lambda: thumbnail(first_img, stories[0]["headline"], date_label).save(cover, quality=92))
     seo = build_seo(script, chapters, date_label)
+    seo["cuts"] = json.dumps(cuts, ensure_ascii=False)
     if notes:
         seo["warning"] = "\n".join(notes)
     if daily.voice_issues:  # контроль озвучки: места, где распознавание услышало не то, что в тексте
@@ -769,3 +774,64 @@ def build_seo(script: dict[str, Any], chapters: list[tuple[float, str]], date_la
 def headlines(script: dict[str, Any]) -> str:
     """Темы выпуска одной строкой (для памяти «что было в прошлый раз»)."""
     return "; ".join(re.sub(r"\s+", " ", s["headline"]) for s in script.get("stories") or [])
+
+
+# ---------------------------------------------------------------- выпуск → вертикальные шортсы
+
+SHORT_MAX = 89.0  # сек: шортс из одной новости выпуска
+
+
+def _short_header(headline: str) -> Image.Image:
+    """Верх вертикального ролика: «НОВОСТИ КИНО» и заголовок новости (до 3 строк)."""
+    layer = Image.new("RGBA", (1080, 520), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    draw.rounded_rectangle((330, 60, 750, 120), radius=30, fill=ACCENT)
+    draw.text((540, 90), "НОВОСТИ КИНО", font=_font("Montserrat.ttf", 32, "Bold"), fill=INK, anchor="mm")
+    size = 78
+    words = headline.upper().split()
+    while True:
+        font = _font("Oswald.ttf", size, "Bold")
+        lines, cur = [], ""
+        for w in words:
+            test = f"{cur} {w}".strip()
+            if draw.textlength(test, font=font) <= 980:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+        if len(lines) <= 3 or size <= 48:
+            break
+        size -= 6
+    y = 170
+    for line in lines[:3]:
+        draw.text((540, y), line, font=font, fill="white", anchor="ma", stroke_width=3, stroke_fill=(0, 0, 0))
+        y += int(size * 1.15)
+    return layer
+
+
+async def vertical_cut(src: Path, start: float, end: float, headline: str, out: Path) -> Path:
+    """Кусок выпуска (одна новость) → шортс 1080×1920: размытый фон, кадр 16:9 по центру, заголовок сверху,
+    звук как в выпуске. До SHORT_MAX секунд."""
+    header = out.with_suffix(".png")
+    await asyncio.to_thread(lambda: _short_header(headline).save(header))
+    dur = max(3.0, min(end - start, SHORT_MAX))
+    filt = ("[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+            "boxblur=24:2,eq=brightness=-0.12[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2[v1];"
+            "[v1][1:v]overlay=0:0[v]")
+    await _run("ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}", "-t", f"{dur:.2f}", "-i", str(src),
+               "-i", str(header), "-filter_complex", filt, "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
+               "-preset", "veryfast", "-crf", "23", "-threads", "2", "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", str(out))
+    header.unlink(missing_ok=True)
+    return out
+
+
+def cut_seo(headline: str, episode_seo: dict[str, str]) -> dict[str, str]:
+    title = headline.strip().rstrip(".")
+    title = (title if len(title) <= 85 else title[:82] + "…") + " #shorts"
+    return {"title": title,
+            "description": f"{headline}\n\nПолный выпуск «Новости кино» — на канале.\n\n"
+                           f"📢 Telegram: {daily.TELEGRAM_URL}\n\n#shorts #новостикино #кино",
+            "tags": episode_seo.get("tags", ""),
+            "pinned": "Что думаешь об этой новости? 👇"}

@@ -996,6 +996,59 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
             "status": str(data.get("status") or "").strip().lower()}
 
 
+async def guess_films(key: str, description: str) -> list[dict[str, Any]]:
+    """«Найди фильм по описанию»: зритель помнит сюжет, а не название. До 3 вариантов
+    [{"ru", "en", "year", "why"}] — самые вероятные первыми; не уверен — меньше вариантов."""
+    if not available(key) or len(description.strip()) < 10:
+        return []
+    prompt = (
+        "Зритель не помнит название фильма или сериала и описывает его своими словами (сюжет, сцены, актёры, "
+        "годы — может путать детали). Назови до 3 самых вероятных вариантов, лучший первым. Только реально "
+        "существующие фильмы и сериалы; не уверен — дай меньше вариантов. Для каждого: ru — название в российском "
+        "прокате, en — оригинальное название, year — год выхода, why — одна короткая фраза, чем совпадает с "
+        "описанием (без спойлеров концовки).\n"
+        'Ответь только JSON: {"films": [{"ru": "...", "en": "...", "year": 2014, "why": "..."}]}\n\n'
+        "ОПИСАНИЕ ЗРИТЕЛЯ:\n" + description.strip()[:1500])
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: guess_films failed: %s", exc)
+        return []
+    out = []
+    for f in (data.get("films") if isinstance(data, dict) else None) or []:
+        if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
+            year = f.get("year")
+            out.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                        "year": int(year) if str(year or "").isdigit() else None,
+                        "why": re.sub(r"\s+", " ", str(f.get("why") or "")).strip()[:160]})
+    return out[:3]
+
+
+async def screen_labels(key: str, lines: list[str], title: str = "") -> list[str]:
+    """Крупные надписи на экране шортса — по одной на фразу озвучки: 2–4 слова КАПСОМ, цепляют и не повторяют
+    фразу дословно («ЗАБУДЬТЕ ПРО ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ»). Пусто — у фразы без надписи."""
+    if not available(key) or not lines:
+        return []
+    listing = "\n".join(f"{k}. {ln}" for k, ln in enumerate(lines, 1))
+    prompt = (
+        "Ты монтажёр YouTube Shorts о кино. К каждой фразе озвучки придумай крупную надпись на экране: 2–4 слова "
+        "КАПСОМ, до 26 символов, цепляет и дополняет голос, а не повторяет фразу целиком. Примеры: «ЗАБУДЬТЕ ПРО "
+        "ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ», «НАПРЯЖЕНИЕ ДО КОНЦА», «МОЯ ОЦЕНКА: 8/10». Без спойлеров. "
+        "К проходной фразе можно дать пустую строку. Ровно столько надписей, сколько фраз, по порядку."
+        + (f" Ролик: {title}." if title else "")
+        + '\n\nОтветь только JSON: {"labels": ["…", "…"]}\n\nФРАЗЫ:\n' + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: screen labels failed: %s", exc)
+        return []
+    raw = data.get("labels") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = [re.sub(r"\s+", " ", str(x or "")).strip().strip("«»\"").upper()[:30] for x in raw]
+    return (out + [""] * len(lines))[:len(lines)]
+
+
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
                           today: str = "", n: int = 5, only: bool = False, hint: str = "") -> dict[str, Any] | None:
     """Пост-подборка для Telegram-канала в стиле POST_STYLE. ИИ сам выбирает n фильмов из всех источников:
@@ -1191,6 +1244,20 @@ async def box_office_post(key: str, today: str) -> dict[str, Any] | None:
     post = _clean_post(data)
     films = _films_from(data or {}, ("gross",))
     return {"post": post, "films": films[:8]} if post and len(films) >= 3 else None
+
+
+async def weekend_candidates(key: str, today: str) -> list[dict[str, Any]]:
+    """Прогноз уикенда: 4 фильма, которые реально могут возглавить мировой прокат в эти выходные (премьеры
+    недели и лидеры прошлого уикенда) — по свежим данным из Google. [{"ru", "en", "year"}]."""
+    prompt = (f"Сегодня {today}. Найди в Google, какие фильмы идут в кинотеатрах в эти выходные: премьеры этой "
+              "недели и лидеры прошлого уикенда по мировым (или североамериканским) сборам. Выбери 4 фильма, "
+              "которые реально могут занять первое место по сборам за эти выходные (не заведомо слабые). "
+              "Названия — как в российском прокате, если есть, и оригинальные."
+              '\n\nОтветь только JSON: {"films": [{"ru": "название по-русски", "en": "оригинальное", '
+              '"year": 2026}]}')
+    data = await _post_json(key, prompt, need_search=True, verify=False,
+                            query=f"box office weekend preview {today} new releases opening weekend")
+    return _films_from(data or {})[:4]
 
 
 async def week_digest_post(key: str, posts: str, own: str, today: str) -> dict[str, Any] | None:
