@@ -9849,7 +9849,7 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
            f"Человек: {res.get('person') or '—'} ({res.get('person_en') or '—'})."
     keep: list[Path] = []
     for k, path in enumerate(files):
-        if k >= 4:
+        if k >= 2:  # остальные кадры альбома — из того же поста; лимит Gemini на день не тратим
             keep.append(path)
             continue
         img = await _media_frame(path, work)
