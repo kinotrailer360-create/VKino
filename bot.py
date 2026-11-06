@@ -245,6 +245,7 @@ MAIN_MENU_LABELS = {
 
 class SearchState(StatesGroup):
     query = State()
+    describe = State()
 
 
 class ShortsState(StatesGroup):
@@ -3995,7 +3996,9 @@ async def ask_search(
     await remember(message)
     await state.set_state(SearchState.query)
     await message.answer(
-        "Напиши название фильма или сериала 👇"
+        "Напиши название фильма или сериала 👇\n\n<i>Не помнишь название? Опиши сюжет — найду по описанию.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤔 Не помню название — опишу сюжет", callback_data="fd:ask")]]),
     )
 
 
@@ -4089,9 +4092,15 @@ async def do_search(
         return
 
     if not items:
+        if len(query.split()) >= 5:  # похоже на описание сюжета, а не на название
+            await state.clear()
+            await find_by_description(message, query)
+            return
         await message.answer(
             "Ничего не нашёл 😕 "
-            "Попробуй другое название."
+            "Попробуй другое название — или опиши сюжет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🤔 Опишу сюжет", callback_data="fd:ask")]]),
         )
         return
 
@@ -4101,6 +4110,59 @@ async def do_search(
         "Вот что нашёл:",
         reply_markup=results_keyboard(items),
     )
+
+
+@router.callback_query(F.data == "fd:ask")
+async def describe_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(SearchState.describe)
+    if callback.message:
+        await callback.message.answer(
+            "🤔 Опиши, что помнишь: сюжет, сцены, актёров, примерный год. Например: «фильм, где мужик застрял в "
+            "одном дне и каждый раз просыпается под одну песню».")
+
+
+@router.message(SearchState.describe, F.text, ~F.text.startswith("/"))
+async def describe_text(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if text in MAIN_MENU_LABELS:
+        await state.clear()
+        await message.answer("Поиск по описанию закрыт.", reply_markup=main_menu())
+        return
+    await state.clear()
+    await find_by_description(message, text)
+
+
+async def find_by_description(message: Message, text: str) -> None:
+    """Фильм по описанию сюжета: ИИ называет до 3 вариантов, бот находит их в каталоге и даёт карточки."""
+    if len(text) < 15:
+        await message.answer("Маловато 🙂 Опиши подробнее: что происходит, кто играет, когда примерно вышел.")
+        return
+    wait = await message.answer("🔎 Вспоминаю фильм по описанию…")
+    guesses = await shorts_ai.guess_films(GEMINI_API_KEY, text)
+    found: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for g in guesses:
+        for q in [x for x in (g["ru"], g["en"]) if x]:
+            try:
+                items = await kp.search(q, limit=5)
+            except Exception:  # noqa: BLE001
+                items = []
+            year = g.get("year")
+            hit = next((it for it in items if not year or abs(int(it.get("year") or 0) - year) <= 1), None)
+            if hit and all(int(hit["id"]) != int(f["id"]) for f in found):
+                found.append(hit)
+                notes.append(f"• «{escape(kp.title(hit))}»" + (f" ({hit.get('year')})" if hit.get("year") else "")
+                             + (f" — {escape(g['why'])}" if g.get("why") else ""))
+                break
+    await wait.delete()
+    if not found:
+        await message.answer("😕 Не узнал фильм по описанию. Попробуй добавить детали: актёров, страну, год, "
+                             "запоминающуюся сцену.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [InlineKeyboardButton(text="🤔 Описать ещё раз", callback_data="fd:ask")]]))
+        return
+    await message.answer("🎯 Похоже, это:\n" + "\n".join(notes) + "\n\nНажми, чтобы открыть карточку 👇",
+                         reply_markup=results_keyboard(found))
 
 
 @router.callback_query(F.data.startswith("open:"))

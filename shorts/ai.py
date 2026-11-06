@@ -996,6 +996,34 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
             "status": str(data.get("status") or "").strip().lower()}
 
 
+async def guess_films(key: str, description: str) -> list[dict[str, Any]]:
+    """«Найди фильм по описанию»: зритель помнит сюжет, а не название. До 3 вариантов
+    [{"ru", "en", "year", "why"}] — самые вероятные первыми; не уверен — меньше вариантов."""
+    if not available(key) or len(description.strip()) < 10:
+        return []
+    prompt = (
+        "Зритель не помнит название фильма или сериала и описывает его своими словами (сюжет, сцены, актёры, "
+        "годы — может путать детали). Назови до 3 самых вероятных вариантов, лучший первым. Только реально "
+        "существующие фильмы и сериалы; не уверен — дай меньше вариантов. Для каждого: ru — название в российском "
+        "прокате, en — оригинальное название, year — год выхода, why — одна короткая фраза, чем совпадает с "
+        "описанием (без спойлеров концовки).\n"
+        'Ответь только JSON: {"films": [{"ru": "...", "en": "...", "year": 2014, "why": "..."}]}\n\n'
+        "ОПИСАНИЕ ЗРИТЕЛЯ:\n" + description.strip()[:1500])
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: guess_films failed: %s", exc)
+        return []
+    out = []
+    for f in (data.get("films") if isinstance(data, dict) else None) or []:
+        if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
+            year = f.get("year")
+            out.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                        "year": int(year) if str(year or "").isdigit() else None,
+                        "why": re.sub(r"\s+", " ", str(f.get("why") or "")).strip()[:160]})
+    return out[:3]
+
+
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
                           today: str = "", n: int = 5, only: bool = False, hint: str = "") -> dict[str, Any] | None:
     """Пост-подборка для Telegram-канала в стиле POST_STYLE. ИИ сам выбирает n фильмов из всех источников:
