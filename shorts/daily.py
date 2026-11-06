@@ -1080,7 +1080,7 @@ voice_cache_hits = 0  # сколько фраз последней озвучк�
 
 def _voice_key(text: str, pause: float) -> Path:
     # настройки голоса тоже в ключе: сменили скорость или живость — фраза озвучивается заново
-    raw = (f"{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
+    raw = (f"v2|{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
            f"{lumean.STYLE:g}|{pause:g}|{text}")
     return VOICE_CACHE / (hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".mp3")
 
@@ -1103,11 +1103,12 @@ async def _lumean_cached(speak: list[str], parts: list[Path], work: Path, pause:
     if not todo:
         return
     await lumean.synthesize([texts[i] for i in todo], [parts[i] for i in todo], work, pause)
-    await _verify_parts([speak[i] for i in todo], [parts[i] for i in todo], work, pause)
+    doubtful = await _verify_parts([speak[i] for i in todo], [parts[i] for i in todo], work, pause)
+    skip = {todo[k] for k in doubtful}  # сомнительный кусок в кэш не кладём — в следующий раз озвучится заново
     try:
         VOICE_CACHE.mkdir(parents=True, exist_ok=True)
         for i in todo:
-            if parts[i].exists() and parts[i].stat().st_size > 1000:
+            if i not in skip and parts[i].exists() and parts[i].stat().st_size > 1000:
                 shutil.copyfile(parts[i], keys[i])
         files = sorted(VOICE_CACHE.glob("*.mp3"), key=lambda f: f.stat().st_mtime)
         for old in files[:max(0, len(files) - VOICE_CACHE_MAX)]:
@@ -1325,30 +1326,61 @@ def _extra_words(expected: str, heard: list[dict[str, Any]]) -> list[str]:
     return extra
 
 
-async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: float) -> None:
-    """ElevenLabs иногда «бормочет» на месте паузы между фразами («Май. Май. Пиро.»): распознаём каждую фразу
-    и, если в ней есть лишние слова, переозвучиваем её отдельным заказом (лучший из двух вариантов)."""
+def _missing_words(expected: str, heard: list[dict[str, Any]]) -> list[str]:
+    """Слова текста, которых в озвучке фразы нет вовсе: фраза обрезана или к ней приклеился кусок соседней,
+    а свой ушёл в другую фразу (тогда звук съезжает относительно субтитров и картинок)."""
+    from difflib import SequenceMatcher
+    want = [_norm_word(w) for w in expected.replace(pronounce.STRESS, "").split() if _norm_word(w)]
+    got = [_norm_word(h["w"]) for h in heard if _norm_word(h["w"])]
+    lost: list[str] = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, want, got, autojunk=False).get_opcodes():
+        if tag == "delete":
+            lost += want[i1:i2]
+        elif tag == "replace" and (i2 - i1) - (j2 - j1) >= 2:  # услышали заметно меньше слов, чем было
+            lost += want[i1 + (j2 - j1):i2]
+    return lost
+
+
+def _bad_part(expected: str, heard: list[dict[str, Any]]) -> int:
+    """Насколько кусок озвучки не совпал с фразой: лишние слова (бормотание, кусок соседней фразы) и пропавшие.
+    0–1 — норма (распознавание само ошибается), 2+ — переозвучиваем."""
+    extra, lost = len(_extra_words(expected, heard)), len(_missing_words(expected, heard))
+    words = len([w for w in expected.split() if _norm_word(w)])
+    return extra + (lost if lost >= max(2, words // 4) else 0)
+
+
+async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: float) -> list[int]:
+    """ElevenLabs иногда «бормочет» на месте паузы между фразами («Май. Май. Пиро.»), а нарезка общей дорожки
+    может ошибиться границей: распознаём каждую фразу и, если в ней лишние слова или не хватает своих,
+    переозвучиваем её отдельным заказом (лучший из двух вариантов). Возвращает номера фраз, которые так и
+    остались сомнительными (их не кладём в кэш)."""
     if not (ai.RESERVE_KEY and "groq.com" in ai.RESERVE_URL):
-        return
+        return []
+    doubtful: list[int] = []
     for i, (text, part) in enumerate(zip(speak, parts)):
         try:
             heard = await ai.transcribe_words(part.read_bytes())
-            extra = _extra_words(text, heard)
+            bad = _bad_part(text, heard)
             for want, got in _misheard(text, heard):  # контроль озвучки: что голос, похоже, сказал не так
                 voice_issues.append({"text": text, "want": want, "got": got})
         except Exception as exc:  # noqa: BLE001 — проверка не должна ломать сборку
             log.warning("shorts: voice check of phrase %d failed: %s", i + 1, exc)
-            return
-        if len(extra) < 2:
+            return doubtful
+        if bad < 2:
             continue
-        log.warning("shorts: phrase %d has extra words %s — re-voicing it", i + 1, extra)
+        log.warning("shorts: phrase %d does not match its text (%d) — re-voicing it", i + 1, bad)
         redo = work / f"voice_redo_{i}.mp3"
         try:
             await lumean.synthesize([_for_lumean(text)], [redo], work, pause)
-            if len(_extra_words(text, await ai.transcribe_words(redo.read_bytes()))) < len(extra):
+            again = _bad_part(text, await ai.transcribe_words(redo.read_bytes()))
+            if again < bad:
                 redo.replace(part)
+            if min(again, bad) >= 2:
+                doubtful.append(i)
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: re-voicing phrase %d failed: %s", i + 1, exc)
+            doubtful.append(i)
+    return doubtful
 
 
 voice_issues: list[dict[str, str]] = []  # слова, которые распознавание услышало иначе (на проверку автору)

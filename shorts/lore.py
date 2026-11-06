@@ -483,8 +483,9 @@ def _quoted(text: str) -> list[str]:
     return out
 
 
-async def _film_backdrops(tmdb_key: str, name: str, n: int = 3) -> list[str]:
-    """Кадры фильма или сериала по названию (русскому или оригинальному): самый похожий и популярный."""
+async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False) -> list[str]:
+    """Кадры фильма или сериала по названию (русскому или оригинальному): самый похожий и популярный.
+    tv — в сценарии сказано, что это сериал («второй сезон «Локи»», плашка «сериал»): сериал впереди."""
     try:
         films, shows = await asyncio.gather(tmdb.search_movie(tmdb_key, name), tmdb.search_tv(tmdb_key, name),
                                             return_exceptions=True)
@@ -497,9 +498,12 @@ async def _film_backdrops(tmdb_key: str, name: str, n: int = 3) -> list[str]:
     def score(c: tuple[dict[str, Any], str]) -> float:
         r = c[0]
         titles = [r.get("title") or "", r.get("original") or ""]
-        if any(name.lower() in t.lower() for t in titles if t):  # «Философский камень» в «Гарри Поттер и …»
-            return max(0.9, *(tmdb.similar(t, name) for t in titles))
-        return max(tmdb.similar(t, name) for t in titles)
+        best = max(tmdb.similar(t, name) for t in titles)
+        # «Философский камень» в «Гарри Поттер и философский камень» — тот фильм; но одно слово («Локи») в
+        # чужом названии («Симпсоны: Добро, Барт и Локи») — не он
+        if len(name.split()) >= 2 and any(name.lower() in t.lower() for t in titles if t):
+            best = max(best, 0.9)
+        return best + (0.05 if tv and c[1] == "tv" else 0)
 
     good = [c for c in cands if score(c) >= 0.6]
     if not good:
@@ -521,21 +525,36 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
     if len(lines) < 2:
         raise RuntimeError("не нашёл фраз: пришли сценарий таблицей «Время | Голос | На экране» или фразу на строку")
     films = _quoted(" ".join(lines + parsed["screens"]))[:10]
-    # франшиза из заголовка раздела («Shorts 3 — Гарри Поттер (сериал HBO)») — ещё и её кадры
+    # франшиза из заголовка раздела («Shorts 1 — Мстители: Судный день», «Shorts 3 — Гарри Поттер (сериал HBO)»)
     topic = re.sub(r"\(.*?\)", "", heading.split("—", 1)[-1]).strip(" «»") if "—" in heading else ""
-    if topic and topic.lower() not in {f.lower() for f in films}:
-        films.append(topic)
-    found = await asyncio.gather(*(_film_backdrops(tmdb_key, f) for f in films)) if tmdb_key else []
+    said: dict[str, str] = {}  # название для поиска -> как оно звучит в тексте (по нему ищем фразу)
+    if topic:
+        # «Судный день» в тексте — это «Мстители: Судный день» из заголовка, а не одноимённый фильм 2008 года
+        for f in films:
+            # но «Дюна» в «Дюна: Часть третья» — сама франшиза (пересказ первых частей): её не меняем
+            if f.lower() != topic.lower() and f.lower() in topic.lower() and not topic.lower().startswith(f.lower()):
+                said.setdefault(topic, f)
+        films = list(dict.fromkeys(topic if f in said.values() else f for f in films))
+        if topic.lower() not in {f.lower() for f in films}:
+            films.append(topic)
+
+    def is_tv(film: str) -> bool:  # «второй сезон «Локи»», «Локи на троне, плашка «сериал»»
+        low = film.lower()
+        return any(low in (ln + " " + sc).lower() and re.search(r"сезон|сериал", (ln + " " + sc).lower())
+                   for ln, sc in zip(lines, parsed["screens"] + [""] * len(lines)))
+
+    found = await asyncio.gather(*(_film_backdrops(tmdb_key, f, tv=is_tv(f)) for f in films)) if tmdb_key else []
     images: list[str] = []
     fixed: list[dict[str, Any]] = []
     for film, urls in zip(films, found):
         if not urls:
             continue
         images += urls[1:]
+        key = said.get(film, film).lower()
         line = next((i for i, (ln, sc) in enumerate(zip(lines, parsed["screens"] + [""] * len(lines)))
-                     if film.lower() in (ln + " " + sc).lower()), None)
+                     if key in (ln + " " + sc).lower()), None)
         if line is not None and all(f["line"] != line + 1 for f in fixed):
-            fixed.append({"line": line + 1, "keys": [film.lower()], "url": urls[0], "mode": "photo", "who": film})
+            fixed.append({"line": line + 1, "keys": [key], "url": urls[0], "mode": "photo", "who": film})
         else:
             images.insert(0, urls[0])
     title = parsed["title"] or (films[0] if films else lines[0][:60])
