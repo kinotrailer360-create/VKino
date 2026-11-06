@@ -432,7 +432,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
 
 # ---------------------------------------------------------------- свой сценарий (озвучка как есть)
 
-TIME_CELL = re.compile(r"^\s*\d{1,3}\s*[–—-]\s*\d{1,3}\s*(?:с|сек)?\s*$")
+TIME_CELL = re.compile(r"^\s*\d{1,3}\s*[–—-]\s*\d{1,3}\s*(?:с|сек)?\.?\s*$")
 
 
 def split_scripts(text: str) -> list[tuple[str, str]]:
@@ -458,12 +458,21 @@ def parse_script(text: str) -> dict[str, Any]:
         title = re.sub(r"\s*#\w+", "", m.group(1)).strip(" *")
     lines: list[str] = []
     screens: list[str] = []
+    voice_col = 1  # таблица «Время | Голос | На экране»; если колонки «Голос» нет — это план монтажа, не текст
+    plan_only = False
     for row in text.splitlines():
         if row.count("|") >= 3:
             cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            if len(cells) >= 2 and TIME_CELL.match(cells[0]) and cells[1]:
-                lines.append(cells[1])
-                screens.append(cells[2] if len(cells) > 2 else "")
+            low = [c.lower() for c in cells]
+            if low and "врем" in low[0]:  # строка заголовков таблицы
+                found = next((k for k, c in enumerate(low) if "голос" in c or "текст диктора" in c or "voice" in c),
+                             None)
+                plan_only = found is None
+                voice_col = found or 1
+                continue
+            if len(cells) > voice_col and TIME_CELL.match(cells[0]) and cells[voice_col] and not plan_only:
+                lines.append(cells[voice_col])
+                screens.append(" ".join(c for k, c in enumerate(cells[1:], 1) if k != voice_col))
     if not lines:  # без таблицы: каждая непустая строка без разметки — фраза
         for row in text.splitlines():
             row = row.strip()
@@ -487,7 +496,7 @@ def _quoted(text: str) -> list[str]:
     return out
 
 
-async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False) -> list[str]:
+async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False, year: int | None = None) -> list[str]:
     """Кадры фильма или сериала по названию (русскому или оригинальному): самый похожий и популярный.
     tv — в сценарии сказано, что это сериал («второй сезон «Локи»», плашка «сериал»): сериал впереди."""
     films: Any = None
@@ -517,7 +526,11 @@ async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False
         # чужом названии («Симпсоны: Добро, Барт и Локи») — не он
         if len(name.split()) >= 2 and any(name.lower() in t.lower() for t in titles if t):
             best = max(best, 0.9)
-        return best + (0.05 if tv and c[1] == "tv" else 0)
+        bonus = 0.05 if tv and c[1] == "tv" else 0.0
+        got = str(r.get("year") or "")[:4]
+        if year and got.isdigit():  # «Обитель зла» (2026) — а не фильмы 2002–2016 с тем же названием
+            bonus += 0.3 if abs(int(got) - year) <= 1 else -0.3
+        return best + bonus
 
     good = [c for c in cands if score(c) >= 0.6]
     if not good:
@@ -559,9 +572,13 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
 
     gate = asyncio.Semaphore(3)  # не залпом: по 3 названия одновременно
 
+    # год рядом с названием: «Обитель зла» (2026) или «Обитель зла» 2026 года — нужен именно этот фильм
+    years = {m.group(1).strip().lower(): int(m.group(2)) for m in re.finditer(
+        r"«([^«»]{2,60})»\s*\(?\s*((?:19|20)\d\d)", " ".join([heading, parsed["title"], text]))}
+
     async def look(film: str) -> list[str]:
         async with gate:
-            return await _film_backdrops(tmdb_key, film, tv=is_tv(film))
+            return await _film_backdrops(tmdb_key, film, tv=is_tv(film), year=years.get(said.get(film, film).lower()))
 
     found = await asyncio.gather(*(look(f) for f in films)) if tmdb_key else []
     images: list[str] = []
