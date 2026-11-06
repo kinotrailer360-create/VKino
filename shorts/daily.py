@@ -705,6 +705,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     items = await news.latest_news(feeds, exclude or set())
     # ИИ-редактор: главные новости без местных событий и повторов, пересказ понятными словами
     ai.last_error = None
+    ai.last_engine = ""
     retold: list[str] | None = None
     if ai.available(gemini_key):
         # свежие посты Telegram-каналов — ИИ сверяет их с новостями СМИ и берёт то, чего в лентах ещё нет
@@ -787,6 +788,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         await _progress(30, "ИИ пересказывает новости")
         retold = await ai.retell_news(gemini_key, [(it.title, it.lead, it.source) for it, _ in chosen])
     spoken = retold or [say(it) for it, _ in chosen]
+    text_engine = ai.last_engine  # кто писал пересказ (до озвучки: там свои запросы к ИИ)
     # дата — только на обложке: голосом «на двадцать третье октября» звучит затянуто
     lines = (["Главные новости кино!"] + spoken
              + [f"Какая новость удивила? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
@@ -814,6 +816,10 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     theme = Theme("news", "НОВОСТИ", "НОВОСТИ КИНО", f"Главные новости кино на {day}", title, [])
     result = ShortResult(work / "short.mp4", cover_path, theme,
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
+    if retold and text_engine == "reserve":  # ни Gemini, ни Lumean не ответили — писал слабый запасной ИИ
+        result.seo["warning"] = ("⚠️ Gemini на лимите, Lumean не ответил — текст писал запасной ИИ, он может звучать "
+                                 "коряво. Послушай перед загрузкой; лучше пересобрать позже (лимит Gemini "
+                                 "обновляется около 13:00 по Екатеринбургу) или пополнить Lumean.")
     if not retold:  # пересказа нет — в ролике заголовки как есть; ошибка Gemini при удачном запасном ИИ — не повод
         result.seo["warning"] = (f"⚠️ ИИ не пересказал новости (в ролике заголовки как есть): "
                                  f"{ai.last_error or 'ИИ не ответил'}")
