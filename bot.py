@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -237,6 +238,7 @@ MAIN_MENU_LABELS = {
     "🎯 Подобрать фильм",
     "🧩 Викторина дня",
     "📔 Кинодневник",
+    "👥 Выбрать вдвоём",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
     "✉️ Написать админу",
@@ -920,6 +922,21 @@ async def init_db() -> None:
                 poster TEXT,
                 watched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (user_id, movie_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS duo (
+                id TEXT PRIMARY KEY,
+                creator BIGINT NOT NULL,
+                films JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS duo_votes (
+                id TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                idx INT NOT NULL,
+                liked BOOLEAN NOT NULL,
+                PRIMARY KEY (id, user_id, idx)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3410,7 +3427,7 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
-            [KeyboardButton(text="📔 Кинодневник")],
+            [KeyboardButton(text="📔 Кинодневник"), KeyboardButton(text="👥 Выбрать вдвоём")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
             [KeyboardButton(text="✉️ Написать админу")],
             [
@@ -3960,6 +3977,12 @@ async def cmd_start(
     if arg == "contact":  # ссылка «связь с админом» (?start=contact) — например, из закрепа канала
         await contact_ask(message, state)
         return
+    if arg.startswith("duo_") and message.from_user:  # друг позвал выбрать фильм вместе
+        await message.answer("👥 Друг зовёт выбрать фильм вместе! Отмечай 👍 то, что готов смотреть, — "
+                             "в конце покажу совпадения.",
+                             reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        await duo_show(message.bot, message.chat.id, message.from_user.id, arg[4:], None)
+        return
     if arg == "quiz":  # кнопка из поста «Знатоки месяца»
         await message.answer("🧩 Викторина дня — жми кнопку в меню или держи кадр 👇",
                              reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
@@ -4054,6 +4077,7 @@ async def do_search(
             "🧩 Викторина дня": "quiz_day_menu",
             "🎁 Пригласить друга": "referral_menu",
             "📔 Кинодневник": "diary_menu",
+            "👥 Выбрать вдвоём": "duo_new",
         }
         handler_name = target_handlers.get(query)
         handler = globals().get(handler_name or "")
@@ -15085,6 +15109,126 @@ async def quiz_leaders(limit: int = 10) -> list[Any]:
 
 def _who(r: Any) -> str:
     return escape("@" + r["username"] if r["username"] else (r["first_name"] or "зритель"))
+
+
+# --- «Выбрать вдвоём»: двое отмечают одни и те же фильмы, бот показывает совпадения
+
+DUO_FILMS = 12
+
+
+@router.message(F.text == "👥 Выбрать вдвоём")
+async def duo_new(message: Message) -> None:
+    await remember(message)
+    wait = await message.answer("🎬 Собираю 12 хороших фильмов…")
+    films: list[dict[str, Any]] = []
+    try:
+        for _ in range(2):
+            for f in await _popular_films(pages=15):
+                if len(films) < DUO_FILMS and all(int(f["id"]) != x["id"] for x in films):
+                    films.append({"id": int(f["id"]), "title": shorts_daily._title(f), "year": f.get("year"),
+                                  "poster": shorts_daily._poster_url(f), "rating": shorts_daily._best_rating(f)[0],
+                                  "genres": ", ".join(str(g.get("name")) for g in (f.get("genres") or [])[:2]
+                                                      if isinstance(g, dict))})
+    except Exception:  # noqa: BLE001
+        logging.exception("Duo: films failed")
+    if len(films) < 6:
+        await wait.edit_text("Не получилось собрать фильмы — попробуй через минуту.")
+        return
+    duo_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    await db().execute("INSERT INTO duo(id, creator, films) VALUES($1, $2, $3)", duo_id, message.from_user.id,
+                       json.dumps(films, ensure_ascii=False))
+    link = f"{await _bot_link(message.bot)}?start=duo_{duo_id}"
+    await wait.edit_text(
+        f"👥 <b>Выбираем вдвоём</b>\n\n1. Отправь другу ссылку: {link}\n2. Каждый отмечает 👍 или 👎 одни и те "
+        f"же {len(films)} фильмов.\n3. Бот покажет фильмы, которые понравились обоим. 🍿\n\nНачинай 👇",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="📤 Отправить другу", url=f"https://t.me/share/url?url={quote(link)}&text="
+            + quote("Давай выберем фильм на вечер вместе 🍿"))]]))
+    await duo_show(message.bot, message.chat.id, message.from_user.id, duo_id, None)
+
+
+async def duo_show(bot: Bot, chat_id: int, user_id: int, duo_id: str, msg: Message | None) -> None:
+    """Следующий фильм, который этот участник ещё не отметил; все отмечены — итог."""
+    row = await db().fetchrow("SELECT films FROM duo WHERE id=$1", duo_id)
+    if not row:
+        await bot.send_message(chat_id, "Эта ссылка устарела — начни заново: «👥 Выбрать вдвоём».")
+        return
+    films = row["films"] if isinstance(row["films"], list) else json.loads(row["films"])
+    done = {int(r["idx"]) for r in await db().fetch("SELECT idx FROM duo_votes WHERE id=$1 AND user_id=$2",
+                                                    duo_id, user_id)}
+    left = [k for k in range(len(films)) if k not in done]
+    if not left:
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        await duo_result(bot, duo_id, user_id)
+        return
+    k = left[0]
+    f = films[k]
+    caption = (f"<b>{escape(f['title'])}</b>" + (f" ({f['year']})" if f.get("year") else "")
+               + (f"\n⭐ {f['rating']:.1f}" if f.get("rating") else "") + (f" · {escape(f['genres'])}" if f.get("genres")
+               else "") + f"\n\n{len(films) - len(left) + 1} из {len(films)}")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👎 Не хочу", callback_data=f"duo:v:{duo_id}:{k}:0"),
+        InlineKeyboardButton(text="👍 Буду смотреть", callback_data=f"duo:v:{duo_id}:{k}:1")]])
+    if msg and f.get("poster"):
+        try:
+            await msg.edit_media(InputMediaPhoto(media=f["poster"], caption=caption), reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001 — не вышло заменить: пришлём новым сообщением
+            pass
+    if f.get("poster"):
+        try:
+            await bot.send_photo(chat_id, f["poster"], caption=caption, reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    await bot.send_message(chat_id, caption, reply_markup=markup)
+
+
+async def duo_result(bot: Bot, duo_id: str, user_id: int) -> None:
+    row = await db().fetchrow("SELECT films, creator FROM duo WHERE id=$1", duo_id)
+    films = row["films"] if isinstance(row["films"], list) else json.loads(row["films"])
+    votes = await db().fetch("SELECT user_id, idx, liked FROM duo_votes WHERE id=$1", duo_id)
+    users: dict[int, dict[int, bool]] = {}
+    for v in votes:
+        users.setdefault(int(v["user_id"]), {})[int(v["idx"])] = bool(v["liked"])
+    finished = [u for u, d in users.items() if len(d) >= len(films)]
+    if len(finished) < 2:
+        await bot.send_message(user_id, "✅ Готово! Ждём, пока друг отметит фильмы, — пришлю совпадения сюда. 👥")
+        return
+    common = [k for k in range(len(films)) if all(users[u].get(k) for u in finished)]
+    if common:
+        text = "🎉 <b>Совпадения!</b> Эти фильмы понравились вам обоим:\n\n" + "\n".join(
+            f"• {escape(films[k]['title'])}" + (f" ({films[k]['year']})" if films[k].get("year") else "") for k in common)
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=f"🎬 {films[k]['title']}"[:64], callback_data=f"open:{films[k]['id']}")] for k in common[:8]])
+    else:
+        text = "😅 Совпадений нет — вкусы разные. Попробуйте ещё раз: «👥 Выбрать вдвоём» даст новые фильмы."
+        markup = None
+    for u in finished:  # итог — всем, кто уже закончил (второму — сразу, первому — когда закончил второй)
+        if u == user_id or len(finished) == 2:
+            try:
+                await bot.send_message(u, text, reply_markup=markup)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+@router.callback_query(F.data.startswith("duo:"))
+async def duo_buttons(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    if len(parts) != 5 or parts[1] != "v" or not parts[3].isdigit():
+        await callback.answer()
+        return
+    await callback.answer()
+    await db().execute("""INSERT INTO duo_votes(id, user_id, idx, liked) VALUES($1, $2, $3, $4)
+                          ON CONFLICT(id, user_id, idx) DO UPDATE SET liked=EXCLUDED.liked""",
+                       parts[2], callback.from_user.id, int(parts[3]), parts[4] == "1")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await duo_show(callback.bot, chat_id, callback.from_user.id, parts[2], callback.message)
 
 
 # --- кинодневник подписчика и «Мой год в кино»
