@@ -291,6 +291,7 @@ class CustomState(StatesGroup):
 
 class LoreState(StatesGroup):
     own = State()
+    wwk = State()
     news = State()
     name = State()
     hook = State()
@@ -8178,7 +8179,8 @@ def shorts_section(name: str) -> InlineKeyboardMarkup:
                 [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
                 [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")]]
     elif name == "own":
-        rows = [[_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
+        rows = [[_btn("🔮 Что мы знаем о фильме (слухи до премьеры)", "lo:wwk")],
+                [_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
                 [_btn("📰 Своя новость: вставлю текст", "lo:news")],
                 [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
                 [_btn("📖 История персонажа", "lo:start")]]
@@ -9083,6 +9085,13 @@ async def review_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "Бот Telegram скачивает файлы <b>до 20 МБ</b>, больше — пришли сжатую версию.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "rv:media_done")], [_btn("🗑 Убрать все мои файлы", "rv:media_clear")]]))
+    elif action == "style":
+        await set_shorts_setting("lore_style", "calm" if await lore_style() == "dynamic" else "dynamic")
+        await message.answer("⚡ Монтаж: динамичный — видео трейлера на весь экран, новый кадр каждые ~2 с, "
+                             "переходы, субтитры по одному слову, без заставки в конце." if await lore_style() ==
+                             "dynamic" else "🎞 Монтаж: спокойный — как раньше (кадр по центру, субтитры фразами, "
+                             "заставка «Подпишись» в конце).")
+        await show_lore(message, state, brief=True)
     elif action in ("media_done", "media_clear"):
         if action == "media_clear":
             await state.update_data(review_media=[])
@@ -13359,6 +13368,12 @@ async def lore_generate(message: Message, state: FSMContext) -> None:
     await show_lore(message, state)
 
 
+async def lore_style() -> str:
+    """Монтаж шортса «свой сценарий / история / новость»: dynamic — видео на весь экран, кадр каждые ~1,8 с,
+    переходы (рывок, наезд, рваная бумага, вспышка), субтитры по одному слову, без заставки; calm — как раньше."""
+    return await shorts_setting("lore_style") or "dynamic"
+
+
 async def show_lore(message: Message, state: FSMContext, brief: bool = False) -> None:
     data = await state.get_data()
     script = data["lore_script"]
@@ -13375,8 +13390,10 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
             f"{chars} символов ≈ {round(chars / 15)} с • источник: {source}{photos}\n"
             "Каждая строка — отдельная картинка в ролике.")
     body = "" if brief else "\n\n" + escape(shorts_lore.script_text(script))
+    dynamic = await lore_style() == "dynamic"
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "lo:go")], [_btn("✏️ Поправить текст", "lo:edit")],
+        [_btn("⚡ Монтаж: динамичный (сменить)" if dynamic else "🎞 Монтаж: спокойный (сменить)", "lo:style")],
         [_btn(f"📎 Свои картинки ({len(media)})" if media else "📎 Добавить свои картинки", "lo:media")],
         [_btn("🔄 Написать заново", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]])
     await message.answer((head + body)[:4000], reply_markup=markup, disable_web_page_preview=True)
@@ -13405,8 +13422,9 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     logging.exception("Lore: user file download failed")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            script = dict(data["lore_script"], style=await lore_style())
             result = await asyncio.wait_for(shorts_lore.make_lore(
-                work, data["lore_script"], music, files, GEMINI_API_KEY, pins), timeout=LORE_TIMEOUT)
+                work, script, music, files, GEMINI_API_KEY, pins), timeout=LORE_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
@@ -13429,6 +13447,28 @@ async def lore_command(message: Message, state: FSMContext) -> None:
         await lore_ask_hook(message, state, name)
     else:
         await lore_ask_name(message, state)
+
+
+@router.message(LoreState.wwk, F.text, ~F.text.startswith("/"))
+async def wwk_film(message: Message, state: FSMContext) -> None:
+    """«🔮 Что мы знаем о фильме»: ИИ с поиском пишет сценарий по схеме, дальше — как «свой сценарий»."""
+    film = _typed(message).strip(" «»\"")[:80]
+    if len(film) < 2:
+        await message.answer("Напиши название фильма или сериала.")
+        return
+    await state.set_state(None)
+    wait = await message.answer(f"🔮 Ищу новости и слухи о «{escape(film)}» и пишу текст, обычно 1–2 минуты…")
+    script = await shorts_ai.whatweknow_script(GEMINI_API_KEY, film, datetime.now(MSK).strftime("%d.%m.%Y"))
+    if not script:
+        await wait.edit_text("❌ Не получилось собрать текст — ИИ не ответил или нашёл слишком мало. "
+                             "Попробуй ещё раз или уточни название.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔮 Ещё раз", "lo:wwk")]]))
+        return
+    await wait.delete()
+    body = (f"**Заголовок:** {script['title']}\n" if script.get("title") else "") + "\n".join(script["lines"])
+    await state.update_data(own_scripts=[(f"Что мы знаем — {film}", body)], own_pick=0, lore_kind="own",
+                            lore_name="Что мы знаем", lore_hook="", lore_script=None, lore_media=[])
+    await own_generate(message, state)
 
 
 @router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
@@ -13581,6 +13621,16 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "ничего не переписывая; кадры подберу к фильмам и сериалам, названным в «ёлочках». Если в файле "
             "несколько сценариев — дам выбрать. Дальше можно поправить текст и добавить свои картинки.\n\n"
             "<i>Передумал — /cancel</i>")
+        return
+    if action == "wwk":
+        await state.clear()
+        await state.set_state(LoreState.wwk)
+        await message.answer(
+            "🔮 <b>Что мы знаем о фильме</b>\n\nНапиши название фильма или сериала, который скоро выходит "
+            "(например: <i>Мстители: Судный день</i>). Бот найдёт свежие новости, реакции и слухи и напишет "
+            "текст по схеме вирусных шортсов: вопрос → «в конце самое шокирующее» → хорошее → «но радоваться "
+            "рано» → тревожные слухи → призыв в ТГ в середине → самая сильная деталь в конце. Кадры — из трейлера, "
+            "а названных героев (Дум, Циклоп…) — из их фильмов.\n\n<i>Передумал — /cancel</i>")
         return
     if action.startswith("ownpick:") and action[8:].isdigit():
         scripts = data.get("own_scripts") or []
