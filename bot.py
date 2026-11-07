@@ -11263,30 +11263,74 @@ async def _frames(film: dict[str, Any], work: Path, n: int, prefix: str) -> list
     return out
 
 
-async def make_quiz_post(bot: Bot, chat_id: int) -> None:
-    """«Угадай фильм по кадру»: кадр без надписей и викторина Telegram из 4 вариантов."""
-    hist = await _posts_history()
-    used = {int(x) for x in hist["quiz"]}
-    films = await _popular_films()
-    work = SHORTS_DIR / f"quiz_{time.time_ns()}"
-    work.mkdir(parents=True, exist_ok=True)
+async def _quiz_from_kp(used: set[str], work: Path) -> tuple[str, str, Image.Image, list[str]] | None:
+    """Викторина из известных фильмов Кинопоиска: (id для истории, название, кадр, 3 других названия)."""
     try:
-        for pick in [f for f in films if f["id"] not in used][:6]:
+        films = await _popular_films()
+    except Exception:  # noqa: BLE001
+        logging.exception("Quiz: kinopoisk list failed")
+        return None
+    for pick in [f for f in films if str(f["id"]) not in used][:6]:
+        try:
             film = await kp._get(f"/movie/{pick['id']}")  # полная карточка — с id TMDB/IMDb, кадр точно из него
             frames = await _frames(film, work, 1, "q")
-            if frames:
-                break
-        else:
-            raise RuntimeError("не нашлось кадра для викторины — попробуй ещё раз")
+        except Exception:  # noqa: BLE001
+            logging.exception("Quiz: film %s failed", pick.get("id"))
+            continue
+        if not frames:
+            continue
         genres = set(shorts_daily._genres(film))
         others = sorted((f for f in films if f["id"] != film["id"]),
                         key=lambda f: -len(genres & set(shorts_daily._genres(f))))[:3]
-        if len(others) < 3:
-            raise RuntimeError("мало фильмов для вариантов ответа — попробуй ещё раз")
-        options = [film, *others]
-        random.shuffle(options)
-        names = [shorts_daily._title(f)[:100] for f in options]
-        correct = options.index(film)
+        if len(others) == 3:
+            return str(film["id"]), shorts_daily._title(film), frames[0], [shorts_daily._title(f) for f in others]
+    logging.warning("Quiz: kinopoisk gave %d films, none with a TMDB frame", len(films))
+    return None
+
+
+async def _quiz_from_tmdb(used: set[str], work: Path) -> tuple[str, str, Image.Image, list[str]] | None:
+    """Запас: известные фильмы TMDB (рейтинг 7+, тысячи голосов), кадр без надписей — с TMDB."""
+    try:
+        pool = await shorts_daily.tmdb.popular_pool(TMDB_API_KEY, random.randint(1, 15))
+    except Exception:  # noqa: BLE001
+        logging.exception("Quiz: tmdb pool failed")
+        return None
+    random.shuffle(pool)
+    for row in [r for r in pool if f"t{r['id']}" not in used][:6]:
+        try:
+            urls = await shorts_daily.tmdb.backdrops(TMDB_API_KEY, "movie", row["id"], 4)
+            img = await _image(random.choice(urls), work, "qt") if urls else None
+        except Exception:  # noqa: BLE001
+            logging.exception("Quiz: tmdb film %s failed", row.get("id"))
+            continue
+        if not img:
+            continue
+        genres = set(row["genres"])
+        others = sorted((r for r in pool if r["id"] != row["id"] and r["title"] != row["title"]),
+                        key=lambda r: -len(genres & set(r["genres"])))[:3]
+        if len(others) == 3:
+            return f"t{row['id']}", row["title"], img, [r["title"] for r in others]
+    return None
+
+
+async def make_quiz_post(bot: Bot, chat_id: int) -> None:
+    """«Угадай фильм по кадру»: кадр без надписей и викторина Telegram из 4 вариантов."""
+    hist = await _posts_history()
+    used = {str(x) for x in hist["quiz"]}
+    work = SHORTS_DIR / f"quiz_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        picked = await _quiz_from_kp(used, work)
+        if not picked:  # Кинопоиск не ответил (лимит запросов) или у фильмов нет кадров — берём фильмы TMDB
+            picked = await _quiz_from_tmdb(used, work)
+        if not picked:
+            raise RuntimeError("не нашлось кадра для викторины: Кинопоиск и TMDB не дали фильмов с кадрами "
+                               "(лимит запросов или нет связи) — попробуй через пару минут")
+        film_id, title, frame, others = picked
+        names = [title[:100], *[o[:100] for o in others]]
+        random.shuffle(names)
+        correct = names.index(title[:100])
+        frames = [frame]
         card = work / "quiz.jpg"
         (await asyncio.to_thread(shorts_postcard.make_quiz_card, frames[0])).save(card, quality=92)
         post = ("🎬 УГАДАЙ ФИЛЬМ ПО КАДРУ!\n\nУзнаёшь, из какого фильма этот кадр? 🤔 Голосуй в викторине ниже — "
@@ -11295,12 +11339,12 @@ async def make_quiz_post(bot: Bot, chat_id: int) -> None:
         ids, kind = await _send_album(bot, chat_id, [card], post, "#викторина")
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    hist["quiz"] = (hist["quiz"] + [str(film["id"])])[-200:]
+    hist["quiz"] = (hist["quiz"] + [film_id])[-200:]
     await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
     await offer_post(bot, chat_id, ids, kind, "pt:qz",
-                     what=f"Викторина готова (правильный ответ — {escape(_label(film))}). В канале под ней будет "
+                     what=f"Викторина готова (правильный ответ — {escape(f"«{title}»")}). В канале под ней будет "
                           "викторина с 4 вариантами",
-                     quiz={"options": names, "correct": correct, "explanation": f"Это {_label(film)} 🎬"[:200]})
+                     quiz={"options": names, "correct": correct, "explanation": f"Это «{title}» 🎬"[:200]})
 
 
 async def make_quote_post(bot: Bot, chat_id: int) -> None:
