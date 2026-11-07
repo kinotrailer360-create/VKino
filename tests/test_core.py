@@ -199,3 +199,24 @@ def test_transitions_render():
     for kind in set(TRANSITIONS):
         for p in (0.0, 0.5, 1.0):
             assert tr.apply(kind, a, b, p).size == (W, H)
+
+
+def test_whatweknow_drops_stale_news(monkeypatch):
+    import asyncio
+
+    from shorts import ai
+
+    async def fake(*a, **k):
+        return {"title": "Т", "about": "о «Мстителях: Судный день»", "premiere": "2026-12-18", "year": 2026,
+                "good": [{"text": "Руссо снова режиссёры", "date": "2024-07-27"},
+                         {"text": "Реакции с показа восторженные", "date": "2026-11-01"},
+                         {"text": "Хронометраж почти три часа", "date": "2026-10-28"}],
+                "bad": [{"text": "По слухам, погибнут два героя", "date": "2026-10-30"}],
+                "shock": [{"text": "Инсайдер пишет о сцене после титров с Росомахой", "date": "2026-11-03"}]}
+    monkeypatch.setattr(ai, "_post_json", fake)
+    got = asyncio.run(ai.whatweknow_script("k", "Мстители: Судный день", "07.11.2026"))
+    text = " ".join(got["lines"])
+    assert got["stale"] == 1 and "Руссо" not in text
+    assert got["lines"][0] == "Что мы знаем о «Мстителях: Судный день» (2026) за 41 день до премьеры?"
+    assert "Но радоваться рано." in got["lines"] and got["lines"][-1].startswith("Инсайдер")
+    assert any("телеграм" in ln for ln in got["lines"])

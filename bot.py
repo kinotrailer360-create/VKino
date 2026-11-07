@@ -13458,7 +13458,25 @@ async def wwk_film(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(None)
     wait = await message.answer(f"🔮 Ищу новости и слухи о «{escape(film)}» и пишу текст, обычно 1–2 минуты…")
-    script = await shorts_ai.whatweknow_script(GEMINI_API_KEY, film, datetime.now(MSK).strftime("%d.%m.%Y"))
+    # главный материал — свежие посты кино-каналов (за месяц), с датами: так в ролик не попадут старые новости
+    material = ""
+    try:
+        await load_fact_channels()
+        posts = await asyncio.wait_for(shorts_tgsearch.search(shorts_daily.fact_channels, [film], per_channel=4), 60)
+        cutoff = time.time() - 31 * 86400
+        posts = sorted((p for p in posts if (p.get("time") or 0) >= cutoff), key=lambda p: -(p.get("time") or 0))
+        material = "\n\n".join(f"{datetime.fromtimestamp(p['time'], MSK):%Y-%m-%d} [t.me/{p['channel']}]\n{p['text']}"
+                                 for p in posts[:20])[:9000]
+    except Exception:  # noqa: BLE001 — без постов ИИ ищет сам
+        logging.exception("wwk: tg search failed")
+    script = await shorts_ai.whatweknow_script(GEMINI_API_KEY, film, datetime.now(MSK).strftime("%d.%m.%Y"),
+                                               material)
+    if script and not script["lines"]:
+        await wait.edit_text(f"🔮 Свежих новостей о «{escape(film)}» за последний месяц почти нет"
+                             + (f" (старых отброшено: {script['stale']})" if script.get("stale") else "")
+                             + " — ролик вышел бы из общеизвестного. Попробуй ближе к премьере или другой фильм.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔮 Другой фильм", "lo:wwk")]]))
+        return
     if not script:
         await wait.edit_text("❌ Не получилось собрать текст — ИИ не ответил или нашёл слишком мало. "
                              "Попробуй ещё раз или уточни название.",
@@ -13469,6 +13487,9 @@ async def wwk_film(message: Message, state: FSMContext) -> None:
     await state.update_data(own_scripts=[(f"Что мы знаем — {film}", body)], own_pick=0, lore_kind="own",
                             lore_name="Что мы знаем", lore_hook="", lore_script=None, lore_media=[])
     await own_generate(message, state)
+    if script.get("stale"):
+        await message.answer(f"🗑 Старых новостей (больше {shorts_ai.WWK_FRESH_DAYS} дней) отброшено: {script['stale']}. "
+                             "Если что-то всё равно давно известно — «✏️ Поправить текст».")
 
 
 @router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
