@@ -179,3 +179,23 @@ def test_recap_title():
     text = ["Вспоминаем, чем закончились части, перед выходом третьей части."]
     assert recap_title(["Дюна", "Дюна: Часть вторая"], text) == "«Дюна»: что было в прошлых частях — перед третьей частью"
     assert recap_title(["Дюна"], ["Обычная рецензия"]) == ""
+
+
+def test_wwk_body_parses_title_and_lines():
+    from shorts.lore import parse_script
+    body = "**Заголовок:** Что мы знаем о Мстителях\nЧто мы знаем о «Мстители: Судный день» (2026)?\nДавайте разберём."
+    got = parse_script(body)
+    assert got["title"] == "Что мы знаем о Мстителях"
+    assert got["lines"][0].startswith("Что мы знаем") and len(got["lines"]) == 2
+
+
+def test_transitions_render():
+    from PIL import Image
+
+    from shorts.make_lore import TRANSITIONS, Transitions
+    from shorts.make_short import H, W
+    a, b = Image.new("RGB", (W, H), "red"), Image.new("RGB", (W, H), "blue")
+    tr = Transitions()
+    for kind in set(TRANSITIONS):
+        for p in (0.0, 0.5, 1.0):
+            assert tr.apply(kind, a, b, p).size == (W, H)

@@ -436,6 +436,58 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
         shutil.rmtree(tdir, ignore_errors=True)
 
 
+async def _hero_clips(work: Path, heroes: list[dict[str, Any]], lines: list[str], durs: list[float],
+                      gemini_key: str) -> dict[int, list[tuple[str, float]]]:
+    """Названный во фразе герой из другого фильма (Дум, Циклоп, Баки) → отрезки трейлера ЭТОГО фильма к фразе:
+    кто назван, тот и на экране. {фраза: [(файл, длина), ...]}; не нашёлся трейлер — фраза остаётся как была."""
+    key = os.getenv("TMDB_API_KEY", "").strip()
+    out: dict[int, list[tuple[str, float]]] = {}
+    for n, hero in enumerate(heroes[:4]):
+        i = int(hero["line"])
+        hdir = work / f"hero{n}"
+        hdir.mkdir(exist_ok=True)
+        try:
+            found = []
+            for q in [hero.get("ru"), hero.get("en")]:
+                if q and not found:
+                    found = await tmdb.search_movie(key, str(q))
+            if hero.get("year"):
+                found = sorted(found, key=lambda m: abs(int(m["year"] or 0) - int(hero["year"])))
+            if not found:
+                continue
+            meta = {**found[0], "kind": "movie"}
+            url = await _trailer_url(meta)
+            if not url:
+                continue
+            src = await clips.download_full(url, hdir)
+            total = await daily._duration(src)
+            frames = [f for f in await clips.sample_frames(src, hdir, duration=total, limit=16, every=3.0)
+                      if _bright(f[1])]
+            if not frames:
+                continue
+            choice = await ai.match_images(gemini_key, [lines[i]], [Image.open(f[1]).convert("RGB") for f in frames])
+            c = choice[0] if choice and 0 <= choice[0] < len(frames) else len(frames) // 2
+            order = sorted(range(len(frames)), key=lambda k: abs(frames[k][0] - frames[c][0]))
+            left, segs = durs[i], []
+            for k in order:
+                if left <= 0.6 or len(segs) >= 5:
+                    break
+                got = await _cut_trailer(work, frames[k][0] - 0.4, src, f"hclip{i}_{len(segs)}",
+                                         min(SEG, max(1.0, left)), True)
+                if got:
+                    segs.append(got)
+                    left -= got[1]
+            if segs:
+                out[i] = segs
+                log.info("shorts: hero line %d → %s", i + 1, meta.get("title"))
+        except Exception as exc:  # noqa: BLE001 — без кадров героя фраза остаётся с кадрами главного фильма
+            log.info("shorts: hero clip %s failed: %s", hero, exc)
+        finally:
+            import shutil
+            shutil.rmtree(hdir, ignore_errors=True)
+    return out
+
+
 def recap_title(titles: list[str], lines: list[str]) -> str:
     """Пересказ франшизы («Вспоминаем, чем закончились „Дюна“ и „Дюна: Часть вторая“») — название про пересказ,
     а не «„Дюна“ (2021) — что нужно знать»: «„Дюна“: что было в прошлых частях — перед третьей частью»."""
@@ -501,7 +553,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     dynamic = dynamic and not mourning  # прощальный ролик — всегда спокойный
     await _progress(5, "Озвучка")
     # в прощальном ролике «подписывайся» в конце неуместно
-    spoken = lines if mourning else lines[:-1] + [daily.with_outro(lines[-1])]
+    # в ролике уже есть призыв в телеграм (рубрика «Что мы знаем») — в конце не дописываем «подпишись»:
+    # он обрывается на самой сильной фразе
+    has_cta = dynamic and any("телеграм" in ln.lower() for ln in lines)
+    spoken = lines if mourning or has_cta else lines[:-1] + [daily.with_outro(lines[-1])]
     voice, starts, voiced, spans = await daily.synthesize(spoken, work)
     await _progress(30, "Субтитры по слову")
     words = await daily.word_timeline(voice, starts, spans) if voiced else []
@@ -615,6 +670,13 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         score_line = int(score["line"]) if score else -1
         if score_line >= 0 and durs[score_line] > 6:
             repeats.add(score_line)  # длинная финальная фраза: после карточки оценки — ещё кадр фильма
+        heroes: dict[int, list[tuple[str, float]]] = {}
+        if dynamic and script.get("kind_own"):
+            # «Доктор Дум», «Циклоп», «Баки» — кадры из фильмов, где эти герои есть
+            await _progress(43, "Трейлеры героев")
+            found = await ai.hero_films(gemini_key, lines, str(tfilm.get("title") or ""))
+            heroes = await _hero_clips(work, [h for h in found if h["line"] not in skip], lines, durs, gemini_key)
+            skip |= set(heroes)
         stills: dict[int, str] = {}
         more: dict[int, list[tuple[str, float]]] = {}
         got, note = await _trailer_clips(work, script.get("trailer_films") or [tfilm], lines, durs, skip, gemini_key,
@@ -627,6 +689,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 extra.append({"start": round(starts[i] + 4.0, 3), "image": name})
             else:
                 slides[i]["image"] = name
+        for i, segs in heroes.items():
+            got[i] = segs[0]
+            more[i] = segs[1:]
         for i, (name, length) in got.items():
             image = slides[i]["image"]
             slides[i] = {"start": starts[i], "clip": name}

@@ -291,6 +291,7 @@ class CustomState(StatesGroup):
 
 class LoreState(StatesGroup):
     own = State()
+    wwk = State()
     news = State()
     name = State()
     hook = State()
@@ -8178,7 +8179,8 @@ def shorts_section(name: str) -> InlineKeyboardMarkup:
                 [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
                 [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")]]
     elif name == "own":
-        rows = [[_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
+        rows = [[_btn("🔮 Что мы знаем о фильме (слухи до премьеры)", "lo:wwk")],
+                [_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
                 [_btn("📰 Своя новость: вставлю текст", "lo:news")],
                 [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
                 [_btn("📖 История персонажа", "lo:start")]]
@@ -13447,6 +13449,28 @@ async def lore_command(message: Message, state: FSMContext) -> None:
         await lore_ask_name(message, state)
 
 
+@router.message(LoreState.wwk, F.text, ~F.text.startswith("/"))
+async def wwk_film(message: Message, state: FSMContext) -> None:
+    """«🔮 Что мы знаем о фильме»: ИИ с поиском пишет сценарий по схеме, дальше — как «свой сценарий»."""
+    film = _typed(message).strip(" «»\"")[:80]
+    if len(film) < 2:
+        await message.answer("Напиши название фильма или сериала.")
+        return
+    await state.set_state(None)
+    wait = await message.answer(f"🔮 Ищу новости и слухи о «{escape(film)}» и пишу текст, обычно 1–2 минуты…")
+    script = await shorts_ai.whatweknow_script(GEMINI_API_KEY, film, datetime.now(MSK).strftime("%d.%m.%Y"))
+    if not script:
+        await wait.edit_text("❌ Не получилось собрать текст — ИИ не ответил или нашёл слишком мало. "
+                             "Попробуй ещё раз или уточни название.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔮 Ещё раз", "lo:wwk")]]))
+        return
+    await wait.delete()
+    body = (f"**Заголовок:** {script['title']}\n" if script.get("title") else "") + "\n".join(script["lines"])
+    await state.update_data(own_scripts=[(f"Что мы знаем — {film}", body)], own_pick=0, lore_kind="own",
+                            lore_name="Что мы знаем", lore_hook="", lore_script=None, lore_media=[])
+    await own_generate(message, state)
+
+
 @router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
 async def own_script_text(message: Message, state: FSMContext) -> None:
     """«🎬 Свой сценарий»: текст или файл .md/.txt; несколько сценариев в файле — кнопки выбора."""
@@ -13597,6 +13621,16 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "ничего не переписывая; кадры подберу к фильмам и сериалам, названным в «ёлочках». Если в файле "
             "несколько сценариев — дам выбрать. Дальше можно поправить текст и добавить свои картинки.\n\n"
             "<i>Передумал — /cancel</i>")
+        return
+    if action == "wwk":
+        await state.clear()
+        await state.set_state(LoreState.wwk)
+        await message.answer(
+            "🔮 <b>Что мы знаем о фильме</b>\n\nНапиши название фильма или сериала, который скоро выходит "
+            "(например: <i>Мстители: Судный день</i>). Бот найдёт свежие новости, реакции и слухи и напишет "
+            "текст по схеме вирусных шортсов: вопрос → «в конце самое шокирующее» → хорошее → «но радоваться "
+            "рано» → тревожные слухи → призыв в ТГ в середине → самая сильная деталь в конце. Кадры — из трейлера, "
+            "а названных героев (Дум, Циклоп…) — из их фильмов.\n\n<i>Передумал — /cancel</i>")
         return
     if action.startswith("ownpick:") and action[8:].isdigit():
         scripts = data.get("own_scripts") or []
