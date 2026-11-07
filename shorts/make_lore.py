@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,7 @@ from .make_short import (
     WordCaptions,
     duration,
     ease_out,
+    font,
     load_logo,
     mix_audio,
 )
@@ -114,6 +117,104 @@ class ClipSlide:
         self.proc.wait()
 
 
+TR = 0.3  # динамичный монтаж: переход между фразами
+PUNCH = 0.14  # и «толчок» камеры на резкой склейке внутри фразы
+TRANSITIONS = ["whip", "zoom", "tear", "flash", "whip", "zoom"]
+
+
+class Transitions:
+    """Переходы динамичного монтажа: «рывок» вбок со смазом, наезд, рваная бумага, вспышка."""
+
+    def __init__(self, seed: int = 7):
+        rnd = random.Random(seed)
+        step = 12
+        # рваный край: случайное блуждание по вертикали (один на ролик — так дешевле)
+        x, edge = 0.0, []
+        for _ in range(H // step + 2):
+            x = max(-34.0, min(34.0, x + rnd.uniform(-14, 14)))
+            edge.append(x)
+        self.edge = edge
+        self.paper = [16 + rnd.uniform(0, 14) for _ in edge]
+        self.step = step
+
+    def apply(self, kind: str, a: Image.Image, b: Image.Image, p: float) -> Image.Image:
+        e = ease_out(p)
+        if kind == "whip":
+            off = round(W * e)
+            img = Image.new("RGB", (W, H))
+            img.paste(a, (-off, 0))
+            img.paste(b, (W - off, 0))
+            smear = img.resize((W // 12, H), Image.BILINEAR).resize((W, H), Image.BILINEAR)  # смаз по горизонтали
+            return Image.blend(img, smear, 0.85 * (1 - abs(2 * p - 1)))
+        if kind == "zoom":
+            z = 1 + 0.25 * (1 - e)
+            bw, bh = round(W * z), round(H * z)
+            big = b.resize((bw, bh), Image.BILINEAR).crop(((bw - W) // 2, (bh - H) // 2, (bw - W) // 2 + W,
+                                                            (bh - H) // 2 + H))
+            return Image.blend(a, big, min(1.0, p * 2.5))
+        if kind == "flash":
+            white = Image.new("RGB", (W, H), (255, 255, 255))
+            if p < 0.4:
+                return Image.blend(a, white, 0.85 * p / 0.4)
+            return Image.blend(b, white, 0.85 * (1 - (p - 0.4) / 0.6))
+        # tear — рваная бумага: новый кадр «отрывается» слева направо, по краю белая полоса бумаги
+        base = -80 + (W + 160) * e
+        pts = [(base + self.edge[k], k * self.step) for k in range(len(self.edge))]
+        mask = Image.new("L", (W, H), 0)
+        md = ImageDraw.Draw(mask)
+        md.polygon([(0, 0)] + pts + [(0, H)], fill=255)
+        img = Image.composite(b, a, mask)
+        d = ImageDraw.Draw(img)
+        shadow = [(x + self.paper[k] + 10, y) for k, (x, y) in enumerate(pts)]
+        d.polygon(pts + shadow[::-1], fill=(40, 40, 40))
+        paper = [(x + self.paper[k], y) for k, (x, y) in enumerate(pts)]
+        d.polygon(pts + paper[::-1], fill=(242, 240, 234))
+        return img
+
+
+def punch(b: Image.Image, t: float) -> Image.Image:
+    """Резкая склейка внутри фразы: кадр «толкается» — за PUNCH секунды с +5 % к обычному размеру."""
+    z = 1 + 0.05 * (1 - ease_out(t / PUNCH))
+    bw, bh = round(W * z), round(H * z)
+    return b.resize((bw, bh), Image.BILINEAR).crop(((bw - W) // 2, (bh - H) // 2, (bw - W) // 2 + W,
+                                                    (bh - H) // 2 + H))
+
+
+class OneWordCaptions(WordCaptions):
+    """Субтитры по одному слову — крупно по центру, заглавными (как в динамичных шортсах); имена — жёлтым."""
+
+    SIZE = 96
+
+    def __init__(self, cfg: dict, words: list[dict], y: int):
+        self.big = font(cfg, "head", self.SIZE)
+        super().__init__(cfg, words, y)
+
+    def _group(self) -> list[list[int]]:
+        return [[k] for k in range(len(self.words))]
+
+    def _render(self, g: int, hot: int) -> Image.Image:
+        raw = self._clean(self.words[self.groups[g][0]]["w"])
+        word = re.sub(r"^[^\w]+|[^\w!?]+$", "", raw) or raw
+        name = word[:1].isupper() and g > 0 and not re.search(r"[.!?…]\W*$", self._clean(
+            self.words[self.groups[g - 1][0]]["w"]))
+        text = word.upper()
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        fnt = self.big
+        while probe.textlength(text, font=fnt) > W - 120 and fnt.size > 48:
+            fnt = fnt.font_variant(size=fnt.size - 6)
+        w, h = round(probe.textlength(text, font=fnt)) + 60, round(fnt.size * 1.5)
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).text((34, 14), text, font=fnt, fill=(0, 0, 0, 190), stroke_width=7,
+                                    stroke_fill=(0, 0, 0, 190))
+        ImageDraw.Draw(layer).text((30, 8), text, font=fnt, fill=self.HOT if name else (255, 255, 255),
+                                   stroke_width=6, stroke_fill=(0, 0, 0))
+        out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        out.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(6)))
+        out.alpha_composite(layer)
+        return out
+
+
 def _label_image(text: str, font_path: Path) -> Image.Image:
     """Крупная надпись на экране: жёлтая плашка, тёмный текст, до двух строк."""
     size = 74
@@ -156,7 +257,14 @@ def render(cfg: dict, base: Path) -> Path:
     slides = cfg["slides"]
     speech_end = duration(voice)
     outro_len = cfg.get("outro_len", 3.5)
-    total = speech_end + outro_len
+    dynamic = cfg.get("style") == "dynamic"
+    # динамичный монтаж: без заставки в конце — последний кадр держится полсекунды, ролик идёт по кругу
+    total = speech_end + (outro_len if outro_len > 0 else 0.5)
+    trans = Transitions()
+    kinds: dict[int, str] = {}  # переход к слайду k (только на новых фразах)
+    for k, sl in enumerate(slides):
+        if k and not sl.get("hard"):
+            kinds[k] = TRANSITIONS[len(kinds) % len(TRANSITIONS)]
     ends = [s["start"] for s in slides[1:]] + [speech_end]
 
     loaded: dict[int, PanSlide | ClipSlide] = {}
@@ -180,7 +288,8 @@ def render(cfg: dict, base: Path) -> Path:
     outro = OutroSlide(cfg, p(cfg.get("outro_image") or slides[0]["image"]), logo)
     labels = [(float(lb["start"]), float(lb["end"]), _label_image(lb["text"], cfg["fonts"]["head"]))
               for lb in cfg.get("labels") or [] if str(lb.get("text") or "").strip()]
-    captions = WordCaptions(cfg, cfg.get("words") or [], cfg.get("word_y", H // 2 + 120))
+    captions = (OneWordCaptions(cfg, cfg.get("words") or [], cfg.get("word_y", H // 2 + 160)) if dynamic
+                else WordCaptions(cfg, cfg.get("words") or [], cfg.get("word_y", H // 2 + 120)))
     wm_w = 150
     wm = logo.resize((wm_w, round(logo.height * wm_w / logo.width)), Image.LANCZOS)
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * 0.85)))
@@ -209,7 +318,7 @@ def render(cfg: dict, base: Path) -> Path:
     n_frames = round(total * FPS)
     for f in range(n_frames):
         t = f / FPS
-        if t >= speech_end:
+        if t >= speech_end and outro_len > 0:
             img = outro.frame(t - speech_end, outro_len)
             if t - speech_end < XFADE:
                 k = len(slides) - 1
@@ -218,9 +327,15 @@ def render(cfg: dict, base: Path) -> Path:
         else:
             k = max(j for j, s in enumerate(slides) if s["start"] <= t)
             img = slide(k).frame(t - slides[k]["start"], ends[k] - slides[k]["start"])
-            if k > 0 and t - slides[k]["start"] < XFADE:
+            into = t - slides[k]["start"]
+            if dynamic and k > 0 and slides[k].get("hard") and into < PUNCH:
+                img = punch(img, into)  # склейка внутри фразы — резкая, с толчком
+            elif dynamic and k in kinds and into < TR:
                 prev = slide(k - 1).frame(t - slides[k - 1]["start"], ends[k - 1] - slides[k - 1]["start"])
-                img = Image.blend(prev, img, ease_out((t - slides[k]["start"]) / XFADE))
+                img = trans.apply(kinds[k], prev, img, into / TR)
+            elif not dynamic and k > 0 and into < XFADE:
+                prev = slide(k - 1).frame(t - slides[k - 1]["start"], ends[k - 1] - slides[k - 1]["start"])
+                img = Image.blend(prev, img, ease_out(into / XFADE))
             img.paste(wm, (W - wm_w - 36, 40), wm)
             for start, end, lab in labels:  # надпись на экране: появляется с фразой, держится до её конца
                 if start <= t < end:

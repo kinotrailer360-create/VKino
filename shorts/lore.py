@@ -296,17 +296,19 @@ def _bright(path: Path) -> bool:
     return sum(px) / len(px) > 28 and sum(v < 25 for v in px) / len(px) < 0.75
 
 
-async def _cut_trailer(work: Path, frame: tuple[float, Path, Path], stem: str, length: float) -> tuple[str, float] | None:
-    """Отрезок трейлера с выбранного момента (чуть раньше — кадр ИИ попадает в середину), 1080×1920 без звука."""
+async def _cut_trailer(work: Path, at: float, src: Path, stem: str, length: float,
+                       full: bool = False) -> tuple[str, float] | None:
+    """Отрезок трейлера с секунды at, 1080×1920 без звука. full — на весь экран (динамичный монтаж), иначе кадр
+    почти целиком по центру, сверху и снизу его размытая копия."""
     length = round(length, 2)
     name = f"{stem}.mp4"
+    vf = ("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" if full else
+          "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+          "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
+          "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30")
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frame[0] - 0.4):.2f}", "-i", str(frame[2]),
-        "-t", f"{length:.2f}", "-an", "-filter_complex",
-        # кадр трейлера почти целиком по центру (как широкие фото), сверху и снизу — его размытая копия
-        "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-        "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
-        "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30",
+        "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, at):.2f}", "-i", str(src),
+        "-t", f"{length:.2f}", "-an", "-filter_complex", vf,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2", str(work / name),
         stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
@@ -316,21 +318,26 @@ async def _cut_trailer(work: Path, frame: tuple[float, Path, Path], stem: str, l
     return name, length
 
 
+SEG = 1.8  # динамичный монтаж: новый момент трейлера каждые ~1,8 с
+
+
 async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[str], durs: list[float], skip: set[int],
                          gemini_key: str, repeats: set[int] | None = None,
                          stills_out: dict[int, str] | None = None,
                          more_out: dict[int, list[tuple[str, float]]] | None = None,
-                         ) -> tuple[dict[int, tuple[str, float]], str]:
+                         dynamic: bool = False) -> tuple[dict[int, tuple[str, float]], str]:
     """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
-    фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото). Отрезки уже
-    1080×1920 без звука. ({фраза: (файл, длина)}, пояснение автору)."""
+    фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото).
+    dynamic — как в динамичных шортсах: видео на весь экран, у каждой фразы (кроме своих картинок автора)
+    отрезки, новый момент каждые ~1,8 с. ({фраза: (файл, длина)}, пояснение автору)."""
     tdir = work / "trailer"
     tdir.mkdir(exist_ok=True)
     want = [i for i in range(len(lines)) if i not in skip]
+    seg = SEG if dynamic else CLIP_MAX
     try:
         # несколько фильмов (пересказ франшизы) — трейлер каждого, кадры для ИИ из всех вместе
         frames: list[tuple[float, Path, Path]] = []  # (секунда, миниатюра, файл трейлера)
-        per = max(10, 30 // max(1, len(films)))
+        per = max(10, (60 if dynamic else 30) // max(1, len(films)))
         for n, film in enumerate(films[:3]):
             url = await _trailer_url(film)
             if not url:
@@ -341,7 +348,8 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
                 src_n = await clips.download_full(url, fdir)
                 total = await daily._duration(src_n)
                 frames += [(t, path, src_n) for t, path in
-                           await clips.sample_frames(src_n, fdir, duration=total, limit=per)]
+                           await clips.sample_frames(src_n, fdir, duration=total, limit=per,
+                                                     every=2.0 if dynamic else 4.0)]
             except Exception as exc:  # noqa: BLE001 — один трейлер не скачался — берём остальные
                 log.info("shorts: trailer of %s failed: %s", film.get("title"), exc)
         if not frames:
@@ -363,28 +371,45 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
                 order[k] = -1
             elif c >= 0:
                 used.add(c)
+        if dynamic:  # фраза без своего момента — всё равно видео: свободный момент трейлера по порядку
+            for k, c in enumerate(order):
+                spare = [j for j in range(len(frames)) if j not in used]
+                if c < 0 and spare:
+                    order[k] = spare[(k * len(spare)) // max(1, len(order))]
+                    used.add(order[k])
+
+        def spare_near(c: int) -> int | None:
+            spare = [k for k in range(len(frames)) if k not in used]
+            if not spare:
+                return None
+            return min(spare, key=lambda x: (frames[x][2] != frames[c][2], abs(frames[x][0] - frames[c][0])))
+
         out: dict[int, tuple[str, float]] = {}
         more: dict[int, list[tuple[str, float]]] = {}  # длинная фраза: следующие отрезки после первого
         for i, c in zip(want, order):
             if c < 0:
                 continue  # у этой фразы остаётся фото
-            got = await _cut_trailer(work, frames[c], f"tclip{i}", min(CLIP_MAX, max(1.2, durs[i])))
+            # кадр ИИ — в середине отрезка; начало чуть раньше, но не больше чем на 0,4 с
+            at, src = frames[c][0] - 0.4, frames[c][2]
+            got = await _cut_trailer(work, at, src, f"tclip{i}", min(seg, max(1.2, durs[i])), dynamic)
             if not got:
                 continue
             out[i] = got
-            # фраза намного длиннее отрезка (финал с датой и «подпишись») — ещё моменты трейлера, а не стоп-кадр
-            left = durs[i] - got[1]
-            while left > 1.5 and len(more.get(i, [])) < 3:
-                spare = [k for k in range(len(frames)) if k not in used]
-                if not spare:
+            # фраза длиннее отрезка — следующие моменты трейлера, а не стоп-кадр
+            left, last_at, last_len = durs[i] - got[1], at, got[1]
+            while left > (0.6 if dynamic else 1.5) and len(more.get(i, [])) < (8 if dynamic else 3):
+                k = spare_near(c)
+                if k is not None:
+                    used.add(k)
+                    at2, src2 = frames[k][0] - 0.4, frames[k][2]
+                else:  # моменты кончились — продолжаем тот же кадр трейлера
+                    at2, src2 = last_at + last_len, src
+                nxt = await _cut_trailer(work, at2, src2, f"tclip{i}_{len(more.get(i, [])) + 1}",
+                                         min(seg, max(1.0, left)), dynamic)
+                if not nxt:
                     break
-                k = min(spare, key=lambda x: (frames[x][2] != frames[c][2], abs(frames[x][0] - frames[c][0])))
-                used.add(k)
-                nxt = await _cut_trailer(work, frames[k], f"tclip{i}_{len(more.get(i, [])) + 1}",
-                                         min(CLIP_MAX, max(1.2, left)))
-                if nxt:
-                    more.setdefault(i, []).append(nxt)
-                    left -= nxt[1]
+                more.setdefault(i, []).append(nxt)
+                left, last_at, last_len = left - nxt[1], at2, nxt[1]
         if more_out is not None:
             more_out.update(more)
         # фразы, где фото повторилось бы (кадров у фильма мало), — стоп-кадр из ещё не взятого момента трейлера
@@ -470,7 +495,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     """user_pins — своя картинка (номер в user_media) -> фраза (с 1), к которой автор её подписал."""
     lines = script["lines"]
     news = script.get("kind") == "news"
+    # динамичный монтаж: видео на весь экран, новый кадр каждые ~1,8 с, переходы, субтитры по слову, без заставки
+    dynamic = script.get("style") == "dynamic"
     mourning = news and is_mourning(script)
+    dynamic = dynamic and not mourning  # прощальный ролик — всегда спокойный
     await _progress(5, "Озвучка")
     # в прощальном ролике «подписывайся» в конце неуместно
     spoken = lines if mourning else lines[:-1] + [daily.with_outro(lines[-1])]
@@ -590,7 +618,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         stills: dict[int, str] = {}
         more: dict[int, list[tuple[str, float]]] = {}
         got, note = await _trailer_clips(work, script.get("trailer_films") or [tfilm], lines, durs, skip, gemini_key,
-                                         repeats, stills, more)
+                                         repeats, stills, more, dynamic)
         if note:
             clip_notes.append(note)
         extra = []
@@ -604,10 +632,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             slides[i] = {"start": starts[i], "clip": name}
             at = starts[i] + length
             for name2, length2 in more.get(i, []):  # длинная фраза: следующие моменты трейлера
-                extra.append({"start": round(at, 3), "clip": name2})
+                extra.append({"start": round(at, 3), "clip": name2, "hard": True})  # склейка внутри фразы
                 at += length2
             if starts[i] + durs[i] > at + 0.8:  # и всё ещё не хватило — кадр, а не стоп-кадр
-                extra.append({"start": round(at, 3), "image": image})
+                extra.append({"start": round(at, 3), "image": image, "hard": True})
         slides = sorted(slides + extra, key=lambda sl: sl["start"])
     labels: list[dict[str, Any]] = []
     if news and gemini_key and script.get("kind_own"):
@@ -626,8 +654,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "slides": slides,
         "labels": labels,
         "outro_image": pool[order[0]][0],
-        # свой сценарий: короткая концовка — долгий статичный финал роняет досмотр шортса
-        "outro_len": 2.0 if script.get("kind_own") else 3.5,
+        # свой сценарий: короткая концовка — долгий статичный финал роняет досмотр шортса;
+        # динамичный — без заставки вовсе: ролик обрывается на последней фразе и идёт по кругу
+        "outro_len": 0 if dynamic else 2.0 if script.get("kind_own") else 3.5,
+        "style": "dynamic" if dynamic else "calm",
         "words": words,
         "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
         "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
