@@ -884,6 +884,16 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
 NUMBERS = {1: "один", 2: "два", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь", 8: "восемь",
            9: "девять", 10: "десять"}
 SAVE_AND_SUBSCRIBE = "Сохрани и подпишись на КиноМир триста шестьдесят!"
+# если в последней фразе уже есть «сохраняй…» — только «подпишись», без двойного «Сохраняй… Сохрани…»
+SUBSCRIBE_ONLY = "Подпишись на КиноМир триста шестьдесят!"
+
+
+def with_outro(line: str) -> str:
+    """Последняя фраза ролика + призыв подписаться (не повторяя «сохрани»/«подпишись», если они уже есть)."""
+    low = line.lower()
+    if "подпиш" in low or "подписыв" in low:
+        return line
+    return f"{line} {SUBSCRIBE_ONLY if 'сохран' in low else SAVE_AND_SUBSCRIBE}"
 
 
 def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
