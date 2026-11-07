@@ -411,6 +411,28 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
         shutil.rmtree(tdir, ignore_errors=True)
 
 
+def recap_title(titles: list[str], lines: list[str]) -> str:
+    """Пересказ франшизы («Вспоминаем, чем закончились „Дюна“ и „Дюна: Часть вторая“») — название про пересказ,
+    а не «„Дюна“ (2021) — что нужно знать»: «„Дюна“: что было в прошлых частях — перед третьей частью»."""
+    text = " ".join(lines).lower().replace("ё", "е")
+    titles = [t for t in titles if t]
+    if len(titles) < 2 and not re.search(r"вспомина|пересказ|чем законч|что было в", text):
+        return ""
+    if not titles:
+        return ""
+    base = titles[0]
+    for t in titles[1:]:  # общее начало названий: «Дюна» и «Дюна: Часть вторая» → «Дюна»
+        while base and not t.lower().startswith(base.lower()):
+            base = base[:-1]
+    base = re.sub(r"[\s:.,—–-]+$", "", base)
+    if not base or (len(base) < len(titles[0]) and titles[0][len(base)].isalnum()):
+        base = titles[0]  # «Чужой» и «Чужие» → не «Чуж», а название первого фильма
+    m = re.search(r"\b(втор|трет|четверт|пят|шест|седьм)ь?(?:ой|ей)\s+част", text)
+    nxt = f" — перед {m.group(1)}{'ьей' if m.group(1) == 'трет' else 'ой'} частью" if m else ""
+    head = "что было в прошлых частях" if len(titles) > 1 or m else "что было раньше"
+    return f"«{base}»: {head}{nxt}"
+
+
 async def _score_card(poster_url: str, value: str, out: Path) -> Path:
     """Финальная карточка рецензии: постер на размытом фоне и «МОЯ ОЦЕНКА 8/10»."""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers={"User-Agent": USER_AGENT}) as s:
@@ -935,6 +957,9 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
         year_tag = f" ({main['year']})" if str(main.get("year") or "").isdigit() else ""
         title = f"«{canon}»{year_tag}" + (f" — рецензия без спойлеров, {score['value']}/10" if score
                                           else " — что нужно знать")
+        recap = recap_title([str(m.get("title") or "") for m in trailer_films], lines)
+        if recap and not score:
+            title = recap
     name = str(main.get("title")) if main and main.get("title") else title
     return {"kind": "news", "kind_own": True, "fixed": fixed, "trailer_film": trailer_film,
             "trailer_films": trailer_films[:3],

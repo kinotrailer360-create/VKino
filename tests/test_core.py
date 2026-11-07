@@ -172,3 +172,10 @@ def test_outro_and_dune_stress():
     assert "Сохрани и подпишись" in daily.with_outro("Премьера в декабре.")
     said = pronounce.apply("находят фременов, КиноМир")
     assert "фре́менов" in said and "Киноми́р" in said
+
+
+def test_recap_title():
+    from shorts.lore import recap_title
+    text = ["Вспоминаем, чем закончились части, перед выходом третьей части."]
+    assert recap_title(["Дюна", "Дюна: Часть вторая"], text) == "«Дюна»: что было в прошлых частях — перед третьей частью"
+    assert recap_title(["Дюна"], ["Обычная рецензия"]) == ""
