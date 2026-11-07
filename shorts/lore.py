@@ -28,7 +28,6 @@ from .cards import make_cover
 from .daily import (
     ASSETS,
     ROOT,
-    SAVE_AND_SUBSCRIBE,
     TELEGRAM_URL,
     ShortResult,
     Theme,
@@ -288,9 +287,40 @@ async def _trailer_url(film: dict[str, Any]) -> str | None:
         return None
 
 
+def _bright(path: Path) -> bool:
+    """Кадр не тёмный: не затемнение и не белые титры на чёрном (почти весь кадр — тёмные точки)."""
+    try:
+        px = list(Image.open(path).convert("L").resize((64, 36)).getdata())
+    except Exception:  # noqa: BLE001
+        return True
+    return sum(px) / len(px) > 28 and sum(v < 25 for v in px) / len(px) < 0.75
+
+
+async def _cut_trailer(work: Path, frame: tuple[float, Path, Path], stem: str, length: float) -> tuple[str, float] | None:
+    """Отрезок трейлера с выбранного момента (чуть раньше — кадр ИИ попадает в середину), 1080×1920 без звука."""
+    length = round(length, 2)
+    name = f"{stem}.mp4"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frame[0] - 0.4):.2f}", "-i", str(frame[2]),
+        "-t", f"{length:.2f}", "-an", "-filter_complex",
+        # кадр трейлера почти целиком по центру (как широкие фото), сверху и снизу — его размытая копия
+        "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+        "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
+        "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2", str(work / name),
+        stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode:
+        log.info("shorts: trailer cut %s failed: %s", stem, err.decode(errors="ignore")[-200:])
+        return None
+    return name, length
+
+
 async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[str], durs: list[float], skip: set[int],
                          gemini_key: str, repeats: set[int] | None = None,
-                         stills_out: dict[int, str] | None = None) -> tuple[dict[int, tuple[str, float]], str]:
+                         stills_out: dict[int, str] | None = None,
+                         more_out: dict[int, list[tuple[str, float]]] | None = None,
+                         ) -> tuple[dict[int, tuple[str, float]], str]:
     """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
     фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото). Отрезки уже
     1080×1920 без звука. ({фраза: (файл, длина)}, пояснение автору)."""
@@ -316,6 +346,8 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
                 log.info("shorts: trailer of %s failed: %s", film.get("title"), exc)
         if not frames:
             return {}, "🎞 Трейлер фильма не нашёлся или не скачался — в ролике кадры и постеры."
+        # тёмные кадры (затемнение, титры «14 октября» на чёрном) ИИ не показываем — в ролике это чёрный экран
+        frames = [f for f in frames if _bright(f[1])] or frames
         thumbs = [Image.open(path).convert("RGB") for _, path, _ in frames]
         choices = await ai.match_images(gemini_key, [lines[i] for i in want], thumbs)
         used: set[int] = set()
@@ -332,25 +364,29 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
             elif c >= 0:
                 used.add(c)
         out: dict[int, tuple[str, float]] = {}
+        more: dict[int, list[tuple[str, float]]] = {}  # длинная фраза: следующие отрезки после первого
         for i, c in zip(want, order):
             if c < 0:
                 continue  # у этой фразы остаётся фото
-            length = round(min(CLIP_MAX, max(1.2, durs[i])), 2)
-            name = f"tclip{i}.mp4"
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frames[c][0] - 1.0):.2f}", "-i", str(frames[c][2]),
-                "-t", f"{length:.2f}", "-an", "-filter_complex",
-                # кадр трейлера почти целиком по центру (как широкие фото), сверху и снизу — его размытая копия
-                "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-                "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
-                "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2", str(work / name),
-                stderr=asyncio.subprocess.PIPE)
-            _, err = await proc.communicate()
-            if proc.returncode:
-                log.info("shorts: trailer cut %s failed: %s", i, err.decode(errors="ignore")[-200:])
+            got = await _cut_trailer(work, frames[c], f"tclip{i}", min(CLIP_MAX, max(1.2, durs[i])))
+            if not got:
                 continue
-            out[i] = (name, length)
+            out[i] = got
+            # фраза намного длиннее отрезка (финал с датой и «подпишись») — ещё моменты трейлера, а не стоп-кадр
+            left = durs[i] - got[1]
+            while left > 1.5 and len(more.get(i, [])) < 3:
+                spare = [k for k in range(len(frames)) if k not in used]
+                if not spare:
+                    break
+                k = min(spare, key=lambda x: (frames[x][2] != frames[c][2], abs(frames[x][0] - frames[c][0])))
+                used.add(k)
+                nxt = await _cut_trailer(work, frames[k], f"tclip{i}_{len(more.get(i, [])) + 1}",
+                                         min(CLIP_MAX, max(1.2, left)))
+                if nxt:
+                    more.setdefault(i, []).append(nxt)
+                    left -= nxt[1]
+        if more_out is not None:
+            more_out.update(more)
         # фразы, где фото повторилось бы (кадров у фильма мало), — стоп-кадр из ещё не взятого момента трейлера
         if stills_out is not None:
             spare = [c for c in range(len(frames)) if c not in used]
@@ -415,7 +451,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     mourning = news and is_mourning(script)
     await _progress(5, "Озвучка")
     # в прощальном ролике «подписывайся» в конце неуместно
-    spoken = lines if mourning else lines[:-1] + [f"{lines[-1]} {SAVE_AND_SUBSCRIBE}"]
+    spoken = lines if mourning else lines[:-1] + [daily.with_outro(lines[-1])]
     voice, starts, voiced, spans = await daily.synthesize(spoken, work)
     await _progress(30, "Субтитры по слову")
     words = await daily.word_timeline(voice, starts, spans) if voiced else []
@@ -530,8 +566,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         if score_line >= 0 and durs[score_line] > 6:
             repeats.add(score_line)  # длинная финальная фраза: после карточки оценки — ещё кадр фильма
         stills: dict[int, str] = {}
+        more: dict[int, list[tuple[str, float]]] = {}
         got, note = await _trailer_clips(work, script.get("trailer_films") or [tfilm], lines, durs, skip, gemini_key,
-                                         repeats, stills)
+                                         repeats, stills, more)
         if note:
             clip_notes.append(note)
         extra = []
@@ -543,8 +580,12 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         for i, (name, length) in got.items():
             image = slides[i]["image"]
             slides[i] = {"start": starts[i], "clip": name}
-            if durs[i] > length + 0.8:  # длинная фраза: после отрезка — кадр, а не стоп-кадр
-                extra.append({"start": round(starts[i] + length, 3), "image": image})
+            at = starts[i] + length
+            for name2, length2 in more.get(i, []):  # длинная фраза: следующие моменты трейлера
+                extra.append({"start": round(at, 3), "clip": name2})
+                at += length2
+            if starts[i] + durs[i] > at + 0.8:  # и всё ещё не хватило — кадр, а не стоп-кадр
+                extra.append({"start": round(at, 3), "image": image})
         slides = sorted(slides + extra, key=lambda sl: sl["start"])
     labels: list[dict[str, Any]] = []
     if news and gemini_key and script.get("kind_own"):

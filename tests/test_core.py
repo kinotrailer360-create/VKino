@@ -164,3 +164,11 @@ def test_fact_check_must_not_change_story() -> None:
     fixed = "🥋 БРЭДЛИ КУПЕР СНИМЕТ ФИЛЬМ ПО «КОБРЕ КАЙ»! По слухам, Netflix готовит фильм, режиссёр — Брэдли Купер."
     assert not same_story(draft, other)
     assert same_story(draft, fixed)
+
+
+def test_outro_and_dune_stress():
+    from shorts import daily, pronounce
+    assert daily.with_outro("Сохраняй, чтобы освежить память.").count("охран") == 1
+    assert "Сохрани и подпишись" in daily.with_outro("Премьера в декабре.")
+    said = pronounce.apply("находят фременов, КиноМир")
+    assert "фре́менов" in said and "Киноми́р" in said
