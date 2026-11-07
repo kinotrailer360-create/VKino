@@ -288,7 +288,7 @@ async def _trailer_url(film: dict[str, Any]) -> str | None:
         return None
 
 
-async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], durs: list[float], skip: set[int],
+async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[str], durs: list[float], skip: set[int],
                          gemini_key: str, repeats: set[int] | None = None,
                          stills_out: dict[int, str] | None = None) -> tuple[dict[int, tuple[str, float]], str]:
     """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
@@ -298,15 +298,25 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
     tdir.mkdir(exist_ok=True)
     want = [i for i in range(len(lines)) if i not in skip]
     try:
-        url = await _trailer_url(film)
-        if not url:
-            return {}, "🎞 Трейлер фильма не нашёлся — в ролике кадры и постеры."
-        src = await clips.download_full(url, tdir)
-        total = await daily._duration(src)
-        frames = await clips.sample_frames(src, tdir, duration=total, limit=30)
+        # несколько фильмов (пересказ франшизы) — трейлер каждого, кадры для ИИ из всех вместе
+        frames: list[tuple[float, Path, Path]] = []  # (секунда, миниатюра, файл трейлера)
+        per = max(10, 30 // max(1, len(films)))
+        for n, film in enumerate(films[:3]):
+            url = await _trailer_url(film)
+            if not url:
+                continue
+            fdir = tdir / f"t{n}"
+            fdir.mkdir(exist_ok=True)
+            try:
+                src_n = await clips.download_full(url, fdir)
+                total = await daily._duration(src_n)
+                frames += [(t, path, src_n) for t, path in
+                           await clips.sample_frames(src_n, fdir, duration=total, limit=per)]
+            except Exception as exc:  # noqa: BLE001 — один трейлер не скачался — берём остальные
+                log.info("shorts: trailer of %s failed: %s", film.get("title"), exc)
         if not frames:
-            return {}, "🎞 Не удалось нарезать кадры трейлера — в ролике кадры и постеры."
-        thumbs = [Image.open(path).convert("RGB") for _, path in frames]
+            return {}, "🎞 Трейлер фильма не нашёлся или не скачался — в ролике кадры и постеры."
+        thumbs = [Image.open(path).convert("RGB") for _, path, _ in frames]
         choices = await ai.match_images(gemini_key, [lines[i] for i in want], thumbs)
         used: set[int] = set()
         if choices:
@@ -328,7 +338,7 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
             length = round(min(CLIP_MAX, max(1.2, durs[i])), 2)
             name = f"tclip{i}.mp4"
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frames[c][0] - 1.0):.2f}", "-i", str(src),
+                "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, frames[c][0] - 1.0):.2f}", "-i", str(frames[c][2]),
                 "-t", f"{length:.2f}", "-an", "-filter_complex",
                 # кадр трейлера почти целиком по центру (как широкие фото), сверху и снизу — его размытая копия
                 "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
@@ -350,7 +360,7 @@ async def _trailer_clips(work: Path, film: dict[str, Any], lines: list[str], dur
                 c = spare.pop(len(spare) // 2)
                 name = f"tstill{i}.jpg"
                 proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-v", "error", "-y", "-ss", f"{frames[c][0]:.2f}", "-i", str(src), "-frames:v", "1",
+                    "ffmpeg", "-v", "error", "-y", "-ss", f"{frames[c][0]:.2f}", "-i", str(frames[c][2]), "-frames:v", "1",
                     "-vf", "scale=1600:-2", "-q:v", "3",  # широкий стоп-кадр — рендер покажет его целиком
                     str(work / name), stderr=asyncio.subprocess.PIPE)
                 await proc.communicate()
@@ -520,7 +530,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         if score_line >= 0 and durs[score_line] > 6:
             repeats.add(score_line)  # длинная финальная фраза: после карточки оценки — ещё кадр фильма
         stills: dict[int, str] = {}
-        got, note = await _trailer_clips(work, tfilm, lines, durs, skip, gemini_key, repeats, stills)
+        got, note = await _trailer_clips(work, script.get("trailer_films") or [tfilm], lines, durs, skip, gemini_key,
+                                         repeats, stills)
         if note:
             clip_notes.append(note)
         extra = []
@@ -756,7 +767,20 @@ async def _film_backdrops(tmdb_key: str, name: str, n: int = 3, tv: bool = False
 def _stem_key(name: str) -> str:
     """Название без падежа: «Обители зла» и «Обитель зла» → «обите зла» — один фильм в разных формах."""
     words = re.findall(r"[0-9a-zа-яё]+", name.lower().replace("ё", "е"))
-    return " ".join(w[:max(4, len(w) - 2)] for w in words)
+    return " ".join(w[:max(3, len(w) - 2)] for w in words)  # «Дюну», «Дюны» → «дюн»
+
+
+def _nominative(name: str) -> str:
+    """Грубо — именительный падеж первого слова названия, чтобы искать в базе: «Дюну»/«Дюны» → «Дюна»,
+    «Обители зла» → «Обитель зла», «Мстителей» → «Мстители». Не угадали — ищем и по форме из текста."""
+    words = name.split(" ", 1)
+    w = words[0]
+    for end, repl in (("ями", "и"), ("ами", "ы"), ("ей", "и"), ("ой", "а"), ("ую", "ая"), ("ом", ""), ("у", "а"),
+                      ("ы", "а"), ("е", "а"), ("ю", "я"), ("и", "ь")):
+        if len(w) > len(end) + 2 and w.lower().endswith(end):
+            w = w[:-len(end)] + repl
+            break
+    return " ".join([w] + words[1:])
 
 
 async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, Any]:
@@ -803,6 +827,9 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
     forms: dict[str, list[str]] = {}
     for f in films:
         forms.setdefault(by_stem[_stem_key(f)], []).append(f)
+    for f, fs in forms.items():  # сначала форма в именительном падеже — по ней база находит сам фильм
+        guess = [_nominative(x) for x in fs]
+        forms[f] = list(dict.fromkeys(guess + fs))
 
     metas: dict[str, dict[str, Any]] = {}
 
@@ -854,6 +881,12 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
         max(with_meta, key=lambda f: (mentions(f), -films.index(f))) if with_meta else None)
     main = metas[main_name] if main_name else None
     trailer_film = {**main, "names": [n for n in films if metas.get(n) is main]} if main else None
+    # пересказ франшизы: «Дюна» (2021) и «Дюна: Часть вторая» (2024) — трейлеры всех фильмов с годом
+    with_year = [metas[f] for f in with_meta if year_of(f) is not None]
+    seen_ids: set[int] = set()
+    trailer_films = [m for m in with_year if not (m["id"] in seen_ids or seen_ids.add(m["id"]))]
+    if not trailer_films and main:
+        trailer_films = [main]
     score = review_score(lines)
     if main and not parsed["title"]:
         # название ролика — официальное из базы, а не форма из фразы («Обители зла» → «Обитель зла»)
@@ -863,6 +896,7 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
                                           else " — что нужно знать")
     name = str(main.get("title")) if main and main.get("title") else title
     return {"kind": "news", "kind_own": True, "fixed": fixed, "trailer_film": trailer_film,
+            "trailer_films": trailer_films[:3],
             "score": score, "name": name, "en": "", "title": title, "lines": lines,
             "hashtags": [], "films": films, "article": "сценарий автора", "url": "", "missing": missing,
             "images": list(dict.fromkeys(images))[:MAX_IMAGES]}

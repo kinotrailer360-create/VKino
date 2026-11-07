@@ -13477,9 +13477,12 @@ async def own_generate(message: Message, state: FSMContext) -> None:
     await show_lore(message, state)
     film = script.get("trailer_film")
     if film:
+        many = script.get("trailer_films") or [film]
+        names = ", ".join(f"«{escape(str(f.get('title') or ''))}»" + (f" ({f['year']})" if f.get("year") else "")
+                          for f in many)
         await message.answer(
-            f"🎞 При сборке бот сам возьмёт официальный трейлер «{escape(str(film.get('title') or ''))}»"
-            + (f" ({film['year']})" if film.get("year") else "") + ", подберёт к каждой фразе отрезок 2–3 с (без "
+            f"🎞 При сборке бот сам возьмёт официальны{'е трейлеры' if len(many) > 1 else 'й трейлер'} {names}"
+            + ", подберёт к каждой фразе отрезок 2–3 с (без "
             "звука трейлера), добавит крупные надписи на экран"
             + (f" и финальную карточку «МОЯ ОЦЕНКА {script['score']['value']}/10»" if script.get("score") else "")
             + ". Свои картинки — только если хочешь заменить что-то (подпиши номер фразы).")
