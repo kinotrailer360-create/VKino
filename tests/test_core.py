@@ -154,3 +154,13 @@ def test_own_script_main_film_any_case() -> None:
         lore._film_backdrops = real
     assert script["trailer_film"]["title"] == "Обитель зла"  # не «Варвар», упомянутый мимоходом
     assert lore._stem_key("Обители зла") == lore._stem_key("Обитель зла")
+
+
+def test_fact_check_must_not_change_story() -> None:
+    from shorts.ai import same_story
+
+    draft = "🥋 БРЭДЛИ КУПЕР СНИМЕТ ФИЛЬМ ПО «КОБРЕ КАЙ»! Netflix и Sony готовят фильм, режиссёр — Брэдли Купер."
+    other = "🎬 НАТАЛИ ДАЙЕР И ЭЛАЙДЖА ВУД СЫГРАЮТ В СИКВЕЛЕ «1408»! К Джону Кьюсаку присоединятся новые актёры."
+    fixed = "🥋 БРЭДЛИ КУПЕР СНИМЕТ ФИЛЬМ ПО «КОБРЕ КАЙ»! По слухам, Netflix готовит фильм, режиссёр — Брэдли Купер."
+    assert not same_story(draft, other)
+    assert same_story(draft, fixed)

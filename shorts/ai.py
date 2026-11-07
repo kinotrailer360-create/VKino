@@ -981,6 +981,21 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip()
     if len(post) < 80:
         return None
+    # фильм и человек из ответа должны быть в самом посте — иначе это поля от другой новости, и бот подберёт
+    # чужие фото и источник: тогда поля обнуляем (фото найдутся по тексту поста или их не будет)
+    low = post.lower().replace("ё", "е")
+
+    def named(*names: Any) -> bool:
+        stems = [w.lower().replace("ё", "е")[:5] for n in names for w in re.findall(r"[\wА-Яа-яЁё]{3,}", str(n or ""))]
+        return bool(stems) and any(st in low for st in stems)
+
+    if (data.get("film") or data.get("film_en")) and not named(data.get("film"), data.get("film_en")):
+        log.warning("shorts: write_post film %r not in the post — dropped", data.get("film"))
+        data["film"] = data["film_en"] = ""
+        data["media"] = []
+    if (data.get("person") or data.get("person_en")) and not named(data.get("person"), data.get("person_en")):
+        log.warning("shorts: write_post person %r not in the post — dropped", data.get("person"))
+        data["person"] = data["person_en"] = ""
     media = []
     for m in data.get("media") or []:
         try:
@@ -1177,6 +1192,9 @@ async def verify_post(key: str, task: str, post: str) -> str:
         "— МАТЕРИАЛ главнее поиска: если черновик взял из поиска другой год, другой список или другую новость "
         "вместо материала — верни то, что в материале;\n"
         "— исправь падежи и опечатки.\n"
+        "НЕ МЕНЯЙ ТЕМУ: пост остаётся о той же новости, о тех же фильмах и людях, что черновик. В материалах "
+        "много других новостей — их не бери и черновик на них не заменяй. Новость черновика не подтверждается "
+        "— убери неподтверждённое или пометь как слух, но тему оставь.\n"
         "Сохрани стиль, эмодзи, структуру, хэштеги и длину (до 950 символов). Если всё верно — верни черновик "
         "без изменений." + GRAMMAR
         + '\n\nОтветь только JSON: {"post": "проверенный текст поста", "fixes": ["что исправил", ...]}'
@@ -1190,7 +1208,33 @@ async def verify_post(key: str, task: str, post: str) -> str:
     fixes = (data or {}).get("fixes") if isinstance(data, dict) else None
     if fixes:
         log.info("shorts: fact-check fixes: %s", "; ".join(map(str, fixes))[:500])
+    if len(checked) >= 80 and not same_story(post, checked):
+        # фактчекер подменил новость на другую из материалов (пост про «1408», а фото и источник — от
+        # «Кобры Кай» из черновика) — оставляем черновик
+        log.warning("shorts: fact-check changed the story — keeping the draft")
+        return post
     return checked[:1020] if len(checked) >= 80 else post
+
+
+def _name_tokens(text: str) -> set[str]:
+    """Имена и названия поста: слова с заглавной не в начале предложения, слова в «ёлочках», латиница, числа —
+    по основе (первые 5 букв), чтобы падежи совпадали."""
+    out: set[str] = set()
+    for q in re.findall(r"«([^«»]{1,60})»", text):
+        out |= {w.lower()[:5] for w in re.findall(r"[\wА-Яа-яЁё]{3,}", q)}
+    for m in re.finditer(r"(?<![.!?\n]\s)(?<!^)\b([A-ZА-ЯЁ][a-zа-яё]{2,})", text):
+        out.add(m.group(1).lower()[:5])
+    out |= {w.lower()[:5] for w in re.findall(r"\b[A-Za-z]{3,}\b", text)}
+    out |= set(re.findall(r"\b\d{3,4}\b", text))
+    return out
+
+
+def same_story(draft: str, checked: str) -> bool:
+    """Проверенный пост — о той же новости, что черновик: хотя бы треть имён и названий черновика на месте."""
+    a, b = _name_tokens(draft), _name_tokens(checked)
+    if len(a) < 3:
+        return True  # не по чему судить
+    return len(a & b) / len(a) >= 0.34
 
 
 def _films_from(data: dict[str, Any], extra: tuple[str, ...] = ()) -> list[dict[str, Any]]:
