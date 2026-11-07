@@ -357,6 +357,18 @@ async def movie(key: str, tmdb_id: int) -> dict[str, Any] | None:
     return _movie_row(data) if data.get("id") else None
 
 
+async def popular_pool(key: str, page: int = 1) -> list[dict[str, Any]]:
+    """Известные фильмы (много голосов, рейтинг 7+) — запас для викторины, если Кинопоиск не ответил.
+    Строки как у _movie_row + "genres" (id жанров TMDB)."""
+    if not key:
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _get(session, key, "/discover/movie", language="ru-RU", sort_by="vote_count.desc",
+                          page=page, **{"vote_average.gte": 7, "vote_count.gte": 3000})
+    return [{**_movie_row(r), "genres": list(r.get("genre_ids") or [])}
+            for r in data.get("results") or [] if r.get("id") and r.get("backdrop_path")]
+
+
 async def search_movie(key: str, query: str, n: int = 5) -> list[dict[str, Any]]:
     if not key or not query.strip():
         return []
