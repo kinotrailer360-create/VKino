@@ -52,6 +52,8 @@ async def resolve(fetch: Fetch, films: list[dict[str, Any]]) -> list[dict[str, A
         for name in (f.get("ru"), f.get("en")):
             if name:
                 queries.append(f"{name} {f['year']}" if f.get("year") else str(name))
+        if f.get("year"):  # с годом не нашлось (год у автора мог быть годом сезона) — просто по названию
+            queries += [str(n) for n in (f.get("ru"), f.get("en")) if n]
         found = None
         for q in queries:
             try:

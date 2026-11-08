@@ -10720,6 +10720,58 @@ def _brand(post: str) -> str:
     return f"{head}\n{BRAND}\n{rest.lstrip(chr(10))}" if rest else f"{head}\n{BRAND}"
 
 
+_ITEM_RE = re.compile(r"^\s*(?:\d️⃣|🔟|\d{1,2}[.)])")
+
+
+def _compact_list(post: str, limit: int) -> str:
+    """Подборка не влезает в подпись Telegram (1024 символа) — сокращаем, но так, чтобы ВСЕ фильмы остались:
+    сначала убираем вводную фразу, потом укорачиваем описания фильмов (по целым словам), потом убираем их совсем,
+    потом строку реакций. Хэштеги и строки названий не трогаем."""
+    if len(post) <= limit:
+        return post
+    lines = post.split("\n")
+    items = [k for k, ln in enumerate(lines) if _ITEM_RE.match(ln)]
+    if not items:
+        return post
+    first, last = items[0], items[-1]
+    # описание фильма — непустые строки после строки названия до следующего фильма (у последнего — до пустой)
+    about: list[int] = []
+    for n, i in enumerate(items):
+        end = items[n + 1] if n + 1 < len(items) else len(lines)
+        for k in range(i + 1, end):
+            if not lines[k].strip():
+                if n + 1 == len(items):
+                    break
+                continue
+            if not lines[k].lstrip().startswith("#") and "❤️" not in lines[k]:
+                about.append(k)
+
+    def size() -> int:
+        return len("\n".join(ln for ln in lines if ln is not None))
+
+    # 1) вводная фраза между заголовком (с подписью) и первым фильмом
+    for k in range(2, first):
+        if size() > limit and lines[k] and lines[k].strip() and "kinomir360" not in lines[k].lower():
+            lines[k] = None
+    # 2) описания — короче, по целым словам
+    for cap in (110, 90, 70, 55, 40):
+        if size() <= limit:
+            break
+        for k in about:
+            if lines[k] and len(lines[k]) > cap:
+                cut = lines[k][:cap].rsplit(" ", 1)[0].rstrip(",;:—– ")
+                lines[k] = cut + "…"
+    # 3) без описаний, 4) без строки реакций
+    for k in about:
+        if size() > limit:
+            lines[k] = None
+    for k in range(last + 1, len(lines)):
+        if size() > limit and lines[k] and ("❤️" in lines[k] or "🔥" in lines[k]):
+            lines[k] = None
+    text = "\n".join(ln for ln in lines if ln is not None)
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
 def _list_fallback(title: str, films: list[dict[str, Any]]) -> str:
     nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
     rows = [f"🍿 {title.upper()}!", BRAND, ""]
@@ -10765,6 +10817,10 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
         if not same and f["year"]:  # чуть другое написание («Шериф поневоле» / «Шериф-поневоле») — того же года
             same = [d for d in docs if abs(int(d.get("year") or 0) - f["year"]) <= 1 and max(
                 (shorts_daily.tmdb.similar(n, t) for n in names for t in titles(d) if t), default=0) >= 0.85]
+        if f.get("series") is not None and same:
+            # «Величайший (1 сезон)» — сериал, а не одноимённый фильм 2024 года: тип должен совпасть
+            kind = [d for d in same if bool(d.get("isSeries")) == bool(f["series"])]
+            same = kind or ([] if f["series"] else same)
         same.sort(key=lambda d: (abs(int(d.get("year") or 0) - f["year"]) > 1 if f["year"] else False,
                                  -int((d.get("votes") or {}).get("kp") or 0)))
         for d in same[:2]:
@@ -12851,19 +12907,27 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
     films = plan.get("films") or []
     if len(films) < 2:
         raise RuntimeError("в источнике не нашлось списка фильмов")
-    lines = [f"«{f['ru'] or f['en']}» ({f.get('year') or '?'})" + (f", ориг. {f['en']}" if f.get("en") else "")
-             + (f". {f['note']}" if f.get("note") else "") for f in films]
+    # сначала находим каждый фильм (постер, год, рейтинг) — год в посте берём из карточки, а не догадку ИИ
+    found = [await _list_poster(f, [], []) for f in films]
+
+    def line(f: dict[str, Any], card: dict[str, Any] | None) -> str:
+        year = (card or {}).get("year") or f.get("year")
+        kind = (f"сериал, {f['season']}-й сезон" if f.get("season") else "сериал") if f.get("series") else "фильм"
+        rating, _ = _trusted_rating(card) if card else (0, "")
+        return (f"«{f['ru'] or f['en']}» — {kind}" + (f", год {'старта ' if f.get('series') else ''}{year}" if year
+                                                       else ", год неизвестен — НЕ пиши год")
+                + (f", рейтинг {rating:.1f}" if rating else "") + (f", ориг. {f['en']}" if f.get("en") else "")
+                + (f". {f['note']}" if f.get("note") else ""))
+
+    lines = [line(f, card) for f, (_, card) in zip(films, found)]
     today = datetime.now(MSK).date()
     res = await shorts_ai.write_list_post(GEMINI_API_KEY, plan.get("title") or "Подборка", lines, "", [],
                                           f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
                                           n=len(films), only=True)
-    picked = (res or {}).get("films") or [{"ru": f["ru"], "en": f["en"],
-                                           "year": int(f["year"]) if str(f.get("year") or "").isdigit() else None}
-                                          for f in films]
     post = _brand(res["post"] if res else "\n".join(
         [f"🍿 {str(plan.get('title') or 'ПОДБОРКА').upper()}", ""] + [f"{k}. {ln}" for k, ln in enumerate(lines, 1)]))
-    names = [f["ru"] or f["en"] for f in picked]
-    found = [await _list_poster(f, [], []) for f in picked]
+    post = _compact_list(post, 1020 - SIGN_LEN - len(" #подборка"))  # все фильмы источника — в подписи
+    names = [f["ru"] or f["en"] for f in films]
     work = SHORTS_DIR / f"llist_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
