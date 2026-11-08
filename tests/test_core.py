@@ -457,3 +457,15 @@ def test_history_key_is_hash_not_long_value():
     # 005 — ровно в том виде, в каком применена на сервере (её контрольная сумма записана в schema_version)
     v5 = next(m for m in migrations.MIGRATIONS if m[0] == 5)
     assert migrations.checksum(v5[2], v5[3]) == SERVER_005
+
+
+def test_fact_check_gets_only_related_materials():
+    from shorts import ai
+    rules = "Правила. " * 200
+    other = "\n\n".join(f"{i}. [t.me/x]\nНовость про «Бэтмен» и Паттинсона номер {i}. " * 3 for i in range(30))
+    ours = "\n\n31. [t.me/y]\nВильнёв снимет «Дюна 3» с Зендеей, премьера в 2026."
+    task = rules + "\n\n" + other + ours
+    got = ai._relevant_task(task, "🏜 «ДЮНА 3»: Вильнёв и Зендея возвращаются")
+    assert "Вильнёв снимет «Дюна 3»" in got and "Бэтмен" not in got
+    assert len(got) < len(task) // 2
+    assert ai._clip("слово " * 200, 50).endswith("…") and len(ai._clip("слово " * 200, 50)) <= 51
