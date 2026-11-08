@@ -1066,7 +1066,9 @@ stressed: dict[str, int] = {}  # слова со знаком ударения �
 async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
     """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
     русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
-    texts = [pronounce.dates(pronounce.apply(text)) for text in lines]  # даты — сразу в нужном падеже
+    # даты и порядковые («4 сезон» → «четвёртый сезон», «2-й» → «второй») — сразу, до ИИ: ИИ их иногда
+    # читает количественными («четыре сезон»)
+    texts = [pronounce.dates(pronounce.numbers(pronounce.apply(text))) for text in lines]
     # ИИ правит все фразы: числа и латиница — словами, а ещё ставит ударения в именах и редких словах
     todo = list(range(len(texts)))
     if todo:
