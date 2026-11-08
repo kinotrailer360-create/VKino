@@ -282,30 +282,6 @@ def test_netsafe_blocks_internal_addresses():
             asyncio.run(netsafe.check_url(url))
 
 
-def test_check_claims_parses_and_failure_is_review_required(monkeypatch):
-    import asyncio
-
-    from shorts import ai
-
-    async def fake(*a, **k):
-        return {"claims": [{"claim": "Премьера 18 декабря", "status": "confirmed_official",
-                            "sources": ["https://marvel.com/x", "не ссылка"], "note": "сайт студии"},
-                           {"claim": "Погибнут два героя", "status": "rumor", "sources": []},
-                           {"claim": "Бюджет 500 млн", "status": "выдумка"}]}
-    monkeypatch.setattr(ai, "_post_json", fake)
-    monkeypatch.setattr(ai, "available", lambda key: True)
-    claims = asyncio.run(ai.check_claims("k", "пост"))
-    assert [c["status"] for c in claims] == ["confirmed_official", "rumor", "unknown"]
-    assert claims[0]["sources"] == ["https://marvel.com/x"]
-    assert "Факты" in ai.claims_summary(claims)
-
-    async def broken(*a, **k):
-        raise RuntimeError("429")
-    monkeypatch.setattr(ai, "_post_json", broken)
-    assert asyncio.run(ai.check_claims("k", "пост")) is None
-    assert "не состоялась" in ai.claims_summary(None)
-
-
 def test_budget_blocks_at_limit(monkeypatch, tmp_path):
     from datetime import date
 

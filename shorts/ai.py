@@ -1419,65 +1419,6 @@ def _name_tokens(text: str) -> set[str]:
     return out
 
 
-CLAIM_STATUSES = {  # статус утверждения → как показать автору
-    "confirmed_official": "✅ официально",
-    "supported": "📰 подтверждают издания",
-    "single_source": "☝️ один источник",
-    "rumor": "🕵️ слух",
-    "contradicted": "❌ опровергается",
-    "unknown": "❔ не проверено",
-}
-
-
-async def check_claims(key: str, post: str, material: str = "") -> list[dict[str, Any]] | None:
-    """Проверка фактов поста с доказательствами: 3–8 главных утверждений (имена, роли, даты, сезоны, цифры,
-    цитаты, статус проекта), у каждого — статус из CLAIM_STATUSES, ссылки-источники и пояснение.
-    material — посты-источники новости. None — проверка не состоялась (лимит, сбой): пост тогда помечается
-    «нужна ручная проверка», а не «проверено»."""
-    if not available(key) or not post.strip():
-        return None
-    prompt = (
-        "Ты фактчекер новостей о кино. Разбей пост на 3–8 главных проверяемых утверждений (имена и фамилии, роли, "
-        "название и сезон, даты премьер и съёмок, цифры: бюджеты, сборы, хронометраж; цитаты; статус проекта). "
-        "Проверь каждое по материалам ниже и поиском Google. Статусы: confirmed_official — подтверждает "
-        "официальный источник (студия, сервис, сам человек); supported — независимые профильные издания; "
-        "single_source — только один источник (перепечатки одного пресс-релиза — это один источник); rumor — "
-        "слух, инсайдер; contradicted — источники опровергают; unknown — не нашёл подтверждения. "
-        "Не путай «готова рассмотреть» с «вернётся», «может появиться» с «утверждена». sources — ссылки, которые "
-        "реально подтверждают или опровергают (только настоящие URL из материалов или поиска, не выдумывай). "
-        "note — коротко, что именно не сходится или чем подтверждено."
-        + '\nОтветь только JSON: {"claims": [{"claim": "…", "status": "supported", "sources": ["https://…"], '
-        '"note": "…"}]}\n\nПОСТ:\n' + post[:2000]
-        + ("\n\nМАТЕРИАЛЫ (посты-источники):\n" + material[:6000] if material else ""))
-    try:
-        data = await _post_json(key, prompt, search=True, verify=False)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("shorts: claim check failed: %s", exc)
-        return None
-    out = []
-    for c in (data or {}).get("claims") or []:
-        if not isinstance(c, dict) or not str(c.get("claim") or "").strip():
-            continue
-        status = str(c.get("status") or "unknown").strip()
-        out.append({"claim": re.sub(r"\s+", " ", str(c["claim"])).strip()[:300],
-                    "status": status if status in CLAIM_STATUSES else "unknown",
-                    "sources": [str(u) for u in (c.get("sources") or []) if re.match(r"https?://", str(u))][:4],
-                    "note": re.sub(r"\s+", " ", str(c.get("note") or "")).strip()[:300]})
-    return out[:8] or None
-
-
-def claims_summary(claims: list[dict[str, Any]] | None) -> str:
-    """Строка автору под постом: «🔎 Факты: 3 📰 · 1 🕵️ · 1 ❔» или предупреждение, что проверка не состоялась."""
-    if not claims:
-        return "⚠️ Проверка фактов не состоялась (лимит или сбой ИИ) — проверь пост вручную или нажми «🔁 Перепроверить»"
-    counts: dict[str, int] = {}
-    for c in claims:
-        counts[c["status"]] = counts.get(c["status"], 0) + 1
-    parts = [f"{n} {CLAIM_STATUSES[s].split()[0]}" for s, n in counts.items()]
-    bad = counts.get("contradicted", 0)
-    return "🔎 Факты: " + " · ".join(parts) + (" — ⚠️ есть опровергнутые, проверь «📚 Источники»" if bad else "")
-
-
 def same_story(draft: str, checked: str) -> bool:
     """Проверенный пост — о той же новости, что черновик: хотя бы треть имён и названий черновика на месте."""
     a, b = _name_tokens(draft), _name_tokens(checked)
