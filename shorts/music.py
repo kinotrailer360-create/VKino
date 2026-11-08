@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 from pathlib import Path
 
 DIR = Path(os.getenv("MUSIC_DIR", "/tmp/kinomir_shorts/music"))
@@ -22,13 +23,14 @@ MOODS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "thriller": ("🔪 Триллер", "Suspenseful thriller underscore, ticking pulse, dark synth bass, mysterious piano",
                  ("триллер", "детектив", "маньяк", "преступ", "убий", "расследов", "тайн")),
     "action": ("💥 Боевик", "Epic action movie trailer music, driving percussion, aggressive hybrid orchestra",
-               ("боевик", "экшн", "погон", "войн", "супергеро", "марвел", "marvel", "драк")),
+               ("боевик", "экшн", "погон", "войн", "супергеро", "марвел", "marvel", "драк", "мстител",
+                "мультивселен", "бэтмен", "супермен", "дэдпул", "росомах", "человек-паук", "злоде")),
     "comedy": ("😂 Комедия", "Playful quirky comedy underscore, pizzicato strings, light percussion, upbeat and fun",
                ("комеди", "смешн", "юмор", "ржач", "угар")),
     "animation": ("🧸 Мультфильмы", "Magical whimsical animated movie music, bright orchestra, celesta, joyful",
                   ("мульт", "аниме", "анимац", "pixar", "пиксар", "дисней", "disney")),
     "scifi": ("🚀 Фантастика", "Futuristic sci-fi soundtrack, pulsing synths, spacey pads, wonder and mystery",
-              ("фантаст", "космос", "косми", "будущ", "робот", "инопланет", "киберпанк")),
+              ("фантаст", "космос", "косми", "будущ", "робот", "инопланет", "киберпанк", "дюн", "звёздн", "звездн")),
     "drama": ("💔 Драма", "Emotional cinematic drama underscore, soft piano and warm strings, touching, hopeful",
               ("драм", "мелодрам", "любов", "роман", "трогат", "слёз", "слез")),
     "nostalgia": ("📼 Ностальгия", "Nostalgic retro 80s synthwave, warm analog synths, dreamy, cinematic",
@@ -57,7 +59,10 @@ def mood_for(*texts: str) -> str:
     for text in texts:
         low = (text or "").lower()
         for mood, (_, _, words) in MOODS.items():
-            if any(w in low for w in words):
+            # слово с начала: «мульт» — это «мультфильм», а не «Мультивселенная» (ролик о «Мстителях» получил
+            # детскую музыку с челестой)
+            if any(re.search(rf"(?<![\w]){re.escape(w)}", low) and not (w == "мульт" and "мультивселен" in low)
+                   for w in words):
                 return mood
     return DEFAULT
 

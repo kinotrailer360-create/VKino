@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -58,6 +59,11 @@ from shorts import postcard as shorts_postcard
 from shorts import clips as shorts_clips
 from shorts import youtube_upload as shorts_yt
 from shorts import linkfetch as shorts_linkfetch
+from shorts import netsafe
+from shorts import diary as shorts_diary
+from shorts import kinodl as shorts_kinodl
+from shorts.postmedia import DIGEST_MARKERS, _focused, _is_digest, _mentions_title, _title_words  # noqa: F401
+from shorts import usage as shorts_usage
 from shorts import news as shorts_news
 from shorts import fastnews as shorts_fast
 from shorts import rt as shorts_rt
@@ -232,6 +238,10 @@ MAIN_MENU_LABELS = {
     "ℹ️ О VKino",
     "🎯 Подобрать фильм",
     "🧩 Викторина дня",
+    "📔 Кинодневник",
+    "👥 Выбрать вдвоём",
+    "🎬 Кинодл — угадай фильм",
+    "🔮 Прогноз уикенда",
     "🎁 Пригласить друга",
     "💡 Предложить идею",
     "✉️ Написать админу",
@@ -240,6 +250,9 @@ MAIN_MENU_LABELS = {
 
 class SearchState(StatesGroup):
     query = State()
+    describe = State()
+    follow = State()
+    kinodl = State()
 
 
 class ShortsState(StatesGroup):
@@ -250,6 +263,7 @@ class ShortsState(StatesGroup):
     trailer_query = State()
     feed_url = State()
     music_file = State()
+    music_own = State()
     clone_audio = State()
     fact_channels = State()
     fact_channels_add = State()
@@ -276,6 +290,8 @@ class CustomState(StatesGroup):
 
 
 class LoreState(StatesGroup):
+    own = State()
+    wwk = State()
     news = State()
     name = State()
     hook = State()
@@ -379,6 +395,7 @@ class PoiskKino:
         self.cache: dict[str, tuple[float, Any]] = {}
         self.hits = self.misses = self.fallbacks = 0
         self.last_error = ""
+        self.tmdb_ratings: dict[int, tuple[float, tuple[float, int] | None]] = {}
 
     def _count(self, token: str) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -387,6 +404,33 @@ class PoiskKino:
         self.calls[token] = self.calls.get(token, 0) + 1
 
     async def _get(self, path: str, **params: Any) -> dict[str, Any]:
+        data = await self._get_raw(path, **params)
+        if re.fullmatch(r"/movie/\d+", path) and isinstance(data, dict) and data.get("id"):
+            await self._add_tmdb_rating(data)
+        return data
+
+    async def _add_tmdb_rating(self, film: dict[str, Any]) -> None:
+        """В карточку фильма — рейтинг TMDB (rating.tmdb, votes.tmdb): его бот показывает в карточках и постах.
+        Запоминаем на сутки по id фильма, чтобы не спрашивать TMDB каждый раз."""
+        fid = int(film["id"])
+        cached = self.tmdb_ratings.get(fid)
+        if not cached or time.time() - cached[0] > 86400:
+            try:
+                got = await shorts_daily.tmdb.rating_for(os.getenv("TMDB_API_KEY", "").strip(), film)
+            except Exception as exc:  # noqa: BLE001 — без рейтинга TMDB останется Кинопоиск/IMDb
+                logging.info("TMDB rating for %s failed: %s", fid, exc)
+                got = None
+            if len(self.tmdb_ratings) > 5000:
+                self.tmdb_ratings.clear()
+            cached = self.tmdb_ratings[fid] = (time.time(), got)
+        if cached[1]:
+            value, votes = cached[1]
+            film.setdefault("rating", {})["tmdb"] = value
+            if not isinstance(film.get("votes"), dict):
+                film["votes"] = {}
+            film["votes"]["tmdb"] = votes
+
+    async def _get_raw(self, path: str, **params: Any) -> dict[str, Any]:
         key = path + "?" + urlencode(sorted((k, str(v)) for k, v in params.items()))
         cached = self.cache.get(key)
         if cached and time.time() - cached[0] < self.CACHE_TTL and not path.startswith(self.NO_CACHE):
@@ -900,6 +944,72 @@ async def init_db() -> None:
                 user_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (chat_id, message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS diary (
+                user_id BIGINT NOT NULL,
+                movie_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                score SMALLINT NOT NULL DEFAULT 0,
+                genres TEXT NOT NULL DEFAULT '',
+                year_released INT,
+                poster TEXT,
+                watched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, movie_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS duo (
+                id TEXT PRIMARY KEY,
+                creator BIGINT NOT NULL,
+                films JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS duo_votes (
+                id TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                idx INT NOT NULL,
+                liked BOOLEAN NOT NULL,
+                PRIMARY KEY (id, user_id, idx)
+            );
+
+            CREATE TABLE IF NOT EXISTS follows (
+                user_id BIGINT NOT NULL,
+                word TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, word)
+            );
+
+            CREATE TABLE IF NOT EXISTS kinodl_day (
+                day DATE PRIMARY KEY,
+                film_id BIGINT NOT NULL,
+                film JSONB NOT NULL,
+                frame TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS kinodl_plays (
+                day DATE NOT NULL,
+                user_id BIGINT NOT NULL,
+                tries INT NOT NULL DEFAULT 0,
+                solved BOOLEAN NOT NULL DEFAULT FALSE,
+                done BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY (day, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS predict_round (
+                week TEXT PRIMARY KEY,
+                options JSONB NOT NULL,
+                winner INT,
+                winner_title TEXT,
+                settled BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS predict_votes (
+                week TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                choice INT NOT NULL,
+                PRIMARY KEY (week, user_id)
             );
 
             CREATE TABLE IF NOT EXISTS ideas (
@@ -3336,52 +3446,16 @@ async def premiere_reminder_loop(
 
 
 def admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить фильм",
-                    callback_data="admin:add:movie",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить серию",
-                    callback_data="admin:add:episode",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 Источники",
-                    callback_data="admin:list",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎬 Видео: шортсы и YouTube",
-                    callback_data="sh:menu",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Посты в Telegram-канал",
-                    callback_data="pt:menu",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📈 Статистика бота",
-                    callback_data="st:home",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Закрыть",
-                    callback_data="admin:cancel",
-                )
-            ],
-        ]
-    )
+    """Админка: Telegram-канал и YouTube — отдельными ветками, чтобы кнопки не смешивались."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Telegram-канал: посты ▸", callback_data="pt:menu")],
+        [InlineKeyboardButton(text="▶️ YouTube и видео: шортсы, выпуски ▸", callback_data="sh:menu")],
+        [InlineKeyboardButton(text="📈 Статистика бота", callback_data="st:home")],
+        [InlineKeyboardButton(text="➕ Фильм", callback_data="admin:add:movie"),
+         InlineKeyboardButton(text="➕ Серия", callback_data="admin:add:episode"),
+         InlineKeyboardButton(text="📋 Источники", callback_data="admin:list")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin:cancel")],
+    ])
 
 
 def premiere_date(item: dict[str, Any]) -> date | None:
@@ -3426,6 +3500,8 @@ def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🆓 Смотреть бесплатно")],
             [KeyboardButton(text="🎲 Что посмотреть?")],
             [KeyboardButton(text="🎯 Подобрать фильм"), KeyboardButton(text="🧩 Викторина дня")],
+            [KeyboardButton(text="🎬 Кинодл — угадай фильм"), KeyboardButton(text="🔮 Прогноз уикенда")],
+            [KeyboardButton(text="📔 Кинодневник"), KeyboardButton(text="👥 Выбрать вдвоём")],
             [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="💡 Предложить идею")],
             [KeyboardButton(text="✉️ Написать админу")],
             [
@@ -3623,6 +3699,7 @@ def card_keyboard(
     if not is_upcoming(item):  # оценка для «Топа по версии подписчиков»
         rows.append([InlineKeyboardButton(text="👍 Понравилось", callback_data=f"rate:{movie_id}:1"),
                      InlineKeyboardButton(text="👎 Не моё", callback_data=f"rate:{movie_id}:-1")])
+        rows.append([InlineKeyboardButton(text="✅ Посмотрел — в кинодневник", callback_data=f"dia:w:{movie_id}")])
     rows.append(
         [
             InlineKeyboardButton(
@@ -3974,6 +4051,17 @@ async def cmd_start(
     if arg == "contact":  # ссылка «связь с админом» (?start=contact) — например, из закрепа канала
         await contact_ask(message, state)
         return
+    if arg.startswith("duo_") and message.from_user:  # друг позвал выбрать фильм вместе
+        await message.answer("👥 Друг зовёт выбрать фильм вместе! Отмечай 👍 то, что готов смотреть, — "
+                             "в конце покажу совпадения.",
+                             reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        await duo_show(message.bot, message.chat.id, message.from_user.id, arg[4:], None)
+        return
+    if arg == "kinodl":
+        await message.answer("🎬 Кинодл — фильм дня за 6 подсказок 👇",
+                             reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
+        await kinodl_menu(message, state)
+        return
     if arg == "quiz":  # кнопка из поста «Знатоки месяца»
         await message.answer("🧩 Викторина дня — жми кнопку в меню или держи кадр 👇",
                              reply_markup=main_menu(bool(message.from_user and message.from_user.id in ADMIN_IDS)))
@@ -4010,7 +4098,9 @@ async def ask_search(
     await remember(message)
     await state.set_state(SearchState.query)
     await message.answer(
-        "Напиши название фильма или сериала 👇"
+        "Напиши название фильма или сериала 👇\n\n<i>Не помнишь название? Опиши сюжет — найду по описанию.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤔 Не помню название — опишу сюжет", callback_data="fd:ask")]]),
     )
 
 
@@ -4065,10 +4155,16 @@ async def do_search(
             "🎯 Подобрать фильм": "rq_menu",
             "🧩 Викторина дня": "quiz_day_menu",
             "🎁 Пригласить друга": "referral_menu",
+            "📔 Кинодневник": "diary_menu",
+            "👥 Выбрать вдвоём": "duo_new",
+            "🎬 Кинодл — угадай фильм": "kinodl_menu",
+            "🔮 Прогноз уикенда": "predict_menu",
         }
         handler_name = target_handlers.get(query)
         handler = globals().get(handler_name or "")
-        if callable(handler):
+        if handler_name == "kinodl_menu":  # игре нужно состояние — ждёт ответы сообщениями
+            await kinodl_menu(message, state)
+        elif callable(handler):
             await handler(message)
         else:
             await message.answer(
@@ -4103,9 +4199,15 @@ async def do_search(
         return
 
     if not items:
+        if len(query.split()) >= 5:  # похоже на описание сюжета, а не на название
+            await state.clear()
+            await find_by_description(message, query)
+            return
         await message.answer(
             "Ничего не нашёл 😕 "
-            "Попробуй другое название."
+            "Попробуй другое название — или опиши сюжет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🤔 Опишу сюжет", callback_data="fd:ask")]]),
         )
         return
 
@@ -4115,6 +4217,59 @@ async def do_search(
         "Вот что нашёл:",
         reply_markup=results_keyboard(items),
     )
+
+
+@router.callback_query(F.data == "fd:ask")
+async def describe_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(SearchState.describe)
+    if callback.message:
+        await callback.message.answer(
+            "🤔 Опиши, что помнишь: сюжет, сцены, актёров, примерный год. Например: «фильм, где мужик застрял в "
+            "одном дне и каждый раз просыпается под одну песню».")
+
+
+@router.message(SearchState.describe, F.text, ~F.text.startswith("/"))
+async def describe_text(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if text in MAIN_MENU_LABELS:
+        await state.clear()
+        await message.answer("Поиск по описанию закрыт.", reply_markup=main_menu())
+        return
+    await state.clear()
+    await find_by_description(message, text)
+
+
+async def find_by_description(message: Message, text: str) -> None:
+    """Фильм по описанию сюжета: ИИ называет до 3 вариантов, бот находит их в каталоге и даёт карточки."""
+    if len(text) < 15:
+        await message.answer("Маловато 🙂 Опиши подробнее: что происходит, кто играет, когда примерно вышел.")
+        return
+    wait = await message.answer("🔎 Вспоминаю фильм по описанию…")
+    guesses = await shorts_ai.guess_films(GEMINI_API_KEY, text)
+    found: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for g in guesses:
+        for q in [x for x in (g["ru"], g["en"]) if x]:
+            try:
+                items = await kp.search(q, limit=5)
+            except Exception:  # noqa: BLE001
+                items = []
+            year = g.get("year")
+            hit = next((it for it in items if not year or abs(int(it.get("year") or 0) - year) <= 1), None)
+            if hit and all(int(hit["id"]) != int(f["id"]) for f in found):
+                found.append(hit)
+                notes.append(f"• «{escape(kp.title(hit))}»" + (f" ({hit.get('year')})" if hit.get("year") else "")
+                             + (f" — {escape(g['why'])}" if g.get("why") else ""))
+                break
+    await wait.delete()
+    if not found:
+        await message.answer("😕 Не узнал фильм по описанию. Попробуй добавить детали: актёров, страну, год, "
+                             "запоминающуюся сцену.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [InlineKeyboardButton(text="🤔 Описать ещё раз", callback_data="fd:ask")]]))
+        return
+    await message.answer("🎯 Похоже, это:\n" + "\n".join(notes) + "\n\nНажми, чтобы открыть карточку 👇",
+                         reply_markup=results_keyboard(found))
 
 
 @router.callback_query(F.data.startswith("open:"))
@@ -5630,19 +5785,116 @@ async def favorites_menu(
         message.from_user.id
     )
 
+    follow_btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🔔 Подписки на франшизы и людей", callback_data="fl:menu")]])
     if not rows:
         await message.answer(
-            "В избранном пока пусто ❤️"
+            "В избранном пока пусто ❤️\n\nА ещё можно подписаться на франшизу или человека (Marvel, Нолан, "
+            "«Ведьмак») — новости канала о них придут сюда.",
+            reply_markup=follow_btn,
         )
         return
 
+    markup = stored_keyboard(rows, "❤️")
+    markup.inline_keyboard.append(follow_btn.inline_keyboard[0])
     await message.answer(
         "❤️ Твоё избранное:",
-        reply_markup=stored_keyboard(
-            rows,
-            "❤️",
-        ),
+        reply_markup=markup,
     )
+
+
+# --- подписки на франшизы и людей: новости канала о них — в личку
+
+FOLLOW_MAX = 15
+FOLLOW_DAILY = 6  # не больше стольких новостей по подпискам одному человеку в день
+_follow_sent: dict[tuple[int, str], int] = {}
+
+
+def _follow_menu_markup(words: list[str]) -> InlineKeyboardMarkup:
+    # в callback_data — номер, а не слово: кириллица быстро упирается в лимит Telegram 64 байта
+    rows = [[InlineKeyboardButton(text=f"❌ {w}"[:64], callback_data=f"fl:del:{k}")] for k, w in enumerate(words)]
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="fl:add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("fl:"))
+async def follow_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    uid, action = callback.from_user.id, (callback.data or "")[3:]
+    if action.startswith("del:") and action[4:].isdigit():
+        current = [r["word"] for r in await db().fetch(
+            "SELECT word FROM follows WHERE user_id=$1 ORDER BY created_at", uid)]
+        if int(action[4:]) < len(current):
+            await db().execute("DELETE FROM follows WHERE user_id=$1 AND word=$2", uid, current[int(action[4:])])
+    if action == "add":
+        await state.set_state(SearchState.follow)
+        if callback.message:
+            await callback.message.answer("✍️ Напиши франшизу, фильм или человека — одно на сообщение. Например: "
+                                          "<code>Marvel</code>, <code>Нолан</code>, <code>Ведьмак</code>.")
+        return
+    words = [r["word"] for r in await db().fetch("SELECT word FROM follows WHERE user_id=$1 ORDER BY created_at",
+                                                 uid)]
+    if callback.message:
+        await callback.message.answer(
+            "🔔 <b>Подписки</b>\n\nКогда в канале " + escape(POST_CHANNEL) + " выйдет новость о том, на что ты "
+            "подписан, бот пришлёт её сюда.\n\n" + ("Сейчас: " + ", ".join(escape(w) for w in words) if words
+                                                     else "Пока подписок нет."),
+            reply_markup=_follow_menu_markup(words))
+
+
+@router.message(SearchState.follow, F.text, ~F.text.startswith("/"))
+async def follow_add(message: Message, state: FSMContext) -> None:
+    word = re.sub(r"\s+", " ", (message.text or "").strip().strip("«»\"'"))[:40]
+    await state.clear()
+    if word in MAIN_MENU_LABELS or len(word) < 2:
+        await message.answer("Подписка не добавлена.", reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        return
+    count = await db().fetchval("SELECT COUNT(*) FROM follows WHERE user_id=$1", message.from_user.id)
+    if count >= FOLLOW_MAX:
+        await message.answer(f"Можно до {FOLLOW_MAX} подписок — убери лишнее в «❤️ Избранное» → «🔔 Подписки».")
+        return
+    await db().execute("INSERT INTO follows(user_id, word) VALUES($1, $2) ON CONFLICT DO NOTHING",
+                       message.from_user.id, word)
+    await message.answer(f"🔔 Подписка на «{escape(word)}» есть! Новости канала об этом придут сюда.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="➕ Ещё подписка", callback_data="fl:add")],
+                             [InlineKeyboardButton(text="🔔 Мои подписки", callback_data="fl:menu")]]))
+
+
+def _follow_hit(word: str, text: str) -> bool:
+    """Слово подписки в тексте поста — с учётом падежей («Нолана», «Marvel’s»): по основе каждого слова."""
+    low = text.lower().replace("ё", "е")
+    parts = [p for p in re.findall(r"[\wа-яё]+", word.lower().replace("ё", "е")) if len(p) >= 2]
+    return bool(parts) and all(re.search(rf"(?<![\wа-яё]){re.escape(p[:max(3, len(p) - 2)])}", low) for p in parts)
+
+
+@router.channel_post()
+async def channel_post_follows(message: Message) -> None:
+    """Пост вышел в нашем канале — тем, кто подписан на его тему, пересылаем (не больше FOLLOW_DAILY в день)."""
+    if not message.chat.username or f"@{message.chat.username}".lower() != POST_CHANNEL.lower():
+        return
+    text = message.text or message.caption or ""
+    if len(text) < 20:
+        return
+    rows = await db().fetch("SELECT user_id, word FROM follows")
+    hits: dict[int, str] = {}
+    for r in rows:
+        if int(r["user_id"]) not in hits and _follow_hit(r["word"], text):
+            hits[int(r["user_id"])] = r["word"]
+    today = datetime.now(MSK).date().isoformat()
+    for uid, word in hits.items():
+        key = (uid, today)
+        if _follow_sent.get(key, 0) >= FOLLOW_DAILY:
+            continue
+        _follow_sent[key] = _follow_sent.get(key, 0) + 1
+        try:
+            await message.bot.send_message(uid, f"🔔 Новость по подписке «{escape(word)}»:")
+            await message.bot.forward_message(uid, message.chat.id, message.message_id)
+        except Exception:  # noqa: BLE001 — человек заблокировал бота и т. п.
+            pass
+        await asyncio.sleep(0.05)
+    for old in [k for k in _follow_sent if k[1] != today]:
+        _follow_sent.pop(old, None)
 
 
 @router.message(F.text == "🕘 История")
@@ -6989,7 +7241,7 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     ):
         await bot.send_message(
             chat_id,
-            f"<b>{label}:</b>\n<pre>{escape(seo[key])}</pre>",
+            f"<b>{label}:</b>\n<pre>{escape(shorts_yt.no_links(seo[key]) if key == 'description' else seo[key])}</pre>",
         )
     await bot.send_message(
         chat_id,
@@ -7742,6 +7994,18 @@ async def ai_status_action(message: Message) -> None:
     else:
         rows.append("Сегодня запросов к Lumean не было (считается с последнего запуска бота).")
     rows.append("Озвучка клоном голоса тоже идёт с баланса Lumean: выпуск на 6–8 минут — самое дорогое.")
+    rows.append("\n📊 <b>Расходы (сохраняются и после обновлений)</b>")
+    for label, days in (("Сегодня", 1), ("7 дней", 7), ("30 дней", 30)):
+        s = shorts_usage.summary(days)
+        rows.append(f"{label}: ИИ Lumean — {int(s.get('llm_calls', 0))} запр. "
+                    f"({int(s.get('llm_tokens', 0)):,} ток.), озвучка — {int(s.get('tts_chars', 0)):,} симв. "
+                    f"({int(s.get('tts_orders', 0))} заказ.), музыка — {int(s.get('music_tracks', 0))} тр."
+                    .replace(",", " "))
+    week = shorts_usage.summary(7)["tasks"]
+    if week:
+        rows.append("ИИ за 7 дней на что: " + ", ".join(
+            f"{escape(t)} — {n}" for t, n in sorted(week.items(), key=lambda kv: -kv[1])[:6]))
+    rows.append("Цену символа и запроса смотри в кабинете Lumean — так можно посчитать стоимость ролика.")
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
@@ -7908,46 +8172,75 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
+SHORTS_SECTIONS: dict[str, tuple[str, str]] = {  # раздел меню YouTube → (кнопка, заголовок)
+    "shorts": ("🎞 Шортсы: готовые темы", "🎞 <b>Шортсы</b> — бот сам находит фильмы и новости, ролик за 2–5 минут."),
+    "long": ("📺 Длинные видео 16:9", "📺 <b>Длинные видео для YouTube</b> — выпуск «Новости кино», обзоры, перевод "
+                                    "трейлеров."),
+    "own": ("✍️ По моему тексту и сценарию", "✍️ <b>По твоему материалу</b> — свой текст, сценарий, подборка, "
+                                          "история персонажа."),
+    "facts": ("💡 Факты о фильме", "💡 <b>Факты о фильме</b> — шортс «5 фактов»: новое, классика или выбери фильм."),
+    "tools": ("🛠 Инструменты", "🛠 <b>Инструменты</b> — диктор, скачать видео, остановить сборку."),
+}
+
+
 def shorts_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
-        [_btn("🎞 Выпуск «Новости кино» для YouTube (8 мин)", "pt:wv")],
-        [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
-        [_btn("⏹ Остановить сборку", "pt:stop")],
-        [_btn("🎙 Диктор: текст → проверка → озвучка", "pt:nar")],
-        [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")],
-        [_btn("📝 Посты в Telegram-канал ▸", "pt:menu")],
-        [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
-        [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
-        *[[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")] for k in holidays_now(datetime.now(MSK).date())],
-        [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
-        [_btn("🎉 Шортс к празднику ▸", "sh:hol")],
-        [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
-        [_btn("💡 Факты: новое (с 2015)", "sh:go:facts_new"), _btn("📼 Факты: классика", "sh:go:facts_old")],
-        [_btn("💡 Факты: случайный", "sh:go:facts"), _btn("📖 История персонажа", "lo:start")],
-        [_btn("📰 Своя новость: вставлю текст", "lo:news")],
-        [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
-        # поиск с подсказками прямо при наборе (inline-режим бота)
-        [InlineKeyboardButton(text="🔎 Факты: найти фильм/сериал", switch_inline_query_current_chat="")],
-        [_btn("✍️ Факты: ввести название", "sh:ask:facts"), _btn("🔎 Факты: интернет или свой текст", "fx:start")],
-        [_btn("⚙️ Настройки ▸", "sh:settings")],
-        [_btn("⬅️ В админку", "admin:home")],
-    ])
+    """YouTube и видео — по разделам, как посты: не один длинный список кнопок."""
+    rows = [[_btn(f"{HOLIDAYS[k][0]}: шортс к празднику", f"sh:hol:{k}")]
+            for k in holidays_now(datetime.now(MSK).date())]
+    rows += [[_btn("🎬 Шортс: тема дня", "sh:go:"), _btn("🎞 Выпуск «Новости кино»", "pt:wv")]]
+    rows += [[_btn(SHORTS_SECTIONS[k][0] + " ▸", f"sh:sec:{k}")] for k in ("shorts", "long", "own", "facts")]
+    rows += [[_btn(SHORTS_SECTIONS["tools"][0] + " ▸", "sh:sec:tools"), _btn("⚙️ Настройки ▸", "sh:settings")],
+             [_btn("⬅️ В админку", "admin:home")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def shorts_section(name: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if name == "shorts":
+        rows = [[_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
+                [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+                [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
+                [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
+                [_btn("🎉 Шортс к празднику ▸", "sh:hol")]]
+    elif name == "long":
+        rows = [[_btn("🎞 Выпуск «Новости кино» (8 мин)", "pt:wv")],
+                [_btn("🔁 Перемонтировать последний выпуск", "pt:wvre")],
+                [_btn("🎞 Обзор фильма 16:9", "rv:start"), _btn("🎙 Перевод трейлера", "dub:start")]]
+    elif name == "own":
+        rows = [[_btn("🔮 Что мы знаем о фильме (слухи до премьеры)", "lo:wwk")],
+                [_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
+                [_btn("📰 Своя новость: вставлю текст", "lo:news")],
+                [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
+                [_btn("📖 История персонажа", "lo:start")]]
+    elif name == "facts":
+        rows = [[_btn("💡 Новое (с 2015)", "sh:go:facts_new"), _btn("📼 Классика", "sh:go:facts_old")],
+                [_btn("🎲 Случайный фильм", "sh:go:facts")],
+                # поиск с подсказками прямо при наборе (inline-режим бота)
+                [InlineKeyboardButton(text="🔎 Найти фильм/сериал", switch_inline_query_current_chat="")],
+                [_btn("✍️ Ввести название", "sh:ask:facts"), _btn("🔎 Интернет или свой текст", "fx:start")]]
+    elif name == "tools":
+        rows = [[_btn("🎙 Диктор: текст → проверка → озвучка", "pt:nar")],
+                [_btn("⬇️ Скачать видео по ссылке (Rutube, VK, YouTube)", "sh:ask:dl")],
+                [_btn("⏹ Остановить сборку", "pt:stop")]]
+    rows.append([_btn("⬅️ YouTube и видео", "sh:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def shorts_genres_menu() -> InlineKeyboardMarkup:
     rows = [[_btn(g.capitalize(), f"sh:go:genre:{g}") for g in SHORTS_GENRES[k:k + 2]]
             for k in range(0, len(SHORTS_GENRES), 2)]
     rows.append([_btn("🎲 Случайный жанр", "sh:go:genre")])
-    rows.append([_btn("⬅️ Назад", "sh:menu")])
+    rows.append([_btn("⬅️ Назад", "sh:sec:shorts")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def shorts_settings_menu() -> InlineKeyboardMarkup:
     clips_on = await shorts_setting("clips") != "off"
     mode = await shorts_setting("sub_mode") or "soft"
+    hidden = await shorts_setting("yt_privacy") == "unlisted"
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn(f"🔒 Подписка на канал: {SUB_MODES.get(mode, mode)}", "sh:sub")],
+        [_btn("▶️ На YouTube: " + ("сначала скрыто (проверю права) 🔐" if hidden else "сразу открыто 🌍"), "sh:ytpriv")],
         [_btn(f"🎞 Трейлеры: {'вкл ✅' if clips_on else 'выкл ❌'}", "sh:clips")],
         [_btn("🎵 Сменить музыку", "sh:ask:music"), _btn("↩️ Стандартная", "sh:music_default")],
         [_btn("🎼 Музыка Lumean под настроение ▸", "sh:mlib")],
@@ -8059,9 +8352,9 @@ async def voice_preview_action(message: Message, voice_id: str) -> None:
 
 
 SHORTS_MENU_TEXT = (
-    "🎬 <b>Видео KinoMir360: шортсы и YouTube</b>\n\n"
-    "Нажми тему — ролик соберётся за 2–5 минут и придёт сюда вместе с SEO для YouTube и TikTok.\n"
-    "Каждый день в 8:00 по Москве ролик приходит сам."
+    "▶️ <b>YouTube и видео KinoMir360</b>\n\n"
+    "Выбери раздел. Ролик приходит сюда вместе с SEO для YouTube и TikTok; шортс дня — сам в 8:00 по Москве, "
+    "выпуск «Новости кино» — по средам и воскресеньям. Посты в Telegram — в админке, «📢 Telegram-канал»."
 )
 
 SHORTS_ASKS = {
@@ -8122,8 +8415,10 @@ async def shorts_panel(
     if data == "sh:menu":
         await state.clear()
         await show(SHORTS_MENU_TEXT, shorts_menu())
+    elif data.startswith("sh:sec:") and data[7:] in SHORTS_SECTIONS:
+        await show(SHORTS_SECTIONS[data[7:]][1], shorts_section(data[7:]))
     elif data == "sh:hol":
-        await show("🎉 <b>Шортс к празднику</b> — выбери праздник:", holidays_menu("sh:hol:", "sh:menu"))
+        await show("🎉 <b>Шортс к празднику</b> — выбери праздник:", holidays_menu("sh:hol:", "sh:sec:shorts"))
     elif data.startswith("sh:hol:") and data[7:] in HOLIDAYS:
         await holiday_short(message, state, data[7:])
     elif data == "sh:genres":
@@ -8161,6 +8456,15 @@ async def shorts_panel(
         _sub_mode = (0.0, new)
         await show("⚙️ <b>Настройки шортсов</b>\n\n🔒 Обязательная подписка на канал: "
                    f"<b>{SUB_MODES[new]}</b>", await shorts_settings_menu())
+    elif data == "sh:ytpriv":
+        hidden = await shorts_setting("yt_privacy") == "unlisted"
+        await set_shorts_setting("yt_privacy", None if hidden else "unlisted")
+        await show("⚙️ <b>Настройки шортсов</b>", await shorts_settings_menu())
+        if not hidden:
+            await message.answer(
+                "🔐 Теперь ролики загружаются на YouTube <b>по ссылке</b> (не видны подписчикам). Открой YouTube "
+                "Studio → ролик → вкладка «Проверки»: если нет претензий по авторским правам, поставь «Открытый "
+                "доступ». Так меньше риск страйка или блокировки монетизации.")
     elif data == "sh:clips":
         off = await shorts_setting("clips") == "off"
         await set_shorts_setting("clips", None if off else "off")
@@ -8184,6 +8488,18 @@ async def shorts_panel(
         await show(*await music_library_menu())
     elif data.startswith("sh:mlib:"):
         await music_make_action(message, data[len("sh:mlib:"):])
+    elif data == "sh:mown":
+        await show("➕ <b>Свои треки</b>\n\nК какому настроению добавить? Потом пришли mp3 — можно несколько "
+                   "подряд. Бесплатная музыка: mixkit.co, pixabay.com/music, Фонотека YouTube "
+                   "(в YouTube Studio → «Фонотека»).", music_own_menu())
+    elif data.startswith("sh:mown:") and data[8:] in shorts_music.MOODS:
+        await state.set_state(ShortsState.music_own)
+        await state.update_data(music_mood=data[8:])
+        await message.answer(f"🎵 Пришли трек для «{shorts_music.MOODS[data[8:]][0]}» файлом mp3 (до 20 МБ). "
+                             "Можно несколько подряд.\n\n<i>Передумал — /cancel</i>")
+    elif data == "sh:mownclr":
+        await set_shorts_setting("music_own", None)
+        await message.answer("🗑 Свои треки убраны — снова играют треки Lumean.")
     elif data == "sh:clone":
         await show(*await shorts_clone_menu())
     elif data == "sh:clone_off":
@@ -8350,7 +8666,9 @@ music_lock = asyncio.Lock()
 
 async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
     lib = await music_library()
-    rows = [f"{label}: {len(lib.get(m) or [])} тр." for m, (label, _, _) in shorts_music.MOODS.items()]
+    own = await _music_json("music_own")
+    rows = [f"{label}: {len(lib.get(m) or [])} тр." + (" (свои)" if own.get(m) else "")
+            for m, (label, _, _) in shorts_music.MOODS.items()]
     missing = [m for m in shorts_music.MOODS if not lib.get(m)]
     custom = await shorts_setting("music_file_id")
     text = (
@@ -8359,6 +8677,8 @@ async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
         "комедия — весёлая, новости — бодрая. Трек 30 с плавно склеен до ~2 минут.\n\n"
         + "\n".join(rows)
         + f"\n\n💰 Каждый трек оплачивается в Lumean отдельно (по {MUSIC_VARIANTS} трека на настроение)."
+        + "\n➕ Или добавь свои треки — бесплатные с mixkit.co, pixabay.com/music, Фонотеки YouTube: "
+        "скачай mp3 и пришли боту. Свои играют вместо треков Lumean."
         + ("\n⚠️ Сейчас стоит своя музыка — она важнее библиотеки. Чтобы играла библиотека, нажми "
            "«↩️ Стандартная» в настройках." if custom else "")
     )
@@ -8368,6 +8688,9 @@ async def music_library_menu() -> tuple[str, InlineKeyboardMarkup]:
     moods = list(shorts_music.MOODS.items())
     for k in range(0, len(moods), 2):
         buttons.append([_btn(f"🔄 {label}", f"sh:mlib:{m}") for m, (label, _, _) in moods[k:k + 2]])
+    buttons.append([_btn("➕ Свои треки (Mixkit и др.)", "sh:mown")])
+    if own:
+        buttons.append([_btn("🗑 Убрать все свои треки", "sh:mownclr")])
     buttons.append([_btn("⬅️ Назад", "sh:settings")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -8438,12 +8761,60 @@ async def music_make_job(message: Message, status: Message, moods: list[str]) ->
 
 
 async def music_library() -> dict[str, list[str]]:
-    """Треки Lumean по настроениям: {настроение: [file_id в Telegram]}."""
+    """Треки по настроениям: {настроение: [file_id в Telegram]}. Свои треки автора (Mixkit и т. п.) важнее
+    треков Lumean: у настроения, куда автор добавил свои, играют только они."""
+    lib, own = await _music_json("music_lib"), await _music_json("music_own")
+    return {m: own.get(m) or lib.get(m) or [] for m in shorts_music.MOODS if own.get(m) or lib.get(m)}
+
+
+async def _music_json(key: str) -> dict[str, list[str]]:
     try:
-        lib = json.loads(await shorts_setting("music_lib") or "{}")
+        lib = json.loads(await shorts_setting(key) or "{}")
     except ValueError:
         return {}
     return {m: [str(f) for f in ids] for m, ids in lib.items() if m in shorts_music.MOODS and isinstance(ids, list)}
+
+
+OWN_TRACKS_MAX = 10  # своих треков на одно настроение
+
+
+def music_own_menu() -> InlineKeyboardMarkup:
+    moods = list(shorts_music.MOODS.items())
+    rows = [[_btn(label, f"sh:mown:{m}") for m, (label, _, _) in moods[k:k + 2]] for k in range(0, len(moods), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows + [[_btn("⬅️ Назад", "sh:mlib")]])
+
+
+@router.message(ShortsState.music_own, F.audio | F.document)
+async def music_own_file(message: Message, state: FSMContext) -> None:
+    """Свой трек в библиотеку настроения (скачанный с Mixkit, Pixabay, YouTube Audio Library…)."""
+    media = message.audio or message.document
+    mood = (await state.get_data()).get("music_mood")
+    if mood not in shorts_music.MOODS:
+        await state.clear()
+        await message.answer("Начни заново: Настройки → «🎼 Музыка под настроение» → «➕ Свои треки».")
+        return
+    name = str(getattr(media, "file_name", "") or "").lower()
+    if message.document and not (str(media.mime_type or "").startswith("audio/") or name.endswith(
+            (".mp3", ".m4a", ".wav", ".ogg", ".aac", ".flac"))):
+        await message.answer("Это не аудио — пришли трек файлом mp3 (или m4a, wav).")
+        return
+    if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("⚠️ Файл больше 20 МБ — бот не может его скачать. Пришли mp3 поменьше.")
+        return
+    async with music_lock:
+        own = await _music_json("music_own")
+        ids = own.get(mood) or []
+        if len(ids) >= OWN_TRACKS_MAX:
+            await message.answer(f"Хватит: у настроения уже {OWN_TRACKS_MAX} своих треков.")
+            return
+        ids.append(media.file_id)
+        own[mood] = ids
+        await set_shorts_setting("music_own", json.dumps(own))
+    label = shorts_music.MOODS[mood][0]
+    await message.answer(
+        f"✅ {label}: своих треков {len(ids)}. Теперь у этого настроения играют только твои треки "
+        "(вперемешку). Пришли ещё или нажми «Готово».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✅ Готово", "sh:mlib")]]))
 
 
 async def sync_music_library(bot: Bot) -> None:
@@ -8742,6 +9113,13 @@ async def review_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "Бот Telegram скачивает файлы <b>до 20 МБ</b>, больше — пришли сжатую версию.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "rv:media_done")], [_btn("🗑 Убрать все мои файлы", "rv:media_clear")]]))
+    elif action == "style":
+        await set_shorts_setting("lore_style", "calm" if await lore_style() == "dynamic" else "dynamic")
+        await message.answer("⚡ Монтаж: динамичный — видео трейлера на весь экран, новый кадр каждые ~2 с, "
+                             "переходы, субтитры по одному слову, без заставки в конце." if await lore_style() ==
+                             "dynamic" else "🎞 Монтаж: спокойный — как раньше (кадр по центру, субтитры фразами, "
+                             "заставка «Подпишись» в конце).")
+        await show_lore(message, state, brief=True)
     elif action in ("media_done", "media_clear"):
         if action == "media_clear":
             await state.update_data(review_media=[])
@@ -9188,6 +9566,7 @@ async def custom_ask(message: Message, state: FSMContext, video: bool) -> None:
 async def show_plan(message: Message, state: FSMContext, title: str, films: list[dict[str, Any]]) -> None:
     wait = await message.answer("🔎 Ищу фильмы на Кинопоиске…")
     items = await shorts_copycat.resolve(kp._get, films)
+    await _tmdb_fill(items, films)
     await wait.delete()
     found = [it for it in items if it["id"]]
     await state.update_data(cs_title=title, cs_items=items, cs_notes=None)
@@ -9257,6 +9636,8 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
     """Своя подборка из любого текста или из картинок автора: ИИ вытаскивает тему, фильмы и фразы для озвучки,
     бот находит фильмы на Кинопоиске (не нашёл — ищет настоящее название в интернете) и сразу собирает ролик."""
     await load_fact_channels()
+    if images is None:  # пересланный пост: постер со списком фильмов пришёл фото, а текст — подписью
+        images = await _state_photos(message, state) or None
     wait = await message.answer(("🤖 ИИ узнаёт фильмы на картинках" if images else "🤖 ИИ разбирает текст")
                                 + " и ищет о них всё: Кинопоиск, интернет, Telegram-каналы. Обычно 1–2 минуты…")
     try:
@@ -9264,10 +9645,13 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
         items = await shorts_copycat.resolve(kp._get, plan["films"])
         for it, f in zip(items, plan["films"]):
             if not it["id"]:
-                film, _ = await shorts_daily.find_film_smart(kp._get, f["ru"] or f["en"], GEMINI_API_KEY)
+                film, _ = await shorts_daily.find_film_smart(
+                    kp._get, f["ru"] or f["en"], GEMINI_API_KEY,
+                    upcoming=bool(f.get("fresh")) and not f.get("year"), exact=True)
                 if film:
                     it.update(id=int(film["id"]), label=shorts_daily._title(film) + (
                         f" ({film['year']})" if film.get("year") else ""))
+        await _tmdb_fill(items, plan["films"])
         await _fill_notes(wait, plan["films"], items)
     except Exception as exc:
         logging.exception("Custom post parsing failed")
@@ -9276,7 +9660,9 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
         await state.set_state(CustomState.text)
         return
     await wait.delete()
-    notes = [f["note"] for f in plan["films"]]
+    # сериал с номером сезона: голос говорит, что это новый сезон, а не «сериал 2022 года»
+    notes = [(f"{f['season']}-й сезон. " if f.get("season") and "сезон" not in f["note"].lower() else "") + f["note"]
+             for f in plan["films"]]
     await state.update_data(cs_title=plan["title"], cs_items=items, cs_notes=notes)
     found = [(it, note) for it, note in zip(items, notes) if it["id"]]
     rows = [f"🎯 <b>{escape(plan['title'])}</b>", ""]
@@ -9293,6 +9679,24 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
              + (f" Ваших фото/видео: {len(media)} — ИИ поставит их к нужным фильмам." if media else "")]
     await message.answer("\n".join(rows))
     await start_custom(message, state, plan["title"], [it["id"] for it, _ in found], [n for _, n in found])
+
+
+async def _tmdb_fill(items: list[dict[str, Any]], films: list[dict[str, Any]]) -> None:
+    """Фильма нет на Кинопоиске (свежая зарубежная новинка, корейское кино) — берём его с TMDB: название, год,
+    рейтинг TMDB, жанры, актёры, кадры. В подборке он остаётся, а не пропускается."""
+    for it, f in zip(items, films):
+        if it["id"]:
+            continue
+        try:
+            card = await shorts_daily.tmdb.find_kp_like(
+                TMDB_API_KEY, [f.get("ru") or "", f.get("en") or ""], f.get("year"), f.get("series"),
+                bool(f.get("fresh")))
+        except Exception:  # noqa: BLE001
+            logging.exception("Custom: TMDB lookup %s failed", f.get("ru") or f.get("en"))
+            continue
+        if card:
+            it.update(id=card["id"], label=f"{card['name']}" + (f" ({card['year']})" if card.get("year") else "")
+                      + " · TMDB")
 
 
 async def _fill_notes(wait: Message, films: list[dict[str, Any]], items: list[dict[str, Any]]) -> None:
@@ -9453,17 +9857,8 @@ PHOTOS_WAIT = 15  # сек: успеть дослать фото или текс
 
 async def custom_from_photos(message: Message, state: FSMContext) -> None:
     """Своя подборка без текста: ИИ узнаёт фильмы на присланных фото; сами фото идут в ролик."""
-    media = (await state.get_data()).get("cs_media") or []
     await state.set_state(None)  # сразу: кнопка и автозапуск не должны собрать ролик дважды
-    images: list[Image.Image] = []
-    for item in media:
-        if item["ext"] == ".mp4":
-            continue
-        try:
-            buf = await message.bot.download(item["file_id"], destination=io.BytesIO())
-            images.append(Image.open(buf).convert("RGB"))
-        except Exception:
-            logging.exception("Custom: photo download failed")
+    images = await _state_photos(message, state)
     if not images:
         await state.set_state(CustomState.text)
         await message.answer("Не вижу фото — пришли картинки или вставь текст подборки.")
@@ -9476,7 +9871,52 @@ async def custom_text(message: Message, state: FSMContext) -> None:
     await custom_text_go(message, state, _typed(message))
 
 
+async def _web_images(urls: list[str], limit: int = 10) -> list[Image.Image]:
+    """Картинки поста по ссылкам (до 15 МБ каждая); битые пропускаем."""
+    out: list[Image.Image] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for url in urls[:limit]:
+            try:
+                raw = await netsafe.fetch(session, url, 15 * 1024 * 1024)
+                out.append(Image.open(io.BytesIO(raw)).convert("RGB"))
+            except Exception as exc:  # noqa: BLE001
+                logging.info("Custom: post image %s skipped: %s", url[:80], exc)
+    return out
+
+
+async def _state_photos(message: Message, state: FSMContext) -> list[Image.Image]:
+    """Фото, присланные в «Своей подборке» (пересланный пост с постером, альбом)."""
+    images: list[Image.Image] = []
+    for item in (await state.get_data()).get("cs_media") or []:
+        if item["ext"] == ".mp4":
+            continue
+        try:
+            buf = await message.bot.download(item["file_id"], destination=io.BytesIO())
+            images.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("Custom: photo download failed")
+    return images
+
+
 async def custom_text_go(message: Message, state: FSMContext, text: str) -> None:
+    link = shorts_linkfetch.TG_POST.search(text)
+    if link and len(text.strip()) - len(link.group(0)) < 40 and shorts_ai.available(GEMINI_API_KEY):
+        # ссылка на пост Telegram: берём его текст и картинки (список фильмов часто только на постере)
+        await state.set_state(None)
+        wait = await message.answer("🔗 Открываю пост…")
+        try:
+            post = await shorts_linkfetch.fetch(link.group(0))
+        except Exception as exc:  # noqa: BLE001
+            await state.set_state(CustomState.text)
+            await wait.edit_text(f"❌ Пост не открылся: <code>{escape(_safe_err(exc)[:300])}</code>\n"
+                                 "Перешли сам пост боту или пришли скриншот.")
+            return
+        urls = [m["image"] for m in post.get("media") or [] if m.get("image")] or (
+            [post["image"]] if post.get("image") else [])
+        images = await _web_images(urls)
+        await wait.delete()
+        await custom_from_post(message, state, post.get("text") or "", images or None)
+        return
     if _free_text(text) and shorts_ai.available(GEMINI_API_KEY):
         await state.set_state(None)
         await custom_from_post(message, state, text)
@@ -9708,8 +10148,9 @@ def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboar
     rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
             [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")],
             [_btn("🖼 Заменить или добавить фото/видео", f"pt:m:{first}")]]
-    if yt:  # шортс — загрузка на YouTube одной кнопкой
-        rows.insert(1, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
+    if yt:  # шортс: YouTube — первой кнопкой, а публикация в канал подписана явно, чтобы не перепутать
+        rows[0] = [_btn(f"✈️ Только в Telegram-канал {POST_CHANNEL}", f"pt:p:{first}")]
+        rows.insert(0, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
     if more:
         rows.append([_btn("🔄 Ещё такой же", more), _btn("📝 Другие посты", "pt:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -9739,6 +10180,7 @@ async def _unqueue(chat_id: int, first: int) -> bool:
 async def _mark_published(chat_id: int, first: int) -> None:
     meta = await _json_setting("posts_meta", {})
     key = f"{chat_id}:{first}"
+    shorts_usage.record("tg_posts")  # для недельного отчёта
     if key in meta:
         meta[key]["published"] = int(time.time())
         await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
@@ -9848,9 +10290,10 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
     news = f"{res['post'][:900]}\nФильм/сериал: {res.get('film') or '—'} ({res.get('film_en') or '—'}). " \
            f"Человек: {res.get('person') or '—'} ({res.get('person_en') or '—'})."
     keep: list[Path] = []
+    unsure: list[Path] = []  # ИИ не ответил (лимит, сбой) — такой картинке не верим, если есть замена из базы
     for k, path in enumerate(files):
         if k >= 2:  # остальные кадры альбома — из того же поста; лимит Gemini на день не тратим
-            keep.append(path)
+            (keep if keep else unsure).append(path)
             continue
         img = await _media_frame(path, work)
         fits, seen = await shorts_ai.media_fits(GEMINI_API_KEY, img, news) if img else (None, "")
@@ -9860,25 +10303,43 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
         if fits is False:
             logging.info("Tg post: media %s rejected for %s", path.name, res.get("topic"))
             continue
-        keep.append(path)
+        (keep if fits else unsure).append(path)
     if keep:
         return keep
-    url = None
-    try:  # новость о человеке (смерть, интервью) — его портрет, иначе постер фильма
+    # непроверенная картинка часто из сборного поста канала (к новости о «I Play Rocky» пришёл постер
+    # «Мстителей» соседней новости) — надёжнее постер или портрет из базы по названию
+    urls = await _tmdb_media_urls(res)
+    if not urls and unsure:
+        if notes is not None:
+            notes.append("⚠️ ИИ не проверил картинку, замены в базе нет — оставил как есть, проверь глазами")
+        return unsure
+    if notes is not None:
+        notes.append({2: "поставил портрет человека и постер фильма из базы TMDB",
+                      1: "поставил портрет или постер из базы TMDB"}.get(len(urls), "подходящей картинки нет — пост "
+                     "без фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»"))
+    if not urls:
+        return []
+    return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
+
+
+async def _tmdb_media_urls(res: dict[str, Any]) -> list[str]:
+    """Картинки из базы фильмов по названию — точно «те»: портрет человека из новости (смерть, интервью,
+    роль) и рядом постер фильма («кто озвучит Дума» — актёр и «Мстители»)."""
+    urls: list[str] = []
+    try:
         if res.get("person_en") or res.get("person"):
             info = await shorts_daily.tmdb.person_by_name(TMDB_API_KEY, res.get("person_en") or res["person"])
-            url = (shorts_daily.tmdb.profile_urls(info) or [None])[0] if info else None
-        if not url and (res.get("film_en") or res.get("film")):
-            url = await shorts_daily.tmdb.poster_by_title(
-                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += (shorts_daily.tmdb.profile_urls(info) or [])[:1] if info else []
     except Exception as exc:  # noqa: BLE001
-        logging.info("Tg post: replacement image failed: %s", exc)
-    if notes is not None:
-        notes.append("поставил портрет или постер из базы TMDB" if url else "подходящей картинки нет — пост без "
-                     "фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»")
-    if not url:
-        return []
-    return await shorts_tgsearch.download_media([{"image": url}], work, limit=1, prefix="repl")
+        logging.info("Tg post: tmdb portrait failed: %s", exc)
+    try:
+        if res.get("film_en") or res.get("film"):
+            poster = await shorts_daily.tmdb.poster_by_title(
+                TMDB_API_KEY, [n for n in (res.get("film_en"), res.get("film")) if n])
+            urls += [poster] if poster else []
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: tmdb poster failed: %s", exc)
+    return urls
 
 
 async def _rutube_post_trailer(titles: list[str], work: Path, season: int | None = None,
@@ -10026,20 +10487,6 @@ def _repeats(words: set[str], stories: list[dict[str, Any]], english: bool = Fal
     return False
 
 
-def _title_words(text: str) -> str:
-    """Для сравнения названий: строчные буквы и цифры через пробел, ё → е, без кавычек и знаков."""
-    return " ".join(re.findall(r"[\wа-яё]+", str(text or "").lower().replace("ё", "е")))
-
-
-def _mentions_title(name: str, text: str) -> bool:
-    """Название есть в тексте — с учётом падежей: каждое слово названия по основе («левиафана», «мстителей»)."""
-    if name in text:
-        return True
-    words = [w for w in name.split() if len(w) >= 3]
-    hits = [w[:max(3, len(w) - 2)] in text for w in words]
-    return bool(words) and hits[0] and sum(hits) * 2 >= len(words)
-
-
 async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
     """Пост в стиле канала автора по самой интересной свежей новости, с фото или видео из источника.
     mode: "tg" — Telegram-каналы за сутки (кроме своего); "fast" — быстрые зарубежные источники (Reddit,
@@ -10124,6 +10571,12 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
             return len(hits) >= 2 and bool(_shared(names_ru | names_en, words))
 
         same = [p for p in same if related(p)]
+        # фото и видео сборных постов (дайджестов) не берём: их картинка обычно от другой новости
+        # и только из постов целиком об этой новости: название в начале, других фильмов не больше одного
+        digests = [p for p in same if not _focused(p.get("text") or "", names)]
+        if digests:
+            logging.info("Tg post: %d digest/off-topic source(s) skipped for media", len(digests))
+            same = [p for p in same if p not in digests]
         work = SHORTS_DIR / f"post_{time.time_ns()}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -10147,8 +10600,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                     # пост именно об этой новости: фильм назван в начале поста и есть общее имя с новостью —
                     # иначе брали видео из подборки, где фильм лишь упомянут (к посту об «Обсессии» Карри
                     # Баркера пришёл ролик «From director Zack Snyder»)
-                    found = [p for p in found if related(p) and any(
-                        _mentions_title(n, _title_words(p["text"][:250])) for n in names)] if names else []
+                    found = [p for p in found if related(p) and _focused(p["text"], names)] if names else []
                     with_media = [p for p in found if p.get("video") or p.get("image")]
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Tg post: media search skipped: %s", exc)
@@ -10180,9 +10632,28 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
                 files = ([with_media[0]["file"]] if with_media and with_media[0].get("file") else
                          await shorts_tgsearch.download_media(with_media[:3], work, limit=1, prefix="post"))
             checks: list[str] = []
-            files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
+            db_files: list[Path] = []
+            # режим «фото из базы фильмов»: постер/портрет TMDB вместо фото из постов (кроме новостей о трейлере
+            # с самим трейлером); в базе ничего — как обычно, фото из новости с проверкой ИИ
+            if await shorts_setting("post_media") == "db" and not (res["trailer"] and files
+                                                                   and files[0].suffix == ".mp4"):
+                db_urls = await _tmdb_media_urls(res)
+                db_files = await shorts_tgsearch.download_media(
+                    [{"image": u} for u in db_urls], work, limit=2, prefix="db") if db_urls else []
+            if db_files:
+                files = db_files
+                checks.append("режим «фото из базы фильмов»: постер/портрет TMDB")
+            else:
+                files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
             caption = post_caption(res["post"], "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
+            # достоверность — автору под постом: слух в канале должен звучать как слух
+            status = {"official": "✅ официально (студия, сервис или сам человек)",
+                      "reported": "📰 сообщают издания (Deadline, Variety и др.)",
+                      "rumor": "🕵️ СЛУХ — не подтверждено; в посте должно быть видно, что это слух"}.get(
+                res.get("status") or "")
+            if status:
+                seen += f"\n\n🏷 Достоверность: {status}"
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
                 await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
@@ -10218,7 +10689,8 @@ def posts_menu() -> InlineKeyboardMarkup:
              for a, b in (("news", "lists"), ("dates", "fun"))]
     rows.append([_btn(POST_SECTIONS["promo"][0] + " ▸", "pt:sec:promo")])
     rows.append([_btn("🗓 Автоплан постов", "pt:plan"), _btn("🔔 Авто-новости 30 мин", "pt:auto")])
-    rows.append([_btn("🎬 Видео для YouTube и шортсы ▸", "sh:menu")])
+    rows.append([_btn("🎬 Трейлеры студий с YouTube (уведомления)", "ytr:list")])
+    rows.append([_btn("⬅️ В админку", "admin:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -10229,7 +10701,8 @@ def posts_section(name: str) -> InlineKeyboardMarkup:
                 [_btn("⚡ Инсайды и слухи раньше всех (Reddit, X, Deadline)", "pt:fast")],
                 [_btn("🔗 Пост по ссылке или тексту", "pt:lk")],
                 [_btn("🧩 Сводка по теме из всех каналов", "pt:dg")],
-                [_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")]]
+                [_btn("💰 Сборы уикенда", "pt:bo"), _btn("🗞 Итоги недели", "pt:wk")],
+                [_btn("🖼 Откуда брать фото к новостям", "pt:pmode")]]
     elif name == "lists":
         keys = list(LIST_POSTS)
         rows = [[_btn(LIST_POSTS[k], f"pt:l:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
@@ -10266,7 +10739,8 @@ def _trusted_rating(f: dict[str, Any]) -> tuple[float, str]:
     """Рейтинг, если за ним достаточно оценок; иначе (0, "")."""
     votes = f.get("votes") or {}
     try:
-        enough = max(int(votes.get("kp") or 0), int(votes.get("imdb") or 0)) >= RATING_MIN_VOTES
+        enough = max(int(votes.get("kp") or 0), int(votes.get("imdb") or 0)) >= RATING_MIN_VOTES or (
+            shorts_daily._best_rating(f)[1] == "TMDB")  # TMDB: _best_rating сам проверил число голосов
     except (TypeError, ValueError):
         enough = False
     return shorts_daily._best_rating(f) if enough else (0.0, "")
@@ -10297,6 +10771,58 @@ def _brand(post: str) -> str:
         return post
     head, _, rest = post.partition("\n")
     return f"{head}\n{BRAND}\n{rest.lstrip(chr(10))}" if rest else f"{head}\n{BRAND}"
+
+
+_ITEM_RE = re.compile(r"^\s*(?:\d️⃣|🔟|\d{1,2}[.)])")
+
+
+def _compact_list(post: str, limit: int) -> str:
+    """Подборка не влезает в подпись Telegram (1024 символа) — сокращаем, но так, чтобы ВСЕ фильмы остались:
+    сначала убираем вводную фразу, потом укорачиваем описания фильмов (по целым словам), потом убираем их совсем,
+    потом строку реакций. Хэштеги и строки названий не трогаем."""
+    if len(post) <= limit:
+        return post
+    lines = post.split("\n")
+    items = [k for k, ln in enumerate(lines) if _ITEM_RE.match(ln)]
+    if not items:
+        return post
+    first, last = items[0], items[-1]
+    # описание фильма — непустые строки после строки названия до следующего фильма (у последнего — до пустой)
+    about: list[int] = []
+    for n, i in enumerate(items):
+        end = items[n + 1] if n + 1 < len(items) else len(lines)
+        for k in range(i + 1, end):
+            if not lines[k].strip():
+                if n + 1 == len(items):
+                    break
+                continue
+            if not lines[k].lstrip().startswith("#") and "❤️" not in lines[k]:
+                about.append(k)
+
+    def size() -> int:
+        return len("\n".join(ln for ln in lines if ln is not None))
+
+    # 1) вводная фраза между заголовком (с подписью) и первым фильмом
+    for k in range(2, first):
+        if size() > limit and lines[k] and lines[k].strip() and "kinomir360" not in lines[k].lower():
+            lines[k] = None
+    # 2) описания — короче, по целым словам
+    for cap in (110, 90, 70, 55, 40):
+        if size() <= limit:
+            break
+        for k in about:
+            if lines[k] and len(lines[k]) > cap:
+                cut = lines[k][:cap].rsplit(" ", 1)[0].rstrip(",;:—– ")
+                lines[k] = cut + "…"
+    # 3) без описаний, 4) без строки реакций
+    for k in about:
+        if size() > limit:
+            lines[k] = None
+    for k in range(last + 1, len(lines)):
+        if size() > limit and lines[k] and ("❤️" in lines[k] or "🔥" in lines[k]):
+            lines[k] = None
+    text = "\n".join(ln for ln in lines if ln is not None)
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 
 def _list_fallback(title: str, films: list[dict[str, Any]]) -> str:
@@ -10344,6 +10870,15 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
         if not same and f["year"]:  # чуть другое написание («Шериф поневоле» / «Шериф-поневоле») — того же года
             same = [d for d in docs if abs(int(d.get("year") or 0) - f["year"]) <= 1 and max(
                 (shorts_daily.tmdb.similar(n, t) for n in names for t in titles(d) if t), default=0) >= 0.85]
+        if f.get("series") is not None and same:
+            # «Величайший (1 сезон)» — сериал, а не одноимённый фильм 2024 года: тип должен совпасть
+            kind = [d for d in same if bool(d.get("isSeries")) == bool(f["series"])]
+            same = kind or ([] if f["series"] else same)
+        if f.get("fresh") and not f["year"] and same:
+            # новинка из поста-афиши: «Обитель зла» на Apple TV — это фильм 2026 года, а не классика 2002-го
+            this_year = datetime.now(MSK).year
+            recent = [d for d in same if int(d.get("year") or 0) >= this_year - 1]
+            same = sorted(recent, key=lambda d: -int(d.get("year") or 0))  # нет новой — ищем на TMDB, не классику
         same.sort(key=lambda d: (abs(int(d.get("year") or 0) - f["year"]) > 1 if f["year"] else False,
                                  -int((d.get("votes") or {}).get("kp") or 0)))
         for d in same[:2]:
@@ -10354,7 +10889,8 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
             if shorts_daily._poster_url(full):
                 return shorts_daily._poster_url(full), full
     try:  # нет на Кинопоиске (бывает у свежих сериалов) — постер с TMDB, тоже по точному названию
-        url = await shorts_daily.tmdb.poster_by_title(TMDB_API_KEY, names, f["year"])
+        url = await shorts_daily.tmdb.poster_by_title(
+            TMDB_API_KEY, names, f["year"] or (datetime.now(MSK).year if f.get("fresh") else None))
         if url:
             return url, None
     except Exception as exc:  # noqa: BLE001
@@ -10842,30 +11378,74 @@ async def _frames(film: dict[str, Any], work: Path, n: int, prefix: str) -> list
     return out
 
 
-async def make_quiz_post(bot: Bot, chat_id: int) -> None:
-    """«Угадай фильм по кадру»: кадр без надписей и викторина Telegram из 4 вариантов."""
-    hist = await _posts_history()
-    used = {int(x) for x in hist["quiz"]}
-    films = await _popular_films()
-    work = SHORTS_DIR / f"quiz_{time.time_ns()}"
-    work.mkdir(parents=True, exist_ok=True)
+async def _quiz_from_kp(used: set[str], work: Path) -> tuple[str, str, Image.Image, list[str]] | None:
+    """Викторина из известных фильмов Кинопоиска: (id для истории, название, кадр, 3 других названия)."""
     try:
-        for pick in [f for f in films if f["id"] not in used][:6]:
+        films = await _popular_films()
+    except Exception:  # noqa: BLE001
+        logging.exception("Quiz: kinopoisk list failed")
+        return None
+    for pick in [f for f in films if str(f["id"]) not in used][:6]:
+        try:
             film = await kp._get(f"/movie/{pick['id']}")  # полная карточка — с id TMDB/IMDb, кадр точно из него
             frames = await _frames(film, work, 1, "q")
-            if frames:
-                break
-        else:
-            raise RuntimeError("не нашлось кадра для викторины — попробуй ещё раз")
+        except Exception:  # noqa: BLE001
+            logging.exception("Quiz: film %s failed", pick.get("id"))
+            continue
+        if not frames:
+            continue
         genres = set(shorts_daily._genres(film))
         others = sorted((f for f in films if f["id"] != film["id"]),
                         key=lambda f: -len(genres & set(shorts_daily._genres(f))))[:3]
-        if len(others) < 3:
-            raise RuntimeError("мало фильмов для вариантов ответа — попробуй ещё раз")
-        options = [film, *others]
-        random.shuffle(options)
-        names = [shorts_daily._title(f)[:100] for f in options]
-        correct = options.index(film)
+        if len(others) == 3:
+            return str(film["id"]), shorts_daily._title(film), frames[0], [shorts_daily._title(f) for f in others]
+    logging.warning("Quiz: kinopoisk gave %d films, none with a TMDB frame", len(films))
+    return None
+
+
+async def _quiz_from_tmdb(used: set[str], work: Path) -> tuple[str, str, Image.Image, list[str]] | None:
+    """Запас: известные фильмы TMDB (рейтинг 7+, тысячи голосов), кадр без надписей — с TMDB."""
+    try:
+        pool = await shorts_daily.tmdb.popular_pool(TMDB_API_KEY, random.randint(1, 15))
+    except Exception:  # noqa: BLE001
+        logging.exception("Quiz: tmdb pool failed")
+        return None
+    random.shuffle(pool)
+    for row in [r for r in pool if f"t{r['id']}" not in used][:6]:
+        try:
+            urls = await shorts_daily.tmdb.backdrops(TMDB_API_KEY, "movie", row["id"], 4)
+            img = await _image(random.choice(urls), work, "qt") if urls else None
+        except Exception:  # noqa: BLE001
+            logging.exception("Quiz: tmdb film %s failed", row.get("id"))
+            continue
+        if not img:
+            continue
+        genres = set(row["genres"])
+        others = sorted((r for r in pool if r["id"] != row["id"] and r["title"] != row["title"]),
+                        key=lambda r: -len(genres & set(r["genres"])))[:3]
+        if len(others) == 3:
+            return f"t{row['id']}", row["title"], img, [r["title"] for r in others]
+    return None
+
+
+async def make_quiz_post(bot: Bot, chat_id: int) -> None:
+    """«Угадай фильм по кадру»: кадр без надписей и викторина Telegram из 4 вариантов."""
+    hist = await _posts_history()
+    used = {str(x) for x in hist["quiz"]}
+    work = SHORTS_DIR / f"quiz_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        picked = await _quiz_from_kp(used, work)
+        if not picked:  # Кинопоиск не ответил (лимит запросов) или у фильмов нет кадров — берём фильмы TMDB
+            picked = await _quiz_from_tmdb(used, work)
+        if not picked:
+            raise RuntimeError("не нашлось кадра для викторины: Кинопоиск и TMDB не дали фильмов с кадрами "
+                               "(лимит запросов или нет связи) — попробуй через пару минут")
+        film_id, title, frame, others = picked
+        names = [title[:100], *[o[:100] for o in others]]
+        random.shuffle(names)
+        correct = names.index(title[:100])
+        frames = [frame]
         card = work / "quiz.jpg"
         (await asyncio.to_thread(shorts_postcard.make_quiz_card, frames[0])).save(card, quality=92)
         post = ("🎬 УГАДАЙ ФИЛЬМ ПО КАДРУ!\n\nУзнаёшь, из какого фильма этот кадр? 🤔 Голосуй в викторине ниже — "
@@ -10874,12 +11454,12 @@ async def make_quiz_post(bot: Bot, chat_id: int) -> None:
         ids, kind = await _send_album(bot, chat_id, [card], post, "#викторина")
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    hist["quiz"] = (hist["quiz"] + [str(film["id"])])[-200:]
+    hist["quiz"] = (hist["quiz"] + [film_id])[-200:]
     await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
     await offer_post(bot, chat_id, ids, kind, "pt:qz",
-                     what=f"Викторина готова (правильный ответ — {escape(_label(film))}). В канале под ней будет "
+                     what=f"Викторина готова (правильный ответ — {escape(f"«{title}»")}). В канале под ней будет "
                           "викторина с 4 вариантами",
-                     quiz={"options": names, "correct": correct, "explanation": f"Это {_label(film)} 🎬"[:200]})
+                     quiz={"options": names, "correct": correct, "explanation": f"Это «{title}» 🎬"[:200]})
 
 
 async def make_quote_post(bot: Bot, chat_id: int) -> None:
@@ -11725,14 +12305,23 @@ async def youtube_button(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     message = callback.message
-    first = (callback.data or "")[3:]
+    first, again = (callback.data or "")[3:], False
+    if first.startswith("again:"):  # «загрузить ещё раз» после предупреждения о повторе
+        first, again = first[6:], True
     if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
         await message.answer(YT_SETUP, disable_web_page_preview=True)
         return
     video = READY_DIR / f"{message.chat.id}_{first}.mp4"
     seo_file = video.with_suffix(".json")
+    done_file = video.with_suffix(".yt")  # ссылка на уже загруженный ролик — от двойной загрузки
     if not video.exists() or not seo_file.exists():
         await message.answer(f"Файла этого шортса уже нет на сервере (храню {READY_DAYS} дня). Собери ролик заново.")
+        return
+    if done_file.exists() and not again:
+        await message.answer(
+            f"⚠️ Этот ролик уже загружен на YouTube: {done_file.read_text().strip()}\nЗагрузить ещё раз (будет дубль)?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("▶️ Да, ещё раз", f"yt:again:{first}")]]),
+            disable_web_page_preview=True)
         return
     if yt_lock.locked():
         await message.answer("⏳ Уже идёт загрузка на YouTube — подожди минуту.")
@@ -11752,8 +12341,14 @@ async def youtube_button(callback: CallbackQuery) -> None:
                 long = bool(seo.get("long"))
                 wait = await message.answer("▶️ Загружаю выпуск на YouTube (большой файл — до 10–15 минут)…"
                                             if long else "▶️ Загружаю шортс на YouTube…")
-                res = await shorts_yt.upload(token, video, seo)
+                hidden = await shorts_setting("yt_privacy") == "unlisted"
+                res = await shorts_yt.upload(token, video, seo, "unlisted" if hidden else "public")
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                shorts_usage.record("yt_long" if long else "yt_shorts")  # для недельного отчёта
+                try:
+                    done_file.write_text(link)
+                except OSError:
+                    logging.info("YouTube: upload mark not saved")
                 thumb_note = ""
                 cover = video.with_suffix(".jpg")
                 if long and cover.exists():
@@ -11764,7 +12359,12 @@ async def youtube_button(callback: CallbackQuery) -> None:
                         thumb_note = ("\n\n🖼 Обложку YouTube не принял (своя обложка доступна только подтверждённым "
                                       "каналам: YouTube Studio → Настройки → Канал → Доступ к функциям). Поставь её "
                                       "вручную — она выше в чате.")
-                if res["privacy"] == "public":
+                if hidden and res["privacy"] == "unlisted":
+                    await wait.edit_text(
+                        f"🔐 {'Выпуск' if long else 'Шортс'} загружен <b>по ссылке</b>: {link}{thumb_note}\n\n"
+                        "Проверь в YouTube Studio → ролик → «Проверки» (авторские права). Всё чисто — «Доступ» → "
+                        "«Открытый».")
+                elif res["privacy"] == "public":
                     await wait.edit_text(f"✅ {'Выпуск' if long else 'Шортс'} на YouTube: {link}{thumb_note}")
                 else:
                     await wait.edit_text(
@@ -11937,6 +12537,10 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     message, action = callback.message, (callback.data or "")[3:]
     chat_id = message.chat.id
     kind, _, arg = action.partition(":")
+    if kind == "wvcut" and arg.isdigit():  # выпуск → вертикальные шортсы по новостям
+        await callback.answer()
+        _run_job(lambda: episode_cuts_job(message.bot, chat_id, int(arg)))
+        return
     if kind == "p" and arg.isdigit():  # опубликовать сейчас
         done = (await _post_meta(chat_id, int(arg))).get("published")
         if done:
@@ -12090,7 +12694,8 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                              "постеры — фирменными карточками.", reply_markup=style_menu())
         return
     if action in ("menu", "home"):
-        text = "📝 <b>Посты в Telegram-канал</b>\n\nВыбери раздел. Видео для YouTube и шортсы — кнопка внизу."
+        text = ("📢 <b>Telegram-канал: посты</b>\n\nВыбери раздел. Видео для YouTube — в админке, «▶️ YouTube и "
+                "видео».")
         if action == "home":  # «⬅️ Все разделы» из раздела — меняем то же сообщение
             try:
                 await message.edit_text(text, reply_markup=posts_menu())
@@ -12124,7 +12729,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await set_shorts_setting("weekly_video", None if action == "wvon" else "off")
         await message.answer("🔔 По средам и воскресеньям в 10:00 (Екатеринбург) соберу выпуск «Новости кино» и пришлю "
                              "сюда." if action == "wvon" else "🔕 По средам и воскресеньям выпуск больше не собираю. Вручную — "
-                             "🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
+                             "▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
         return
     if action == "stop":
         await message.answer(await stop_jobs())
@@ -12243,6 +12848,22 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
         _run_job(list_job)
         return
+    if action in ("pmode", "pmode:live", "pmode:db"):
+        if action != "pmode":
+            await set_shorts_setting("post_media", "db" if action == "pmode:db" else None)
+        db = await shorts_setting("post_media") == "db"
+        await message.answer(
+            "🖼 <b>Фото к новостям</b>\n\n"
+            f"{'⚪️' if db else '🟢'} <b>Из новости</b> — фото и видео из поста-источника (кадры со съёмок, ролики, "
+            "альбомы), если ИИ подтвердил, что они о той же новости; иначе постер из базы фильмов.\n"
+            f"{'🟢' if db else '⚪️'} <b>Из базы фильмов</b> — всегда постер фильма и портрет человека из базы TMDB: "
+            "чужих фото почти не бывает, но меньше живых кадров и видео. Видео трейлера к новости о трейлере "
+            "остаётся.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn(("✅ " if not db else "") + "Из новости", "pt:pmode:live"),
+                 _btn(("✅ " if db else "") + "Из базы фильмов", "pt:pmode:db")],
+                [_btn("⬅️ Назад", "pt:sec:news")]]))
+        return
     if action == "auto":
         on = await shorts_setting("posts_auto") != "on"
         await set_shorts_setting("posts_auto", "on" if on else None)
@@ -12313,38 +12934,59 @@ async def make_digest_post(bot: Bot, chat_id: int, topic: str) -> None:
                      what=f"Сводка готова: {len(posts)} постов из {len(used)} каналов")
 
 
-async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str]) -> None:
-    """«🔗 Подборка по ссылке или тексту»: фильмы ровно из источника автора → пост-подборка с карточками."""
+async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
+                              photos: list[Image.Image] | None = None) -> None:
+    """«🔗 Подборка по ссылке или тексту»: фильмы ровно из источника автора → пост-подборка с карточками.
+    Список часто только на постере — картинки поста (и присланные фото) тоже показываем ИИ."""
     texts = []
+    image_urls: list[str] = []
     for url in urls:
         try:
             src = await shorts_linkfetch.fetch(url)
             texts.append(f"{src['title']}\n{src['text']}")
+            image_urls += [m["image"] for m in src.get("media") or [] if m.get("image")] or (
+                [src["image"]] if src.get("image") else [])
         except Exception as exc:  # noqa: BLE001
             logging.info("List link %s failed: %s", url, exc)
     rest = URL_RE.sub("", raw).strip()
     if rest:
         texts.append(rest)
     material = "\n\n".join(t for t in texts if t.strip())
-    if len(material) < 20:
+    images = list(photos or []) + await _web_images(list(dict.fromkeys(image_urls)), 8)
+    if len(material) < 20 and not images:
         raise RuntimeError("не получилось прочитать ссылку — вставь список фильмов текстом")
-    plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
+    try:
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
+    except shorts_ai.AIError:
+        if not images:
+            raise
+        plan = None  # в тексте фильмов нет — читаем постеры
+    if images and (plan is None or len(plan.get("films") or []) < 3):
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, 10, images[:8])
     films = plan.get("films") or []
     if len(films) < 2:
         raise RuntimeError("в источнике не нашлось списка фильмов")
-    lines = [f"«{f['ru'] or f['en']}» ({f.get('year') or '?'})" + (f", ориг. {f['en']}" if f.get("en") else "")
-             + (f". {f['note']}" if f.get("note") else "") for f in films]
+    # сначала находим каждый фильм (постер, год, рейтинг) — год в посте берём из карточки, а не догадку ИИ
+    found = [await _list_poster(f, [], []) for f in films]
+
+    def line(f: dict[str, Any], card: dict[str, Any] | None) -> str:
+        year = (card or {}).get("year") or f.get("year")
+        kind = (f"сериал, {f['season']}-й сезон" if f.get("season") else "сериал") if f.get("series") else "фильм"
+        rating, _ = _trusted_rating(card) if card else (0, "")
+        return (f"«{f['ru'] or f['en']}» — {kind}" + (f", год {'старта ' if f.get('series') else ''}{year}" if year
+                                                       else ", год неизвестен — НЕ пиши год")
+                + (f", рейтинг {rating:.1f}" if rating else "") + (f", ориг. {f['en']}" if f.get("en") else "")
+                + (f". {f['note']}" if f.get("note") else ""))
+
+    lines = [line(f, card) for f, (_, card) in zip(films, found)]
     today = datetime.now(MSK).date()
     res = await shorts_ai.write_list_post(GEMINI_API_KEY, plan.get("title") or "Подборка", lines, "", [],
                                           f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}",
                                           n=len(films), only=True)
-    picked = (res or {}).get("films") or [{"ru": f["ru"], "en": f["en"],
-                                           "year": int(f["year"]) if str(f.get("year") or "").isdigit() else None}
-                                          for f in films]
     post = _brand(res["post"] if res else "\n".join(
         [f"🍿 {str(plan.get('title') or 'ПОДБОРКА').upper()}", ""] + [f"{k}. {ln}" for k, ln in enumerate(lines, 1)]))
-    names = [f["ru"] or f["en"] for f in picked]
-    found = [await _list_poster(f, [], []) for f in picked]
+    post = _compact_list(post, 1020 - SIGN_LEN - len(" #подборка"))  # все фильмы источника — в подписи
+    names = [f["ru"] or f["en"] for f in films]
     work = SHORTS_DIR / f"llist_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -12359,10 +13001,17 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str])
 async def post_list_link(message: Message, state: FSMContext) -> None:
     await state.clear()
     raw = message.text or message.caption or ""
+    photos: list[Image.Image] = []
+    if message.photo:  # пересланный пост с постером или скриншот списка
+        try:
+            buf = await message.bot.download(message.photo[-1].file_id, destination=io.BytesIO())
+            photos.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("List link: photo download failed")
     urls = list(dict.fromkeys(
         [u.rstrip(").,»\"'") for u in URL_RE.findall(raw)]
         + [e.url for e in (message.entities or message.caption_entities or []) if e.type == "text_link" and e.url]))[:3]
-    if not urls and len(raw) < 20:
+    if not urls and len(raw) < 20 and not photos:
         await message.answer("Не вижу ни ссылки, ни списка. Нажми «🔗 Подборка по ссылке» и пришли ещё раз.")
         return
     if post_lock.locked():
@@ -12374,7 +13023,7 @@ async def post_list_link(message: Message, state: FSMContext) -> None:
     async def job() -> None:
         try:
             async with post_lock:
-                await make_link_list_post(message.bot, chat_id, raw, urls)
+                await make_link_list_post(message.bot, chat_id, raw, urls, photos)
             await wait.delete()
         except Exception as exc:  # noqa: BLE001
             logging.exception("List-by-link post failed")
@@ -12484,7 +13133,7 @@ async def narrator_voice(message: Message) -> None:
         saved = {}
     speech = saved.get("speech") or []
     if not speech:
-        await message.answer("Сначала пришли текст: 🎬 Видео → «🎙 Диктор».")
+        await message.answer("Сначала пришли текст: ▶️ YouTube и видео → 🛠 Инструменты → «🎙 Диктор».")
         return
     status = await message.answer("🎙 Озвучиваю твоим голосом" + (" (жду, пока соберётся другой ролик)…"
                                                                    if shorts_lock.locked() else "…"))
@@ -12570,6 +13219,13 @@ async def post_from_link(message: Message, state: FSMContext) -> None:
     """«🔗 Пост по ссылке»: ссылки (сайты, посты каналов), пересланный пост или текст → пост в стиле канала."""
     await state.clear()
     raw = message.text or message.caption or ""
+    photos: list[Image.Image] = []
+    if message.photo:  # пересланный пост с постером или скриншот списка
+        try:
+            buf = await message.bot.download(message.photo[-1].file_id, destination=io.BytesIO())
+            photos.append(Image.open(buf).convert("RGB"))
+        except Exception:
+            logging.exception("List link: photo download failed")
     urls = list(dict.fromkeys(
         [u.rstrip(").,»\"'") for u in URL_RE.findall(raw)]
         + [e.url for e in (message.entities or message.caption_entities or []) if e.type == "text_link" and e.url]))[:5]
@@ -12849,6 +13505,9 @@ async def news_generate(message: Message, state: FSMContext) -> None:
     await wait.delete()
     await state.update_data(lore_name=script["name"], lore_script=script)
     await show_lore(message, state)
+    if script.get("missing"):
+        await message.answer("🔎 Не нашёл на TMDB кадров к: " + ", ".join(f"«{escape(m)}»" for m in script["missing"])
+                             + ". К этим фразам встанут общие кадры — свои добавь кнопкой «📎 Добавить свои картинки».")
     if len(script.get("images") or []) < 6:
         await message.answer(f"🖼 Нашёл только {len(script.get('images') or [])} фото — добавь свои кнопкой "
                              "«📎 Добавить свои картинки», иначе картинки будут повторяться.")
@@ -12858,6 +13517,9 @@ async def lore_generate(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get("lore_kind") == "news":
         await news_generate(message, state)
+        return
+    if data.get("lore_kind") == "own":
+        await own_generate(message, state)
         return
     wait = await message.answer("✍️ Читаю Википедию и пишу сценарий, обычно до минуты…")
     try:
@@ -12871,6 +13533,12 @@ async def lore_generate(message: Message, state: FSMContext) -> None:
     await wait.delete()
     await state.update_data(lore_script=script)
     await show_lore(message, state)
+
+
+async def lore_style() -> str:
+    """Монтаж шортса «свой сценарий / история / новость»: dynamic — видео на весь экран, кадр каждые ~1,8 с,
+    переходы (рывок, наезд, рваная бумага, вспышка), субтитры по одному слову, без заставки; calm — как раньше."""
+    return await shorts_setting("lore_style") or "dynamic"
 
 
 async def show_lore(message: Message, state: FSMContext, brief: bool = False) -> None:
@@ -12889,8 +13557,10 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
             f"{chars} символов ≈ {round(chars / 15)} с • источник: {source}{photos}\n"
             "Каждая строка — отдельная картинка в ролике.")
     body = "" if brief else "\n\n" + escape(shorts_lore.script_text(script))
+    dynamic = await lore_style() == "dynamic"
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "lo:go")], [_btn("✏️ Поправить текст", "lo:edit")],
+        [_btn("⚡ Монтаж: динамичный (сменить)" if dynamic else "🎞 Монтаж: спокойный (сменить)", "lo:style")],
         [_btn(f"📎 Свои картинки ({len(media)})" if media else "📎 Добавить свои картинки", "lo:media")],
         [_btn("🔄 Написать заново", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]])
     await message.answer((head + body)[:4000], reply_markup=markup, disable_web_page_preview=True)
@@ -12907,17 +13577,21 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             music = await custom_music(bot, work)
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "история персонажа"}))
             files: list[Path] = []
+            pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
                     await bot.download(item["file_id"], destination=path)
+                    if item.get("line"):
+                        pins[len(files)] = int(item["line"])
                     files.append(path)
                 except Exception:
                     logging.exception("Lore: user file download failed")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
+            script = dict(data["lore_script"], style=await lore_style())
             result = await asyncio.wait_for(shorts_lore.make_lore(
-                work, data["lore_script"], music, files, GEMINI_API_KEY), timeout=LORE_TIMEOUT)
+                work, script, music, files, GEMINI_API_KEY, pins), timeout=LORE_TIMEOUT)
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
@@ -12940,6 +13614,109 @@ async def lore_command(message: Message, state: FSMContext) -> None:
         await lore_ask_hook(message, state, name)
     else:
         await lore_ask_name(message, state)
+
+
+@router.message(LoreState.wwk, F.text, ~F.text.startswith("/"))
+async def wwk_film(message: Message, state: FSMContext) -> None:
+    """«🔮 Что мы знаем о фильме»: ИИ с поиском пишет сценарий по схеме, дальше — как «свой сценарий»."""
+    film = _typed(message).strip(" «»\"")[:80]
+    if len(film) < 2:
+        await message.answer("Напиши название фильма или сериала.")
+        return
+    await state.set_state(None)
+    wait = await message.answer(f"🔮 Ищу новости и слухи о «{escape(film)}» и пишу текст, обычно 1–2 минуты…")
+    # главный материал — свежие посты кино-каналов (за месяц), с датами: так в ролик не попадут старые новости
+    material = ""
+    try:
+        await load_fact_channels()
+        posts = await asyncio.wait_for(shorts_tgsearch.search(shorts_daily.fact_channels, [film], per_channel=4), 60)
+        cutoff = time.time() - 31 * 86400
+        posts = sorted((p for p in posts if (p.get("time") or 0) >= cutoff), key=lambda p: -(p.get("time") or 0))
+        material = "\n\n".join(f"{datetime.fromtimestamp(p['time'], MSK):%Y-%m-%d} [t.me/{p['channel']}]\n{p['text']}"
+                                 for p in posts[:20])[:9000]
+    except Exception:  # noqa: BLE001 — без постов ИИ ищет сам
+        logging.exception("wwk: tg search failed")
+    script = await shorts_ai.whatweknow_script(GEMINI_API_KEY, film, datetime.now(MSK).strftime("%d.%m.%Y"),
+                                               material)
+    if script and not script["lines"]:
+        await wait.edit_text(f"🔮 Свежих новостей о «{escape(film)}» за последний месяц почти нет"
+                             + (f" (старых отброшено: {script['stale']})" if script.get("stale") else "")
+                             + " — ролик вышел бы из общеизвестного. Попробуй ближе к премьере или другой фильм.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔮 Другой фильм", "lo:wwk")]]))
+        return
+    if not script:
+        await wait.edit_text("❌ Не получилось собрать текст — ИИ не ответил или нашёл слишком мало. "
+                             "Попробуй ещё раз или уточни название.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("🔮 Ещё раз", "lo:wwk")]]))
+        return
+    await wait.delete()
+    body = (f"**Заголовок:** {script['title']}\n" if script.get("title") else "") + "\n".join(script["lines"])
+    await state.update_data(own_scripts=[(f"Что мы знаем — {film}", body)], own_pick=0, lore_kind="own",
+                            lore_name="Что мы знаем", lore_hook="", lore_script=None, lore_media=[])
+    await own_generate(message, state)
+    if script.get("stale"):
+        await message.answer(f"🗑 Старых новостей (больше {shorts_ai.WWK_FRESH_DAYS} дней) отброшено: {script['stale']}. "
+                             "Если что-то всё равно давно известно — «✏️ Поправить текст».")
+
+
+@router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
+async def own_script_text(message: Message, state: FSMContext) -> None:
+    """«🎬 Свой сценарий»: текст или файл .md/.txt; несколько сценариев в файле — кнопки выбора."""
+    text = message.text or ""
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith((".md", ".txt")) or (message.document.file_size or 0) > 1024 * 1024:
+            await message.answer("Нужен файл .md или .txt до 1 МБ — или вставь сценарий сообщением.")
+            return
+        buf = io.BytesIO()
+        await message.bot.download(message.document.file_id, destination=buf)
+        text = buf.getvalue().decode("utf-8", "ignore")
+    scripts = shorts_lore.split_scripts(text)
+    if not any(len(shorts_lore.parse_script(body)["lines"]) >= 2 for _, body in scripts):
+        await message.answer("Не нашёл фраз. Пришли таблицей «Время | Голос | На экране» или фразу на строку.")
+        return
+    await state.set_state(None)
+    await state.update_data(own_scripts=scripts[:10], own_pick=0, lore_kind="own", lore_name="Свой сценарий",
+                            lore_hook="", lore_script=None, lore_media=[])
+    if len(scripts) == 1:
+        await own_generate(message, state)
+        return
+    await message.answer("В файле несколько сценариев — какой собрать?", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[_btn(f"🎬 {head[:50]}", f"lo:ownpick:{k}")] for k, (head, _) in enumerate(scripts[:10])]))
+
+
+async def own_generate(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    scripts = data.get("own_scripts") or []
+    k = int(data.get("own_pick") or 0)
+    if not 0 <= k < len(scripts):
+        await message.answer("Сценарий потерялся — пришли заново: «🎬 Свой сценарий».")
+        return
+    head, body = scripts[k]
+    wait = await message.answer(f"🎬 «{escape(head)}»: подбираю кадры к фильмам из сценария…")
+    try:
+        script = await shorts_lore.write_own(body, TMDB_API_KEY, head)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Own script failed")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:400])}</code>")
+        return
+    await wait.delete()
+    await state.update_data(lore_name=script["name"], lore_script=script)
+    await show_lore(message, state)
+    film = script.get("trailer_film")
+    if film:
+        many = script.get("trailer_films") or [film]
+        names = ", ".join(f"«{escape(str(f.get('title') or ''))}»" + (f" ({f['year']})" if f.get("year") else "")
+                          for f in many)
+        await message.answer(
+            f"🎞 При сборке бот сам возьмёт официальны{'е трейлеры' if len(many) > 1 else 'й трейлер'} {names}"
+            + ", подберёт к каждой фразе отрезок 2–3 с (без "
+            "звука трейлера), добавит крупные надписи на экран"
+            + (f" и финальную карточку «МОЯ ОЦЕНКА {script['score']['value']}/10»" if script.get("score") else "")
+            + ". Свои картинки — только если хочешь заменить что-то (подпиши номер фразы).")
+    elif len(script.get("images") or []) + len(script.get("fixed") or []) < len(script["lines"]):
+        await message.answer(f"🖼 Кадров нашлось меньше, чем фраз ({len(script.get('images') or [])}) — добавь свои "
+                             "кнопкой «📎 Добавить свои картинки», иначе картинки будут повторяться.")
 
 
 @router.message(LoreState.news, F.text, ~F.text.startswith("/"))
@@ -12997,9 +13774,15 @@ async def lore_media(message: Message, state: FSMContext) -> None:
         if len(media) >= LORE_MEDIA_MAX:
             await message.answer(f"Хватит: уже {LORE_MEDIA_MAX} картинок. Нажми «✅ Готово».")
             return
-        media.append({"file_id": file.file_id, "ext": ext})
+        # подпись-число под картинкой — номер фразы: «4» — картинка встанет именно к фразе 4
+        num = re.fullmatch(r"\s*№?\s*(\d{1,2})\s*", message.caption or "")
+        item = {"file_id": file.file_id, "ext": ext}
+        if num:
+            item["line"] = int(num.group(1))
+        media.append(item)
         await state.update_data(lore_media=media)
-    await message.answer(f"📎 Принято: {len(media)}", reply_markup=InlineKeyboardMarkup(
+    note = f" — к фразе {item['line']}" if item.get("line") else ""
+    await message.answer(f"📎 Принято: {len(media)}{note}", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[_btn("✅ Готово", "lo:media_done")]]))
 
 
@@ -13016,6 +13799,35 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action == "news":
         await news_ask_text(message, state)
+        return
+    if action == "own":
+        await state.clear()
+        await state.set_state(LoreState.own)
+        await message.answer(
+            "🎬 <b>Свой сценарий</b>\n\nПришли готовый сценарий шортса сообщением или файлом .md / .txt — "
+            "таблицей «Время | Голос | На экране» или просто фраза на строку. Голосом прочитаю фразы как есть, "
+            "ничего не переписывая; кадры подберу к фильмам и сериалам, названным в «ёлочках». Если в файле "
+            "несколько сценариев — дам выбрать. Дальше можно поправить текст и добавить свои картинки.\n\n"
+            "<i>Передумал — /cancel</i>")
+        return
+    if action == "wwk":
+        await state.clear()
+        await state.set_state(LoreState.wwk)
+        await message.answer(
+            "🔮 <b>Что мы знаем о фильме</b>\n\nНапиши название фильма или сериала, который скоро выходит "
+            "(например: <i>Мстители: Судный день</i>). Бот найдёт свежие новости, реакции и слухи и напишет "
+            "текст по схеме вирусных шортсов: вопрос → «в конце самое шокирующее» → хорошее → «но радоваться "
+            "рано» → тревожные слухи → призыв в ТГ в середине → самая сильная деталь в конце. Кадры — из трейлера, "
+            "а названных героев (Дум, Циклоп…) — из их фильмов.\n\n<i>Передумал — /cancel</i>")
+        return
+    if action.startswith("ownpick:") and action[8:].isdigit():
+        scripts = data.get("own_scripts") or []
+        k = int(action[8:])
+        if not 0 <= k < len(scripts):
+            await message.answer("Список устарел — пришли сценарий заново: «🎬 Свой сценарий».")
+            return
+        await state.update_data(own_pick=k)
+        await own_generate(message, state)
         return
     if action == "cancel":
         await state.clear()
@@ -13037,8 +13849,9 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(LoreState.media)
         await message.answer(
             "📎 Присылай картинки — страницы комиксов, кадры, арты, по одной или альбомом (до 24). "
-            "ИИ поставит каждую к подходящей фразе, камера проедет по странице сверху вниз. "
-            "Файлы до 20 МБ.",
+            "ИИ поставит каждую к подходящей фразе, камера проедет по странице сверху вниз.\n\n"
+            "📌 Чтобы картинка встала к определённой фразе, подпиши под ней номер фразы цифрой "
+            "(например <b>4</b>). Файлы до 20 МБ.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "lo:media_done")], [_btn("🗑 Убрать все мои картинки", "lo:media_clear")]]))
     elif action in ("media_done", "media_clear"):
@@ -13943,6 +14756,11 @@ async def yt_trailer_buttons(callback: CallbackQuery) -> None:
         return
     _, kind, arg = ((callback.data or "") + "::").split(":")[:3]
     message = callback.message
+    if kind == "list":
+        await callback.answer()
+        wait = await message.answer("🎬 Смотрю свежие трейлеры на каналах студий…")
+        await wait.edit_text(await trailers_overview(), disable_web_page_preview=True)
+        return
     if kind in ("off", "on"):
         await set_shorts_setting("yt_trailers", None if kind == "on" else "off")
         await callback.answer("Готово")
@@ -14008,19 +14826,24 @@ async def trailers_command(message: Message) -> None:
         await set_shorts_setting("yt_channels", json.dumps(mine, ensure_ascii=False))
         await message.answer(f"✅ Канал «{escape(name)}» убран.")
         return
-    on = await shorts_setting("yt_trailers") != "off"
     wait = await message.answer("🎬 Смотрю свежие трейлеры на каналах студий…")
+    await wait.edit_text(await trailers_overview(), disable_web_page_preview=True)
+
+
+async def trailers_overview() -> str:
+    """Свежие трейлеры с YouTube-каналов студий и как управлять уведомлениями (/trailers и кнопка в меню)."""
+    mine = await _json_setting("yt_channels", {})
+    on = await shorts_setting("yt_trailers") != "off"
     found = await shorts_yttrailers.latest(hours=72, extra=mine)
     rows = [f"• {escape(v['studio'])}: <a href=\"{v['url']}\">{escape(v['title'][:80])}</a>" for v in found[:15]]
-    await wait.edit_text(
+    return (
         f"🎬 <b>Трейлеры с YouTube-каналов студий</b> — {'включены ✅' if on else 'выключены ❌'} (проверка раз в "
         f"30 минут, с 8 до 23).\nКаналы: {escape(', '.join(shorts_yttrailers.STUDIOS))}."
         + (f"\nТвои каналы: {escape(', '.join(mine))}." if mine else "") + "\n\nЗа 3 дня:\n"
         + ("\n".join(rows) if rows else "новых трейлеров нет")
         + "\n\n<code>/trailers add ссылка на канал</code> — добавить свой канал (трейлеры любой студии)\n"
           "<code>/trailers del Название</code> — убрать свой канал\n"
-          "<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать",
-        disable_web_page_preview=True)
+          "<code>/trailers off</code> — не присылать, <code>/trailers on</code> — присылать")
 
 
 async def rt_watch(bot: Bot) -> None:
@@ -14426,6 +15249,7 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                  "загружу полное качество, название, описание с таймкодами, теги и обложку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
+            [_btn("✂️ Нарезать на шортсы (по новости)", f"pt:wvcut:{msg.message_id}")],
             [_btn("🔁 Переозвучить и перемонтировать", "pt:wvre")],
             [_btn("🔕 Не собирать по ср и вс" if on else "🔔 Собирать по ср и вс в 10:00",
                   "pt:wvoff" if on else "pt:wvon")]]))
@@ -14457,6 +15281,55 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
                      f"{escape(seo['stress'][:3500])}\n\nУслышал неверное ударение — исправь: ударную гласную пиши "
                      "заглавной, например <code>/say обитель = обИтель</code>. Потом жми «🔁 Переозвучить и "
                      "перемонтировать» — выпуск соберётся с тем же текстом заново.")
+
+
+async def episode_cuts_job(bot: Bot, chat_id: int, first: int) -> None:
+    """«✂️ Нарезать на шортсы»: каждая новость выпуска — вертикальный шортс 9:16 с заголовком (озвучка, графика и
+    музыка уже есть — новых трат нет). Каждый шортс — с кнопками «Загрузить на YouTube» и «В канал»."""
+    video = READY_DIR / f"{chat_id}_{first}.mp4"
+    seo_file = video.with_suffix(".json")
+    if not video.exists() or not seo_file.exists():
+        await bot.send_message(chat_id, f"Файла выпуска уже нет на сервере (храню {READY_DAYS} дня).")
+        return
+    seo = json.loads(seo_file.read_text())
+    cuts = json.loads(seo.get("cuts") or "[]")
+    if not cuts:
+        await bot.send_message(chat_id, "В этом выпуске нет разметки по новостям (собран до обновления) — "
+                                        "нарезка будет у следующих выпусков.")
+        return
+    if shorts_lock.locked():
+        await bot.send_message(chat_id, "⏳ Сейчас собирается другой ролик — нажми «✂️ Нарезать» через пару минут.")
+        return
+    status = await bot.send_message(chat_id, f"✂️ Режу выпуск на {len(cuts)} шортсов…")
+    work = SHORTS_DIR / f"cuts_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    done = 0
+    try:
+        async with shorts_lock:
+            for k, (start, end, headline) in enumerate(cuts, 1):
+                try:
+                    await status.edit_text(f"✂️ Шортс {k} из {len(cuts)}: {escape(headline[:60])}")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    out = await shorts_weekly.vertical_cut(video, float(start), float(end), headline,
+                                                           work / f"cut{k}.mp4")
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("Episode cut %s failed", k)
+                    await bot.send_message(chat_id, f"❌ Шортс {k} не собрался: <code>{escape(_safe_err(exc)[:200])}</code>")
+                    continue
+                cut_seo = shorts_weekly.cut_seo(headline, seo)
+                sent = await bot.send_video(chat_id, FSInputFile(out, filename=f"kinomir360_news_{k}.mp4"),
+                                            caption=post_caption(f"🎬 {headline}"), width=1080, height=1920,
+                                            supports_streaming=True, request_timeout=300)
+                keep_for_upload(chat_id, sent.message_id, SimpleNamespace(video=out, seo=cut_seo))
+                await offer_post(bot, chat_id, [sent.message_id], "caption", what=f"Шортс {k}: {cut_seo['title']}",
+                                 extra={"yt": True})
+                done += 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await status.edit_text(f"✅ Готово: {done} шортсов из выпуска. Под каждым — «▶️ Загрузить на YouTube». "
+                           "Совет: выкладывай по 1–2 в день, а не все сразу.")
 
 
 rt_watch_busy = asyncio.Lock()
@@ -14495,9 +15368,76 @@ async def weekly_video_job(bot: Bot) -> None:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
                                                  "</code>\n" + ("Попробую ещё раз через 30 минут. " if retry else "")
-                                       + "Собрать вручную — 🎬 Видео: шортсы и YouTube → «🎞 Выпуск «Новости кино»».")
+                                       + "Собрать вручную — ▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
+
+
+async def weekly_admin_report() -> str:
+    """Отчёт админу по понедельникам: подписчики бота, что делали, что вышло, сколько потрачено, план недели."""
+    async def q(sql: str) -> int:
+        try:
+            return int(await db().fetchval(sql) or 0)
+        except Exception:  # noqa: BLE001 — нет таблицы и т. п.
+            return 0
+
+    new_users = await q("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'")
+    active = await q("SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '7 days'")
+    total = await q("SELECT COUNT(*) FROM users")
+    searches = await q("SELECT COUNT(*) FROM search_history WHERE searched_at > NOW() - INTERVAL '7 days'")
+    diary_n = await q("SELECT COUNT(*) FROM diary WHERE watched_at > NOW() - INTERVAL '7 days'")
+    quiz_n = await q("SELECT COUNT(*) FROM quiz_answers WHERE created_at > NOW() - INTERVAL '7 days'")
+    favs = await q("SELECT COUNT(*) FROM favorites WHERE created_at > NOW() - INTERVAL '7 days'")
+    try:
+        top = await db().fetch("""SELECT lower(query) q, COUNT(*) n FROM search_history
+            WHERE searched_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 2 DESC LIMIT 5""")
+    except Exception:  # noqa: BLE001
+        top = []
+    u = shorts_usage.summary(7)
+    lines = [
+        "📊 <b>Неделя KinoMir360</b>", "",
+        f"👥 Бот: новых <b>{new_users}</b>, заходили <b>{active}</b>, всего <b>{total}</b>",
+        f"🔎 Поисков {searches} · ❤️ в избранное {favs} · 📔 в кинодневник {diary_n} · 🧩 ответов в викторине {quiz_n}",
+        f"📢 Постов в канал: <b>{int(u.get('tg_posts', 0))}</b> · ▶️ на YouTube: шортсов "
+        f"<b>{int(u.get('yt_shorts', 0))}</b>, выпусков <b>{int(u.get('yt_long', 0))}</b>",
+        f"💳 Расходы: ИИ Lumean {int(u.get('llm_calls', 0))} запр., озвучка {int(u.get('tts_chars', 0)):,} симв., "
+        f"музыка {int(u.get('music_tracks', 0))} тр.".replace(",", " "),
+    ]
+    if top:
+        lines.append("🔥 Чаще искали: " + ", ".join(f"{escape(r['q'][:30])} ({r['n']})" for r in top))
+    try:
+        soon = (await kp.upcoming_releases(False, limit=20, days_ahead=8))[:6]
+    except Exception:  # noqa: BLE001
+        soon = []
+    lines += ["", "🗓 <b>План недели</b>",
+              "• среда и воскресенье — выпуск «Новости кино» (соберётся сам)",
+              "• пятница 18:00 — подборка недели подписчикам бота"]
+    if soon:
+        lines.append("• премьеры недели — повод для постов и шортсов: "
+                     + ", ".join(f"«{escape(kp.title(f))}»" for f in soon))
+    if top:
+        lines.append(f"• подписчики ищут «{escape(top[0]['q'][:40])}» — можно сделать пост или шортс")
+    return "\n".join(lines)
+
+
+@router.message(Command("report"))
+async def report_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer(await weekly_admin_report(), disable_web_page_preview=True)
+
+
+ALIVE_FILE = Path("/tmp/vkino_alive")
+
+
+async def heartbeat() -> None:
+    """Раз в 30 с отмечает, что цикл бота работает (healthcheck Docker; не обновляется — бот завис или упал)."""
+    while True:
+        try:
+            ALIVE_FILE.touch()
+        except OSError:
+            pass
+        await asyncio.sleep(30)
 
 
 async def growth_loop(bot: Bot) -> None:
@@ -14536,6 +15476,27 @@ async def growth_loop(bot: Bot) -> None:
                     and not weekly_busy):
                 await set_shorts_setting("weekly_video_done", today_key)
                 _run_job(lambda: weekly_video_job(bot))
+            # прогноз уикенда: пятница–суббота — открыть (ИИ ищет кандидатов), понедельник после 12:00 — итоги
+            if (now.weekday() in (4, 5) and now.hour >= 11 and await shorts_setting("predict_open_try") != week
+                    and not await db().fetchval("SELECT 1 FROM predict_round WHERE week=$1", week)):
+                if time.time() > float(await shorts_setting("predict_open_retry") or 0):
+                    # ИИ не нашёл кандидатов — следующая попытка через 2 часа; в субботу вечером — сдаёмся
+                    await set_shorts_setting("predict_open_retry", str(time.time() + 2 * 3600))
+                    if now.weekday() == 5 and now.hour >= 18:
+                        await set_shorts_setting("predict_open_try", week)
+                    await predict_open(week)
+            if now.weekday() == 0 and now.hour >= 12:
+                prev = (now - timedelta(days=7)).isocalendar()
+                await predict_settle(bot, f"{prev[0]}-{prev[1]}")
+            if (now.weekday() == 0 and now.hour >= 10 and ADMIN_IDS
+                    and await shorts_setting("admin_report_done") != week):
+                await set_shorts_setting("admin_report_done", week)
+                try:
+                    report = await weekly_admin_report()
+                    for admin_id in ADMIN_IDS:
+                        await bot.send_message(admin_id, report, disable_web_page_preview=True)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Weekly admin report failed")
             if (now.weekday() == 4 and now.hour >= 18 and await shorts_setting("digest") != "off"
                     and await shorts_setting("digest_done") != week):
                 await set_shorts_setting("digest_done", week)
@@ -14614,6 +15575,486 @@ async def quiz_leaders(limit: int = 10) -> list[Any]:
 
 def _who(r: Any) -> str:
     return escape("@" + r["username"] if r["username"] else (r["first_name"] or "зритель"))
+
+
+# --- «🔮 Прогноз уикенда»: кто возглавит прокат; итоги в понедельник по реальным сборам
+
+def _week_key(when: datetime | None = None) -> str:
+    iso = (when or datetime.now(POST_TZ)).isocalendar()
+    return f"{iso[0]}-{iso[1]}"
+
+
+async def predict_open(week: str) -> bool:
+    today = datetime.now(MSK).date()
+    try:
+        films = await shorts_ai.weekend_candidates(
+            GEMINI_API_KEY, f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    except Exception:  # noqa: BLE001
+        logging.exception("Predict: candidates failed")
+        films = []
+    if len(films) < 3:
+        return False
+    await db().execute("INSERT INTO predict_round(week, options) VALUES($1, $2) ON CONFLICT DO NOTHING",
+                       week, json.dumps(films, ensure_ascii=False))
+    return True
+
+
+def _pname(f: dict[str, Any]) -> str:
+    return f.get("ru") or f.get("en") or "?"
+
+
+async def predict_settle(bot: Bot, week: str) -> None:
+    row = await db().fetchrow("SELECT * FROM predict_round WHERE week=$1 AND NOT settled", week)
+    if not row:
+        return
+    if time.time() < float(await shorts_setting("predict_settle_retry") or 0):
+        return
+    await set_shorts_setting("predict_settle_retry", str(time.time() + 3 * 3600))  # ИИ не ответил — через 3 ч
+    options = row["options"] if isinstance(row["options"], list) else json.loads(row["options"])
+    today = datetime.now(MSK).date()
+    res = await shorts_ai.box_office_post(GEMINI_API_KEY,
+                                          f"{today.day} {shorts_daily.MONTHS[today.month - 1]} {today.year}")
+    if not res or not res["films"]:
+        return
+    top = res["films"][0]
+    winner = next((k for k, f in enumerate(options) if any(
+        shorts_daily.tmdb.similar(a, b) >= 0.7 for a in (f.get("ru"), f.get("en")) if a
+        for b in (top.get("ru"), top.get("en")) if b)), -1)
+    await db().execute("UPDATE predict_round SET settled=TRUE, winner=$2, winner_title=$3 WHERE week=$1",
+                       week, winner, _pname(top))
+    votes = await db().fetch("SELECT user_id, choice FROM predict_votes WHERE week=$1", week)
+    for v in votes:
+        right = int(v["choice"]) == winner
+        text = (f"🔮 Итоги прогноза уикенда: первое место — «{escape(_pname(top))}»"
+                + (f" ({escape(top['gross'])})" if top.get("gross") else "") + ".\n"
+                + ("🎯 Ты угадал! +1 очко в таблице прогнозистов." if right else "Не угадал — в эту пятницу новый шанс!"))
+        try:
+            await bot.send_message(int(v["user_id"]), text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏆 Таблица прогнозистов", callback_data="pv:top")]]))
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.05)
+
+
+@router.message(F.text == "🔮 Прогноз уикенда")
+async def predict_menu(message: Message) -> None:
+    await remember(message)
+    week = _week_key()
+    row = await db().fetchrow("SELECT * FROM predict_round WHERE week=$1", week)
+    top_btn = [InlineKeyboardButton(text="🏆 Таблица прогнозистов", callback_data="pv:top")]
+    if not row:
+        await message.answer("🔮 <b>Прогноз уикенда</b>\n\nКаждую пятницу угадываем, какой фильм заработает "
+                             "больше всех в мировом прокате за выходные. Итоги — в понедельник, за верный прогноз "
+                             "очко в таблице. Новый прогноз откроется в пятницу! 🍿",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[top_btn]))
+        return
+    options = row["options"] if isinstance(row["options"], list) else json.loads(row["options"])
+    mine = await db().fetchval("SELECT choice FROM predict_votes WHERE week=$1 AND user_id=$2", week,
+                               message.from_user.id)
+    if mine is not None or row["settled"] or datetime.now(POST_TZ).weekday() not in (4, 5, 6):
+        text = "🔮 <b>Прогноз уикенда</b>\n\n"
+        if mine is not None:
+            text += f"Твой выбор: «{escape(_pname(options[int(mine)]))}». "
+        text += (f"Победил «{escape(row['winner_title'] or '')}»." if row["settled"]
+                 else "Итоги — в понедельник днём, пришлю сюда.")
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[top_btn]))
+        return
+    await message.answer(
+        "🔮 <b>Прогноз уикенда</b>\n\nКакой фильм заработает больше всех в мировом прокате за эти выходные? "
+        "Итоги в понедельник — за верный ответ очко в таблице 🏆",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎬 {_pname(f)}"[:64], callback_data=f"pv:v:{k}")]
+            for k, f in enumerate(options)] + [top_btn]))
+
+
+@router.callback_query(F.data.startswith("pv:"))
+async def predict_buttons(callback: CallbackQuery) -> None:
+    action = (callback.data or "")[3:]
+    if action == "top":
+        await callback.answer()
+        rows = await db().fetch("""SELECT v.user_id, COUNT(*) pts, MAX(u.username) username, MAX(u.first_name) first_name
+            FROM predict_votes v JOIN predict_round r ON r.week = v.week AND r.settled AND r.winner = v.choice
+            LEFT JOIN users u ON u.user_id = v.user_id GROUP BY v.user_id ORDER BY pts DESC LIMIT 10""")
+        medals = ["🥇", "🥈", "🥉"] + [f"{k}." for k in range(4, 11)]
+        text = ("🏆 <b>Лучшие прогнозисты</b>\n\n" + "\n".join(f"{medals[k]} {_who(r)} — {r['pts']}"
+                                                              for k, r in enumerate(rows))) if rows else \
+            "🏆 Таблица пока пустая — первые итоги в понедельник."
+        if callback.message:
+            await callback.message.answer(text)
+        return
+    if action.startswith("v:") and action[2:].isdigit():
+        week = _week_key()
+        if datetime.now(POST_TZ).weekday() not in (4, 5, 6):
+            await callback.answer("Прогноз уже закрыт — итоги в понедельник", show_alert=True)
+            return
+        await db().execute("""INSERT INTO predict_votes(week, user_id, choice) VALUES($1, $2, $3)
+                              ON CONFLICT(week, user_id) DO UPDATE SET choice=EXCLUDED.choice""",
+                           week, callback.from_user.id, int(action[2:]))
+        await callback.answer("Принято! Итоги в понедельник 🔮")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("✅ Прогноз принят. В понедельник пришлю, кто победил в прокате.")
+        return
+    await callback.answer()
+
+
+# --- «Кинодл»: фильм дня за 6 подсказок, серия побед
+
+kinodl_lock = asyncio.Lock()
+
+
+async def kinodl_today() -> dict[str, Any] | None:
+    today = datetime.now(POST_TZ).date()
+    async with kinodl_lock:
+        row = await db().fetchrow("SELECT * FROM kinodl_day WHERE day=$1", today)
+        if row:
+            film = row["film"] if isinstance(row["film"], dict) else json.loads(row["film"])
+            return {"day": today, "film": film, "frame": row["frame"]}
+        used = {int(r["film_id"]) for r in await db().fetch(
+            "SELECT film_id FROM kinodl_day WHERE day > CURRENT_DATE - 365")}
+        for pick in [f for f in await _popular_films(pages=20) if int(f["id"]) not in used][:5]:
+            try:
+                film = await kp._get(f"/movie/{pick['id']}")
+            except Exception:  # noqa: BLE001
+                continue
+            if not film.get("persons") or not shorts_kinodl.titles(film):
+                continue
+            keep = {k: film.get(k) for k in ("id", "name", "alternativeName", "enName", "names", "year", "genres",
+                                             "countries", "persons", "rating", "movieLength", "seriesLength",
+                                             "shortDescription", "description", "slogan", "isSeries", "poster")}
+            keep["persons"] = [p for p in film.get("persons") or [] if p.get("enProfession") in ("director", "actor")][:8]
+            frame = None
+            try:
+                backdrops, _ = await shorts_daily.tmdb.images(TMDB_API_KEY, film, limit=3)
+                frame = backdrops[0] if backdrops else None
+            except Exception:  # noqa: BLE001
+                pass
+            await db().execute("INSERT INTO kinodl_day(day, film_id, film, frame) VALUES($1, $2, $3, $4)",
+                               today, int(film["id"]), json.dumps(keep, ensure_ascii=False), frame)
+            return {"day": today, "film": keep, "frame": frame}
+    return None
+
+
+async def _kinodl_streak(user_id: int) -> int:
+    days = [r["day"] for r in await db().fetch(
+        "SELECT day FROM kinodl_plays WHERE user_id=$1 AND solved ORDER BY day DESC LIMIT 400", user_id)]
+    streak, expect = 0, datetime.now(POST_TZ).date()
+    for d in days:
+        if d == expect or (streak == 0 and d == expect - timedelta(days=1)):
+            streak += 1
+            expect = d - timedelta(days=1)
+        else:
+            break
+    return streak
+
+
+@router.message(Command("kinodl"))
+@router.message(F.text == "🎬 Кинодл — угадай фильм")
+async def kinodl_menu(message: Message, state: FSMContext | None = None) -> None:
+    await remember(message)
+    game = await kinodl_today()
+    if not game:
+        await message.answer("Фильм дня ещё не готов — загляни через минуту 🙂")
+        return
+    uid = message.from_user.id
+    play = await db().fetchrow("SELECT * FROM kinodl_plays WHERE day=$1 AND user_id=$2", game["day"], uid)
+    if play and play["done"]:
+        await _kinodl_finish(message, game, play["tries"], play["solved"], again=True)
+        return
+    tries = play["tries"] if play else 0
+    if state is not None:
+        await state.set_state(SearchState.kinodl)
+    await _kinodl_clues(message, game, tries, intro=not play)
+
+
+async def _kinodl_clues(message: Message, game: dict[str, Any], tries: int, intro: bool = False) -> None:
+    clue_list = shorts_kinodl.clues(game["film"])
+    shown = clue_list[:min(tries + 1, len(clue_list))]
+    head = ("🎬 <b>Кинодл</b> — угадай фильм дня за 6 подсказок. Пиши название сообщением; каждая ошибка "
+            "открывает новую подсказку.\n\n" if intro else "")
+    text = head + "\n".join(escape(c) for c in shown) + f"\n\nПопытка {tries + 1} из {shorts_kinodl.MAX_TRIES} ✍️"
+    if tries + 1 >= shorts_kinodl.MAX_TRIES and game.get("frame"):
+        try:
+            await message.answer_photo(game["frame"], caption=text[:1024])
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    await message.answer(text)
+
+
+async def _kinodl_finish(message: Message, game: dict[str, Any], tries: int, solved: bool,
+                         again: bool = False) -> None:
+    film = game["film"]
+    title = shorts_kinodl.titles(film)[0]
+    streak = await _kinodl_streak(message.from_user.id if message.from_user else 0)
+    day = game["day"].strftime("%d.%m")
+    share = shorts_kinodl.share_line(day, tries, solved)
+    link = f"{await _bot_link(message.bot)}?start=kinodl"
+    text = ((f"🎉 Угадал с {tries}-й попытки! Это «{escape(title)}» ({film.get('year') or ''})."
+             if solved else f"😔 Это был «{escape(title)}» ({film.get('year') or ''})."))
+    if again:
+        text = "✅ Сегодня ты уже сыграл. " + text
+    text += (f"\n🔥 Серия побед: <b>{streak}</b>" if streak else "") + "\nНовый фильм — завтра!\n\n" \
+        f"Поделись без спойлера:\n<code>{escape(share)}</code>\n{link}"
+    await message.answer(text, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Открыть карточку фильма", callback_data=f"open:{film['id']}")],
+        [InlineKeyboardButton(text="📤 Позвать друга играть", url="https://t.me/share/url?url=" + quote(link)
+                              + "&text=" + quote(share))]]))
+
+
+@router.message(SearchState.kinodl, F.text, ~F.text.startswith("/"))
+async def kinodl_guess(message: Message, state: FSMContext) -> None:
+    guess = (message.text or "").strip()
+    if guess in MAIN_MENU_LABELS:
+        await state.clear()
+        await do_search(message, state)  # переход в другой раздел меню
+        return
+    game = await kinodl_today()
+    if not game:
+        await state.clear()
+        return
+    uid = message.from_user.id
+    play = await db().fetchrow("SELECT * FROM kinodl_plays WHERE day=$1 AND user_id=$2", game["day"], uid)
+    if play and play["done"]:
+        await state.clear()
+        await _kinodl_finish(message, game, play["tries"], play["solved"], again=True)
+        return
+    tries = (play["tries"] if play else 0) + 1
+    solved = shorts_kinodl.is_correct(guess, game["film"])
+    done = solved or tries >= shorts_kinodl.MAX_TRIES
+    await db().execute("""INSERT INTO kinodl_plays(day, user_id, tries, solved, done) VALUES($1, $2, $3, $4, $5)
+                          ON CONFLICT(day, user_id) DO UPDATE SET tries=$3, solved=$4, done=$5""",
+                       game["day"], uid, tries, solved, done)
+    if done:
+        await state.clear()
+        await _kinodl_finish(message, game, tries, solved)
+        return
+    await message.answer("❌ Не то. Новая подсказка 👇")
+    await _kinodl_clues(message, game, tries)
+
+
+# --- «Выбрать вдвоём»: двое отмечают одни и те же фильмы, бот показывает совпадения
+
+DUO_FILMS = 12
+
+
+@router.message(F.text == "👥 Выбрать вдвоём")
+async def duo_new(message: Message) -> None:
+    await remember(message)
+    wait = await message.answer("🎬 Собираю 12 хороших фильмов…")
+    films: list[dict[str, Any]] = []
+    try:
+        for _ in range(2):
+            for f in await _popular_films(pages=15):
+                if len(films) < DUO_FILMS and all(int(f["id"]) != x["id"] for x in films):
+                    films.append({"id": int(f["id"]), "title": shorts_daily._title(f), "year": f.get("year"),
+                                  "poster": shorts_daily._poster_url(f), "rating": shorts_daily._best_rating(f)[0],
+                                  "genres": ", ".join(str(g.get("name")) for g in (f.get("genres") or [])[:2]
+                                                      if isinstance(g, dict))})
+    except Exception:  # noqa: BLE001
+        logging.exception("Duo: films failed")
+    if len(films) < 6:
+        await wait.edit_text("Не получилось собрать фильмы — попробуй через минуту.")
+        return
+    duo_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    await db().execute("INSERT INTO duo(id, creator, films) VALUES($1, $2, $3)", duo_id, message.from_user.id,
+                       json.dumps(films, ensure_ascii=False))
+    link = f"{await _bot_link(message.bot)}?start=duo_{duo_id}"
+    await wait.edit_text(
+        f"👥 <b>Выбираем вдвоём</b>\n\n1. Отправь другу ссылку: {link}\n2. Каждый отмечает 👍 или 👎 одни и те "
+        f"же {len(films)} фильмов.\n3. Бот покажет фильмы, которые понравились обоим. 🍿\n\nНачинай 👇",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="📤 Отправить другу", url=f"https://t.me/share/url?url={quote(link)}&text="
+            + quote("Давай выберем фильм на вечер вместе 🍿"))]]))
+    await duo_show(message.bot, message.chat.id, message.from_user.id, duo_id, None)
+
+
+async def duo_show(bot: Bot, chat_id: int, user_id: int, duo_id: str, msg: Message | None) -> None:
+    """Следующий фильм, который этот участник ещё не отметил; все отмечены — итог."""
+    row = await db().fetchrow("SELECT films FROM duo WHERE id=$1", duo_id)
+    if not row:
+        await bot.send_message(chat_id, "Эта ссылка устарела — начни заново: «👥 Выбрать вдвоём».")
+        return
+    films = row["films"] if isinstance(row["films"], list) else json.loads(row["films"])
+    done = {int(r["idx"]) for r in await db().fetch("SELECT idx FROM duo_votes WHERE id=$1 AND user_id=$2",
+                                                    duo_id, user_id)}
+    left = [k for k in range(len(films)) if k not in done]
+    if not left:
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        await duo_result(bot, duo_id, user_id)
+        return
+    k = left[0]
+    f = films[k]
+    caption = (f"<b>{escape(f['title'])}</b>" + (f" ({f['year']})" if f.get("year") else "")
+               + (f"\n⭐ {f['rating']:.1f}" if f.get("rating") else "") + (f" · {escape(f['genres'])}" if f.get("genres")
+               else "") + f"\n\n{len(films) - len(left) + 1} из {len(films)}")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👎 Не хочу", callback_data=f"duo:v:{duo_id}:{k}:0"),
+        InlineKeyboardButton(text="👍 Буду смотреть", callback_data=f"duo:v:{duo_id}:{k}:1")]])
+    if msg and f.get("poster"):
+        try:
+            await msg.edit_media(InputMediaPhoto(media=f["poster"], caption=caption), reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001 — не вышло заменить: пришлём новым сообщением
+            pass
+    if f.get("poster"):
+        try:
+            await bot.send_photo(chat_id, f["poster"], caption=caption, reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    await bot.send_message(chat_id, caption, reply_markup=markup)
+
+
+async def duo_result(bot: Bot, duo_id: str, user_id: int) -> None:
+    row = await db().fetchrow("SELECT films, creator FROM duo WHERE id=$1", duo_id)
+    films = row["films"] if isinstance(row["films"], list) else json.loads(row["films"])
+    votes = await db().fetch("SELECT user_id, idx, liked FROM duo_votes WHERE id=$1", duo_id)
+    users: dict[int, dict[int, bool]] = {}
+    for v in votes:
+        users.setdefault(int(v["user_id"]), {})[int(v["idx"])] = bool(v["liked"])
+    finished = [u for u, d in users.items() if len(d) >= len(films)]
+    if len(finished) < 2:
+        await bot.send_message(user_id, "✅ Готово! Ждём, пока друг отметит фильмы, — пришлю совпадения сюда. 👥")
+        return
+    common = [k for k in range(len(films)) if all(users[u].get(k) for u in finished)]
+    if common:
+        text = "🎉 <b>Совпадения!</b> Эти фильмы понравились вам обоим:\n\n" + "\n".join(
+            f"• {escape(films[k]['title'])}" + (f" ({films[k]['year']})" if films[k].get("year") else "") for k in common)
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=f"🎬 {films[k]['title']}"[:64], callback_data=f"open:{films[k]['id']}")] for k in common[:8]])
+    else:
+        text = "😅 Совпадений нет — вкусы разные. Попробуйте ещё раз: «👥 Выбрать вдвоём» даст новые фильмы."
+        markup = None
+    for u in finished:  # итог — всем, кто уже закончил (второму — сразу, первому — когда закончил второй)
+        if u == user_id or len(finished) == 2:
+            try:
+                await bot.send_message(u, text, reply_markup=markup)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+@router.callback_query(F.data.startswith("duo:"))
+async def duo_buttons(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    if len(parts) != 5 or parts[1] != "v" or not parts[3].isdigit():
+        await callback.answer()
+        return
+    await callback.answer()
+    await db().execute("""INSERT INTO duo_votes(id, user_id, idx, liked) VALUES($1, $2, $3, $4)
+                          ON CONFLICT(id, user_id, idx) DO UPDATE SET liked=EXCLUDED.liked""",
+                       parts[2], callback.from_user.id, int(parts[3]), parts[4] == "1")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await duo_show(callback.bot, chat_id, callback.from_user.id, parts[2], callback.message)
+
+
+# --- кинодневник подписчика и «Мой год в кино»
+
+def _diary_score_markup(movie_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(n), callback_data=f"dia:s:{movie_id}:{n}") for n in range(1, 6)],
+        [InlineKeyboardButton(text=str(n), callback_data=f"dia:s:{movie_id}:{n}") for n in range(6, 11)],
+        [InlineKeyboardButton(text="Без оценки", callback_data=f"dia:s:{movie_id}:0")]])
+
+
+@router.message(F.text == "📔 Кинодневник")
+async def diary_menu(message: Message) -> None:
+    await remember(message)
+    uid, year = message.from_user.id, datetime.now(MSK).year
+    rows = await db().fetch("SELECT title, score, watched_at FROM diary WHERE user_id=$1 ORDER BY watched_at DESC",
+                            uid)
+    this_year = [r for r in rows if r["watched_at"].astimezone(MSK).year == year]
+    if not rows:
+        await message.answer(
+            "📔 <b>Кинодневник</b>\n\nОтмечай, что посмотрел, и ставь оценку — кнопка «✅ Посмотрел» в карточке "
+            "любого фильма. В конце года бот соберёт твою карточку «Мой год в кино»: сколько фильмов, любимый "
+            "жанр и лучшее за год. 🍿\n\nНайди фильм: «🔎 Найти фильм или сериал».")
+        return
+    lines = [f"{'⭐ ' + str(r['score']) + '/10' if r['score'] else '✅'} {escape(r['title'])}" for r in rows[:15]]
+    await message.answer(
+        f"📔 <b>Кинодневник</b>\n\nЗа {year} год: <b>{len(this_year)}</b> · всего: <b>{len(rows)}</b>\n\n"
+        + "\n".join(lines) + ("\n…" if len(rows) > 15 else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎉 Мой {year} в кино", callback_data="dia:y")],
+            [InlineKeyboardButton(text="🗑 Убрать последнюю запись", callback_data="dia:undo")]]))
+
+
+@router.callback_query(F.data.startswith("dia:"))
+async def diary_buttons(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    uid = callback.from_user.id
+    if parts[1] == "w" and len(parts) == 3 and parts[2].isdigit():
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("⭐ Как тебе? Оцени от 1 до 10:", reply_markup=_diary_score_markup(int(parts[2])))
+        return
+    if parts[1] == "s" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+        movie_id, score = int(parts[2]), max(0, min(10, int(parts[3])))
+        try:
+            item = await kp.details(movie_id)
+        except Exception:  # noqa: BLE001
+            item = {}
+        genres = ", ".join(str(g.get("name")) for g in (item.get("genres") or []) if isinstance(g, dict))[:120]
+        year = item.get("year") if str(item.get("year") or "").isdigit() else None
+        title = kp.title(item) if item else (await db().fetchval(
+            "SELECT title FROM history WHERE user_id=$1 AND movie_id=$2 LIMIT 1", uid, movie_id) or "Фильм")
+        await db().execute(
+            """INSERT INTO diary(user_id, movie_id, title, score, genres, year_released, poster)
+               VALUES($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT(user_id, movie_id) DO UPDATE SET score=EXCLUDED.score, watched_at=NOW()""",
+            uid, movie_id, title, score, genres, int(year) if year else None, kp.poster(item) if item else None)
+        if score:  # оценка дневника — и в «Топ по версии подписчиков»
+            await db().execute(
+                """INSERT INTO ratings(user_id, movie_id, title, value) VALUES($1, $2, $3, $4)
+                   ON CONFLICT(user_id, movie_id) DO UPDATE SET value=EXCLUDED.value, created_at=NOW()""",
+                uid, movie_id, title, 1 if score >= 6 else -1)
+        n = await db().fetchval("SELECT COUNT(*) FROM diary WHERE user_id=$1 AND watched_at >= $2", uid,
+                                datetime(datetime.now(MSK).year, 1, 1, tzinfo=MSK))
+        await callback.answer("Записал в кинодневник ✅")
+        if callback.message:
+            await callback.message.edit_text(
+                f"✅ «{escape(title)}» в кинодневнике" + (f" — {score}/10" if score else "")
+                + f". В этом году: <b>{n}</b>. Все записи — кнопка «📔 Кинодневник».")
+        return
+    if parts[1] == "undo":
+        await db().execute("""DELETE FROM diary WHERE (user_id, movie_id) IN (
+            SELECT user_id, movie_id FROM diary WHERE user_id=$1 ORDER BY watched_at DESC LIMIT 1)""", uid)
+        await callback.answer("Убрал последнюю запись")
+        return
+    if parts[1] == "y":
+        await callback.answer()
+        year = datetime.now(MSK).year
+        rows = [dict(r) for r in await db().fetch(
+            "SELECT title, score, genres, year_released, poster FROM diary WHERE user_id=$1 AND watched_at >= $2",
+            uid, datetime(year, 1, 1, tzinfo=MSK))]
+        if not callback.message:
+            return
+        if not rows:
+            await callback.message.answer("В этом году в дневнике пока пусто — отмечай фильмы кнопкой «✅ Посмотрел».")
+            return
+        st = shorts_diary.stats(rows)
+        posters: list[bytes | None] = []
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            for r in st["best"]:
+                try:
+                    posters.append(await netsafe.fetch(session, r["poster"], 8 * 1024 * 1024) if r.get("poster")
+                                   else None)
+                except Exception:  # noqa: BLE001
+                    posters.append(None)
+        link = (await _bot_link(callback.bot)).replace("https://", "")
+        name = callback.from_user.first_name or ""
+        png = await asyncio.to_thread(shorts_diary.year_card, name, year, st, posters, link)
+        await callback.message.answer_photo(
+            BufferedInputFile(png, filename=f"my_{year}_in_cinema.png"),
+            caption=f"🎉 Твой {year} в кино! Перешли друзьям — пусть тоже посчитают свой 🍿\n"
+                    f"Кинодневник ведётся здесь: {link}")
+        return
+    await callback.answer()
 
 
 @router.message(F.text == "🧩 Викторина дня")
@@ -14932,15 +16373,16 @@ async def sub_check(callback: CallbackQuery) -> None:
 async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
+        BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
+        BotCommand(command="report", description="📊 Отчёт за неделю и план"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
-        BotCommand(command="shorts", description="🎬 Панель шортсов (кнопки)"),
+        BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
         BotCommand(command="lore", description="Шортс «история персонажа»: /lore Доктор Дум"),
         BotCommand(command="mylist", description="Своя подборка: тема и список фильмов"),
         BotCommand(command="ai", description="Проверить ИИ: Gemini, Groq, BeatAPI"),
-        BotCommand(command="admin", description="Админка"),
         BotCommand(command="voice", description="Проверить озвучку фразы"),
         BotCommand(command="clone", description="Свой голос (или кнопками в /shorts → Настройки)"),
         BotCommand(command="say", description="Произношение слов в озвучке"),
@@ -15035,12 +16477,14 @@ async def main() -> None:
             await asyncio.sleep(min(5 * attempt, 60))
 
     logging.info("VKino started")
+    heartbeat_task = asyncio.create_task(heartbeat())  # «бот жив» — по нему автообновление решает, откатывать ли
 
     try:
         await dp.start_polling(bot)
     finally:
         global stopping
         stopping = True
+        heartbeat_task.cancel()
         provider_task.cancel()
         blender_task.cancel()
         reminder_task.cancel()

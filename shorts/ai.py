@@ -16,12 +16,13 @@ import logging
 import os
 import re
 import time
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
+from . import usage as usage_log
 from . import websearch
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -97,6 +98,8 @@ def _count_lumean(data: Any) -> None:
     task = next((f.function for f in inspect.stack()[1:12] if f.function not in skip
                  and f.filename.endswith(("ai.py", "daily.py", "weekly.py", "bot.py"))), "?")
     lumean_usage["tasks"][task] = lumean_usage["tasks"].get(task, 0) + 1
+    usage_log.record("llm_calls", 1, task)
+    usage_log.record("llm_tokens", int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0))
 
 
 _lumean_model = ""
@@ -301,6 +304,19 @@ async def _ask(key: str, parts: list[dict[str, Any]], search: bool = False) -> A
         raise AIError(f"Gemini не ответил за {budget} с") from None
 
 
+def _until_quota_reset() -> float:
+    """Секунды до сброса дневного лимита бесплатного Gemini (полночь по тихоокеанскому времени): раньше бот
+    каждые 30 минут снова получал отказ и терял время; не больше 24 ч, не меньше паузы QUOTA_PAUSE."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    try:
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:  # noqa: BLE001 — нет базы часовых поясов: как раньше
+        return QUOTA_PAUSE
+    reset = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+    return max(QUOTA_PAUSE, min((reset - now).total_seconds(), 86400))
+
+
 async def _ask_keys(key: str, parts: list[dict[str, Any]], search: bool) -> Any:
     global last_key_no
     keys = gemini_keys(key)
@@ -351,7 +367,7 @@ async def _ask_key(key: str, parts: list[dict[str, Any]], search: bool, wait_min
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
             kind, _ = _quota(status, data)
             if kind:  # лимит этого ключа: на день — пауза 30 мин, в минуту — 1 мин; пробуем другой ключ
-                _quota_until[(key, search)] = time.monotonic() + (QUOTA_PAUSE if kind == "day" else 60)
+                _quota_until[(key, search)] = time.monotonic() + (_until_quota_reset() if kind == "day" else 60)
                 value = _quota_value(data)
                 raise QuotaError(f"лимит {'на день' if kind == 'day' else 'в минуту'} ({model}"
                                  + (f", разрешено {value}" if value else "") + ")")
@@ -602,13 +618,17 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
     prompt = (
         source + "Вытащи:\n"
         "1) title — короткую тему ролика по-русски, 3–6 слов, без эмодзи (например «Онлайн-премьеры недели»);\n"
-        f"2) films — до {max_films} фильмов и сериалов в том же порядке, что у автора: ru — название по-русски "
-        "(как в тексте или официальное), en — оригинальное название, если знаешь, year — год, если указан или "
-        "известен, note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если "
+        f"2) films — ВСЕ фильмы и сериалы автора (до {max_films}), в том же порядке, ни одного не пропускай: "
+        "ru — название по-русски (как в тексте или официальное), en — оригинальное название, если знаешь, "
+        "year — год ТОЛЬКО если он написан у автора, иначе null (не угадывай: новинки бывают 2026 года), "
+        "series — true, если это сериал (есть «сезон», «серия», «сериал»), season — номер сезона, если указан, "
+        "fresh — true, если у автора это новинка (премьера, «вышел», «новинки недели», «скоро») — тогда это "
+        "новый фильм, а не одноимённая классика, "
+        "note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если "
         "указано, " + about + "Названия сервисов пиши как у автора (Netflix, Apple TV). Не выдумывай фильмы, "
         "которых у автора нет." + GRAMMAR +
-        '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": 2025, '
-        '"note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
+        '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": null, '
+        '"series": false, "season": null, "fresh": false, "note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
     )
     if images:
         parts: list[dict[str, Any]] = [{"text": prompt}]
@@ -621,8 +641,12 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
     for f in (data.get("films") if isinstance(data, dict) else None) or []:
         if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
             year = f.get("year")
+            season = f.get("season")
             films.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
                           "year": int(year) if str(year or "").isdigit() else None,
+                          "series": bool(f.get("series")) or bool(str(season or "").isdigit()),
+                          "season": int(season) if str(season or "").isdigit() else None,
+                          "fresh": bool(f.get("fresh")),
                           "note": re.sub(r"\s+", " ", str(f.get("note") or "")).strip()[:220]})
     if len(films) < 3:
         raise AIError("ИИ не нашёл " + ("на картинках" if images else "в тексте") + " хотя бы 3 фильма или сериала")
@@ -955,6 +979,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         '"film": "название фильма или сериала по-русски или пусто", "film_en": "оригинальное название или пусто", '
         '"person": "главный человек новости по-русски или пусто", "person_en": "его имя латиницей или пусто", '
         '"trailer": true или false (true — если новость: вышел трейлер или тизер), '
+        '"status": "official" (объявила студия, сервис или сам человек), "reported" (сообщают Deadline, Variety, '
+        'THR и другие издания со ссылкой на источники) или "rumor" (инсайдер, слух, не подтверждено), '
         '"media": [номера постов об этой же новости, самый подходящий для фото/видео первым]}'
     )
     data = await _post_json(key, rules + "\n\nПОСТЫ:\n" + listing)  # Google → сильная модель → фактчекер
@@ -963,6 +989,21 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     post = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]", "", str(data.get("post") or "")).strip()
     if len(post) < 80:
         return None
+    # фильм и человек из ответа должны быть в самом посте — иначе это поля от другой новости, и бот подберёт
+    # чужие фото и источник: тогда поля обнуляем (фото найдутся по тексту поста или их не будет)
+    low = post.lower().replace("ё", "е")
+
+    def named(*names: Any) -> bool:
+        stems = [w.lower().replace("ё", "е")[:5] for n in names for w in re.findall(r"[\wА-Яа-яЁё]{3,}", str(n or ""))]
+        return bool(stems) and any(st in low for st in stems)
+
+    if (data.get("film") or data.get("film_en")) and not named(data.get("film"), data.get("film_en")):
+        log.warning("shorts: write_post film %r not in the post — dropped", data.get("film"))
+        data["film"] = data["film_en"] = ""
+        data["media"] = []
+    if (data.get("person") or data.get("person_en")) and not named(data.get("person"), data.get("person_en")):
+        log.warning("shorts: write_post person %r not in the post — dropped", data.get("person"))
+        data["person"] = data["person_en"] = ""
     media = []
     for m in data.get("media") or []:
         try:
@@ -974,7 +1015,191 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
             "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
-            "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true"}
+            "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true",
+            "status": str(data.get("status") or "").strip().lower()}
+
+
+async def guess_films(key: str, description: str) -> list[dict[str, Any]]:
+    """«Найди фильм по описанию»: зритель помнит сюжет, а не название. До 3 вариантов
+    [{"ru", "en", "year", "why"}] — самые вероятные первыми; не уверен — меньше вариантов."""
+    if not available(key) or len(description.strip()) < 10:
+        return []
+    prompt = (
+        "Зритель не помнит название фильма или сериала и описывает его своими словами (сюжет, сцены, актёры, "
+        "годы — может путать детали). Назови до 3 самых вероятных вариантов, лучший первым. Только реально "
+        "существующие фильмы и сериалы; не уверен — дай меньше вариантов. Для каждого: ru — название в российском "
+        "прокате, en — оригинальное название, year — год выхода, why — одна короткая фраза, чем совпадает с "
+        "описанием (без спойлеров концовки).\n"
+        'Ответь только JSON: {"films": [{"ru": "...", "en": "...", "year": 2014, "why": "..."}]}\n\n'
+        "ОПИСАНИЕ ЗРИТЕЛЯ:\n" + description.strip()[:1500])
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: guess_films failed: %s", exc)
+        return []
+    out = []
+    for f in (data.get("films") if isinstance(data, dict) else None) or []:
+        if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
+            year = f.get("year")
+            out.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
+                        "year": int(year) if str(year or "").isdigit() else None,
+                        "why": re.sub(r"\s+", " ", str(f.get("why") or "")).strip()[:160]})
+    return out[:3]
+
+
+WWK_FRESH_DAYS = 45  # «Что мы знаем»: новость старше — уже всем известна, в ролик не берём
+
+
+async def whatweknow_script(key: str, film: str, today: str, material: str = "") -> dict[str, Any] | None:
+    """Шортс «Что мы знаем о … до премьеры» по схеме вирусных роликов: вопрос, обещание («в конце самое
+    шокирующее»), хорошие новости, поворот «но радоваться рано», тревожные слухи, призыв в ТГ в середине и самая
+    сильная деталь последней фразой. Только СВЕЖЕЕ (за ~месяц): ИИ даёт каждой новости дату, бот выбрасывает
+    старые («Руссо снова режиссёры», «Дауни — Дум» знают все) и сам собирает связки схемы.
+    material — свежие посты ТГ-каналов с датами. {"title", "lines": [...], "stale": число выброшенных} или None."""
+    prompt = (
+        f"Сегодня {today}. Ты автор вертикальных шортсов о кино канала KinoMir360. Нужен ролик «Что мы знаем о "
+        f"«{film}» до премьеры» — ТОЛЬКО СВЕЖИЕ новости и слухи за последние 4–6 недель: реакции с закрытых "
+        "показов, утечки, слова инсайдеров, свежие интервью актёров и режиссёров, новые кадры, хронометраж, "
+        "рейтинг, кто погибнет, сцены после титров. НЕ БЕРИ то, что давно всем известно: кто режиссёр, кто в "
+        "касте, давно объявленные роли, перенос даты, первый трейлер и постер, если они вышли раньше. Не пиши "
+        "про сборы до премьеры и не называй сайты-источники («по данным KinoNews») — только «инсайдер пишет», "
+        "«по слухам», «актёр рассказал».\n"
+        "Раздели находки на три группы: good — хорошие новости, bad — тревожные детали и слухи, shock — 1–2 самые "
+        "безумные/шокирующие детали (они пойдут в конец). У каждой находки: text — одна короткая фраза для "
+        "озвучки (до 120 символов, разговорно, имена как в русском прокате, слух — со словами «по слухам» / "
+        "«инсайдер пишет»), date — дата появления новости ГГГГ-ММ-ДД (как в источнике; не знаешь — пусто). "
+        "Только то, что есть в материалах или в поиске, ничего не выдумывай. Лучше 6 свежих находок, чем 12 "
+        "старых.\n"
+        "Ещё: about — «о» + название в предложном падеже в ёлочках («о «Мстителях: Судный день»», «о сериале "
+        "«Дом дракона»»); premiere — дата премьеры в России или мире ГГГГ-ММ-ДД, year — год выхода, title — название ролика "
+        "для YouTube до 90 символов (вопрос-интрига, без «что известно за N дней»)."
+        + GRAMMAR +
+        '\nОтветь только JSON: {"title": "…", "about": "о «…»", "premiere": "2026-12-18", "year": 2026, '
+        '"good": [{"text": "…", "date": "2026-10-30"}], "bad": [...], "shock": [...]}'
+        + ("\n\nСВЕЖИЕ ПОСТЫ КИНО-КАНАЛОВ (дата в начале; это главный материал):\n" + material if material else ""))
+    data = await _post_json(key, prompt, search=True, query=f"{film} новости слухи инсайдеры реакции",
+                            verify=False, premium=True)
+    if not isinstance(data, dict):
+        return None
+    try:
+        now = datetime.strptime(today, "%d.%m.%Y")
+    except ValueError:
+        now = datetime.now()
+    stale = 0
+
+    def fresh(group: str) -> list[str]:
+        nonlocal stale
+        out = []
+        for item in data.get(group) or []:
+            if isinstance(item, str):
+                item = {"text": item}
+            if not isinstance(item, dict):
+                continue
+            text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+            if len(text) < 12:
+                continue
+            m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(item.get("date") or ""))
+            if m:
+                try:
+                    if (now - datetime(int(m[1]), int(m[2]), int(m[3]))).days > WWK_FRESH_DAYS:
+                        stale += 1
+                        continue
+                except ValueError:
+                    pass
+            out.append(text if text[-1] in ".!?…" else text + ".")
+        return out
+
+    good, bad, shock = fresh("good")[:5], fresh("bad")[:5], fresh("shock")[:3]
+    if len(good) + len(bad) + len(shock) < 4:
+        return {"title": "", "lines": [], "stale": stale}
+    if not shock:  # самое сильное — в конец
+        shock = [(bad or good).pop()]
+    when = ""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(data.get("premiere") or ""))
+    if m:
+        try:
+            days = (datetime(int(m[1]), int(m[2]), int(m[3])) - now).days
+            if 0 < days <= 120:
+                when = (" за месяц до премьеры" if 25 <= days <= 35 else " за неделю до премьеры" if 5 <= days <= 9
+                        else f" за {days} {plural_days(days)} до премьеры")
+        except ValueError:
+            pass
+    year = f" ({data['year']})" if str(data.get("year") or "").isdigit() else ""
+    about = re.sub(r"\s+", " ", str(data.get("about") or "")).strip()
+    if not re.fullmatch(r"о(?:б)?\s+[^«»]{0,20}«[^«»]{2,80}»", about):
+        about = f"о фильме «{film}»"
+    lines = [f"Что мы знаем {about}{year}{when}?", "Давайте разберём самые интересные детали."]
+    lines.append("Начнём с хорошего, а в конце — самое шокирующее." if good and bad
+                 else "А в конце — самое шокирующее.")
+    lines += good
+    if bad:
+        lines += ["Но радоваться рано."] + bad
+    lines.insert(max(4, len(lines) * 2 // 3), "Больше подробностей — в нашем телеграм-канале КиноМир 360.")
+    lines += ["Но самое безумное — впереди."] + shock
+    return {"title": str(data.get("title") or "").strip()[:95], "lines": lines[:20], "stale": stale}
+
+
+def plural_days(n: int) -> str:
+    n = abs(n) % 100
+    return "дней" if 11 <= n <= 14 else {1: "день", 2: "дня", 3: "дня", 4: "дня"}.get(n % 10, "дней")
+
+
+async def hero_films(key: str, lines: list[str], main: str = "") -> list[dict[str, Any]]:
+    """Фразы, где назван герой или актёр из ДРУГИХ фильмов («Доктор Дум», «Циклоп», «Баки», «Тоби Магуайр»), →
+    фильм, где этот герой лучше всего виден: [{"line": номер фразы с 0, "ru", "en", "year"}]. Бот возьмёт трейлер
+    этого фильма и поставит его кадры к фразе — кто назван, тот и на экране."""
+    if not available(key) or not lines:
+        return []
+    listing = "\n".join(f"{k}. {ln}" for k, ln in enumerate(lines, 1))
+    prompt = (
+        "Ролик о кино" + (f" (главный фильм — «{main}»)" if main else "") + ". В каких фразах назван конкретный "
+        "персонаж или актёр, которого лучше показать кадрами из ДРУГОГО, уже вышедшего фильма, где он главный или "
+        "заметный (например: Циклоп → «Люди Икс: Апокалипсис» 2016, Баки → «Первый мститель: Другая война» 2014, "
+        "Тоби Магуайр → «Человек-паук» 2002)? Главный фильм ролика не предлагай. До 4 фраз, самые яркие герои; "
+        "нет таких — пустой список.\n"
+        'Ответь только JSON: {"heroes": [{"line": 5, "ru": "название в российском прокате", "en": "оригинальное", '
+        '"year": 2016}]}\n\nФРАЗЫ:\n' + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: hero_films failed: %s", exc)
+        return []
+    out, seen = [], set()
+    for h in (data.get("heroes") if isinstance(data, dict) else None) or []:
+        if not isinstance(h, dict) or not str(h.get("line") or "").isdigit():
+            continue
+        n = int(h["line"]) - 1
+        ru, en = str(h.get("ru") or "").strip(" «»\""), str(h.get("en") or "").strip(" «»\"")
+        if 0 <= n < len(lines) and n not in seen and (ru or en):
+            seen.add(n)
+            year = h.get("year")
+            out.append({"line": n, "ru": ru, "en": en, "year": int(year) if str(year or "").isdigit() else None})
+    return out[:4]
+
+
+async def screen_labels(key: str, lines: list[str], title: str = "") -> list[str]:
+    """Крупные надписи на экране шортса — по одной на фразу озвучки: 2–4 слова КАПСОМ, цепляют и не повторяют
+    фразу дословно («ЗАБУДЬТЕ ПРО ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ»). Пусто — у фразы без надписи."""
+    if not available(key) or not lines:
+        return []
+    listing = "\n".join(f"{k}. {ln}" for k, ln in enumerate(lines, 1))
+    prompt = (
+        "Ты монтажёр YouTube Shorts о кино. К каждой фразе озвучки придумай крупную надпись на экране: 2–4 слова "
+        "КАПСОМ, до 26 символов, цепляет и дополняет голос, а не повторяет фразу целиком. Примеры: «ЗАБУДЬТЕ ПРО "
+        "ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ», «НАПРЯЖЕНИЕ ДО КОНЦА», «МОЯ ОЦЕНКА: 8/10». Без спойлеров. "
+        "К проходной фразе можно дать пустую строку. Ровно столько надписей, сколько фраз, по порядку."
+        + (f" Ролик: {title}." if title else "")
+        + '\n\nОтветь только JSON: {"labels": ["…", "…"]}\n\nФРАЗЫ:\n' + listing)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: screen labels failed: %s", exc)
+        return []
+    raw = data.get("labels") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = [re.sub(r"\s+", " ", str(x or "")).strip().strip("«»\"").upper()[:30] for x in raw]
+    return (out + [""] * len(lines))[:len(lines)]
 
 
 async def write_list_post(key: str, title: str, films: list[str], posts: str = "", recent: list[str] | None = None,
@@ -1001,7 +1226,9 @@ async def write_list_post(key: str, title: str, films: list[str], posts: str = "
         + ("\n".join(f"— {t}" for t in (recent or [])[-40:]) or "—")
         + (f"\n\nО ЧЁМ ПОДБОРКА: {hint}" if hint else "")
         + ("\n\nВАЖНО: это подборка автора — бери ТОЛЬКО фильмы и сериалы из списка кандидатов, все и в том же "
-           "порядке, ничего не добавляй и не убирай." if only else
+           f"порядке, ничего не добавляй и не убирай. Их {n} — у каждого фраза не длиннее "
+           f"{max(40, 560 // max(n, 1))} символов, чтобы ВСЕ {n} влезли в пост. Год пиши только тот, что указан у "
+           "кандидата; у сериала — сезон, без года старта." if only else
            "\n\nКандидаты идут от самых популярных и обсуждаемых — их бери в первую очередь; у каждого из них в "
            "посте — 1 короткая фраза, о чём он.")
         + "\n\nНапиши пост точно в стиле образца: заголовок КАПСОМ с эмодзи, под ним строка «🎬 Подборка от "
@@ -1105,6 +1332,9 @@ async def verify_post(key: str, task: str, post: str) -> str:
         "— МАТЕРИАЛ главнее поиска: если черновик взял из поиска другой год, другой список или другую новость "
         "вместо материала — верни то, что в материале;\n"
         "— исправь падежи и опечатки.\n"
+        "НЕ МЕНЯЙ ТЕМУ: пост остаётся о той же новости, о тех же фильмах и людях, что черновик. В материалах "
+        "много других новостей — их не бери и черновик на них не заменяй. Новость черновика не подтверждается "
+        "— убери неподтверждённое или пометь как слух, но тему оставь.\n"
         "Сохрани стиль, эмодзи, структуру, хэштеги и длину (до 950 символов). Если всё верно — верни черновик "
         "без изменений." + GRAMMAR
         + '\n\nОтветь только JSON: {"post": "проверенный текст поста", "fixes": ["что исправил", ...]}'
@@ -1118,7 +1348,33 @@ async def verify_post(key: str, task: str, post: str) -> str:
     fixes = (data or {}).get("fixes") if isinstance(data, dict) else None
     if fixes:
         log.info("shorts: fact-check fixes: %s", "; ".join(map(str, fixes))[:500])
+    if len(checked) >= 80 and not same_story(post, checked):
+        # фактчекер подменил новость на другую из материалов (пост про «1408», а фото и источник — от
+        # «Кобры Кай» из черновика) — оставляем черновик
+        log.warning("shorts: fact-check changed the story — keeping the draft")
+        return post
     return checked[:1020] if len(checked) >= 80 else post
+
+
+def _name_tokens(text: str) -> set[str]:
+    """Имена и названия поста: слова с заглавной не в начале предложения, слова в «ёлочках», латиница, числа —
+    по основе (первые 5 букв), чтобы падежи совпадали."""
+    out: set[str] = set()
+    for q in re.findall(r"«([^«»]{1,60})»", text):
+        out |= {w.lower()[:5] for w in re.findall(r"[\wА-Яа-яЁё]{3,}", q)}
+    for m in re.finditer(r"(?<![.!?\n]\s)(?<!^)\b([A-ZА-ЯЁ][a-zа-яё]{2,})", text):
+        out.add(m.group(1).lower()[:5])
+    out |= {w.lower()[:5] for w in re.findall(r"\b[A-Za-z]{3,}\b", text)}
+    out |= set(re.findall(r"\b\d{3,4}\b", text))
+    return out
+
+
+def same_story(draft: str, checked: str) -> bool:
+    """Проверенный пост — о той же новости, что черновик: хотя бы треть имён и названий черновика на месте."""
+    a, b = _name_tokens(draft), _name_tokens(checked)
+    if len(a) < 3:
+        return True  # не по чему судить
+    return len(a & b) / len(a) >= 0.34
 
 
 def _films_from(data: dict[str, Any], extra: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -1172,6 +1428,20 @@ async def box_office_post(key: str, today: str) -> dict[str, Any] | None:
     post = _clean_post(data)
     films = _films_from(data or {}, ("gross",))
     return {"post": post, "films": films[:8]} if post and len(films) >= 3 else None
+
+
+async def weekend_candidates(key: str, today: str) -> list[dict[str, Any]]:
+    """Прогноз уикенда: 4 фильма, которые реально могут возглавить мировой прокат в эти выходные (премьеры
+    недели и лидеры прошлого уикенда) — по свежим данным из Google. [{"ru", "en", "year"}]."""
+    prompt = (f"Сегодня {today}. Найди в Google, какие фильмы идут в кинотеатрах в эти выходные: премьеры этой "
+              "недели и лидеры прошлого уикенда по мировым (или североамериканским) сборам. Выбери 4 фильма, "
+              "которые реально могут занять первое место по сборам за эти выходные (не заведомо слабые). "
+              "Названия — как в российском прокате, если есть, и оригинальные."
+              '\n\nОтветь только JSON: {"films": [{"ru": "название по-русски", "en": "оригинальное", '
+              '"year": 2026}]}')
+    data = await _post_json(key, prompt, need_search=True, verify=False,
+                            query=f"box office weekend preview {today} new releases opening weekend")
+    return _films_from(data or {})[:4]
 
 
 async def week_digest_post(key: str, posts: str, own: str, today: str) -> dict[str, Any] | None:
@@ -2023,10 +2293,16 @@ async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | No
         "НЕ подходит: на картинке название или логотип ДРУГОГО фильма, сериала, игры или франшизы (новость о "
         "«Дюне», а на картинке «Мстители»); другой человек; постер фильма, к которому человек из новости не "
         "имеет отношения.\n"
+        "ПОРТРЕТ ЧЕЛОВЕКА: подходит, только если ты узнаёшь в нём именно человека из новости (по лицу или "
+        "подписи). Узнаёшь другого (новость о японском актёре озвучки, а на фото Глен Пауэлл) или не можешь "
+        "узнать, кто это, — false: чужое лицо под новостью хуже, чем никакого. Кого узнал — напиши в seen.\n"
+        "Коллаж или обложка дайджеста с несколькими фильмами — false, если наш фильм не главный на ней. "
+        "Сомневаешься — false.\n"
         "Ответь только JSON: {\"seen\": \"что на картинке и какие надписи, до 12 слов\", \"fits\": true или "
         "false}\n\nНОВОСТЬ:\n" + post[:1200])
     try:
-        data = await _with_reserve(key, [{"text": prompt}, _thumb(image, 768)], prompt, image)
+        # сильная модель первой: слабая запасная пропускала чужие постеры («Мстители» к новости о «Рокки»)
+        data = await _with_reserve(key, [{"text": prompt}, _thumb(image, 768)], prompt, image, premium=True)
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI media_fits failed: %s", exc)
         return None, ""

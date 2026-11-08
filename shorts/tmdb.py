@@ -357,6 +357,109 @@ async def movie(key: str, tmdb_id: int) -> dict[str, Any] | None:
     return _movie_row(data) if data.get("id") else None
 
 
+TMDB_PREFIX = "tmdb:"  # id фильма с TMDB в подборке («tmdb:movie:123»), а не с Кинопоиска
+
+
+def _kp_like(kind: str, d: dict[str, Any]) -> dict[str, Any]:
+    """Карточка TMDB в том же виде, что карточка Кинопоиска (поля, которые читает сборка шортса)."""
+    date = str(d.get("release_date") or d.get("first_air_date") or "")
+    cast = ((d.get("credits") or {}).get("cast") or [])[:8]
+    crew = [c for c in (d.get("credits") or {}).get("crew") or [] if c.get("job") == "Director"][:2]
+    overview = re.sub(r"\s+", " ", str(d.get("overview") or "")).strip()
+    return {
+        "id": f"{TMDB_PREFIX}{kind}:{d['id']}",
+        "name": str(d.get("title") or d.get("name") or ""),
+        "alternativeName": str(d.get("original_title") or d.get("original_name") or ""),
+        "enName": str(d.get("original_title") or d.get("original_name") or ""),
+        "year": int(date[:4]) if date[:4].isdigit() else None,
+        "poster": {"url": f"{IMG}w780{d['poster_path']}"} if d.get("poster_path") else None,
+        "backdrop": {"url": f"{IMG}w1280{d['backdrop_path']}"} if d.get("backdrop_path") else None,
+        "rating": {"tmdb": round(float(d.get("vote_average") or 0), 1)} if int(d.get("vote_count") or 0) >= 20 else {},
+        "votes": {"tmdb": int(d.get("vote_count") or 0)},
+        "genres": [{"name": str(g.get("name") or "")} for g in d.get("genres") or [] if g.get("name")],
+        "persons": [{"name": str(c.get("name") or ""), "enProfession": "actor"} for c in cast if c.get("name")]
+        + [{"name": str(c.get("name") or ""), "enProfession": "director"} for c in crew if c.get("name")],
+        "description": overview, "shortDescription": overview[:160],
+        "externalId": {"tmdb": int(d["id"])}, "isSeries": kind == "tv", "type": "tv-series" if kind == "tv" else "movie",
+        "premiere": {"world": date} if date else {},
+    }
+
+
+async def kp_like_by_id(key: str, ref: str) -> dict[str, Any] | None:
+    """«tmdb:movie:123» → карточка в виде Кинопоиска (с актёрами и рейтингом TMDB)."""
+    try:
+        kind, tid = ref[len(TMDB_PREFIX):].split(":", 1)
+    except ValueError:
+        return None
+    if kind not in ("movie", "tv") or not tid.isdigit() or not key:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        d = await _get(session, key, f"/{kind}/{tid}", language="ru-RU", append_to_response="credits")
+    return _kp_like(kind, d) if d.get("id") else None
+
+
+async def find_kp_like(key: str, names: list[str], year: int | None = None, series: bool | None = None,
+                       fresh: bool = False) -> dict[str, Any] | None:
+    """Фильма нет на Кинопоиске — ищем на TMDB (точное название, тип и год, новинка — из новых):
+    карточка в виде Кинопоиска или None."""
+    names = [n for n in names if n and n.strip()]
+    if not key or not names:
+        return None
+    kinds = ["tv"] if series else ["movie"] if series is False else ["movie", "tv"]
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for name in names:
+            for kind in kinds:
+                data = await _get(session, key, f"/search/{kind}", query=name, language="ru-RU")
+                hits = []
+                for r in data.get("results") or []:
+                    titles = [r.get(k) for k in ("title", "original_title", "name", "original_name") if r.get(k)]
+                    if not any(similar(name, str(t)) >= 0.85 for t in titles):
+                        continue
+                    y = str(r.get("release_date") or r.get("first_air_date") or "")[:4]
+                    y = int(y) if y.isdigit() else 0
+                    if year and y and abs(y - year) > 1:
+                        continue
+                    hits.append((y, r))
+                if fresh and not year:
+                    hits.sort(key=lambda h: -h[0])  # новинка — самая новая из одноимённых
+                else:
+                    hits.sort(key=lambda h: -float(h[1].get("popularity") or 0))
+                if hits:
+                    d = await _get(session, key, f"/{kind}/{hits[0][1]['id']}", language="ru-RU",
+                                   append_to_response="credits")
+                    if d.get("id"):
+                        return _kp_like(kind, d)
+    return None
+
+
+async def rating_for(key: str, item: dict[str, Any]) -> tuple[float, int] | None:
+    """Рейтинг TMDB (средняя оценка, число голосов) для карточки Кинопоиска: по id TMDB/IMDb или точному
+    названию и году. None — не нашёлся."""
+    if not key:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        found = await _resolve(session, key, item)
+        if not found:
+            return None
+        kind, tid = found
+        d = await _get(session, key, f"/{kind}/{tid}")
+    if not d.get("id"):
+        return None
+    return round(float(d.get("vote_average") or 0), 1), int(d.get("vote_count") or 0)
+
+
+async def popular_pool(key: str, page: int = 1) -> list[dict[str, Any]]:
+    """Известные фильмы (много голосов, рейтинг 7+) — запас для викторины, если Кинопоиск не ответил.
+    Строки как у _movie_row + "genres" (id жанров TMDB)."""
+    if not key:
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        data = await _get(session, key, "/discover/movie", language="ru-RU", sort_by="vote_count.desc",
+                          page=page, **{"vote_average.gte": 7, "vote_count.gte": 3000})
+    return [{**_movie_row(r), "genres": list(r.get("genre_ids") or [])}
+            for r in data.get("results") or [] if r.get("id") and r.get("backdrop_path")]
+
+
 async def search_movie(key: str, query: str, n: int = 5) -> list[dict[str, Any]]:
     if not key or not query.strip():
         return []
@@ -542,3 +645,21 @@ async def top_movies(key: str, name: str, n: int = 6) -> tuple[str, list[dict[st
     return str(info.get("name") or name), [
         {"title": str(c.get("title") or c.get("original_title") or ""), "year": str(c.get("release_date"))[:4],
          "poster": f"{IMG}w342{c['poster_path']}" if c.get("poster_path") else None} for c in films]
+
+
+async def youtube_trailer(key: str, kind: str, tmdb_id: int) -> str | None:
+    """Официальный трейлер фильма/сериала на YouTube по его id на TMDB: свежий, сначала русский, потом английский.
+    (Rutube бывает со старым трейлером — у TMDB трейлер привязан к карточке именно этого фильма.)"""
+    if not key:
+        return None
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for lang in ("ru-RU", "en-US"):
+            data = await _get(session, key, f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}/videos", language=lang)
+            vids = [v for v in data.get("results") or [] if v.get("site") == "YouTube" and v.get("key")
+                    and v.get("type") in ("Trailer", "Teaser")]
+            vids.sort(key=lambda v: str(v.get("published_at") or ""), reverse=True)
+            vids.sort(key=lambda v: v.get("type") != "Trailer")
+            if vids:
+                return f"https://www.youtube.com/watch?v={vids[0]['key']}"
+    return None

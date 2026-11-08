@@ -38,7 +38,8 @@ MIN_RATING = 6.0  # ниже — рейтинг не показываем, он 
 SKIP_RATING = 5.5  # ниже — фильм в подборку не берём
 
 YOUTUBE_URL = "https://youtube.com/@kinomir360"
-TELEGRAM_URL = "https://t.me/KinoMir360"
+# в описании YouTube ссылки ставить нельзя (у канала нет такого права) — адрес Telegram без https://
+TELEGRAM_URL = "t.me/KinoMir360"
 
 # По дням недели (пн..вс)
 SCHEDULE = ["online", "cinema", "facts_new", "genre", "news", "upcoming", "facts"]
@@ -119,9 +120,22 @@ def _poster_url(item: dict[str, Any]) -> str | None:
     return _image_url(item)
 
 
+RATING_SOURCE = "tmdb"  # какой рейтинг показывать в карточках и постах: tmdb — TMDB, если он известен
+TMDB_MIN_VOTES = 30  # у TMDB голосов меньше, чем у Кинопоиска; меньше 30 — рейтинг случайный
+
+
 def _best_rating(item: dict[str, Any]) -> tuple[float, str]:
-    """Больший из рейтингов IMDb и Кинопоиска (0 — рейтинга нет)."""
+    """Рейтинг для карточки: TMDB (если он есть и за ним хватает голосов), иначе больший из IMDb и Кинопоиска
+    (0 — рейтинга нет)."""
     r = item.get("rating") or {}
+    if RATING_SOURCE == "tmdb":
+        try:
+            v = float(r.get("tmdb") or 0)
+            votes = int((item.get("votes") or {}).get("tmdb") or TMDB_MIN_VOTES)
+        except (TypeError, ValueError):
+            v, votes = 0.0, 0
+        if v > 0 and votes >= TMDB_MIN_VOTES:
+            return v, "TMDB"
     best, label = 0.0, ""
     for key, name in (("imdb", "IMDb"), ("kp", "КП")):
         try:
@@ -295,6 +309,55 @@ def theme_for(key: str | None, today: date) -> Theme:
                  [f"лучшие {plural}", plural, "что посмотреть", "подборка фильмов", "топ фильмов"])
 
 
+def _is_russian(doc: dict[str, Any]) -> bool:
+    return any(str(c.get("name") or "") in ("Россия", "СССР") for c in doc.get("countries") or [])
+
+
+async def _foreign_online(fetch: Fetch, since: date, until: date) -> list[dict[str, Any]]:
+    """Зарубежные фильмы и сериалы, вышедшие онлайн за период (по TMDB: цифровые релизы США и свежие серии), —
+    карточками Кинопоиска (русское название, рейтинг, актёры). На Кинопоиске «онлайн-премьеры» — это в основном
+    российские онлайн-кинотеатры, и подборка выходила целиком из российских фильмов."""
+    key = os.getenv("TMDB_API_KEY", "").strip()
+    if not key:
+        return []
+    try:
+        films, shows = await asyncio.gather(tmdb.movies_digital(key, since.isoformat(), until.isoformat(), 10),
+                                            tmdb.tv_aired(key, since.isoformat(), until.isoformat(), 6),
+                                            return_exceptions=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: foreign online failed: %s", exc)
+        return []
+    found: list[dict[str, Any]] = []
+    for item in [*(films if isinstance(films, list) else []), *(shows if isinstance(shows, list) else [])]:
+        name = item.get("original") or item.get("name") or ""
+        year = int(item.get("year") or 0)
+        if not name:
+            continue
+        try:
+            data = await fetch("/movie/search", query=name, page=1, limit=5)
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: KP search %s failed: %s", name, exc)
+            continue
+        for d in data.get("docs") or []:
+            titles = [t for t in (str(d.get(k) or "") for k in ("alternativeName", "enName", "name")) if t]
+            if not d.get("id") or not titles or _is_russian(d):
+                continue
+            if year and abs(int(d.get("year") or 0) - year) > 1:
+                continue
+            if max(tmdb.similar(name, t) for t in titles) >= 0.85:
+                found.append(d)
+                break
+    return found
+
+
+def _mix(foreign: list[dict[str, Any]], local: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Зарубежные и российские через одну — подборка не из одних российских и не из одних голливудских."""
+    out: list[dict[str, Any]] = []
+    for k in range(max(len(foreign), len(local))):
+        out += [x[k] for x in (foreign, local) if k < len(x)]
+    return out
+
+
 async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int]) -> list[dict[str, Any]]:
     common = {"sortField": "votes.kp", "sortType": "-1", "notNullFields": "name"}
     if theme.key == "online":
@@ -303,12 +366,14 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         docs += await _query(fetch, isSeries="true",
                              **{"premiere.world": _range(today - timedelta(days=30), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
+        docs = _mix(await _foreign_online(fetch, today - timedelta(days=30), today), docs)
     elif theme.key == "fresh":  # вышло в цифре (фильмы) или стартовало (сериалы) за последние 10 дней
         docs = await _query(fetch, isSeries="false",
                             **{"premiere.digital": _range(today - timedelta(days=10), today)}, **common)
         docs += await _query(fetch, isSeries="true",
                              **{"premiere.world": _range(today - timedelta(days=10), today)}, **common)
         docs.sort(key=lambda x: -int((x.get("votes") or {}).get("kp") or 0))
+        docs = _mix(await _foreign_online(fetch, today - timedelta(days=14), today), docs)
     elif theme.key == "cinema":  # год — отсекаем повторный прокат старых фильмов
         docs = await _query(fetch, isSeries="false", year=f"{today.year - 1}-{today.year + 1}",
                             **{"premiere.russia": _range(today - timedelta(days=35), today)}, **common)
@@ -802,7 +867,6 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
         f"Главные новости кино на {day} 🎬", "",
         *[f"{i}. {it.title} ({it.source})" for i, (it, _) in enumerate(chosen, 1)], "",
         "Какая новость удивила больше всего? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#новостикино #кино #KinoMir360",
     ])
@@ -833,6 +897,16 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
 NUMBERS = {1: "один", 2: "два", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь", 8: "восемь",
            9: "девять", 10: "десять"}
 SAVE_AND_SUBSCRIBE = "Сохрани и подпишись на КиноМир триста шестьдесят!"
+# если в последней фразе уже есть «сохраняй…» — только «подпишись», без двойного «Сохраняй… Сохрани…»
+SUBSCRIBE_ONLY = "Подпишись на КиноМир триста шестьдесят!"
+
+
+def with_outro(line: str) -> str:
+    """Последняя фраза ролика + призыв подписаться (не повторяя «сохрани»/«подпишись», если они уже есть)."""
+    low = line.lower()
+    if "подпиш" in low or "подписыв" in low:
+        return line
+    return f"{line} {SUBSCRIBE_ONLY if 'сохран' in low else SAVE_AND_SUBSCRIBE}"
 
 
 def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
@@ -1029,7 +1103,7 @@ voice_cache_hits = 0  # сколько фраз последней озвучк�
 
 def _voice_key(text: str, pause: float) -> Path:
     # настройки голоса тоже в ключе: сменили скорость или живость — фраза озвучивается заново
-    raw = (f"{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
+    raw = (f"v2|{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
            f"{lumean.STYLE:g}|{pause:g}|{text}")
     return VOICE_CACHE / (hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".mp3")
 
@@ -1052,11 +1126,12 @@ async def _lumean_cached(speak: list[str], parts: list[Path], work: Path, pause:
     if not todo:
         return
     await lumean.synthesize([texts[i] for i in todo], [parts[i] for i in todo], work, pause)
-    await _verify_parts([speak[i] for i in todo], [parts[i] for i in todo], work, pause)
+    doubtful = await _verify_parts([speak[i] for i in todo], [parts[i] for i in todo], work, pause)
+    skip = {todo[k] for k in doubtful}  # сомнительный кусок в кэш не кладём — в следующий раз озвучится заново
     try:
         VOICE_CACHE.mkdir(parents=True, exist_ok=True)
         for i in todo:
-            if parts[i].exists() and parts[i].stat().st_size > 1000:
+            if i not in skip and parts[i].exists() and parts[i].stat().st_size > 1000:
                 shutil.copyfile(parts[i], keys[i])
         files = sorted(VOICE_CACHE.glob("*.mp3"), key=lambda f: f.stat().st_mtime)
         for old in files[:max(0, len(files) - VOICE_CACHE_MAX)]:
@@ -1274,30 +1349,61 @@ def _extra_words(expected: str, heard: list[dict[str, Any]]) -> list[str]:
     return extra
 
 
-async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: float) -> None:
-    """ElevenLabs иногда «бормочет» на месте паузы между фразами («Май. Май. Пиро.»): распознаём каждую фразу
-    и, если в ней есть лишние слова, переозвучиваем её отдельным заказом (лучший из двух вариантов)."""
+def _missing_words(expected: str, heard: list[dict[str, Any]]) -> list[str]:
+    """Слова текста, которых в озвучке фразы нет вовсе: фраза обрезана или к ней приклеился кусок соседней,
+    а свой ушёл в другую фразу (тогда звук съезжает относительно субтитров и картинок)."""
+    from difflib import SequenceMatcher
+    want = [_norm_word(w) for w in expected.replace(pronounce.STRESS, "").split() if _norm_word(w)]
+    got = [_norm_word(h["w"]) for h in heard if _norm_word(h["w"])]
+    lost: list[str] = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, want, got, autojunk=False).get_opcodes():
+        if tag == "delete":
+            lost += want[i1:i2]
+        elif tag == "replace" and (i2 - i1) - (j2 - j1) >= 2:  # услышали заметно меньше слов, чем было
+            lost += want[i1 + (j2 - j1):i2]
+    return lost
+
+
+def _bad_part(expected: str, heard: list[dict[str, Any]]) -> int:
+    """Насколько кусок озвучки не совпал с фразой: лишние слова (бормотание, кусок соседней фразы) и пропавшие.
+    0–1 — норма (распознавание само ошибается), 2+ — переозвучиваем."""
+    extra, lost = len(_extra_words(expected, heard)), len(_missing_words(expected, heard))
+    words = len([w for w in expected.split() if _norm_word(w)])
+    return extra + (lost if lost >= max(2, words // 4) else 0)
+
+
+async def _verify_parts(speak: list[str], parts: list[Path], work: Path, pause: float) -> list[int]:
+    """ElevenLabs иногда «бормочет» на месте паузы между фразами («Май. Май. Пиро.»), а нарезка общей дорожки
+    может ошибиться границей: распознаём каждую фразу и, если в ней лишние слова или не хватает своих,
+    переозвучиваем её отдельным заказом (лучший из двух вариантов). Возвращает номера фраз, которые так и
+    остались сомнительными (их не кладём в кэш)."""
     if not (ai.RESERVE_KEY and "groq.com" in ai.RESERVE_URL):
-        return
+        return []
+    doubtful: list[int] = []
     for i, (text, part) in enumerate(zip(speak, parts)):
         try:
             heard = await ai.transcribe_words(part.read_bytes())
-            extra = _extra_words(text, heard)
+            bad = _bad_part(text, heard)
             for want, got in _misheard(text, heard):  # контроль озвучки: что голос, похоже, сказал не так
                 voice_issues.append({"text": text, "want": want, "got": got})
         except Exception as exc:  # noqa: BLE001 — проверка не должна ломать сборку
             log.warning("shorts: voice check of phrase %d failed: %s", i + 1, exc)
-            return
-        if len(extra) < 2:
+            return doubtful
+        if bad < 2:
             continue
-        log.warning("shorts: phrase %d has extra words %s — re-voicing it", i + 1, extra)
+        log.warning("shorts: phrase %d does not match its text (%d) — re-voicing it", i + 1, bad)
         redo = work / f"voice_redo_{i}.mp3"
         try:
             await lumean.synthesize([_for_lumean(text)], [redo], work, pause)
-            if len(_extra_words(text, await ai.transcribe_words(redo.read_bytes()))) < len(extra):
+            again = _bad_part(text, await ai.transcribe_words(redo.read_bytes()))
+            if again < bad:
                 redo.replace(part)
+            if min(again, bad) >= 2:
+                doubtful.append(i)
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: re-voicing phrase %d failed: %s", i + 1, exc)
+            doubtful.append(i)
+    return doubtful
 
 
 voice_issues: list[dict[str, str]] = []  # слова, которые распознавание услышало иначе (на проверку автору)
@@ -1446,7 +1552,6 @@ def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
     description = "\n".join([
         f"{theme.hook} — сохрани, чтобы не потерять! 🍿", "", *rows, "",
         "Какой посмотришь первым? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         " ".join(hashtags),
     ])
@@ -1472,7 +1577,6 @@ def build_facts_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
         f"{n} {_facts_word(n)} о {kind} «{t}»" + (f" ({year})" if year else "") + " — сохрани! 🍿", "",
         *[f"{i}. {f}" for i, f in enumerate(facts, 1)], "",
         "Какой факт удивил тебя больше всего? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#фактыокино #кино #KinoMir360",
     ])
@@ -1497,7 +1601,6 @@ def build_review_seo(film: dict[str, Any], points: list[str]) -> dict[str, str]:
         f"«{t}»" + (f" ({year})" if year else "") + " — стоит ли смотреть? Короткий обзор 🎬", "",
         *[f"• {p}" for p in points], "",
         "А ты посмотришь? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#обзорфильма #кино #KinoMir360",
     ])
@@ -1521,7 +1624,6 @@ def build_rumors_seo(film: dict[str, Any], facts: list[str]) -> dict[str, str]:
         f"Что известно о {kind} «{t}»" + (f" ({year})" if year else "") + " — главные новости и слухи 🔥", "",
         *[f"{i}. {f}" for i, f in enumerate(facts, 1)], "",
         "Ждёшь премьеру? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#новостикино #слухи #KinoMir360",
     ])
@@ -1962,7 +2064,16 @@ def is_upcoming(item: dict[str, Any]) -> bool:
     return bool(dates) and min(dates) > today
 
 
-async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[str, Any] | None:
+def _same_name(name: str, film: dict[str, Any]) -> bool:
+    """Название совпадает с одним из названий фильма (с учётом мелких отличий написания): «Черные голуби» ≠
+    «Черные паруса», «Что, если любовь» ≠ «Что, если...?»."""
+    from .tmdb import similar
+    titles = [film.get("name"), film.get("alternativeName"), film.get("enName")]
+    titles += [x.get("name") for x in film.get("names") or [] if isinstance(x, dict)]
+    return any(similar(name, str(t)) >= 0.85 for t in titles if t)
+
+
+async def find_film(fetch: Fetch, query: str, upcoming: bool = False, exact: bool = False) -> dict[str, Any] | None:
     """Фильм по «Название» или «Название 2018»: самый известный из найденных (полная карточка).
     upcoming=True — сначала те, что выходят в этом году или позже (новый сериал, а не старый фильм).
     Слово «сериал» или «фильм» в запросе — уточнение: ищем без него, но такой тип — первым."""
@@ -1978,6 +2089,8 @@ async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[st
     name = query[: year_m.start()].strip() if year_m else query
     data = await fetch("/movie/search", query=name, page=1, limit=10)
     cands = [x for x in data.get("docs") or [] if isinstance(x, dict) and x.get("id")]
+    if exact:  # только с тем же названием: самый известный из найденных бывает совсем другим фильмом
+        cands = [c for c in cands if _same_name(name, c)]
     if year:
         cands = [c for c in cands if c.get("year") in (year - 1, year, year + 1)] or cands
     if not cands:
@@ -2007,10 +2120,10 @@ def renamed(film: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",
-                          upcoming: bool = False) -> tuple[dict[str, Any] | None, str]:
+                          upcoming: bool = False, exact: bool = False) -> tuple[dict[str, Any] | None, str]:
     """find_film, а если Кинопоиск не нашёл — ИИ по интернету и Telegram-каналам узнаёт, как фильм называется
     официально («Глиноликий» → «Клейфейс» / Clayface 2026), и ищем снова. (фильм | None, заметка автору)."""
-    film = await find_film(fetch, query, upcoming)
+    film = await find_film(fetch, query, upcoming, exact)
     if film or not ai.available(gemini_key) or query.startswith("id:"):
         return film, ""
     name = re.sub(r"[\s(]+(19\d\d|20\d\d)\)?$", "", query).strip()
@@ -2019,7 +2132,7 @@ async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",
         y = f" {guess['year']}" if guess["year"] else ""
         for q in dict.fromkeys(x for x in (guess["ru"] + y, guess["en"] + y, guess["ru"], guess["en"]) if x.strip()):
             try:
-                film = await find_film(fetch, q, upcoming)
+                film = await find_film(fetch, q, upcoming, exact)
             except Exception as exc:  # noqa: BLE001
                 log.warning("shorts: film lookup %r failed: %s", q, exc)
                 continue
@@ -2048,7 +2161,14 @@ async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list
     if not CUSTOM_MIN <= len(film_ids) <= CUSTOM_MAX:
         raise RuntimeError(f"в подборке должно быть от {CUSTOM_MIN} до {CUSTOM_MAX} фильмов")
     await _progress(5, "Загружаю фильмы")
-    films = [await fetch(f"/movie/{i}") for i in film_ids]
+    films = []
+    for i in film_ids:  # фильм с TMDB («tmdb:movie:123») — его нет на Кинопоиске
+        film = (await tmdb.kp_like_by_id(tmdb_key, str(i)) if str(i).startswith(tmdb.TMDB_PREFIX)
+                else await fetch(f"/movie/{i}"))
+        if film:
+            films.append(film)
+    if len(films) < CUSTOM_MIN:
+        raise RuntimeError("не загрузились карточки фильмов — попробуй ещё раз")
     result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips,
                                notes, user_media, gemini_key)
     add_english_seo(result)
@@ -2112,7 +2232,6 @@ def build_birthday_seo(name: str, en: str, age: int, films: list[dict[str, Any]]
         *[f"{len(films) - i}. {t}" + (f" ({str(f.get('release_date'))[:4]})" if f.get("release_date") else "")
           for i, (t, f) in enumerate(zip(names, films))], "",
         "А какой фильм твой любимый? Пиши в комментариях 👇", "",
-        f"📺 YouTube: {YOUTUBE_URL}",
         f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", "",
         "#деньрождения #кино #KinoMir360",
     ])
@@ -2350,8 +2469,10 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
                 overlay = card_overlay(_title(f), i, n, rating, src or "IMDb", _actors(f), badge, place=n - i + 1)
                 overlay.save(work / f"overlay{i}.png")
                 video = {"clip": clip, "overlay": f"overlay{i}.png"}
+            # у сериала с новым сезоном под карточкой — «4-й сезон», а не год старта (2022)
+            season = re.search(r"(\d{1,2})[-‑]?(?:й|ый|ий)?\s+сезон", notes[i - 1] if notes and i <= len(notes) else "")
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
-                                             str(f.get("year") or "")] if x)
+                                             f"{season.group(1)}-й сезон" if season else str(f.get("year") or "")] if x)
             rows = info_rows(f)
             f["_awards"] = wiki.awards_line(await wiki.awards(f))
             if f["_awards"]:

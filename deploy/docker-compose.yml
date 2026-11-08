@@ -35,6 +35,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # бот жив, если раз в 30 с обновляет /tmp/vkino_alive; нет — автообновление откатит версию
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(time.time() - os.path.getmtime('/tmp/vkino_alive') > 120)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     logging:
       options: {max-size: "10m", max-file: "3"}
 

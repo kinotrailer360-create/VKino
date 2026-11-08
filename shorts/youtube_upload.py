@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -89,10 +90,17 @@ def _tags(raw: str) -> list[str]:
     return out
 
 
+def no_links(text: str) -> str:
+    """В описании канала ссылки запрещены (YouTube отклоняет или прячет их): «https://t.me/x» → «t.me/x»,
+    ссылки на сам YouTube убираем целиком."""
+    lines = [ln for ln in text.splitlines() if not re.search(r"(?:youtube\.com|youtu\.be)/", ln)]
+    return re.sub(r"https?://(?:www\.)?", "", "\n".join(lines))
+
+
 async def upload(token: str, video: Path, seo: dict[str, str], privacy: str = "public") -> dict[str, Any]:
     """Загрузить ролик; {"id", "privacy"} — privacy может оказаться private, пока проект Google не прошёл аудит."""
     meta = {
-        "snippet": {"title": seo.get("title", "")[:100], "description": seo.get("description", "")[:4900],
+        "snippet": {"title": seo.get("title", "")[:100], "description": no_links(seo.get("description", ""))[:4900],
                     "tags": _tags(seo.get("tags", "")), "categoryId": "1", "defaultLanguage": "ru"},
         "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }

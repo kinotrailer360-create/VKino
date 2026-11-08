@@ -52,10 +52,14 @@ async def resolve(fetch: Fetch, films: list[dict[str, Any]]) -> list[dict[str, A
         for name in (f.get("ru"), f.get("en")):
             if name:
                 queries.append(f"{name} {f['year']}" if f.get("year") else str(name))
+        if f.get("year"):  # с годом не нашлось (год у автора мог быть годом сезона) — просто по названию
+            queries += [str(n) for n in (f.get("ru"), f.get("en")) if n]
         found = None
         for q in queries:
             try:
-                found = await find_film(fetch, q)
+                # «сериал» в запросе — сериал первым; новинка — сначала этого года и позже, а не классика
+                found = await find_film(fetch, f"{q} сериал" if f.get("series") else q,
+                                        upcoming=bool(f.get("fresh")) and not f.get("year"), exact=True)
             except Exception as exc:  # noqa: BLE001
                 log.warning("shorts: film lookup %r failed: %s", q, exc)
             if found:
@@ -77,6 +81,7 @@ def parse_plan(text: str) -> tuple[str, list[dict[str, Any]]]:
     films = []
     for r in rows[1:]:
         r = re.sub(r"\s*[—–-]\s*(✅|❌).*$", "", r)  # строка из нашего же списка с пометкой «— ✅ найден …»
+        r = re.sub(r"\s*·\s*TMDB\s*$", "", r)  # «Название (2025) · TMDB» — фильм с TMDB из нашего списка
         m = re.search(r"[\s(]+(19\d\d|20\d\d)\)?$", r)
         films.append({"ru": r[: m.start()].strip() if m else r, "en": "", "year": int(m.group(1)) if m else None})
     return rows[0], films

@@ -26,7 +26,6 @@ from .daily import (
     ASSETS,
     ROOT,
     TELEGRAM_URL,
-    YOUTUBE_URL,
     Fetch,
     ShortResult,
     Theme,
@@ -274,7 +273,6 @@ def build_review_seo(film: dict[str, Any], script: dict[str, Any], chapters: lis
     if actors:
         lines.append("В ролях: " + ", ".join(actors))
     lines += ["", "А тебе как фильм? Пиши в комментариях 👇", "",
-              f"📺 YouTube: {YOUTUBE_URL}",
               f"✈️ Telegram: {TELEGRAM_URL} — новинки, трейлеры и подборки каждый день", ""]
     name_tag = re.sub(r"[^\wё]", "", t.lower().replace(" ", ""))
     lines.append(" ".join(f"#{h}" for h in ["обзор", "обзорфильма", name_tag, "кино", "KinoMir360"] if h))
