@@ -459,7 +459,7 @@ def _json_from(text: str) -> Any:
 # у бесплатного Groq лимит ~7000 токенов в минуту (≈ 4 символа на токен по-русски): длинный материал
 # (статья Википедии, посты каналов) сокращаем — начало с заданием и конец с форматом ответа остаются
 RESERVE_MAX_CHARS = 16000
-LUMEAN_MAX_CHARS = 24000  # потолок задания для платной модели Lumean
+LUMEAN_MAX_CHARS = 60000  # потолок задания для платной модели Lumean — только от сбоя (обычное задание меньше)
 
 
 def _fit(prompt: str, limit: int = RESERVE_MAX_CHARS) -> str:
@@ -965,10 +965,6 @@ POST_STYLE = """🏜 ФИНАЛЬНЫЙ ТРЕЙЛЕР «ДЮНЫ 3»!
 #Дюна3 #DunePartThree #Вильнёв #ТимотиШаламе #Зендея #Трейлер #КиноНовости"""
 
 
-WRITE_POSTS_MAX = 28  # постов-кандидатов в одном запросе
-WRITE_POST_CHARS = 450  # символов от каждого — заголовок и суть
-
-
 def _clip(text: str, limit: int) -> str:
     """Начало текста до limit символов по границе слова."""
     text = re.sub(r"\s+", " ", text or "").strip()
@@ -982,10 +978,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     {"post": текст, "topic": тема, "media": [номера постов о той же новости — оттуда фото/видео]} или None."""
     if not available(key) or not posts:
         return None
-    # экономия токенов: ИИ выбирает новость — для этого хватает начала поста (заголовок и суть), а целиком
-    # материал нужного поста бот передаёт дальше сам; раньше уходило до 45 постов × 700 символов
-    posts = posts[:WRITE_POSTS_MAX]
-    listing = "\n\n".join(f"{i}. [{p.get('label') or 't.me/' + p['channel']}]\n{_clip(p['text'], WRITE_POST_CHARS)}"
+    # посты целиком: по ним же пишется сам пост — урезать нельзя, иначе ИИ видит только начало новости
+    listing = "\n\n".join(f"{i}. [{p.get('label') or 't.me/' + p['channel']}]\n{p['text']}"
                           for i, p in enumerate(posts, 1))
     foreign = any(p.get("lang") == "en" for p in posts)
     rules = (
@@ -1410,7 +1404,7 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
 
 
 VERIFY_RULES_CHARS = 1500  # начало задания (что за пост) — фактчекеру для контекста
-VERIFY_MATERIAL_CHARS = 5000  # материалы о той же новости
+VERIFY_MATERIAL_CHARS = 8000  # материалы о той же новости (все посты о ней обычно влезают)
 
 
 def _relevant_task(task: str, post: str) -> str:
