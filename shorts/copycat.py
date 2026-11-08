@@ -81,6 +81,7 @@ def parse_plan(text: str) -> tuple[str, list[dict[str, Any]]]:
     films = []
     for r in rows[1:]:
         r = re.sub(r"\s*[—–-]\s*(✅|❌).*$", "", r)  # строка из нашего же списка с пометкой «— ✅ найден …»
+        r = re.sub(r"\s*·\s*TMDB\s*$", "", r)  # «Название (2025) · TMDB» — фильм с TMDB из нашего списка
         m = re.search(r"[\s(]+(19\d\d|20\d\d)\)?$", r)
         films.append({"ru": r[: m.start()].strip() if m else r, "en": "", "year": int(m.group(1)) if m else None})
     return rows[0], films

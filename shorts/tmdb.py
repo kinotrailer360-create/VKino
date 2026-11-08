@@ -357,6 +357,80 @@ async def movie(key: str, tmdb_id: int) -> dict[str, Any] | None:
     return _movie_row(data) if data.get("id") else None
 
 
+TMDB_PREFIX = "tmdb:"  # id фильма с TMDB в подборке («tmdb:movie:123»), а не с Кинопоиска
+
+
+def _kp_like(kind: str, d: dict[str, Any]) -> dict[str, Any]:
+    """Карточка TMDB в том же виде, что карточка Кинопоиска (поля, которые читает сборка шортса)."""
+    date = str(d.get("release_date") or d.get("first_air_date") or "")
+    cast = ((d.get("credits") or {}).get("cast") or [])[:8]
+    crew = [c for c in (d.get("credits") or {}).get("crew") or [] if c.get("job") == "Director"][:2]
+    overview = re.sub(r"\s+", " ", str(d.get("overview") or "")).strip()
+    return {
+        "id": f"{TMDB_PREFIX}{kind}:{d['id']}",
+        "name": str(d.get("title") or d.get("name") or ""),
+        "alternativeName": str(d.get("original_title") or d.get("original_name") or ""),
+        "enName": str(d.get("original_title") or d.get("original_name") or ""),
+        "year": int(date[:4]) if date[:4].isdigit() else None,
+        "poster": {"url": f"{IMG}w780{d['poster_path']}"} if d.get("poster_path") else None,
+        "backdrop": {"url": f"{IMG}w1280{d['backdrop_path']}"} if d.get("backdrop_path") else None,
+        "rating": {"tmdb": round(float(d.get("vote_average") or 0), 1)} if int(d.get("vote_count") or 0) >= 20 else {},
+        "genres": [{"name": str(g.get("name") or "")} for g in d.get("genres") or [] if g.get("name")],
+        "persons": [{"name": str(c.get("name") or ""), "enProfession": "actor"} for c in cast if c.get("name")]
+        + [{"name": str(c.get("name") or ""), "enProfession": "director"} for c in crew if c.get("name")],
+        "description": overview, "shortDescription": overview[:160],
+        "externalId": {"tmdb": int(d["id"])}, "isSeries": kind == "tv", "type": "tv-series" if kind == "tv" else "movie",
+        "premiere": {"world": date} if date else {},
+    }
+
+
+async def kp_like_by_id(key: str, ref: str) -> dict[str, Any] | None:
+    """«tmdb:movie:123» → карточка в виде Кинопоиска (с актёрами и рейтингом TMDB)."""
+    try:
+        kind, tid = ref[len(TMDB_PREFIX):].split(":", 1)
+    except ValueError:
+        return None
+    if kind not in ("movie", "tv") or not tid.isdigit() or not key:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        d = await _get(session, key, f"/{kind}/{tid}", language="ru-RU", append_to_response="credits")
+    return _kp_like(kind, d) if d.get("id") else None
+
+
+async def find_kp_like(key: str, names: list[str], year: int | None = None, series: bool | None = None,
+                       fresh: bool = False) -> dict[str, Any] | None:
+    """Фильма нет на Кинопоиске — ищем на TMDB (точное название, тип и год, новинка — из новых):
+    карточка в виде Кинопоиска или None."""
+    names = [n for n in names if n and n.strip()]
+    if not key or not names:
+        return None
+    kinds = ["tv"] if series else ["movie"] if series is False else ["movie", "tv"]
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for name in names:
+            for kind in kinds:
+                data = await _get(session, key, f"/search/{kind}", query=name, language="ru-RU")
+                hits = []
+                for r in data.get("results") or []:
+                    titles = [r.get(k) for k in ("title", "original_title", "name", "original_name") if r.get(k)]
+                    if not any(similar(name, str(t)) >= 0.85 for t in titles):
+                        continue
+                    y = str(r.get("release_date") or r.get("first_air_date") or "")[:4]
+                    y = int(y) if y.isdigit() else 0
+                    if year and y and abs(y - year) > 1:
+                        continue
+                    hits.append((y, r))
+                if fresh and not year:
+                    hits.sort(key=lambda h: -h[0])  # новинка — самая новая из одноимённых
+                else:
+                    hits.sort(key=lambda h: -float(h[1].get("popularity") or 0))
+                if hits:
+                    d = await _get(session, key, f"/{kind}/{hits[0][1]['id']}", language="ru-RU",
+                                   append_to_response="credits")
+                    if d.get("id"):
+                        return _kp_like(kind, d)
+    return None
+
+
 async def popular_pool(key: str, page: int = 1) -> list[dict[str, Any]]:
     """Известные фильмы (много голосов, рейтинг 7+) — запас для викторины, если Кинопоиск не ответил.
     Строки как у _movie_row + "genres" (id жанров TMDB)."""
