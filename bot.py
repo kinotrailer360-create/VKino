@@ -9660,7 +9660,9 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
         await state.set_state(CustomState.text)
         return
     await wait.delete()
-    notes = [f["note"] for f in plan["films"]]
+    # сериал с номером сезона: голос говорит, что это новый сезон, а не «сериал 2022 года»
+    notes = [(f"{f['season']}-й сезон. " if f.get("season") and "сезон" not in f["note"].lower() else "") + f["note"]
+             for f in plan["films"]]
     await state.update_data(cs_title=plan["title"], cs_items=items, cs_notes=notes)
     found = [(it, note) for it, note in zip(items, notes) if it["id"]]
     rows = [f"🎯 <b>{escape(plan['title'])}</b>", ""]

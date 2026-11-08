@@ -2469,8 +2469,10 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
                 overlay = card_overlay(_title(f), i, n, rating, src or "IMDb", _actors(f), badge, place=n - i + 1)
                 overlay.save(work / f"overlay{i}.png")
                 video = {"clip": clip, "overlay": f"overlay{i}.png"}
+            # у сериала с новым сезоном под карточкой — «4-й сезон», а не год старта (2022)
+            season = re.search(r"(\d{1,2})[-‑]?(?:й|ый|ий)?\s+сезон", notes[i - 1] if notes and i <= len(notes) else "")
             caption = " • ".join(x for x in [", ".join(_genres(f)[:2]).capitalize(),
-                                             str(f.get("year") or "")] if x)
+                                             f"{season.group(1)}-й сезон" if season else str(f.get("year") or "")] if x)
             rows = info_rows(f)
             f["_awards"] = wiki.awards_line(await wiki.awards(f))
             if f["_awards"]:
