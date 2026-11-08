@@ -477,3 +477,33 @@ def test_season_number_is_ordinal():
     assert pronounce.numbers("во 2 сезоне") == "во втором сезоне"
     assert pronounce.numbers("3 часть") == "третья часть"
     assert pronounce.numbers("2 сезона подряд") == "2 сезона подряд"  # «два сезона» — не трогаем
+
+
+def test_title_numbers_and_wednesday_stress():
+    from shorts import pronounce
+    assert pronounce.numbers("сиквел фильма «1408»") == "сиквел фильма «четырнадцать ноль восемь»"
+    assert pronounce.numbers("в 1408 году") == "в 1408 году"  # год — не название
+    assert pronounce.numbers("14080 долларов") == "14080 долларов"
+    assert pronounce.apply("выйдет в среду") == "выйдет в сре́ду"
+
+
+def test_spoken_form_is_cached(tmp_path, monkeypatch):
+    """Переозвучка: неизменная фраза даёт тот же текст для голоса без нового запроса к ИИ."""
+    import asyncio
+    from shorts import ai, daily
+    monkeypatch.setattr(daily, "SPOKEN_CACHE", tmp_path / "spoken.json")
+    calls = []
+
+    async def fake(texts, key=None, premium=False):
+        calls.append(list(texts))
+        return [t + " (ИИ)" for t in texts]
+
+    async def no_accent(texts):
+        return texts
+
+    monkeypatch.setattr(ai, "spoken_form", fake)
+    monkeypatch.setattr(daily, "_accent", no_accent)
+    first = asyncio.run(daily.spoken_lines(["Привет", "Пока"], careful=True))
+    second = asyncio.run(daily.spoken_lines(["Привет", "Пока", "Новая"], careful=True))
+    assert second[:2] == first
+    assert calls == [["Привет", "Пока"], ["Новая"]]

@@ -601,6 +601,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     cuts: list[list[Any]] = []  # [начало, конец, заголовок] каждой новости — для «✂️ Нарезать на шортсы»
     clock = 0.0
     notes: list[str] = []
+    phrases: list[list[Any]] = []  # [секунда в выпуске, текст фразы] — для «🎙 Переозвучить только звук»
     first_img: Image.Image | None = None
 
     daily.stressed.clear()
@@ -657,6 +658,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     else:
         slides = [(intro_card, dur + 0.4)]
     main_music = musiclib.pick("новости кино") or ASSETS / "music.mp3"  # общая тема выпуска: вступление и финал
+    phrases += [[round(clock + t, 2), line] for t, line in zip(starts, script["intro"])]
     segments.append(await _segment(work, "intro", slides, None, voice, dur + 0.4, main_music))
     clock += dur + 0.4
 
@@ -676,6 +678,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         chapters.append((clock, story.get("chapter") or story["headline"].capitalize()))
         clock += CARD_SEC
         voice, starts, dur, voiced = await _voice(story["lines"], work / f"v{n}")
+        phrases += [[round(clock + t, 2), line] for t, line in zip(starts, story["lines"])]
         if not voiced and not notes:
             notes.append(daily.no_voice_note(voiced))
         paths = await asyncio.to_thread(save_slides, imgs, f"st{n}") or [card]
@@ -691,6 +694,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
 
     await daily._progress(84, "Финал выпуска")
     voice, starts, dur, voiced = await _voice(script["outro"], work / "v_outro")
+    phrases += [[round(clock + t, 2), line] for t, line in zip(starts, script["outro"])]
     outro_card = work / "outro_card.jpg"
     # «Спасибо, что смотрите!» говорит анимированная концовка — здесь вопрос зрителям, без повтора
     await asyncio.to_thread(card_file, first_img, "НОВЫЕ ВЫПУСКИ ПО СРЕДАМ И ВОСКРЕСЕНЬЯМ",
@@ -740,6 +744,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     await asyncio.to_thread(lambda: thumbnail(first_img, stories[0]["headline"], date_label).save(cover, quality=92))
     seo = build_seo(script, chapters, date_label)
     seo["cuts"] = json.dumps(cuts, ensure_ascii=False)
+    seo["phrases"] = json.dumps(phrases, ensure_ascii=False)
     if notes:
         seo["warning"] = "\n".join(notes)
     if daily.voice_issues:  # контроль озвучки: места, где распознавание услышало не то, что в тексте
