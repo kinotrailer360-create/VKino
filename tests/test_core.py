@@ -269,3 +269,17 @@ def test_amazon_stress():
     from shorts import pronounce
     assert "Амазо́н" in pronounce.apply("премьера на Amazon")
     assert "Амазо́не" in pronounce.apply("вышел на Амазоне")
+
+
+def test_budget_blocks_at_limit(monkeypatch, tmp_path):
+    from datetime import date
+
+    from shorts import budget, usage
+    month = date.today().isoformat()
+    monkeypatch.setattr(usage, "FILE", tmp_path / "usage.json")
+    monkeypatch.setattr(usage, "_cache", {month: {"usd": 7.9}})
+    monkeypatch.setattr(budget, "MONTHLY_USD", 10.0)
+    assert budget.allow(0.045)
+    assert "⚠️" in budget.charge(0.2, "test")  # перешли 80 %
+    usage._cache[month]["usd"] = 9.99
+    assert not budget.allow(0.045)

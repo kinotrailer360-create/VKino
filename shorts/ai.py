@@ -1177,6 +1177,50 @@ async def hero_films(key: str, lines: list[str], main: str = "") -> list[dict[st
     return out[:4]
 
 
+async def _image_model(session: aiohttp.ClientSession, key: str) -> str:
+    """Модель Gemini, которая рисует картинки (Flash Image), — по списку моделей, доступных ключу, а не по
+    зашитому имени: имена у Google меняются. Нет такой — "" (у бесплатного ключа её обычно нет)."""
+    async with session.get(MODELS, params={"pageSize": 200}, headers={"x-goog-api-key": key}) as resp:
+        data = await resp.json(content_type=None)
+    names = [str(m.get("name", "")).removeprefix("models/") for m in (data.get("models") or [])
+             if "generateContent" in (m.get("supportedGenerationMethods") or [])] if isinstance(data, dict) else []
+    found = [n for n in names if n.startswith("gemini-") and "flash" in n and "image" in n]
+    return sorted(found, key=lambda n: (_version(n), "preview" not in n, "lite" not in n), reverse=True)[0] \
+        if found else ""
+
+
+async def generate_illustration(key: str, topic: str, film: str = "") -> bytes | None:
+    """Оригинальная атмосферная иллюстрация 16:9 к новости, когда настоящего фото нет: без лиц реальных людей,
+    без текста, логотипов и подделки постеров или кадров. PNG/JPEG-байты или None (модель недоступна, лимит)."""
+    if not key:
+        return None
+    prompt = (
+        "Create an original atmospheric illustration (16:9) for a short cinema news post. "
+        f"Theme: {topic[:300]}" + (f" (film or series: {film[:80]})" if film else "") + ". "
+        "Symbolic, moody, cinematic lighting. STRICT RULES: no text, letters or logos; no recognizable real "
+        "people or celebrity likeness; do not imitate an official movie poster or a still from the film; "
+        "no watermarks. It must look like an illustration, not a photo.")
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"], "imageConfig": {"aspectRatio": "16:9"}}}
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        model = await _image_model(session, key)
+        if not model:
+            log.info("shorts: no Gemini image model for this key")
+            return None
+        status, data = await _post(session, key, model, body, wait_minute=False)
+    if status != 200:
+        log.warning("shorts: illustration failed (HTTP %s): %s", status, str(data)[:300])
+        return None
+    for cand in (data.get("candidates") or []) if isinstance(data, dict) else []:
+        for part in ((cand.get("content") or {}).get("parts") or []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                import base64
+                return base64.b64decode(inline["data"])
+    return None
+
+
 async def screen_labels(key: str, lines: list[str], title: str = "") -> list[str]:
     """Крупные надписи на экране шортса — по одной на фразу озвучки: 2–4 слова КАПСОМ, цепляют и не повторяют
     фразу дословно («ЗАБУДЬТЕ ПРО ЙОВОВИЧ!», «ОБЫЧНЫЙ КУРЬЕР. СТРАШНАЯ НОЧЬ»). Пусто — у фразы без надписи."""
