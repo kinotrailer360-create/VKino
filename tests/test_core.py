@@ -469,3 +469,11 @@ def test_fact_check_gets_only_related_materials():
     assert "Вильнёв снимет «Дюна 3»" in got and "Бэтмен" not in got
     assert len(got) < len(task) // 2
     assert ai._clip("слово " * 200, 50).endswith("…") and len(ai._clip("слово " * 200, 50)) <= 51
+
+
+def test_season_number_is_ordinal():
+    from shorts import pronounce
+    assert pronounce.numbers("4 сезон на HBO") == "четвёртый сезон на HBO"
+    assert pronounce.numbers("во 2 сезоне") == "во втором сезоне"
+    assert pronounce.numbers("3 часть") == "третья часть"
+    assert pronounce.numbers("2 сезона подряд") == "2 сезона подряд"  # «два сезона» — не трогаем
