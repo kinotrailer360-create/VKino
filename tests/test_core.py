@@ -447,7 +447,13 @@ def test_fsm_storage_rejects_non_json():
         asyncio.run(s.set_data(StorageKey(bot_id=1, chat_id=1, user_id=1), {"img": b"\x89PNG"}))
 
 
+SERVER_005 = "47c3808c9f7e2ad57b115535951869ce3cdd48caa9d5c3dc12eb135b5372c203"
+
+
 def test_history_key_is_hash_not_long_value():
     from shorts import migrations
-    sql = next(m[2] for m in migrations.MIGRATIONS if m[0] == 5)
+    sql = next(m[2] for m in migrations.MIGRATIONS if m[0] == 7)
     assert "PRIMARY KEY (kind, vhash)" in sql and "md5(value)" in sql  # длинный сюжет не влезал в индекс
+    # 005 — ровно в том виде, в каком применена на сервере (её контрольная сумма записана в schema_version)
+    v5 = next(m for m in migrations.MIGRATIONS if m[0] == 5)
+    assert migrations.checksum(v5[2], v5[3]) == SERVER_005

@@ -150,11 +150,8 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             kind TEXT NOT NULL,
             pos BIGINT NOT NULL,
             value TEXT NOT NULL,
-            -- ключ — отпечаток значения: сюжет (JSON со словами новости) бывает длиннее 2,7 КБ, а столько
-            -- не влезает в индекс PostgreSQL (на сервере так упал первый запуск миграции 005)
-            vhash TEXT GENERATED ALWAYS AS (md5(value)) STORED,
             added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (kind, vhash)
+            PRIMARY KEY (kind, value)
         );
         CREATE INDEX IF NOT EXISTS idx_ai_post_history_kind ON ai_post_history(kind, pos);
     """, _copy_history),
@@ -172,6 +169,13 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             settled_at TIMESTAMPTZ
         );
         CREATE INDEX IF NOT EXISTS idx_ai_usage_month ON ai_usage(pool, created_at);
+    """, None),
+    # 007 — ключ истории по отпечатку значения: «сюжет» (JSON со словами новости) бывает длиннее 2,7 КБ, а такое
+    # значение не влезает в индекс PostgreSQL — запись истории падала бы. 005 уже применена на сервере, её не трогаем
+    (7, "ai_post_history: ключ (kind, md5(value))", """
+        ALTER TABLE ai_post_history ADD COLUMN IF NOT EXISTS vhash TEXT GENERATED ALWAYS AS (md5(value)) STORED;
+        ALTER TABLE ai_post_history DROP CONSTRAINT IF EXISTS ai_post_history_pkey;
+        ALTER TABLE ai_post_history ADD PRIMARY KEY (kind, vhash);
     """, None),
 ]
 
