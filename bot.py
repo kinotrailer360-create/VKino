@@ -49,9 +49,10 @@ from aiogram.types import (
     WebAppInfo,
 )
 from dotenv import load_dotenv
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from shorts import ai as shorts_ai
+from shorts import budget as shorts_budget
 from shorts import narrator as shorts_narrator
 from shorts import yttrailers as shorts_yttrailers
 from shorts import tgsearch as shorts_tgsearch
@@ -8066,6 +8067,7 @@ async def ai_status_action(message: Message) -> None:
         rows.append("ИИ за 7 дней на что: " + ", ".join(
             f"{escape(t)} — {n}" for t, n in sorted(week.items(), key=lambda kv: -kv[1])[:6]))
     rows.append("Цену символа и запроса смотри в кабинете Lumean — так можно посчитать стоимость ролика.")
+    rows.append(shorts_budget.status_line())
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
@@ -10454,6 +10456,51 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
     return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
 
 
+async def _illustration(res: dict[str, Any], work: Path, checks: list[str]) -> list[Path]:
+    """Подходящего реального фото нет — оригинальная иллюстрация от ИИ (не фото, не постер, без лиц реальных
+    людей) с пометкой «Иллюстрация · ИИ» на самой картинке. Только в пределах месячного лимита; выключается
+    в «🖼 Фото к новостям»."""
+    if await shorts_setting("illustrations") == "off":
+        return []
+    if not shorts_budget.allow(shorts_budget.IMAGE_USD):
+        checks.append("🎨 картинку ИИ не рисую: месячный лимит исчерпан — " + shorts_budget.status_line())
+        return []
+    try:
+        raw = await shorts_ai.generate_illustration(GEMINI_API_KEY, res.get("topic") or res["post"][:300],
+                                                    res.get("film_en") or res.get("film") or "")
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: illustration failed: %s", exc)
+        raw = None
+    if not raw:
+        checks.append("🎨 нарисовать иллюстрацию не вышло (у ключа Gemini нет модели картинок — она только на "
+                      "платном тарифе Google) — пост без фото, добавь кнопкой")
+        return []
+    warn = shorts_budget.charge(shorts_budget.IMAGE_USD, "иллюстрация к посту")
+
+    def mark() -> Path:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        d = ImageDraw.Draw(img)
+        size = max(18, img.width // 40)
+        try:
+            font = ImageFont.truetype(str(shorts_daily.ASSETS / "Montserrat.ttf"), size)
+        except OSError:
+            font = ImageFont.load_default()
+        text = "Иллюстрация · ИИ"
+        w = d.textlength(text, font=font)
+        pad = size // 2
+        box = (pad, img.height - size * 2 - pad, pad + w + size, img.height - pad)
+        d.rounded_rectangle(box, radius=size // 2, fill=(0, 0, 0))
+        d.text((box[0] + size // 2, box[1] + size // 2), text, font=font, fill=(255, 255, 255))
+        out = work / "illustration.jpg"
+        img.save(out, quality=92)
+        return out
+
+    path = await asyncio.to_thread(mark)
+    checks.append(f"🎨 реального фото нет — ИИ нарисовал иллюстрацию (≈{shorts_budget.IMAGE_USD:.3f}$, "
+                  "помечена на картинке). Замени, если найдёшь фото" + (f"\n{warn}" if warn else ""))
+    return [path]
+
+
 async def _tmdb_media_urls(res: dict[str, Any]) -> list[str]:
     """Картинки из базы фильмов по названию — точно «те»: портрет человека из новости (смерть, интервью,
     роль) и рядом постер фильма («кто озвучит Дума» — актёр и «Мстители»)."""
@@ -10781,6 +10828,8 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 checks.append("режим «фото из базы фильмов»: постер/портрет TMDB")
             else:
                 files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
+            if not files:  # ни фото из новости, ни постера в базе — картинку рисует ИИ (помечена как иллюстрация)
+                files = await _illustration(res, work, checks)
             caption = post_caption(res["post"], "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
             # достоверность — автору под постом: слух в канале должен звучать как слух
@@ -13187,20 +13236,29 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
         _run_job(list_job)
         return
-    if action in ("pmode", "pmode:live", "pmode:db"):
-        if action != "pmode":
+    if action in ("pmode", "pmode:live", "pmode:db", "pmode:art"):
+        if action == "pmode:art":
+            await set_shorts_setting("illustrations",
+                                     None if await shorts_setting("illustrations") == "off" else "off")
+        elif action != "pmode":
             await set_shorts_setting("post_media", "db" if action == "pmode:db" else None)
         db = await shorts_setting("post_media") == "db"
+        art = await shorts_setting("illustrations") != "off"
         await message.answer(
             "🖼 <b>Фото к новостям</b>\n\n"
             f"{'⚪️' if db else '🟢'} <b>Из новости</b> — фото и видео из поста-источника (кадры со съёмок, ролики, "
             "альбомы), если ИИ подтвердил, что они о той же новости; иначе постер из базы фильмов.\n"
             f"{'🟢' if db else '⚪️'} <b>Из базы фильмов</b> — всегда постер фильма и портрет человека из базы TMDB: "
             "чужих фото почти не бывает, но меньше живых кадров и видео. Видео трейлера к новости о трейлере "
-            "остаётся.",
+            "остаётся.\n\n"
+            f"🎨 <b>Картинка ИИ</b> ({'вкл' if art else 'выкл'}) — если ни фото, ни постера не нашлось, ИИ рисует "
+            "иллюстрацию (без лиц реальных людей, не постер) с пометкой «Иллюстрация · ИИ». "
+            f"≈{shorts_budget.IMAGE_USD:.3f}$ за картинку, лимит {shorts_budget.MONTHLY_USD:.0f}$ в месяц.\n"
+            + shorts_budget.status_line(),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn(("✅ " if not db else "") + "Из новости", "pt:pmode:live"),
                  _btn(("✅ " if db else "") + "Из базы фильмов", "pt:pmode:db")],
+                [_btn(("✅ " if art else "") + "🎨 Картинка ИИ, если фото нет", "pt:pmode:art")],
                 [_btn("⬅️ Назад", "pt:sec:news")]]))
         return
     if action == "auto":

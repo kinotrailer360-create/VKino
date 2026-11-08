@@ -304,3 +304,17 @@ def test_check_claims_parses_and_failure_is_review_required(monkeypatch):
     monkeypatch.setattr(ai, "_post_json", broken)
     assert asyncio.run(ai.check_claims("k", "пост")) is None
     assert "не состоялась" in ai.claims_summary(None)
+
+
+def test_budget_blocks_at_limit(monkeypatch, tmp_path):
+    from datetime import date
+
+    from shorts import budget, usage
+    month = date.today().isoformat()
+    monkeypatch.setattr(usage, "FILE", tmp_path / "usage.json")
+    monkeypatch.setattr(usage, "_cache", {month: {"usd": 7.9}})
+    monkeypatch.setattr(budget, "MONTHLY_USD", 10.0)
+    assert budget.allow(0.045)
+    assert "⚠️" in budget.charge(0.2, "test")  # перешли 80 %
+    usage._cache[month]["usd"] = 9.99
+    assert not budget.allow(0.045)
