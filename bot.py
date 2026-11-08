@@ -10718,9 +10718,12 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 checks.append("режим «фото из базы фильмов»: постер/портрет TMDB")
             else:
                 files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
+            illustrated = False
             if not files:  # ни фото из новости, ни постера в базе — картинку рисует ИИ (помечена как иллюстрация)
                 files = await _illustration(res, work, checks)
-            caption = post_caption(res["post"], "#новости")
+                illustrated = bool(files)
+            # у нарисованной картинки — видимая подпись в самом посте, а не только плашка на картинке
+            caption = post_caption(res["post"] + ("\n\n🎨 иллюстрация" if illustrated else ""), "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
             # достоверность — автору под постом: слух в канале должен звучать как слух
             status = {"official": "✅ официально (студия, сервис или сам человек)",
