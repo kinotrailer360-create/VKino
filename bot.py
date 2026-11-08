@@ -1022,44 +1022,6 @@ async def init_db() -> None:
                 text TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
-            -- черновики постов для канала (раньше — JSON в shorts_settings.posts_meta): статус публикации
-            -- меняется одним UPDATE, поэтому двойное нажатие или перезапуск бота не дают двух публикаций
-            CREATE TABLE IF NOT EXISTS ai_drafts (
-                chat_id BIGINT NOT NULL,
-                first_id BIGINT NOT NULL,
-                meta JSONB NOT NULL,
-                status TEXT NOT NULL DEFAULT 'draft',
-                claimed_at TIMESTAMPTZ,
-                published_at TIMESTAMPTZ,
-                published_by BIGINT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (chat_id, first_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_ai_drafts_time ON ai_drafts(created_at);
-            -- проверка фактов поста: утверждение, статус, источники
-            CREATE TABLE IF NOT EXISTS ai_claims (
-                chat_id BIGINT NOT NULL,
-                first_id BIGINT NOT NULL,
-                idx INT NOT NULL,
-                claim TEXT NOT NULL,
-                status TEXT NOT NULL,
-                sources JSONB NOT NULL DEFAULT '[]',
-                note TEXT NOT NULL DEFAULT '',
-                checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (chat_id, first_id, idx)
-            );
-            -- журнал: кто и что сделал с постом (черновик, проверка, публикация, ошибка)
-            CREATE TABLE IF NOT EXISTS ai_audit_log (
-                id BIGSERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                first_id BIGINT NOT NULL,
-                actor BIGINT,
-                action TEXT NOT NULL,
-                details JSONB NOT NULL DEFAULT '{}',
-                at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_ai_audit_post ON ai_audit_log(chat_id, first_id, at);
             """
         )
     logging.info("PostgreSQL connected")
@@ -10194,34 +10156,14 @@ async def save_post(chat_id: int, ids: list[int], kind: str, poll: list[str] | N
                     question: str = POLL_QUESTION, quiz: dict[str, Any] | None = None,
                     extra: dict[str, Any] | None = None) -> None:
     """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), опрос, викторина;
-    extra — {"button": {"text", "url"}} или {"vote": {"ids", "titles"}}. Хранится в таблице ai_drafts."""
-    meta = {"ids": ids, "kind": kind, "poll": poll or [], "question": question, "quiz": quiz, **(extra or {})}
-    await db().execute(
-        "INSERT INTO ai_drafts (chat_id, first_id, meta) VALUES ($1, $2, $3::jsonb) "
-        "ON CONFLICT (chat_id, first_id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()",
-        chat_id, ids[0], json.dumps(meta, ensure_ascii=False))
-    await audit(chat_id, ids[0], None, "draft", {"kind": kind})
-
-
-async def audit(chat_id: int, first: int, actor: int | None, action: str, details: dict[str, Any] | None = None) -> None:
-    """Запись в журнал действий с постом; ошибка журнала не мешает работе."""
-    try:
-        await db().execute("INSERT INTO ai_audit_log (chat_id, first_id, actor, action, details) "
-                           "VALUES ($1, $2, $3, $4, $5::jsonb)", chat_id, first, actor, action,
-                           json.dumps(details or {}, ensure_ascii=False))
-    except Exception:  # noqa: BLE001
-        logging.exception("Audit log write failed")
+    extra — {"button": {"text", "url"}} или {"vote": {"ids", "titles"}}."""
+    meta = await _json_setting("posts_meta", {})
+    meta[f"{chat_id}:{ids[0]}"] = {"ids": ids, "kind": kind, "poll": poll or [], "question": question,
+                                   "quiz": quiz, **(extra or {})}
+    await set_shorts_setting("posts_meta", json.dumps(dict(list(meta.items())[-80:]), ensure_ascii=False))
 
 
 async def _post_meta(chat_id: int, first: int) -> dict[str, Any]:
-    row = await db().fetchrow("SELECT meta, published_at FROM ai_drafts WHERE chat_id = $1 AND first_id = $2",
-                              chat_id, first)
-    if row:
-        meta = json.loads(row["meta"]) if isinstance(row["meta"], str) else dict(row["meta"])
-        if row["published_at"]:
-            meta["published"] = int(row["published_at"].timestamp())
-        return meta
-    # черновик до переезда в таблицу — из старого JSON
     return (await _json_setting("posts_meta", {})).get(f"{chat_id}:{first}") or {"ids": [first], "kind": "caption",
                                                                                    "poll": []}
 
@@ -10259,44 +10201,32 @@ async def _unqueue(chat_id: int, first: int) -> bool:
     return len(rest) != len(queue)
 
 
+async def _mark_published(chat_id: int, first: int) -> None:
+    meta = await _json_setting("posts_meta", {})
+    key = f"{chat_id}:{first}"
+    shorts_usage.record("tg_posts")  # для недельного отчёта
+    if key in meta:
+        meta[key]["published"] = int(time.time())
+        await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
+
+
+_publishing: set[tuple[int, int]] = set()  # посты, которые публикуются прямо сейчас (двойное нажатие)
+
+
 class AlreadyPublishing(RuntimeError):
     pass
 
 
-PUBLISH_CLAIM = timedelta(minutes=5)  # «публикуется» дольше — публикация оборвалась (перезапуск), можно снова
-
-
-async def _claim_publish(chat_id: int, first: int) -> bool:
-    """Атомарно занять пост для публикации: True — можно публиковать (второе нажатие, кнопка + расписание или
-    повтор после перезапуска получат False, пока идёт первая публикация)."""
-    meta = await _post_meta(chat_id, first)
-    meta.pop("published", None)
-    await db().execute(  # старый черновик (из JSON) — заводим строку, чтобы было что занимать
-        "INSERT INTO ai_drafts (chat_id, first_id, meta) VALUES ($1, $2, $3::jsonb) ON CONFLICT DO NOTHING",
-        chat_id, first, json.dumps(meta, ensure_ascii=False))
-    got = await db().fetchval(
-        "UPDATE ai_drafts SET status = 'publishing', claimed_at = NOW(), updated_at = NOW() "
-        "WHERE chat_id = $1 AND first_id = $2 AND (status <> 'publishing' OR claimed_at < NOW() - $3::interval) "
-        "RETURNING 1", chat_id, first, PUBLISH_CLAIM)
-    return bool(got)
-
-
-async def publish_post(bot: Bot, chat_id: int, first: int, actor: int | None = None) -> None:
-    """Публикация в канал, один раз: занимаем пост в базе (status='publishing'), публикуем, отмечаем
-    'published' (или 'failed'). Повторная публикация того же поста — только после подтверждения автора."""
-    if not await _claim_publish(chat_id, first):
+async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
+    """Обёртка: один и тот же пост не публикуется дважды одновременно (двойное нажатие, кнопка + расписание)."""
+    key = (chat_id, first)
+    if key in _publishing:
         raise AlreadyPublishing("этот пост уже публикуется")
+    _publishing.add(key)
     try:
         await _publish_post(bot, chat_id, first)
-    except Exception as exc:
-        await db().execute("UPDATE ai_drafts SET status = 'failed', updated_at = NOW() "
-                           "WHERE chat_id = $1 AND first_id = $2", chat_id, first)
-        await audit(chat_id, first, actor, "publish_failed", {"error": _safe_err(exc)[:300]})
-        raise
-    await db().execute("UPDATE ai_drafts SET status = 'published', published_at = NOW(), published_by = $3, "
-                       "updated_at = NOW() WHERE chat_id = $1 AND first_id = $2", chat_id, first, actor)
-    shorts_usage.record("tg_posts")  # для недельного отчёта
-    await audit(chat_id, first, actor, "published", {"channel": POST_CHANNEL, "scheduled": actor is None})
+    finally:
+        _publishing.discard(key)
 
 
 async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
@@ -10311,6 +10241,7 @@ async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
             inline_keyboard=[[InlineKeyboardButton(text=button["text"], url=button["url"])]]))
     else:
         await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
+    await _mark_published(chat_id, first)
     vote = meta.get("vote")
     if vote:  # «Выбор подписчиков»: опрос запоминаем — в пятницу бот подведёт итог и сделает пост о победителе
         sent = await bot.send_poll(POST_CHANNEL, VOTE_QUESTION, vote["titles"], is_anonymous=True)
@@ -12878,7 +12809,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             return
     if (kind == "p" or kind == "pf") and arg.isdigit():
         try:
-            await publish_post(message.bot, chat_id, int(arg), callback.from_user.id)
+            await publish_post(message.bot, chat_id, int(arg))
         except AlreadyPublishing:
             await callback.answer("⏳ Уже публикую — секунду")
             return
