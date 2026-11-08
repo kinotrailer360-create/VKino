@@ -269,3 +269,179 @@ def test_amazon_stress():
     from shorts import pronounce
     assert "Амазо́н" in pronounce.apply("премьера на Amazon")
     assert "Амазо́не" in pronounce.apply("вышел на Амазоне")
+
+
+def test_netsafe_blocks_internal_addresses():
+    import asyncio
+
+    import pytest
+
+    from shorts import netsafe
+    for url in ("http://127.0.0.1/", "http://169.254.169.254/latest", "http://10.0.0.5/x", "file:///etc/passwd"):
+        with pytest.raises(netsafe.UnsafeURL):
+            asyncio.run(netsafe.check_url(url))
+
+
+def test_budget_reserves_before_call_and_blocks_at_limit():
+    import asyncio
+
+    import pytest
+
+    from shorts import budget
+
+    class Conn:  # имитация PostgreSQL: строки ai_usage в памяти
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def execute(self, sql, *a):
+            if sql.startswith("UPDATE ai_usage SET status = 'settled'"):
+                self.rows[a[0]]["actual"], self.rows[a[0]]["status"] = a[1], "settled"
+            elif sql.startswith("UPDATE ai_usage SET status = 'failed'"):
+                self.rows[a[0]]["status"] = "failed"
+
+        async def fetchval(self, sql, *a):
+            if sql.startswith("SELECT COALESCE"):
+                return sum((r["actual"] if r["actual"] is not None else r["est"]) for r in self.rows.values()
+                           if r["pool"] == a[0] and r["status"] in ("reserved", "settled"))
+            rid = len(self.rows) + 1
+            self.rows[rid] = {"pool": a[0], "est": a[3], "actual": None, "status": "reserved"}
+            return rid
+
+        def transaction(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Pool(Conn):
+        def acquire(self):
+            return self
+
+    rows = {}
+    pool = Pool(rows)
+    budget.attach(lambda: pool)
+    budget.LIMITS["ai"], budget.LIMITS["tts"] = 1.0, 1.0
+    budget.on_warning = None
+
+    async def run():
+        async with budget.guard("ai", "gemini", 0.5) as r:
+            await r.settle(0.7)  # факт дороже оценки — учитывается факт
+        with pytest.raises(budget.BudgetExceeded):
+            async with budget.guard("ai", "image", 0.45):
+                pass  # 0.7 + 0.45 > 1.0 — запрос не делается
+        async with budget.guard("ai", "free", 0.0):
+            pass  # бесплатное не блокируется
+        async with budget.guard("tts", "tts", 0.9):
+            pass  # отдельный кошелёк озвучки
+        with pytest.raises(RuntimeError):
+            async with budget.guard("ai", "gemini", 0.1):
+                raise RuntimeError("сбой")  # резерв снят
+        assert await budget.spent("ai") == pytest.approx(0.7)
+    try:
+        asyncio.run(run())
+    finally:
+        budget.attach(None)
+
+
+def test_safe_resolver_blocks_rebinding():
+    import asyncio
+
+    import pytest
+
+    from shorts import netsafe
+
+    class Flip:  # DNS-перепривязка: первый ответ публичный, второй — внутренний
+        def __init__(self):
+            self.n = 0
+
+        async def resolve(self, host, port=0, family=0):
+            self.n += 1
+            ip = "93.184.216.34" if self.n == 1 else "127.0.0.1"
+            return [{"hostname": host, "host": ip, "port": port, "family": family, "proto": 0, "flags": 0}]
+
+        async def close(self):
+            pass
+
+    async def run():
+        r = netsafe.SafeResolver()
+        r._inner = Flip()
+        assert (await r.resolve("evil.example"))[0]["host"] == "93.184.216.34"
+        with pytest.raises(OSError):
+            await r.resolve("evil.example")  # соединение по второму ответу не состоится
+    asyncio.run(run())
+
+
+def test_fetch_checks_every_redirect(monkeypatch):
+    import asyncio
+
+    import pytest
+
+    from shorts import netsafe
+
+    class Resp:
+        def __init__(self, status, location=None):
+            self.status, self.headers = status, ({"Location": location} if location else {})
+            self.url = __import__("yarl").URL("https://public.example/a")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, allow_redirects=True):
+            assert allow_redirects is False
+            self.calls.append(url)
+            return Resp(302, "http://169.254.169.254/latest/meta-data")
+
+    async def ok(url):
+        if "169.254" in url:
+            raise netsafe.UnsafeURL("внутренний адрес")
+    monkeypatch.setattr(netsafe, "check_url", ok)
+    s = Session()
+    with pytest.raises(netsafe.UnsafeURL):
+        asyncio.run(netsafe.fetch(s, "https://public.example/a"))
+    assert s.calls == ["https://public.example/a"]  # во внутреннюю сеть запрос так и не ушёл
+
+
+def test_no_builtin_admin():
+    import pathlib
+    import re
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("bot.py").read_text(encoding="utf-8")
+    assert re.search(r'os\.getenv\("ADMIN_IDS", ""\)', src)  # пусто по умолчанию — админов нет
+
+
+def test_migrations_numbered_and_checked():
+    import pytest
+
+    from shorts import migrations
+    nums = [m[0] for m in migrations.MIGRATIONS]
+    assert nums == sorted(set(nums)) and nums[0] == 1
+    applied = {v: migrations.checksum(sql, step) for v, _, sql, step in migrations.MIGRATIONS[:3]}
+    assert migrations.pending(applied) == nums[3:]  # применённые второй раз не идут
+    applied[2] = "изменённая"
+    with pytest.raises(migrations.MigrationError):
+        migrations.pending(applied)
+
+
+def test_fsm_storage_rejects_non_json():
+    import asyncio
+
+    import pytest
+    from aiogram.fsm.storage.base import StorageKey
+
+    from shorts import fsm_pg
+
+    class Pool:
+        async def execute(self, *a):
+            pass
+    s = fsm_pg.PgStorage(lambda: Pool())
+    with pytest.raises(fsm_pg.FSMDataError):
+        asyncio.run(s.set_data(StorageKey(bot_id=1, chat_id=1, user_id=1), {"img": b"\x89PNG"}))

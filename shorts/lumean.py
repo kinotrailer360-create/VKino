@@ -20,7 +20,7 @@ from typing import Any
 
 import aiohttp
 
-from . import usage
+from . import budget, usage
 from .ai import _env_key
 
 API = os.getenv("LUMEAN_API_URL", "https://api.lumean.app/api/public").rstrip("/")
@@ -254,10 +254,15 @@ async def _download(session: aiohttp.ClientSession, path: str, out: Path) -> Pat
 async def _order_audio(session: aiohttp.ClientSession, text: str, out: Path, wait: float = WAIT,
                        service: str | None = None, voice: str | None = None) -> Path:
     # учёт расходов: озвучка оплачивается по символам (паузы {{pause=…}} — не текст)
-    usage.record("tts_chars", len(re.sub(r"\{\{[^}]*\}\}", "", text).strip()))
+    chars = len(re.sub(r"\{\{[^}]*\}\}", "", text).strip())
+    usage.record("tts_chars", chars)
     usage.record("tts_orders")
-    order = await _call(session, "POST", "/orders", json={
-        "template_id": await _template_id(session, service, voice), "input_text": text, "name": "KinoMir360 short"})
+    # свой кошелёк «озвучка»: лимит проверяется ДО заказа; цена за 1000 символов — из .env
+    async with budget.guard("tts", "tts", chars / 1000 * budget.price("lumean_tts_per_1k"), "lumean-tts") as r:
+        order = await _call(session, "POST", "/orders", json={
+            "template_id": await _template_id(session, service, voice), "input_text": text,
+            "name": "KinoMir360 short"})
+        await r.settle(None, {"chars": chars, "order": str((order or {}).get("id") if isinstance(order, dict) else "")})
     return await _download(session, (await _wait_files(session, order, wait))[0], out)
 
 
@@ -268,10 +273,12 @@ async def make_music(prompt: str, out_dir: Path, name: str, variants: int = 2, w
     usage.record("music_tracks", variants)
     timeout = aiohttp.ClientTimeout(total=wait + 120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        order = await _call(session, "POST", "/orders", json={"task_type": "music", "name": f"KinoMir360 {name}",
-                                                             "task_data": {"prompt": prompt, "n_variants": variants,
-                                                                           "force_instrumental": True,
-                                                                           "music_length_ms": 30000}})
+        async with budget.guard("ai", "music", variants * budget.price("lumean_music_track"), "lumean-music") as r:
+            order = await _call(session, "POST", "/orders", json={
+                "task_type": "music", "name": f"KinoMir360 {name}",
+                "task_data": {"prompt": prompt, "n_variants": variants, "force_instrumental": True,
+                              "music_length_ms": 30000}})
+            await r.settle(None, {"tracks": variants})
         files = await _wait_files(session, order, wait)
         return [await _download(session, f, out_dir / f"{name}_{i}.mp3") for i, f in enumerate(files)]
 

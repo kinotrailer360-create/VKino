@@ -24,6 +24,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
+from . import budget, netsafe
+
 log = logging.getLogger("shorts")
 
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
@@ -81,7 +83,8 @@ async def tavily(query: str, n: int = 6) -> list[dict[str, str]]:
     if not TAVILY_KEY:
         return []
     body = {"query": query[:400], "max_results": n, "search_depth": "advanced", "include_answer": False}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with budget.guard("ai", "search", budget.price("search_call"), "tavily"), \
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.post(TAVILY_URL, json=body, headers={"Authorization": f"Bearer {TAVILY_KEY}"}) as resp:
             data = await _json_or_error("Tavily", resp)
     return [{"title": str(r.get("title") or ""), "url": str(r.get("url") or ""),
@@ -93,7 +96,8 @@ async def yandex(query: str, n: int = 6) -> list[dict[str, str]]:
         return []
     body = {"query": {"searchType": "SEARCH_TYPE_RU", "queryText": query[:400]}, "folderId": YANDEX_FOLDER,
             "responseFormat": "FORMAT_XML", "groupSpec": {"groupsOnPage": str(n)}}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with budget.guard("ai", "search", budget.price("search_call"), "yandex"), \
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.post(YANDEX_URL, json=body, headers={"Authorization": f"Api-Key {YANDEX_KEY}"}) as resp:
             data = await _json_or_error("Яндекс", resp)
     root = ET.fromstring(base64.b64decode(data.get("rawData") or ""))
@@ -167,11 +171,15 @@ async def duckduckgo(query: str, n: int = 6) -> list[dict[str, str]]:
 
 
 async def _page_text(url: str) -> str:
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), headers=BROWSER) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200 or "html" not in resp.headers.get("Content-Type", ""):
-                return ""
-            html = await resp.text(errors="ignore")
+    # адрес из выдачи поиска — чужой: только публичный интернет и не больше 3 МБ (netsafe)
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=15), headers=BROWSER) as session:
+        try:
+            html, ctype = await netsafe.fetch_page(session, url)
+        except (netsafe.UnsafeURL, aiohttp.ClientResponseError) as exc:
+            log.info("shorts: page %s skipped: %s", url[:60], exc)
+            return ""
+    if "html" not in ctype:
+        return ""
     paras = [re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", p))).strip()
              for p in re.findall(r"<p[^>]*>(.*?)</p>", html, re.S | re.I)]
     return " ".join(p for p in paras if len(p) >= 40)[:1200]

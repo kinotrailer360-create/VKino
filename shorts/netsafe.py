@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 
+from typing import Any
+
 import aiohttp
+import aiohttp.abc
 from yarl import URL
 
 MAX_BYTES = 15 * 1024 * 1024  # картинка или лента больше — не нужна
@@ -49,6 +53,32 @@ async def check_url(url: str) -> None:
             raise UnsafeURL(f"{host} ведёт во внутреннюю сеть")
 
 
+class SafeResolver(aiohttp.abc.AbstractResolver):
+    """DNS-резолвер для чужих адресов: отдаёт соединению только публичные IP. Проверка в момент соединения —
+    так «перепривязка DNS» (первый ответ публичный, второй — 127.0.0.1) не проходит: проверенный адрес и есть
+    тот, к которому подключаемся. IP-адреса в самой ссылке aiohttp не резолвит — их ловит check_url."""
+
+    def __init__(self) -> None:
+        self._inner = aiohttp.ThreadedResolver()
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET) -> list[dict[str, Any]]:
+        infos = await self._inner.resolve(host, port, family)
+        good = [i for i in infos if not _bad_ip(str(i["host"]))]
+        if not good:
+            raise OSError(f"{host} ведёт во внутреннюю сеть")
+        return good
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+def safe_session(**kwargs: Any) -> aiohttp.ClientSession:
+    """Сессия для адресов из чужих постов, лент и выдачи поиска: соединение только с публичными IP
+    (SafeResolver), без кэша DNS. Перенаправления и размер — в fetch / fetch_page."""
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=SafeResolver(), use_dns_cache=False),
+                                 **kwargs)
+
+
 def _same_origin(url: str, trusted: str) -> bool:
     """Тот же сервер, что доверенный (схема, хост и порт — разобранные, а не сравнение строк: иначе
     «http://rsshub:1200@чужой-сайт/» тоже начиналось бы с доверенного адреса)."""
@@ -62,6 +92,27 @@ def _same_origin(url: str, trusted: str) -> bool:
 async def fetch(session: aiohttp.ClientSession, url: str, limit: int = MAX_BYTES, trusted: str = "") -> bytes:
     """GET с проверкой адреса на каждом перенаправлении и потолком размера. trusted — свой адрес из .env
     (RSSHub в docker-сети: он внутренний, но его задал владелец бота)."""
+    return (await _get(session, url, limit, trusted))[0]
+
+
+PAGE_BYTES = 3 * 1024 * 1024  # html-страница больше — читать не нужно
+
+
+async def fetch_page(session: aiohttp.ClientSession, url: str, limit: int = PAGE_BYTES) -> tuple[str, str]:
+    """Веб-страница (адрес из чужого поста или выдачи поиска): (текст, Content-Type) — только публичный
+    интернет, не больше limit байт, перенаправления проверяются."""
+    raw, ctype = await _get(session, url, limit, "")
+    charset = "utf-8"
+    m = re.search(r"charset=([\w-]+)", ctype)
+    if m:
+        charset = m.group(1)
+    try:
+        return raw.decode(charset, errors="ignore"), ctype
+    except LookupError:
+        return raw.decode("utf-8", errors="ignore"), ctype
+
+
+async def _get(session: aiohttp.ClientSession, url: str, limit: int, trusted: str) -> tuple[bytes, str]:
     for _ in range(MAX_REDIRECTS + 1):
         if not (trusted and _same_origin(url, trusted)):
             await check_url(url)
@@ -78,5 +129,5 @@ async def fetch(session: aiohttp.ClientSession, url: str, limit: int = MAX_BYTES
                 if size > limit:
                     raise UnsafeURL(f"файл больше {limit / 1048576:.1f} МБ")
                 chunks.append(chunk)
-            return b"".join(chunks)
+            return b"".join(chunks), resp.headers.get("Content-Type", "")
     raise UnsafeURL("слишком много перенаправлений")

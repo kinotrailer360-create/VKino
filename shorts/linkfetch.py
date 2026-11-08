@@ -9,7 +9,7 @@ from typing import Any
 
 import aiohttp
 
-from . import tgsearch
+from . import netsafe, tgsearch
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/120.0 Mobile Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
@@ -59,7 +59,7 @@ async def fetch(url: str) -> dict[str, Any]:
     """{"url", "title", "text", "image", "video", "thumb"} — пост Telegram (через веб-версию) или статья сайта;
     thumb — маленькая обложка видео, которое веб-версия Telegram не отдаёт."""
     timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as session:
+    async with netsafe.safe_session(timeout=timeout, headers=HEADERS) as session:
         m = TG_POST.search(url)
         if m:
             async with session.get(f"https://t.me/{m.group(1)}/{m.group(2)}", params={"embed": "1", "mode": "tme"}) as resp:
@@ -71,9 +71,8 @@ async def fetch(url: str) -> dict[str, Any]:
                 raise RuntimeError("пост не открылся (канал закрытый или пост удалён)")
             return {"url": url, "title": "", "text": post["text"][:TEXT_MAX], "image": post["image"],
                     "video": post["video"], "thumb": post.get("thumb"), "media": post.get("media") or []}
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            html = await resp.text(errors="ignore")
+        # статья по ссылке: только публичный интернет (и после перенаправлений), не больше 3 МБ
+        html, _ = await netsafe.fetch_page(session, url)
     parser = _Article()
     parser.feed(html)
     text = "\n".join(parser.paras)[:TEXT_MAX] or parser.meta.get("og:description", "")

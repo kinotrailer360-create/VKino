@@ -55,6 +55,19 @@ healthy() {
   return 1
 }
 
+# копия базы ПЕРЕД обновлением: новая версия может применить миграции (shorts/migrations.py). Миграции только
+# добавляют таблицы, а откат версии ниже их не трогает, но копия — на случай худшего. Хранится 5 последних.
+# Восстановить: docker compose exec -T db pg_restore -U vkino -d vkino --clean < /opt/vkino-backups/pre-update-….dump
+mkdir -p /opt/vkino-backups && chmod 700 /opt/vkino-backups
+pre=/opt/vkino-backups/pre-update-$old.dump
+if ! docker compose exec -T db pg_dump -U vkino -Fc vkino > "$pre.tmp" || [ ! -s "$pre.tmp" ]; then
+  rm -f "$pre.tmp"
+  echo "$(date '+%F %T') копия базы перед обновлением не удалась — обновление отложено"
+  exit 0
+fi
+mv "$pre.tmp" "$pre"
+ls -1t /opt/vkino-backups/pre-update-*.dump 2>/dev/null | tail -n +6 | xargs -r rm -f
+
 if bash "$DIR/deploy/install.sh" >/tmp/vkino-update.out 2>&1 && healthy; then
   status="✅ Бот обновлён автоматически"
 else
@@ -74,8 +87,9 @@ echo "$(date '+%F %T') $status ($old → $new)"
 # сообщение админам: ключ и id — из .env (в git их нет)
 token=$(grep -E '^BOT_TOKEN=' .env | head -1 | cut -d= -f2- | tr -d "\"' \r")
 admins=$(grep -E '^ADMIN_IDS=' .env | head -1 | cut -d= -f2- | tr -d "\"' \r")
-admins=${admins:-803444545}
-[ -n "$token" ] || exit 0
+# id по умолчанию нет: без ADMIN_IDS в .env сообщать некому (и админки в боте тоже нет)
+[ -n "$admins" ] || echo "$(date '+%F %T') ВНИМАНИЕ: в .env нет ADMIN_IDS — админка бота закрыта"
+[ -n "$token" ] && [ -n "$admins" ] || exit 0
 for id in ${admins//,/ }; do
   curl -fsS -m 20 "https://api.telegram.org/bot${token}/sendMessage" \
     --data-urlencode "chat_id=${id}" \

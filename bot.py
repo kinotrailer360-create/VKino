@@ -49,9 +49,12 @@ from aiogram.types import (
     WebAppInfo,
 )
 from dotenv import load_dotenv
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from shorts import ai as shorts_ai
+from shorts import budget as shorts_budget
+from shorts import migrations as shorts_migrations
+from shorts import fsm_pg as shorts_fsm
 from shorts import narrator as shorts_narrator
 from shorts import yttrailers as shorts_yttrailers
 from shorts import tgsearch as shorts_tgsearch
@@ -198,11 +201,14 @@ BLENDER_OPEN_MOVIE_TITLES: list[tuple[str, str]] = [
     ("wing it", "Wing It!"),
 ]
 
-ADMIN_IDS = {
+# админы — только из .env; не задано или пусто — админки нет ни у кого (никакого id по умолчанию)
+ADMIN_IDS: set[int] = {
     int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "803444545").split(",")
+    for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
+if not ADMIN_IDS:
+    logging.warning("ADMIN_IDS is empty — admin panel is closed for everyone. Set ADMIN_IDS in .env")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not configured")
@@ -1023,6 +1029,11 @@ async def init_db() -> None:
             );
             """
         )
+    # новые таблицы — только нумерованными миграциями (shorts/migrations.py, таблица schema_version)
+    applied = await shorts_migrations.migrate(pool)
+    if applied:
+        logging.info("Migrations applied: %s", ", ".join(f"{v:03d}" for v in applied))
+    shorts_budget.attach(db)  # учёт и лимиты платных вызовов — в таблице ai_usage (миграция 006)
     logging.info("PostgreSQL connected")
 
 
@@ -8028,6 +8039,10 @@ async def ai_status_action(message: Message) -> None:
         rows.append("ИИ за 7 дней на что: " + ", ".join(
             f"{escape(t)} — {n}" for t, n in sorted(week.items(), key=lambda kv: -kv[1])[:6]))
     rows.append("Цену символа и запроса смотри в кабинете Lumean — так можно посчитать стоимость ролика.")
+    rows += await shorts_budget.status_lines()
+    lumean_rows = await shorts_budget.lumean_check()
+    if lumean_rows:
+        rows.append("Lumean за 30 дней по журналу (для сверки цен с кабинетом): " + "; ".join(lumean_rows))
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
@@ -10070,18 +10085,41 @@ class PostState(StatesGroup):
     rt = State()
 
 
-async def _posts_history() -> dict[str, list[str]]:
-    try:
-        data = json.loads(await shorts_setting("posts_history") or "{}")
-    except ValueError:
-        data = {}
-    return {"urls": list(data.get("urls") or []), "topics": list(data.get("topics") or []),
-            "films": list(data.get("films") or []), "list_titles": list(data.get("list_titles") or []),
-            "people": list(data.get("people") or []), "facts": list(data.get("facts") or []),
-            "quiz": list(data.get("quiz") or []), "quotes": list(data.get("quotes") or []),
-            "anniv": list(data.get("anniv") or []), "evening": list(data.get("evening") or []),
-            "battle": list(data.get("battle") or []), "bloopers": list(data.get("bloopers") or []),
-            "stories": list(data.get("stories") or [])}
+HISTORY_KINDS = ("urls", "topics", "films", "list_titles", "people", "facts", "quiz", "quotes", "anniv", "evening",
+                 "battle", "bloopers", "stories")
+HISTORY_CAP = {"urls": 500, "topics": 60, "stories": 60, "list_titles": 80, "people": 100, "facts": 150,
+               "films": 150}  # остальные — 200
+
+
+async def _posts_history() -> dict[str, list[Any]]:
+    """Что уже было в постах (ссылки, темы, сюжеты, фильмы рубрик) — из таблицы ai_post_history (миграция 005),
+    по порядку добавления; сюжеты — словари."""
+    out: dict[str, list[Any]] = {k: [] for k in HISTORY_KINDS}
+    for r in await db().fetch("SELECT kind, value FROM ai_post_history ORDER BY kind, pos"):
+        if r["kind"] in out:
+            out[r["kind"]].append(json.loads(r["value"]) if r["kind"] == "stories" else r["value"])
+    return out
+
+
+async def save_posts_history(hist: dict[str, list[Any]]) -> None:
+    """Записать историю постов: новые элементы ДОБАВЛЯЮТСЯ (то, что параллельно записала другая задача, не
+    затирается), старые сверх лимита вида удаляются. Плюс старый JSON на переходный период (откат версии)."""
+    async with db().acquire() as conn, conn.transaction():
+        for kind in HISTORY_KINDS:
+            values = [shorts_migrations.history_value(v) for v in hist.get(kind) or []]
+            if not values:
+                continue
+            have = {r["value"] for r in await conn.fetch("SELECT value FROM ai_post_history WHERE kind = $1", kind)}
+            pos = int(await conn.fetchval("SELECT COALESCE(MAX(pos), 0) FROM ai_post_history WHERE kind = $1", kind))
+            for v in dict.fromkeys(values):
+                if v not in have:
+                    pos += 1
+                    await conn.execute("INSERT INTO ai_post_history (kind, pos, value) VALUES ($1, $2, $3) "
+                                       "ON CONFLICT DO NOTHING", kind, pos, v)
+            await conn.execute(
+                "DELETE FROM ai_post_history WHERE kind = $1 AND pos < (SELECT MIN(pos) FROM (SELECT pos FROM "
+                "ai_post_history WHERE kind = $1 ORDER BY pos DESC LIMIT $2) t)", kind, HISTORY_CAP.get(kind, 200))
+    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))  # двойная запись: откат версии
 
 
 # рубрики — хэштег в каждом посте; закреп-навигатор ведёт по ним (тап по хэштегу ищет посты канала)
@@ -10154,14 +10192,37 @@ async def save_post(chat_id: int, ids: list[int], kind: str, poll: list[str] | N
                     question: str = POLL_QUESTION, quiz: dict[str, Any] | None = None,
                     extra: dict[str, Any] | None = None) -> None:
     """Запомнить готовый пост в чате бота: сообщения (альбом), где текст (caption | text), опрос, викторина;
-    extra — {"button": {"text", "url"}} или {"vote": {"ids", "titles"}}."""
-    meta = await _json_setting("posts_meta", {})
-    meta[f"{chat_id}:{ids[0]}"] = {"ids": ids, "kind": kind, "poll": poll or [], "question": question,
-                                   "quiz": quiz, **(extra or {})}
-    await set_shorts_setting("posts_meta", json.dumps(dict(list(meta.items())[-80:]), ensure_ascii=False))
+    extra — {"button": {"text", "url"}} или {"vote": {"ids", "titles"}}. Таблица ai_drafts (миграция 003)."""
+    meta = {"ids": ids, "kind": kind, "poll": poll or [], "question": question, "quiz": quiz, **(extra or {})}
+    await db().execute(
+        "INSERT INTO ai_drafts (chat_id, first_id, meta) VALUES ($1, $2, $3::jsonb) "
+        "ON CONFLICT (chat_id, first_id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()",
+        chat_id, ids[0], json.dumps(meta, ensure_ascii=False))
+    await audit(chat_id, ids[0], None, "draft", {"kind": kind})
+    # двойная запись в старый JSON на переходный период: откат на прошлую версию бота не потеряет черновики
+    old = await _json_setting("posts_meta", {})
+    old[f"{chat_id}:{ids[0]}"] = meta
+    await set_shorts_setting("posts_meta", json.dumps(dict(list(old.items())[-80:]), ensure_ascii=False))
+
+
+async def audit(chat_id: int, first: int, actor: int | None, action: str, details: dict[str, Any] | None = None) -> None:
+    """Журнал действий с постом (ai_audit_log); ошибка журнала не мешает работе."""
+    try:
+        await db().execute("INSERT INTO ai_audit_log (chat_id, first_id, actor, action, details) "
+                           "VALUES ($1, $2, $3, $4, $5::jsonb)", chat_id, first, actor, action,
+                           json.dumps(details or {}, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        logging.exception("Audit log write failed")
 
 
 async def _post_meta(chat_id: int, first: int) -> dict[str, Any]:
+    row = await db().fetchrow("SELECT meta, published_at FROM ai_drafts WHERE chat_id = $1 AND first_id = $2",
+                              chat_id, first)
+    if row:
+        meta = json.loads(row["meta"]) if isinstance(row["meta"], str) else dict(row["meta"])
+        if row["published_at"]:
+            meta["published"] = int(row["published_at"].timestamp())
+        return meta
     return (await _json_setting("posts_meta", {})).get(f"{chat_id}:{first}") or {"ids": [first], "kind": "caption",
                                                                                    "poll": []}
 
@@ -10190,41 +10251,71 @@ async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: st
                            disable_web_page_preview=True)
 
 
-async def _unqueue(chat_id: int, first: int) -> bool:
-    """Снять пост с отложенной публикации; True — он там был."""
+async def _queue_json_remove(pairs: set[tuple[int, int]]) -> None:
+    """Двойная запись очереди в старый JSON (переходный период)."""
     queue = await _json_setting("posts_queue", [])
-    rest = [q for q in queue if not (q["chat"] == chat_id and q["first"] == first)]
+    rest = [q for q in queue if (q["chat"], q["first"]) not in pairs]
     if len(rest) != len(queue):
         await set_shorts_setting("posts_queue", json.dumps(rest))
-    return len(rest) != len(queue)
 
 
-async def _mark_published(chat_id: int, first: int) -> None:
-    meta = await _json_setting("posts_meta", {})
-    key = f"{chat_id}:{first}"
-    shorts_usage.record("tg_posts")  # для недельного отчёта
-    if key in meta:
-        meta[key]["published"] = int(time.time())
-        await set_shorts_setting("posts_meta", json.dumps(meta, ensure_ascii=False))
+async def queue_add(chat_id: int, first: int, at: int) -> None:
+    """Поставить пост в отложенную публикацию (ai_queue, миграция 004); тот же пост — новое время."""
+    await db().execute("INSERT INTO ai_queue (chat_id, first_id, at) VALUES ($1, $2, to_timestamp($3)) "
+                       "ON CONFLICT (chat_id, first_id) DO UPDATE SET at = EXCLUDED.at", chat_id, first, at)
+    queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == first)]
+    await set_shorts_setting("posts_queue", json.dumps(queue + [{"chat": chat_id, "first": first, "at": at}]))
 
 
-_publishing: set[tuple[int, int]] = set()  # посты, которые публикуются прямо сейчас (двойное нажатие)
+async def _unqueue(chat_id: int, first: int) -> bool:
+    """Снять пост с отложенной публикации; True — он там был."""
+    done = await db().execute("DELETE FROM ai_queue WHERE chat_id = $1 AND first_id = $2", chat_id, first)
+    await _queue_json_remove({(chat_id, first)})
+    return done.endswith(" 1")
 
 
 class AlreadyPublishing(RuntimeError):
     pass
 
 
-async def publish_post(bot: Bot, chat_id: int, first: int) -> None:
-    """Обёртка: один и тот же пост не публикуется дважды одновременно (двойное нажатие, кнопка + расписание)."""
-    key = (chat_id, first)
-    if key in _publishing:
+PUBLISH_CLAIM = timedelta(minutes=5)  # «публикуется» дольше — публикация оборвалась (перезапуск), можно снова
+
+
+async def _claim_publish(chat_id: int, first: int) -> bool:
+    """Атомарно занять пост для публикации: True — можно публиковать. Второе нажатие, кнопка + расписание или
+    повтор после перезапуска получат False, пока идёт первая публикация."""
+    meta = await _post_meta(chat_id, first)
+    meta.pop("published", None)
+    await db().execute(  # черновик из старого JSON — заводим строку, чтобы было что занимать
+        "INSERT INTO ai_drafts (chat_id, first_id, meta) VALUES ($1, $2, $3::jsonb) ON CONFLICT DO NOTHING",
+        chat_id, first, json.dumps(meta, ensure_ascii=False))
+    got = await db().fetchval(
+        "UPDATE ai_drafts SET status = 'publishing', claimed_at = NOW(), updated_at = NOW() "
+        "WHERE chat_id = $1 AND first_id = $2 AND (status <> 'publishing' OR claimed_at < NOW() - $3::interval) "
+        "RETURNING 1", chat_id, first, PUBLISH_CLAIM)
+    return bool(got)
+
+
+async def publish_post(bot: Bot, chat_id: int, first: int, actor: int | None = None) -> None:
+    """Публикация в канал ровно один раз: занимаем пост в базе (status='publishing'), публикуем, отмечаем
+    'published' (или 'failed'). Повторно тот же пост — только после подтверждения автора («📢 Да, ещё раз»)."""
+    if not await _claim_publish(chat_id, first):
         raise AlreadyPublishing("этот пост уже публикуется")
-    _publishing.add(key)
     try:
         await _publish_post(bot, chat_id, first)
-    finally:
-        _publishing.discard(key)
+    except Exception as exc:
+        await db().execute("UPDATE ai_drafts SET status = 'failed', updated_at = NOW() "
+                           "WHERE chat_id = $1 AND first_id = $2", chat_id, first)
+        await audit(chat_id, first, actor, "publish_failed", {"error": _safe_err(exc)[:300]})
+        raise
+    await db().execute("UPDATE ai_drafts SET status = 'published', published_at = NOW(), published_by = $3, "
+                       "updated_at = NOW() WHERE chat_id = $1 AND first_id = $2", chat_id, first, actor)
+    shorts_usage.record("tg_posts")  # для недельного отчёта
+    await audit(chat_id, first, actor, "published", {"channel": POST_CHANNEL, "scheduled": actor is None})
+    old = await _json_setting("posts_meta", {})  # двойная запись: отметка в старом JSON
+    if f"{chat_id}:{first}" in old:
+        old[f"{chat_id}:{first}"]["published"] = int(time.time())
+        await set_shorts_setting("posts_meta", json.dumps(old, ensure_ascii=False))
 
 
 async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
@@ -10239,7 +10330,6 @@ async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
             inline_keyboard=[[InlineKeyboardButton(text=button["text"], url=button["url"])]]))
     else:
         await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
-    await _mark_published(chat_id, first)
     vote = meta.get("vote")
     if vote:  # «Выбор подписчиков»: опрос запоминаем — в пятницу бот подведёт итог и сделает пост о победителе
         sent = await bot.send_poll(POST_CHANNEL, VOTE_QUESTION, vote["titles"], is_anonymous=True)
@@ -10342,6 +10432,51 @@ async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
     if not urls:
         return []
     return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
+
+
+async def _illustration(res: dict[str, Any], work: Path, checks: list[str]) -> list[Path]:
+    """Подходящего реального фото нет — оригинальная иллюстрация от ИИ (не фото, не постер, без лиц реальных
+    людей) с пометкой «Иллюстрация · ИИ» на самой картинке. Только в пределах месячного лимита; выключается
+    в «🖼 Фото к новостям»."""
+    if await shorts_setting("illustrations") == "off":
+        return []
+    try:
+        # платная картинка — через общий бюджет: резерв до запроса, не влезает — не рисуем
+        raw = await shorts_ai.generate_illustration(GEMINI_API_KEY, res.get("topic") or res["post"][:300],
+                                                    res.get("film_en") or res.get("film") or "")
+    except shorts_budget.BudgetExceeded as exc:
+        checks.append(f"🎨 картинку ИИ не рисую: {exc}")
+        return []
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Tg post: illustration failed: %s", exc)
+        raw = None
+    if not raw:
+        checks.append("🎨 нарисовать иллюстрацию не вышло (у ключа Gemini нет модели картинок — она только на "
+                      "платном тарифе Google) — пост без фото, добавь кнопкой")
+        return []
+
+    def mark() -> Path:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        d = ImageDraw.Draw(img)
+        size = max(18, img.width // 40)
+        try:
+            font = ImageFont.truetype(str(shorts_daily.ASSETS / "Montserrat.ttf"), size)
+        except OSError:
+            font = ImageFont.load_default()
+        text = "Иллюстрация · ИИ"
+        w = d.textlength(text, font=font)
+        pad = size // 2
+        box = (pad, img.height - size * 2 - pad, pad + w + size, img.height - pad)
+        d.rounded_rectangle(box, radius=size // 2, fill=(0, 0, 0))
+        d.text((box[0] + size // 2, box[1] + size // 2), text, font=font, fill=(255, 255, 255))
+        out = work / "illustration.jpg"
+        img.save(out, quality=92)
+        return out
+
+    path = await asyncio.to_thread(mark)
+    checks.append(f"🎨 реального фото нет — ИИ нарисовал иллюстрацию (≈{shorts_budget.IMAGE_USD:.3f}$, "
+                  "помечена на картинке). Замени, если найдёшь фото")
+    return [path]
 
 
 async def _tmdb_media_urls(res: dict[str, Any]) -> list[str]:
@@ -10562,7 +10697,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
             if not fresh:
                 break
         if not res:
-            await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+            await save_posts_history(hist)
             return ""
         res = await _fix_titles(res)  # «Клейкое лицо» → «Глиноликий»: прокатное название из базы фильмов
         same = [fresh[i] for i in res["media"]]
@@ -10570,7 +10705,7 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
         sources = list(same)  # для автора под постом: откуда взята новость
         hist["urls"] = (hist["urls"] + [p["url"] for p in same])[-500:]
         hist["topics"] = (hist["topics"] + [res["topic"] or res["post"][:60]])[-60:]
-        await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+        await save_posts_history(hist)
         # фото и видео — только из постов, где упомянут сам фильм: ИИ иногда даёт номер соседнего поста
         # (в посте о «Leviathan» оказался баннер Game Pass из той же ленты X)
         names = [_title_words(n) for n in (res["film"], res["film_en"]) if n and len(_title_words(n)) >= 3]
@@ -10671,7 +10806,16 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 checks.append("режим «фото из базы фильмов»: постер/портрет TMDB")
             else:
                 files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
-            caption = post_caption(res["post"], "#новости")
+            illustrated = False
+            if not files:  # ни фото из новости, ни постера в базе — картинку рисует ИИ (помечена как иллюстрация)
+                files = await _illustration(res, work, checks)
+                illustrated = bool(files)
+            # у нарисованной картинки — видимая подпись в самом посте, а не только плашка на картинке
+            text = res["post"]
+            if illustrated:  # сразу под заголовком: подгонка под 1024 символа режет конец текста, а не начало
+                head, _, rest = text.partition("\n")
+                text = f"{head}\n🎨 иллюстрация\n{rest}" if rest else f"{head}\n🎨 иллюстрация"
+            caption = post_caption(text, "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
             # достоверность — автору под постом: слух в канале должен звучать как слух
             status = {"official": "✅ официально (студия, сервис или сам человек)",
@@ -11044,7 +11188,7 @@ async def make_birthday_post(bot: Bot, chat_id: int, chosen: dict[str, Any] | No
            for n, f in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"], films)]
         + ["", "🎉 — поздравляю! ❤️ — обожаю эти фильмы", "", "#ДеньРождения #Кино #KinoMir360"])
     hist["people"] = (hist["people"] + [str(shorts_daily.person_uid(who["imdb"]))])[-100:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     work = SHORTS_DIR / f"bday_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -11356,7 +11500,7 @@ async def make_facts_post(bot: Bot, chat_id: int, era: str = "", film_id: int = 
         + ["", "Какой факт удивил больше всего? 👇", "", "❤️ — не знал! 🔥 — знал всё", "",
            "#ФактыОКино #Кино #KinoMir360"])
     hist["facts"] = (hist["facts"] + [str(film["id"])])[-150:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     work = SHORTS_DIR / f"facts_post_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -11481,7 +11625,7 @@ async def make_quiz_post(bot: Bot, chat_id: int) -> None:
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["quiz"] = (hist["quiz"] + [film_id])[-200:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     await offer_post(bot, chat_id, ids, kind, "pt:qz",
                      what=f"Викторина готова (правильный ответ — {escape(f"«{title}»")}). В канале под ней будет "
                           "викторина с 4 вариантами",
@@ -11512,7 +11656,7 @@ async def make_quote_post(bot: Bot, chat_id: int) -> None:
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["quotes"] = (hist["quotes"] + [str(film["id"])])[-200:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     await offer_post(bot, chat_id, ids, kind, "pt:qt", what="Цитата дня готова")
 
 
@@ -11571,7 +11715,7 @@ async def make_anniversary_post(bot: Bot, chat_id: int) -> None:
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["anniv"] = (hist["anniv"] + [f"{film['id']}:{today.year}"])[-200:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     await offer_post(bot, chat_id, ids, kind, what="Пост «Этот день в кино» готов")
 
 
@@ -11650,7 +11794,7 @@ async def make_evening_post(bot: Bot, chat_id: int) -> None:
         "🍿 — смотрю сегодня ❤️ — уже видел"])
     links = kp.watch_links(film)
     hist["evening"] = (hist["evening"] + [str(film["id"])])[-200:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     work = SHORTS_DIR / f"evening_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -11704,7 +11848,7 @@ async def make_battle_post(bot: Bot, chat_id: int) -> None:
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hist["battle"] = (hist["battle"] + [f"{min(a['id'], b['id'])}:{max(a['id'], b['id'])}"])[-200:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     await offer_post(bot, chat_id, ids, kind, "pt:bt", [shorts_daily._title(a), shorts_daily._title(b)],
                      "Битва фильмов готова", "Какой фильм лучше? ⚔️")
 
@@ -11772,7 +11916,7 @@ async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
                                                                                bloopers)]
         + ["", "А вы замечали? 👇", "", "🔥 — замечал ❤️ — теперь пересмотрю"])
     hist["bloopers"] = (hist["bloopers"] + [str(film["id"])])[-200:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     work = SHORTS_DIR / f"bloopers_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -12264,7 +12408,7 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
     post = _brand(post)
     hist["films"] = (hist["films"] + [str(f["id"]) for f in kp_films if f.get("id")])[-150:]
     hist["list_titles"] = (hist["list_titles"] + names)[-80:]
-    await set_shorts_setting("posts_history", json.dumps(hist, ensure_ascii=False))
+    await save_posts_history(hist)
     work = SHORTS_DIR / f"list_{time.time_ns()}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -12435,8 +12579,9 @@ def _when(at: datetime, now: datetime) -> str:
 
 async def _scheduled() -> list[dict[str, Any]]:
     """Отложенные посты в канал (у всех админов — канал общий), по времени."""
-    return sorted((q for q in await _json_setting("posts_queue", []) if q["at"] > time.time() - 60),
-                  key=lambda q: q["at"])
+    rows = await db().fetch("SELECT chat_id, first_id, EXTRACT(EPOCH FROM at)::BIGINT AS at FROM ai_queue "
+                            "WHERE at > NOW() - INTERVAL '60 seconds' ORDER BY at")
+    return [{"chat": r["chat_id"], "first": r["first_id"], "at": int(r["at"])} for r in rows]
 
 
 def _busy_note(queue: list[dict[str, Any]], now: datetime) -> str:
@@ -12448,12 +12593,12 @@ def _busy_note(queue: list[dict[str, Any]], now: datetime) -> str:
 
 async def publish_due(bot: Bot) -> None:
     """Очередь «⏰ Опубликовать позже»: подошло время — публикуем и сообщаем автору."""
-    queue = await _json_setting("posts_queue", [])
-    now = time.time()
-    due = [q for q in queue if q["at"] <= now]
+    # подошедшие посты забираем из очереди одним запросом: вторая копия цикла (или повтор) их уже не увидит
+    rows = await db().fetch("DELETE FROM ai_queue WHERE at <= NOW() RETURNING chat_id, first_id")
+    due = [{"chat": r["chat_id"], "first": r["first_id"]} for r in rows]
     if not due:
         return
-    await set_shorts_setting("posts_queue", json.dumps([q for q in queue if q["at"] > now]))
+    await _queue_json_remove({(q["chat"], q["first"]) for q in due})
     for q in due:
         try:
             await publish_post(bot, q["chat"], q["first"])
@@ -12760,7 +12905,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             return
     if (kind == "p" or kind == "pf") and arg.isdigit():
         try:
-            await publish_post(message.bot, chat_id, int(arg))
+            await publish_post(message.bot, chat_id, int(arg), callback.from_user.id)
         except AlreadyPublishing:
             await callback.answer("⏳ Уже публикую — секунду")
             return
@@ -12855,17 +13000,14 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         if not first.isdigit() or not minute.isdigit():
             return
         at = int(minute) * 60
-        queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == int(first))]
-        queue.append({"chat": chat_id, "first": int(first), "at": at})
-        await set_shorts_setting("posts_queue", json.dumps(queue))
+        await queue_add(chat_id, int(first), at)
         when = _when(datetime.fromtimestamp(at, POST_TZ), datetime.now(POST_TZ))
         await message.edit_text(f"⏰ Пост выйдет в канале {when} ({POST_TZ_NAME}).", reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[_btn("📢 Нет, опубликовать сейчас", f"pt:p:{first}")],
                              [_btn("❌ Отменить", f"pt:u:{first}")]]))
         return
     if kind == "u" and arg.isdigit():
-        queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == int(arg))]
-        await set_shorts_setting("posts_queue", json.dumps(queue))
+        await _unqueue(chat_id, int(arg))
         meta = await _post_meta(chat_id, int(arg))
         await message.edit_text("Отложенная публикация отменена.",
                                 reply_markup=post_keyboard(int(arg), yt=bool(meta.get("yt"))))
@@ -13056,20 +13198,29 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
         _run_job(list_job)
         return
-    if action in ("pmode", "pmode:live", "pmode:db"):
-        if action != "pmode":
+    if action in ("pmode", "pmode:live", "pmode:db", "pmode:art"):
+        if action == "pmode:art":
+            await set_shorts_setting("illustrations",
+                                     None if await shorts_setting("illustrations") == "off" else "off")
+        elif action != "pmode":
             await set_shorts_setting("post_media", "db" if action == "pmode:db" else None)
         db = await shorts_setting("post_media") == "db"
+        art = await shorts_setting("illustrations") != "off"
         await message.answer(
             "🖼 <b>Фото к новостям</b>\n\n"
             f"{'⚪️' if db else '🟢'} <b>Из новости</b> — фото и видео из поста-источника (кадры со съёмок, ролики, "
             "альбомы), если ИИ подтвердил, что они о той же новости; иначе постер из базы фильмов.\n"
             f"{'🟢' if db else '⚪️'} <b>Из базы фильмов</b> — всегда постер фильма и портрет человека из базы TMDB: "
             "чужих фото почти не бывает, но меньше живых кадров и видео. Видео трейлера к новости о трейлере "
-            "остаётся.",
+            "остаётся.\n\n"
+            f"🎨 <b>Картинка ИИ</b> ({'вкл' if art else 'выкл'}) — если ни фото, ни постера не нашлось, ИИ рисует "
+            "иллюстрацию (без лиц реальных людей, не постер) с пометкой «Иллюстрация · ИИ». "
+            f"≈{shorts_budget.IMAGE_USD:.3f}$ за картинку, из общего лимита {shorts_budget.LIMITS['ai']:.0f}$ "
+            "в месяц.\n" + "\n".join(await shorts_budget.status_lines()),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn(("✅ " if not db else "") + "Из новости", "pt:pmode:live"),
                  _btn(("✅ " if db else "") + "Из базы фильмов", "pt:pmode:db")],
+                [_btn(("✅ " if art else "") + "🎨 Картинка ИИ, если фото нет", "pt:pmode:art")],
                 [_btn("⬅️ Назад", "pt:sec:news")]]))
         return
     if action == "auto":
@@ -15639,12 +15790,20 @@ ALIVE_FILE = Path("/tmp/vkino_alive")
 
 
 async def heartbeat() -> None:
-    """Раз в 30 с отмечает, что цикл бота работает (healthcheck Docker; не обновляется — бот завис или упал)."""
+    """Раз в 30 с отмечает, что цикл бота работает (healthcheck Docker; не обновляется — бот завис или упал);
+    раз в сутки удаляет брошенные диалоги (fsm_states старше недели)."""
+    last_clean = 0.0
     while True:
         try:
             ALIVE_FILE.touch()
         except OSError:
             pass
+        if time.monotonic() - last_clean > 86400:
+            last_clean = time.monotonic()
+            try:
+                await shorts_fsm.PgStorage(db).cleanup()
+            except Exception:  # noqa: BLE001
+                logging.exception("FSM cleanup failed")
         await asyncio.sleep(30)
 
 
@@ -16666,6 +16825,15 @@ async def main() -> None:
         ),
     )
 
+    async def budget_warning(text: str) -> None:  # 80 % месячного лимита — сообщение админам
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception:  # noqa: BLE001
+                logging.exception("Budget warning to %s failed", admin_id)
+
+    shorts_budget.on_warning = budget_warning
+
     reminder_task = asyncio.create_task(
         premiere_reminder_loop(bot)
     )
@@ -16677,7 +16845,9 @@ async def main() -> None:
     hype_task = asyncio.create_task(hype_loop(bot))  # 🔥 громкие инфоповоды → уведомление автору
     growth_task = asyncio.create_task(growth_loop(bot))  # уведомления из избранного, подборка недели, выпуск
 
-    dp = Dispatcher()
+    # состояния диалогов — в PostgreSQL (таблица fsm_states, миграция 002): переживают перезапуск бота
+    fsm_storage = shorts_fsm.PgStorage(db)
+    dp = Dispatcher(storage=fsm_storage)
     dp.message.outer_middleware(activity_tracker)
     dp.callback_query.outer_middleware(activity_tracker)
     dp.message.outer_middleware(subscription_gate)

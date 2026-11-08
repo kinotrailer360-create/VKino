@@ -171,7 +171,10 @@ _reddit: asyncio.Lock | None = None
 
 async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
     trusted = next((t for t in (rsshub(), nitter()) if t and netsafe._same_origin(url, t)), "")
-    return await netsafe.fetch(session, url, 5 * 1024 * 1024, trusted)
+    if trusted:  # свой RSSHub/Nitter во внутренней сети — его задал владелец бота
+        return await netsafe.fetch(session, url, 5 * 1024 * 1024, trusted)
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=20)) as safe:  # чужой адрес — только публичные IP
+        return await netsafe.fetch(safe, url, 5 * 1024 * 1024)
 
 
 async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_feed: int) -> list[dict[str, Any]]:

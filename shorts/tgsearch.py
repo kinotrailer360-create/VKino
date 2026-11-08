@@ -229,25 +229,15 @@ async def download_media(posts: list[dict[str, Any]], work: Path, limit: int = 8
         elif p.get("image"):
             urls.append((p["image"], ".jpg"))
     out: list[Path] = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), headers=HEADERS) as session:
+    # адреса из чужих постов и лент: только публичный интернет — каждое перенаправление проверяется до запроса,
+    # соединение — только с проверенными IP (netsafe.safe_session), размер — не больше MEDIA_MAX
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=60), headers=HEADERS) as session:
         for url, ext in urls:
             if len(out) >= limit:
                 break
             try:
-                await netsafe.check_url(url)  # адрес из чужого поста или ленты — только публичный интернет
-                async with session.get(url) as resp:
-                    await netsafe.check_url(str(resp.url))  # и после перенаправлений
-                    resp.raise_for_status()
-                    if int(resp.headers.get("Content-Length") or 0) > MEDIA_MAX:
-                        continue
-                    chunks, size = [], 0
-                    async for chunk in resp.content.iter_chunked(1 << 16):  # read(n) отдаёт лишь доступный кусок
-                        chunks.append(chunk)
-                        size += len(chunk)
-                        if size > MEDIA_MAX:
-                            break
-                    data = b"".join(chunks)
-                if len(data) > MEDIA_MAX or len(data) < 2000:
+                data = await netsafe.fetch(session, url, MEDIA_MAX)
+                if len(data) < 2000:
                     continue
                 if data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html", b"<?xml", b"{")):
                     log.info("shorts: tg media %s is a web page, not a file — skipped", url[:80])
