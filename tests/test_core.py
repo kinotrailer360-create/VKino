@@ -263,3 +263,9 @@ def test_tmdb_rating_preferred_when_enough_votes():
     assert daily._best_rating(film) == (7.9, "TMDB")
     few = {"rating": {"kp": 8.4, "imdb": 8.1, "tmdb": 9.5}, "votes": {"kp": 900000, "tmdb": 4}}
     assert daily._best_rating(few) == (8.4, "КП")  # мало голосов на TMDB — как раньше
+
+
+def test_amazon_stress():
+    from shorts import pronounce
+    assert "Амазо́н" in pronounce.apply("премьера на Amazon")
+    assert "Амазо́не" in pronounce.apply("вышел на Амазоне")
