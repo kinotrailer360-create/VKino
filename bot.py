@@ -10723,7 +10723,12 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 files = await _illustration(res, work, checks)
                 illustrated = bool(files)
             # у нарисованной картинки — видимая подпись в самом посте, а не только плашка на картинке
-            caption = post_caption(res["post"] + ("\n\n🎨 иллюстрация" if illustrated else ""), "#новости")
+            text = res["post"]
+            if illustrated:  # перед строкой хэштегов: её подгонка под 1024 символа не трогает
+                head, _, tags = text.rstrip().rpartition("\n")
+                text = (f"{head}\n\n🎨 иллюстрация\n{tags}" if head and tags.lstrip().startswith("#")
+                        else f"{text}\n\n🎨 иллюстрация")
+            caption = post_caption(text, "#новости")
             seen = ("\n\n🖼 Проверка картинки ИИ:\n" + "\n".join(f"• {escape(c)}" for c in checks)) if checks else ""
             # достоверность — автору под постом: слух в канале должен звучать как слух
             status = {"official": "✅ официально (студия, сервис или сам человек)",
