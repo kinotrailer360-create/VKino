@@ -507,3 +507,56 @@ def test_spoken_form_is_cached(tmp_path, monkeypatch):
     second = asyncio.run(daily.spoken_lines(["Привет", "Пока", "Новая"], careful=True))
     assert second[:2] == first
     assert calls == [["Привет", "Пока"], ["Новая"]]
+
+
+def test_project_revoice_only_fixed_phrase(tmp_path, monkeypatch):
+    """«🎙 Только звук»: исправленная фраза встаёт на своё место, остальные и длина ролика — как были."""
+    import asyncio
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нет ffmpeg")
+    from shorts import daily, project
+
+    def ff(*a):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", *a], check=True)
+
+    for i, f in enumerate([440, 550, 660]):
+        ff("-f", "lavfi", "-i", f"sine=f={f}:d=2", "-ar", "48000", str(tmp_path / f"p{i}.wav"))
+    ff("-i", str(tmp_path / "p0.wav"), "-i", str(tmp_path / "p1.wav"), "-i", str(tmp_path / "p2.wav"),
+       "-filter_complex", "[0:a]apad=pad_dur=0.2[a];[1:a]apad=pad_dur=0.2[b];[2:a]apad=pad_dur=0.2[c];"
+       "[a][b][c]concat=n=3:v=0:a=1", "-ar", "48000", str(tmp_path / "voice.wav"))
+    ff("-f", "lavfi", "-i", "sine=f=100:d=10", "-ar", "48000", str(tmp_path / "music.mp3"))
+    ff("-f", "lavfi", "-i", "color=c=red:s=160x120:d=8:r=25", "-i", str(tmp_path / "voice.wav"), "-shortest",
+       "-c:v", "libx264", "-c:a", "aac", str(tmp_path / "short.mp4"))
+    (tmp_path / "short.json").write_text(json.dumps({"music": "music.mp3", "music_db": -14, "sfx": []}))
+    voice = {"file": "voice.wav", "lines": ["раз", "два", "три"], "prepared": False, "careful": False,
+             "pause": None, "starts": [0, 2.2, 4.4], "speech": [2, 2, 2]}
+    project.save(tmp_path, "short", "shorts.make_short", "short.json", "short.mp4", voice, {})
+
+    async def spoken(lines, careful=False):
+        return [x + "!" if x == "два" else x for x in lines]
+
+    class Key:
+        def __init__(self, text):
+            self.text = text
+
+        def exists(self):
+            return self.text != "два!"
+
+    async def synth(lines, work, pause=None, careful=False, prepared=False):
+        work.mkdir(parents=True, exist_ok=True)
+        for k, _ in enumerate(lines):
+            ff("-f", "lavfi", "-i", "sine=f=1000:d=2.4", "-ar", "44100", str(work / f"voice_{k}.mp3"))
+
+    monkeypatch.setattr(daily, "spoken_lines", spoken)
+    monkeypatch.setattr(daily, "_voice_key", lambda t, p: Key(t))
+    monkeypatch.setattr(daily, "synthesize", synth)
+    before = asyncio.run(daily._duration(tmp_path / "short.mp4"))
+    video, fixed, notes = asyncio.run(project.revoice(tmp_path))
+    assert fixed == [(1, 2.2, "два")] and notes == []
+    assert abs(asyncio.run(daily._duration(video)) - before) < 0.1  # длина ролика та же
+    assert abs(asyncio.run(daily._duration(tmp_path / "voice.wav")) - 6.6) < 0.1  # фраза ужата в своё место
