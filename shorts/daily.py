@@ -120,11 +120,24 @@ def _poster_url(item: dict[str, Any]) -> str | None:
     return _image_url(item)
 
 
+RATING_SOURCE = "tmdb"  # какой рейтинг показывать в карточках и постах: tmdb — TMDB, если он известен
+TMDB_MIN_VOTES = 30  # у TMDB голосов меньше, чем у Кинопоиска; меньше 30 — рейтинг случайный
+
+
 def _best_rating(item: dict[str, Any]) -> tuple[float, str]:
-    """Больший из рейтингов IMDb и Кинопоиска (0 — рейтинга нет); у фильма с TMDB — рейтинг TMDB."""
+    """Рейтинг для карточки: TMDB (если он есть и за ним хватает голосов), иначе больший из IMDb и Кинопоиска
+    (0 — рейтинга нет)."""
     r = item.get("rating") or {}
+    if RATING_SOURCE == "tmdb":
+        try:
+            v = float(r.get("tmdb") or 0)
+            votes = int((item.get("votes") or {}).get("tmdb") or TMDB_MIN_VOTES)
+        except (TypeError, ValueError):
+            v, votes = 0.0, 0
+        if v > 0 and votes >= TMDB_MIN_VOTES:
+            return v, "TMDB"
     best, label = 0.0, ""
-    for key, name in (("imdb", "IMDb"), ("kp", "КП"), ("tmdb", "TMDB")):
+    for key, name in (("imdb", "IMDb"), ("kp", "КП")):
         try:
             v = float(r.get(key) or 0)
         except (TypeError, ValueError):
