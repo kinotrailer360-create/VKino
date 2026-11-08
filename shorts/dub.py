@@ -178,7 +178,7 @@ async def _lumean_voice(texts: list[str], parts: list[Path], work: Path, voice_i
 
 
 async def _voice_lines(lines: list[dict[str, Any]], voices: dict[str, dict[str, str]], work: Path) -> list[Path]:
-    """mp3 на каждую реплику: голос героя из Lumean; не вышло — голос Microsoft; и он не смог — тишина."""
+    """mp3 на каждую реплику голосом героя из Lumean (ElevenLabs); не вышло — сборка останавливается."""
     spoken = await daily.spoken_lines([ln["ru"] for ln in lines])
     spoken = [t.replace(pronounce.STRESS, "") for t in spoken]
     parts = [work / f"dub_{i}.mp3" for i in range(len(lines))]
@@ -192,19 +192,14 @@ async def _voice_lines(lines: list[dict[str, Any]], voices: dict[str, dict[str, 
         by_voice.setdefault(ln["speaker"], []).append(i)
     for spk, idx in by_voice.items():
         v = voices[spk]
-        if v["id"]:
-            try:
-                await _lumean_voice([spoken[i] for i in idx], [parts[i] for i in idx], work, v["id"])
-                continue
-            except Exception as exc:  # noqa: BLE001
-                log.warning("shorts: Lumean dub for %s failed (%s), using Edge", spk, exc)
-                notes.append(f"🗣 Голос {v['name']} (Lumean) не сработал: {str(exc)[:200]} — "
-                             "его реплики озвучены голосом Microsoft.")
-        for i in idx:
-            if not await _edge_safe(spoken[i], v["gender"], parts[i]):
-                await _silence(parts[i])
-                lost.append(i + 1)
-            await asyncio.sleep(1.0)
+        # только голоса ElevenLabs (Lumean): запасной голос Microsoft убран — он звучал заметно хуже
+        if not v["id"]:
+            raise RuntimeError("голоса Lumean недоступны (нет LUMEAN_API_KEY или библиотека голосов не ответила) "
+                               "— попробуй позже")
+        try:
+            await _lumean_voice([spoken[i] for i in idx], [parts[i] for i in idx], work, v["id"])
+        except Exception as exc:
+            raise RuntimeError(f"голос {v['name']} (Lumean) не сработал: {str(exc)[:200]} — попробуй позже") from exc
     if lost:
         notes.append(f"⚠️ Не озвучились реплики № {', '.join(map(str, lost))} — в видео они без перевода.")
     daily.tts_note = "\n".join(notes) or None
