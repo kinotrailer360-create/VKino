@@ -66,6 +66,8 @@ from shorts.postmedia import DIGEST_MARKERS, _focused, _is_digest, _mentions_tit
 from shorts import usage as shorts_usage
 from shorts import news as shorts_news
 from shorts import fastnews as shorts_fast
+from shorts import hype as shorts_hype
+from shorts import teaser as shorts_teaser
 from shorts import rt as shorts_rt
 from shorts import weekly as shorts_weekly
 from shorts import lumean as shorts_lumean
@@ -3715,6 +3717,11 @@ def card_keyboard(
             )
         ]
     )
+    if BOT_USERNAME:  # друг по ссылке сразу открывает этот фильм в боте (и подписывается на канал)
+        link = f"https://t.me/{BOT_USERNAME}?start=f_{movie_id}"
+        share = (f"https://t.me/share/url?url={quote(link)}&text="
+                 + quote(f"«{kp.title(item)}» — описание, трейлер и где посмотреть 🍿"))
+        rows.append([InlineKeyboardButton(text="📤 Поделиться с другом", url=share)])
     rows.append(
         [
             InlineKeyboardButton(
@@ -3992,6 +3999,11 @@ async def send_card(
     )
 
     poster = kp.poster(item)
+    if not BOT_USERNAME:
+        try:
+            await _bot_link(message.bot)
+        except Exception:  # noqa: BLE001 — без кнопки «Поделиться»
+            pass
 
     keyboard = card_keyboard(
         item,
@@ -4056,6 +4068,16 @@ async def cmd_start(
                              "в конце покажу совпадения.",
                              reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
         await duo_show(message.bot, message.chat.id, message.from_user.id, arg[4:], None)
+        return
+    if arg.startswith("f_") and arg[2:].isdigit() and message.from_user:  # друг поделился фильмом
+        await track(message.from_user.id, "share_open")
+        await message.answer("🍿 Друг поделился с тобой фильмом 👇",
+                             reply_markup=main_menu(message.from_user.id in ADMIN_IDS))
+        try:
+            await send_card(message, await kp.details(int(arg[2:])), message.from_user.id)
+        except Exception:  # noqa: BLE001
+            logging.exception("Shared film open failed")
+            await message.answer("Не получилось открыть фильм — найди его через «🔎 Найти фильм или сериал».")
         return
     if arg == "kinodl":
         await message.answer("🎬 Кинодл — фильм дня за 6 подсказок 👇",
@@ -10487,7 +10509,8 @@ def _repeats(words: set[str], stories: list[dict[str, Any]], english: bool = Fal
     return False
 
 
-async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
+async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
+                       pool: list[dict[str, Any]] | None = None) -> str:
     """Пост в стиле канала автора по самой интересной свежей новости, с фото или видео из источника.
     mode: "tg" — Telegram-каналы за сутки (кроме своего); "fast" — быстрые зарубежные источники (Reddit,
     Deadline, инсайдеры, X) за 12 часов — там новости раньше; "all" — и то и другое.
@@ -10495,11 +10518,14 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg") -> str:
     async with post_lock:
         own = POST_CHANNEL.lstrip("@").lower()
         channels = [c for c in await fact_channels() if c.lower() != own]
-        posts = await shorts_tgsearch.latest(channels, hours=24, per_channel=5) if mode != "fast" else []
+        if pool is not None:  # инфоповод: пост только по этим постам-источникам
+            posts = list(pool)
+        else:
+            posts = await shorts_tgsearch.latest(channels, hours=24, per_channel=5) if mode != "fast" else []
         hist = await _posts_history()
         used = set(hist["urls"])
         fresh = [p for p in posts if p["url"] not in used][:30 if mode == "tg" else 20]
-        if mode != "tg":
+        if mode != "tg" and pool is None:
             try:
                 fast = await shorts_fast.latest(await fast_feeds(), timeout=50)
             except Exception as exc:  # noqa: BLE001
@@ -11768,9 +11794,14 @@ async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
     await offer_post(bot, chat_id, ids, kind, "pt:bl", what="Пост с ляпами готов")
 
 
+BOT_USERNAME = ""  # имя бота: для ссылок «Поделиться» (запоминаем при первом запросе)
+
+
 async def _bot_link(bot: Bot) -> str:
-    me = await bot.get_me()
-    return f"https://t.me/{me.username}"
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        BOT_USERNAME = (await bot.get_me()).username or ""
+    return f"https://t.me/{BOT_USERNAME}"
 
 
 async def _card_post(bot: Bot, chat_id: int, tagline: str, link: str, post: str, rubric: str = "") -> list[int]:
@@ -12495,6 +12526,183 @@ def _run_job(coro_fn: Any) -> None:
     task = asyncio.create_task(coro_fn())
     shorts_jobs.add(task)
     task.add_done_callback(shorts_jobs.discard)
+
+
+# ---------------------------------------------------------------- 🔥 инфоповоды
+
+HYPE_EVERY = 20 * 60
+HYPE_MAX_DAY = int(os.getenv("HYPE_MAX_DAY", "4"))  # не больше уведомлений в день, чтобы не заспамить
+hype_cache: dict[str, dict[str, Any]] = {}
+
+
+async def hype_scan() -> list[dict[str, Any]]:
+    """Громкие истории за 8 часов, о которых ещё не было уведомления (за 3 дня)."""
+    own = POST_CHANNEL.lstrip("@").lower()
+    channels = [c for c in await fact_channels() if c.lower() != own]
+    posts = await shorts_tgsearch.latest(channels, hours=8, per_channel=6)
+    try:
+        posts += await shorts_fast.latest(await fast_feeds(), timeout=50)
+    except Exception as exc:  # noqa: BLE001
+        logging.info("Hype: fast sources failed: %s", exc)
+    seen = json.loads(await shorts_setting("hype_seen") or "[]")
+    out = []
+    for g in shorts_hype.hot(shorts_hype.clusters(posts, _key_tokens, _shared)):
+        toks = set(g["tokens"])
+        if _repeats(toks, seen) or _repeats(toks, seen, english=True):
+            continue
+        out.append(g)
+    return out
+
+
+async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> None:
+    """«🔥 Инфоповод» автору: о чём, сколько источников, кнопки «Пост», «Тизер», «Текст для рекламы»."""
+    hid = secrets.token_hex(4)
+    hype_cache[hid] = g
+    for old in list(hype_cache)[:-40]:
+        hype_cache.pop(old, None)
+    hist = await _posts_history()
+    stories = [st for st in hist["stories"] if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
+    posted = _repeats(set(g["tokens"]), stories)
+    head = f"🔥 <b>Инфоповод</b> — пишут {g['sources']} источника(ов)"
+    if g["franchise"]:
+        head += f" · громкое имя: <b>{escape(g['franchise'])}</b>"
+    lines = [head, ""]
+    for p in g["posts"][:3]:
+        lines.append("— " + escape(re.sub(r"\s+", " ", p.get("text") or "")[:180]) + "…")
+    links = " · ".join(
+        f'<a href="{escape(p["url"])}">{escape(str(p.get("channel") or p.get("label") or "источник"))[:24]}</a>'
+        for p in g["posts"][:6] if p.get("url"))
+    lines.append("\nИсточники: " + links)
+    lines.append("\n✅ Пост об этом в канале уже был — сделай тизер и рекламу." if posted else
+                 "\n⚡ Хайп держится 3–5 дней — лучше выйти с постом сегодня.")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("📝 Пост в канал сейчас", f"hy:p:{hid}")],
+        [_btn("🎬 Тизер-ролик (Telegram и MAX)", f"hy:t:{hid}")],
+        [_btn("📣 Текст для посева и Директа", f"hy:a:{hid}")]])
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id, "\n".join(lines), reply_markup=markup, disable_web_page_preview=True)
+        except Exception:  # noqa: BLE001
+            logging.exception("Hype alert failed")
+
+
+async def _hype_remember(g: dict[str, Any]) -> None:
+    seen = [st for st in json.loads(await shorts_setting("hype_seen") or "[]")
+            if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
+    seen.append({"at": int(time.time()), "tokens": g["tokens"][:120]})
+    await set_shorts_setting("hype_seen", json.dumps(seen[-80:], ensure_ascii=False))
+
+
+async def hype_loop(bot: Bot) -> None:
+    """Раз в 20 минут (кроме ночи): громкие инфоповоды — уведомление автору, не больше HYPE_MAX_DAY в день."""
+    while True:
+        await asyncio.sleep(HYPE_EVERY)
+        try:
+            if await shorts_setting("hype") == "off":
+                continue
+            now = datetime.now(POST_TZ)
+            if now.hour in POSTS_NIGHT:
+                continue
+            day = json.loads(await shorts_setting("hype_day") or "{}")
+            if day.get("d") != now.date().isoformat():
+                day = {"d": now.date().isoformat(), "n": 0}
+            if day["n"] >= HYPE_MAX_DAY:
+                continue
+            for g in (await hype_scan())[:HYPE_MAX_DAY - day["n"]]:
+                await hype_alert(bot, g, sorted(ADMIN_IDS))
+                await _hype_remember(g)
+                day["n"] += 1
+            await set_shorts_setting("hype_day", json.dumps(day))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.exception("Hype loop failed")
+
+
+@router.message(Command("hype"))
+async def hype_command(message: Message) -> None:
+    """/hype — проверить инфоповоды сейчас; /hype on|off — включить/выключить автоуведомления."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip().lower()
+    if arg in ("on", "off"):
+        await set_shorts_setting("hype", arg)
+        await message.answer("🔥 Уведомления об инфоповодах " + (
+            f"включены: проверка каждые 20 минут, не больше {HYPE_MAX_DAY} в день." if arg == "on" else "выключены."))
+        return
+    wait = await message.answer("⏳ Ищу громкие новости: Telegram-каналы и зарубежные источники за 8 часов…")
+    try:
+        groups = await hype_scan()
+    except Exception as exc:  # noqa: BLE001
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+        return
+    if not groups:
+        auto = "выключена — /hype on" if await shorts_setting("hype") == "off" else "каждые 20 минут"
+        await wait.edit_text("Сейчас громких инфоповодов нет (нужно от 3 источников, для больших франшиз — от 2). "
+                             f"Автопроверка: {auto}.")
+        return
+    await wait.delete()
+    for g in groups[:3]:
+        await hype_alert(message.bot, g, [message.chat.id])
+        await _hype_remember(g)
+
+
+async def _hype_teaser_job(bot: Bot, chat_id: int, g: dict[str, Any]) -> None:
+    lines = await shorts_hype.teaser_lines(GEMINI_API_KEY, shorts_hype.material(g))
+    work = SHORTS_DIR / f"hype_{time.time_ns()}"
+    try:
+        for key, label in (("tg", "Telegram"), ("max", "MAX")):
+            path = await asyncio.to_thread(shorts_teaser.render, lines, work / f"teaser_{key}.mp4", key)
+            await bot.send_video(chat_id, FSInputFile(path, filename=f"kinomir360_teaser_{key}.mp4"), width=1080,
+                                 height=1080, caption=f"🎬 Тизер для {label}: в канал, в посев или в объявление Директа.")
+        await bot.send_message(chat_id, "Текст ролика: " + escape(" · ".join(v for v in lines.values() if v)))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@router.callback_query(F.data.startswith("hy:"))
+async def hype_buttons(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    _, kind, hid = ((callback.data or "") + "::").split(":", 2)
+    g = hype_cache.get(hid.rstrip(":"))
+    if not g:
+        await callback.answer("Инфоповод устарел (бот перезапускался) — /hype найдёт заново", show_alert=True)
+        return
+    await callback.answer()
+    bot, chat_id = callback.bot, callback.message.chat.id
+    if kind == "p":
+        await bot.send_message(chat_id, "📝 Пишу пост по этому инфоповоду…")
+
+        async def post_job() -> None:
+            try:
+                if not await make_tg_post(bot, [chat_id], "all", pool=g["posts"]):
+                    await bot.send_message(chat_id, "Пост не собрался: похоже, об этом уже писали в канале.")
+            except Exception as exc:  # noqa: BLE001
+                await bot.send_message(chat_id, f"❌ <code>{escape(_safe_err(exc)[:400])}</code>")
+        _run_job(post_job)
+    elif kind == "t":
+        await bot.send_message(chat_id, "🎬 Собираю тизер-ролики (Telegram и MAX), пара минут…")
+
+        async def teaser_job() -> None:
+            try:
+                await _hype_teaser_job(bot, chat_id, g)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Hype teaser failed")
+                await bot.send_message(chat_id, f"❌ Тизер не собрался: <code>{escape(_safe_err(exc)[:400])}</code>")
+        _run_job(teaser_job)
+    elif kind == "a":
+        texts = await shorts_hype.promo_texts(GEMINI_API_KEY, shorts_hype.material(g), POST_CHANNEL)
+        if not texts:
+            await bot.send_message(chat_id, "❌ ИИ сейчас не ответил — попробуй через пару минут.")
+            return
+        await bot.send_message(chat_id, "📣 <b>Пост для посева</b> (в чужой кино-канал):\n\n" + escape(texts["seed"]))
+        await bot.send_message(
+            chat_id, "🟡 <b>Для Яндекс Директа</b> (нативный пост, без эмодзи)\n\n<b>Заголовок:</b> "
+            + escape(texts["direct_title"]) + "\n\n<b>Текст:</b>\n" + escape(texts["direct_text"])
+            + "\n\nНазвания чужих брендов модерация может не пропустить — тогда замени их описанием "
+            "(«культовый сериал про 80-е»).")
 
 
 POST_MAKERS.update({
@@ -16323,6 +16531,9 @@ def sub_markup() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Я подписался", callback_data="sub:check")]])
 
 
+sub_pending: dict[int, str] = {}  # /start-ссылка, с которой пришёл неподписанный: откроем после подписки
+
+
 async def subscription_gate(handler: Any, event: Any, data: dict[str, Any]) -> Any:
     """Перед каждым сообщением и кнопкой в личке: подписан ли человек на канал (кроме админов)."""
     user = getattr(event, "from_user", None)
@@ -16346,6 +16557,8 @@ async def subscription_gate(handler: Any, event: Any, data: dict[str, Any]) -> A
     text = (f"🔒 Чтобы пользоваться ботом дальше, подпишись на наш канал {escape(POST_CHANNEL)} — там новинки, "
             "подборки и трейлеры каждый день 🎬\n\nПодписался — жми «✅ Я подписался».")
     await track(user.id, "sub_lock")
+    if isinstance(event, Message) and (event.text or "").startswith("/start f_"):
+        sub_pending[user.id] = (event.text or "").partition(" ")[2].strip()  # откроем после подписки
     if isinstance(event, CallbackQuery):
         await event.answer()
         if event.message:
@@ -16366,6 +16579,12 @@ async def sub_check(callback: CallbackQuery) -> None:
                 await callback.message.edit_text("✅ Спасибо за подписку! Пользуйся ботом — повтори свой запрос 🎬")
             except TelegramBadRequest:
                 pass
+            arg = sub_pending.pop(callback.from_user.id, "")
+            if arg.startswith("f_") and arg[2:].isdigit():  # пришёл по ссылке «Поделиться» — сразу фильм
+                try:
+                    await send_card(callback.message, await kp.details(int(arg[2:])), callback.from_user.id)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Shared film after subscribe failed")
     else:
         await callback.answer("Подписка пока не видна — подпишись и нажми ещё раз.", show_alert=True)
 
@@ -16376,6 +16595,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
         BotCommand(command="report", description="📊 Отчёт за неделю и план"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
+        BotCommand(command="hype", description="🔥 Инфоповоды: проверить сейчас, /hype on|off"),
         BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
@@ -16454,6 +16674,7 @@ async def main() -> None:
     )
     posts_task = asyncio.create_task(posts_auto_loop(bot))
     direct_task = asyncio.create_task(direct_report_loop(bot))  # статистика рекламы в Директе
+    hype_task = asyncio.create_task(hype_loop(bot))  # 🔥 громкие инфоповоды → уведомление автору
     growth_task = asyncio.create_task(growth_loop(bot))  # уведомления из избранного, подборка недели, выпуск
 
     dp = Dispatcher()
@@ -16492,6 +16713,7 @@ async def main() -> None:
         posts_task.cancel()
         growth_task.cancel()
         direct_task.cancel()
+        hype_task.cancel()
         commands_task.cancel()
 
         try:
