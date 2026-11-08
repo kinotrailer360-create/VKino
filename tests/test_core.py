@@ -294,3 +294,75 @@ def test_budget_blocks_at_limit(monkeypatch, tmp_path):
     assert "⚠️" in budget.charge(0.2, "test")  # перешли 80 %
     usage._cache[month]["usd"] = 9.99
     assert not budget.allow(0.045)
+
+
+def test_safe_resolver_blocks_rebinding():
+    import asyncio
+
+    import pytest
+
+    from shorts import netsafe
+
+    class Flip:  # DNS-перепривязка: первый ответ публичный, второй — внутренний
+        def __init__(self):
+            self.n = 0
+
+        async def resolve(self, host, port=0, family=0):
+            self.n += 1
+            ip = "93.184.216.34" if self.n == 1 else "127.0.0.1"
+            return [{"hostname": host, "host": ip, "port": port, "family": family, "proto": 0, "flags": 0}]
+
+        async def close(self):
+            pass
+
+    async def run():
+        r = netsafe.SafeResolver()
+        r._inner = Flip()
+        assert (await r.resolve("evil.example"))[0]["host"] == "93.184.216.34"
+        with pytest.raises(OSError):
+            await r.resolve("evil.example")  # соединение по второму ответу не состоится
+    asyncio.run(run())
+
+
+def test_fetch_checks_every_redirect(monkeypatch):
+    import asyncio
+
+    import pytest
+
+    from shorts import netsafe
+
+    class Resp:
+        def __init__(self, status, location=None):
+            self.status, self.headers = status, ({"Location": location} if location else {})
+            self.url = __import__("yarl").URL("https://public.example/a")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, allow_redirects=True):
+            assert allow_redirects is False
+            self.calls.append(url)
+            return Resp(302, "http://169.254.169.254/latest/meta-data")
+
+    async def ok(url):
+        if "169.254" in url:
+            raise netsafe.UnsafeURL("внутренний адрес")
+    monkeypatch.setattr(netsafe, "check_url", ok)
+    s = Session()
+    with pytest.raises(netsafe.UnsafeURL):
+        asyncio.run(netsafe.fetch(s, "https://public.example/a"))
+    assert s.calls == ["https://public.example/a"]  # во внутреннюю сеть запрос так и не ушёл
+
+
+def test_no_builtin_admin():
+    import pathlib
+    import re
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("bot.py").read_text(encoding="utf-8")
+    assert re.search(r'os\.getenv\("ADMIN_IDS", ""\)', src)  # пусто по умолчанию — админов нет

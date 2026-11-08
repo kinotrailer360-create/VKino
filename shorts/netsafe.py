@@ -12,7 +12,10 @@ import re
 import socket
 from urllib.parse import urlparse
 
+from typing import Any
+
 import aiohttp
+import aiohttp.abc
 from yarl import URL
 
 MAX_BYTES = 15 * 1024 * 1024  # картинка или лента больше — не нужна
@@ -48,6 +51,32 @@ async def check_url(url: str) -> None:
     for info in infos:
         if _bad_ip(info[4][0]):
             raise UnsafeURL(f"{host} ведёт во внутреннюю сеть")
+
+
+class SafeResolver(aiohttp.abc.AbstractResolver):
+    """DNS-резолвер для чужих адресов: отдаёт соединению только публичные IP. Проверка в момент соединения —
+    так «перепривязка DNS» (первый ответ публичный, второй — 127.0.0.1) не проходит: проверенный адрес и есть
+    тот, к которому подключаемся. IP-адреса в самой ссылке aiohttp не резолвит — их ловит check_url."""
+
+    def __init__(self) -> None:
+        self._inner = aiohttp.ThreadedResolver()
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET) -> list[dict[str, Any]]:
+        infos = await self._inner.resolve(host, port, family)
+        good = [i for i in infos if not _bad_ip(str(i["host"]))]
+        if not good:
+            raise OSError(f"{host} ведёт во внутреннюю сеть")
+        return good
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+def safe_session(**kwargs: Any) -> aiohttp.ClientSession:
+    """Сессия для адресов из чужих постов, лент и выдачи поиска: соединение только с публичными IP
+    (SafeResolver), без кэша DNS. Перенаправления и размер — в fetch / fetch_page."""
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=SafeResolver(), use_dns_cache=False),
+                                 **kwargs)
 
 
 def _same_origin(url: str, trusted: str) -> bool:

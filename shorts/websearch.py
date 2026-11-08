@@ -170,7 +170,7 @@ async def duckduckgo(query: str, n: int = 6) -> list[dict[str, str]]:
 
 async def _page_text(url: str) -> str:
     # адрес из выдачи поиска — чужой: только публичный интернет и не больше 3 МБ (netsafe)
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), headers=BROWSER) as session:
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=15), headers=BROWSER) as session:
         try:
             html, ctype = await netsafe.fetch_page(session, url)
         except (netsafe.UnsafeURL, aiohttp.ClientResponseError) as exc:

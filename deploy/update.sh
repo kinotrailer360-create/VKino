@@ -74,8 +74,9 @@ echo "$(date '+%F %T') $status ($old → $new)"
 # сообщение админам: ключ и id — из .env (в git их нет)
 token=$(grep -E '^BOT_TOKEN=' .env | head -1 | cut -d= -f2- | tr -d "\"' \r")
 admins=$(grep -E '^ADMIN_IDS=' .env | head -1 | cut -d= -f2- | tr -d "\"' \r")
-admins=${admins:-803444545}
-[ -n "$token" ] || exit 0
+# id по умолчанию нет: без ADMIN_IDS в .env сообщать некому (и админки в боте тоже нет)
+[ -n "$admins" ] || echo "$(date '+%F %T') ВНИМАНИЕ: в .env нет ADMIN_IDS — админка бота закрыта"
+[ -n "$token" ] && [ -n "$admins" ] || exit 0
 for id in ${admins//,/ }; do
   curl -fsS -m 20 "https://api.telegram.org/bot${token}/sendMessage" \
     --data-urlencode "chat_id=${id}" \

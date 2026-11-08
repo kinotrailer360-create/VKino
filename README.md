@@ -33,7 +33,7 @@ KINOPOISK_TOKEN_2=...
 # необязательно: запасной Кинопоиск — kinopoiskapiunofficial.tech (поиск и карточки, когда ключи на лимите)
 KP_UNOFFICIAL_KEY=...
 DATABASE_URL=postgresql://user:password@host:5432/dbname
-ADMIN_IDS=803444545
+ADMIN_IDS=ваш_telegram_id   # обязательно: без него админки нет ни у кого
 ```
 
 Необязательные:

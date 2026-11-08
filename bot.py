@@ -199,11 +199,14 @@ BLENDER_OPEN_MOVIE_TITLES: list[tuple[str, str]] = [
     ("wing it", "Wing It!"),
 ]
 
-ADMIN_IDS = {
+# админы — только из .env; не задано или пусто — админки нет ни у кого (никакого id по умолчанию)
+ADMIN_IDS: set[int] = {
     int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "803444545").split(",")
+    for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
+if not ADMIN_IDS:
+    logging.warning("ADMIN_IDS is empty — admin panel is closed for everyone. Set ADMIN_IDS in .env")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not configured")

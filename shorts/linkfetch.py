@@ -59,7 +59,7 @@ async def fetch(url: str) -> dict[str, Any]:
     """{"url", "title", "text", "image", "video", "thumb"} — пост Telegram (через веб-версию) или статья сайта;
     thumb — маленькая обложка видео, которое веб-версия Telegram не отдаёт."""
     timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as session:
+    async with netsafe.safe_session(timeout=timeout, headers=HEADERS) as session:
         m = TG_POST.search(url)
         if m:
             async with session.get(f"https://t.me/{m.group(1)}/{m.group(2)}", params={"embed": "1", "mode": "tme"}) as resp:
