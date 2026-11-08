@@ -133,7 +133,7 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     if image is not None:
         small = image.copy()
-        small.thumbnail((1600, 1600))
+        small.thumbnail((1024, 1024))  # на 1600 px картинка стоила вдвое больше токенов, а видно то же
         buf = io.BytesIO()
         small.convert("RGB").save(buf, "JPEG", quality=82)
         content.append({"type": "image_url", "image_url": {
@@ -459,6 +459,7 @@ def _json_from(text: str) -> Any:
 # у бесплатного Groq лимит ~7000 токенов в минуту (≈ 4 символа на токен по-русски): длинный материал
 # (статья Википедии, посты каналов) сокращаем — начало с заданием и конец с форматом ответа остаются
 RESERVE_MAX_CHARS = 16000
+LUMEAN_MAX_CHARS = 24000  # потолок задания для платной модели Lumean
 
 
 def _fit(prompt: str, limit: int = RESERVE_MAX_CHARS) -> str:
@@ -515,7 +516,8 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
     async def ask_lumean() -> Any:
         global last_engine
         try:
-            result = await asyncio.wait_for(_ask_lumean(prompt, image), RESERVE_BUDGET + 60)
+            # платная модель: длинное задание урезаем (середина), чтобы один запрос не стоил как десять
+            result = await asyncio.wait_for(_ask_lumean(_fit(prompt, LUMEAN_MAX_CHARS), image), RESERVE_BUDGET + 60)
             log.info("shorts: Lumean LLM answered")
             last_engine = "lumean"
             return result
@@ -963,6 +965,16 @@ POST_STYLE = """🏜 ФИНАЛЬНЫЙ ТРЕЙЛЕР «ДЮНЫ 3»!
 #Дюна3 #DunePartThree #Вильнёв #ТимотиШаламе #Зендея #Трейлер #КиноНовости"""
 
 
+WRITE_POSTS_MAX = 28  # постов-кандидатов в одном запросе
+WRITE_POST_CHARS = 450  # символов от каждого — заголовок и суть
+
+
+def _clip(text: str, limit: int) -> str:
+    """Начало текста до limit символов по границе слова."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
+
+
 async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
                      own_posts: str = "") -> dict[str, Any] | None:
     """Пост для Telegram-канала автора в его стиле (POST_STYLE) по самой интересной свежей новости из постов
@@ -970,7 +982,10 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
     {"post": текст, "topic": тема, "media": [номера постов о той же новости — оттуда фото/видео]} или None."""
     if not available(key) or not posts:
         return None
-    listing = "\n\n".join(f"{i}. [{p.get('label') or 't.me/' + p['channel']}]\n{p['text']}"
+    # экономия токенов: ИИ выбирает новость — для этого хватает начала поста (заголовок и суть), а целиком
+    # материал нужного поста бот передаёт дальше сам; раньше уходило до 45 постов × 700 символов
+    posts = posts[:WRITE_POSTS_MAX]
+    listing = "\n\n".join(f"{i}. [{p.get('label') or 't.me/' + p['channel']}]\n{_clip(p['text'], WRITE_POST_CHARS)}"
                           for i, p in enumerate(posts, 1))
     foreign = any(p.get("lang") == "en" for p in posts)
     rules = (
@@ -978,8 +993,8 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         "интересную для широкой аудитории новость: трейлер, премьера, кастинг, продолжение, сборы, награды, "
         "громкие слухи. Пропускай рекламу, розыгрыши, политику, местные события и то, что уже было:\n"
         + ("\n".join(f"— {t}" for t in recent[-40:]) or "—")
-        + ("\n\nУЖЕ ОПУБЛИКОВАНО В НАШЕМ КАНАЛЕ — эти новости не бери, даже другими словами:\n" + own_posts[:5000]
-           if own_posts else "")
+        + ("\n\nУЖЕ ОПУБЛИКОВАНО В НАШЕМ КАНАЛЕ — эти новости не бери, даже другими словами:\n"
+           + "\n".join(ln[:110] for ln in own_posts.splitlines())[:2500] if own_posts else "")
         + ("\n\nЧАСТЬ ПОСТОВ — ЗАРУБЕЖНЫЕ ИСТОЧНИКИ (Reddit, X, Deadline, Variety, THR, инсайдеры) на английском: "
            "там новости появляются раньше русских каналов, их ценность — скорость. Переведи сам смысл; фильмы — "
            "как в российском прокате, если названия ещё нет — оригинальное; имена — по-русски. НАЗВАНИЯ НЕ "
@@ -1394,6 +1409,32 @@ async def _post_json(key: str, prompt: str, search: bool = True, need_search: bo
     return data
 
 
+VERIFY_RULES_CHARS = 1500  # начало задания (что за пост) — фактчекеру для контекста
+VERIFY_MATERIAL_CHARS = 5000  # материалы о той же новости
+
+
+def _relevant_task(task: str, post: str) -> str:
+    """Для фактчекера — не всё задание (там десятки чужих новостей и правила стиля), а его начало и только
+    те куски материалов, где есть имена и названия из черновика. Раньше уходило до 12 000 символов."""
+    names = _name_tokens(post)
+    head = task[:VERIFY_RULES_CHARS]
+    blocks = [b for b in re.split(r"\n\s*\n", task[VERIFY_RULES_CHARS:]) if b.strip()]
+
+    def hits(b: str) -> int:
+        return len(names & _name_tokens(b))
+
+    picked, size = [], 0
+    for b in sorted(blocks, key=hits, reverse=True):
+        if hits(b) == 0 or size >= VERIFY_MATERIAL_CHARS:
+            break
+        part = b[:2500]
+        picked.append(part)
+        size += len(part)
+    if not picked:  # ничего не совпало — как раньше, но короче
+        return _fit(task, 6000)
+    return head + "\n…\nМАТЕРИАЛЫ О ЭТОЙ НОВОСТИ:\n" + "\n\n".join(picked)
+
+
 async def verify_post(key: str, task: str, post: str) -> str:
     """Второй проход — строгий фактчекер: сверяет каждое утверждение поста с материалами задания и убирает
     или помечает неподтверждённое. Не вышло — возвращаем пост как был."""
@@ -1415,7 +1456,7 @@ async def verify_post(key: str, task: str, post: str) -> str:
         "Сохрани стиль, эмодзи, структуру, хэштеги и длину (до 950 символов). Если всё верно — верни черновик "
         "без изменений." + GRAMMAR
         + '\n\nОтветь только JSON: {"post": "проверенный текст поста", "fixes": ["что исправил", ...]}'
-        + "\n\nЗАДАНИЕ:\n" + _fit(task, 12000) + "\n\nЧЕРНОВИК:\n" + post)
+        + "\n\nЗАДАНИЕ:\n" + _relevant_task(task, post) + "\n\nЧЕРНОВИК:\n" + post)
     try:
         data = await _with_reserve(key, [{"text": prompt}], prompt)
     except Exception as exc:  # noqa: BLE001
