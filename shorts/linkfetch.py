@@ -9,7 +9,7 @@ from typing import Any
 
 import aiohttp
 
-from . import tgsearch
+from . import netsafe, tgsearch
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/120.0 Mobile Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
@@ -71,9 +71,8 @@ async def fetch(url: str) -> dict[str, Any]:
                 raise RuntimeError("пост не открылся (канал закрытый или пост удалён)")
             return {"url": url, "title": "", "text": post["text"][:TEXT_MAX], "image": post["image"],
                     "video": post["video"], "thumb": post.get("thumb"), "media": post.get("media") or []}
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            html = await resp.text(errors="ignore")
+        # статья по ссылке: только публичный интернет (и после перенаправлений), не больше 3 МБ
+        html, _ = await netsafe.fetch_page(session, url)
     parser = _Article()
     parser.feed(html)
     text = "\n".join(parser.paras)[:TEXT_MAX] or parser.meta.get("og:description", "")

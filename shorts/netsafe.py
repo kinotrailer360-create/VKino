@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -62,6 +63,27 @@ def _same_origin(url: str, trusted: str) -> bool:
 async def fetch(session: aiohttp.ClientSession, url: str, limit: int = MAX_BYTES, trusted: str = "") -> bytes:
     """GET с проверкой адреса на каждом перенаправлении и потолком размера. trusted — свой адрес из .env
     (RSSHub в docker-сети: он внутренний, но его задал владелец бота)."""
+    return (await _get(session, url, limit, trusted))[0]
+
+
+PAGE_BYTES = 3 * 1024 * 1024  # html-страница больше — читать не нужно
+
+
+async def fetch_page(session: aiohttp.ClientSession, url: str, limit: int = PAGE_BYTES) -> tuple[str, str]:
+    """Веб-страница (адрес из чужого поста или выдачи поиска): (текст, Content-Type) — только публичный
+    интернет, не больше limit байт, перенаправления проверяются."""
+    raw, ctype = await _get(session, url, limit, "")
+    charset = "utf-8"
+    m = re.search(r"charset=([\w-]+)", ctype)
+    if m:
+        charset = m.group(1)
+    try:
+        return raw.decode(charset, errors="ignore"), ctype
+    except LookupError:
+        return raw.decode("utf-8", errors="ignore"), ctype
+
+
+async def _get(session: aiohttp.ClientSession, url: str, limit: int, trusted: str) -> tuple[bytes, str]:
     for _ in range(MAX_REDIRECTS + 1):
         if not (trusted and _same_origin(url, trusted)):
             await check_url(url)
@@ -78,5 +100,5 @@ async def fetch(session: aiohttp.ClientSession, url: str, limit: int = MAX_BYTES
                 if size > limit:
                     raise UnsafeURL(f"файл больше {limit / 1048576:.1f} МБ")
                 chunks.append(chunk)
-            return b"".join(chunks)
+            return b"".join(chunks), resp.headers.get("Content-Type", "")
     raise UnsafeURL("слишком много перенаправлений")

@@ -269,3 +269,14 @@ def test_amazon_stress():
     from shorts import pronounce
     assert "Амазо́н" in pronounce.apply("премьера на Amazon")
     assert "Амазо́не" in pronounce.apply("вышел на Амазоне")
+
+
+def test_netsafe_blocks_internal_addresses():
+    import asyncio
+
+    import pytest
+
+    from shorts import netsafe
+    for url in ("http://127.0.0.1/", "http://169.254.169.254/latest", "http://10.0.0.5/x", "file:///etc/passwd"):
+        with pytest.raises(netsafe.UnsafeURL):
+            asyncio.run(netsafe.check_url(url))

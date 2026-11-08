@@ -24,6 +24,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
+from . import netsafe
+
 log = logging.getLogger("shorts")
 
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
@@ -167,11 +169,15 @@ async def duckduckgo(query: str, n: int = 6) -> list[dict[str, str]]:
 
 
 async def _page_text(url: str) -> str:
+    # адрес из выдачи поиска — чужой: только публичный интернет и не больше 3 МБ (netsafe)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), headers=BROWSER) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200 or "html" not in resp.headers.get("Content-Type", ""):
-                return ""
-            html = await resp.text(errors="ignore")
+        try:
+            html, ctype = await netsafe.fetch_page(session, url)
+        except (netsafe.UnsafeURL, aiohttp.ClientResponseError) as exc:
+            log.info("shorts: page %s skipped: %s", url[:60], exc)
+            return ""
+    if "html" not in ctype:
+        return ""
     paras = [re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", p))).strip()
              for p in re.findall(r"<p[^>]*>(.*?)</p>", html, re.S | re.I)]
     return " ".join(p for p in paras if len(p) >= 40)[:1200]
