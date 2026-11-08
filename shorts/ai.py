@@ -622,11 +622,13 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
         "ru — название по-русски (как в тексте или официальное), en — оригинальное название, если знаешь, "
         "year — год ТОЛЬКО если он написан у автора, иначе null (не угадывай: новинки бывают 2026 года), "
         "series — true, если это сериал (есть «сезон», «серия», «сериал»), season — номер сезона, если указан, "
+        "fresh — true, если у автора это новинка (премьера, «вышел», «новинки недели», «скоро») — тогда это "
+        "новый фильм, а не одноимённая классика, "
         "note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если "
         "указано, " + about + "Названия сервисов пиши как у автора (Netflix, Apple TV). Не выдумывай фильмы, "
         "которых у автора нет." + GRAMMAR +
         '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": null, '
-        '"series": false, "season": null, "note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
+        '"series": false, "season": null, "fresh": false, "note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
     )
     if images:
         parts: list[dict[str, Any]] = [{"text": prompt}]
@@ -644,6 +646,7 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
                           "year": int(year) if str(year or "").isdigit() else None,
                           "series": bool(f.get("series")) or bool(str(season or "").isdigit()),
                           "season": int(season) if str(season or "").isdigit() else None,
+                          "fresh": bool(f.get("fresh")),
                           "note": re.sub(r"\s+", " ", str(f.get("note") or "")).strip()[:220]})
     if len(films) < 3:
         raise AIError("ИИ не нашёл " + ("на картинках" if images else "в тексте") + " хотя бы 3 фильма или сериала")

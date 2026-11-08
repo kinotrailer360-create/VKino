@@ -10821,6 +10821,11 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
             # «Величайший (1 сезон)» — сериал, а не одноимённый фильм 2024 года: тип должен совпасть
             kind = [d for d in same if bool(d.get("isSeries")) == bool(f["series"])]
             same = kind or ([] if f["series"] else same)
+        if f.get("fresh") and not f["year"] and same:
+            # новинка из поста-афиши: «Обитель зла» на Apple TV — это фильм 2026 года, а не классика 2002-го
+            this_year = datetime.now(MSK).year
+            recent = [d for d in same if int(d.get("year") or 0) >= this_year - 1]
+            same = sorted(recent, key=lambda d: -int(d.get("year") or 0))  # нет новой — ищем на TMDB, не классику
         same.sort(key=lambda d: (abs(int(d.get("year") or 0) - f["year"]) > 1 if f["year"] else False,
                                  -int((d.get("votes") or {}).get("kp") or 0)))
         for d in same[:2]:
@@ -10831,7 +10836,8 @@ async def _list_poster(f: dict[str, Any], kp_films: list[dict[str, Any]],
             if shorts_daily._poster_url(full):
                 return shorts_daily._poster_url(full), full
     try:  # нет на Кинопоиске (бывает у свежих сериалов) — постер с TMDB, тоже по точному названию
-        url = await shorts_daily.tmdb.poster_by_title(TMDB_API_KEY, names, f["year"])
+        url = await shorts_daily.tmdb.poster_by_title(
+            TMDB_API_KEY, names, f["year"] or (datetime.now(MSK).year if f.get("fresh") else None))
         if url:
             return url, None
     except Exception as exc:  # noqa: BLE001
