@@ -1781,17 +1781,52 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     }
     cfg_path = work / "short.json"
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # рендер — отдельным процессом, чтобы не блокировать бота; его строки PROGRESS двигают полоску
     await _progress(50, "Монтаж видео")
+    try:
+        await _run_render(cfg_path)
+    except RenderStalled:
+        # монтаж встал (не хватает памяти/процессора на отрывки трейлеров) — собираем ещё раз без видео,
+        # из карточек: так ролик всё равно получится
+        log.warning("shorts: render stalled — retrying without trailer clips")
+        for c in cfg["cards"]:
+            c.pop("clip", None)
+            c.pop("overlay", None)
+        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        await _progress(50, "Монтаж встал — собираю без отрывков трейлеров")
+        await _run_render(cfg_path, "Монтаж без отрывков")
+    await _progress(98, "Видео готово")
+    return voiced
+
+
+RENDER_STALL = 240  # монтаж не двигается столько секунд — он встал
+
+
+class RenderStalled(RuntimeError):
+    pass
+
+
+async def _run_render(cfg_path: Path, stage: str = "Монтаж видео") -> None:
+    """Рендер — отдельным процессом, чтобы не блокировать бота; его строки PROGRESS двигают полоску.
+    Нет новой строки RENDER_STALL секунд — процесс убиваем (RenderStalled)."""
     proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "shorts.make_short", str(cfg_path),
                                                 stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent)
     errors = asyncio.create_task(proc.stderr.read())  # читаем параллельно, иначе процесс может встать
+    started = False  # до первой строки рендер готовит кадры трейлеров и звук — даём вдвое больше времени
     try:
-        async for line in proc.stdout:
+        while True:
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), RENDER_STALL * (1 if started else 2))
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise RenderStalled(f"монтаж не двигался {RENDER_STALL // 60} минуты") from None
+            if not line:
+                break
             m = re.match(rb"PROGRESS ([\d.]+)", line)
             if m:
-                await _progress(50 + round(48 * float(m.group(1))), "Монтаж видео")
+                started = True
+                await _progress(50 + round(48 * float(m.group(1))), stage)
         await proc.wait()
     except asyncio.CancelledError:
         proc.kill()  # сборку прервали по таймауту — не оставляем рендер жрать память
@@ -1799,8 +1834,6 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     err = await errors
     if proc.returncode:
         raise RuntimeError(f"{sys.executable} failed: {err.decode(errors='ignore')[-800:]}")
-    await _progress(98, "Видео готово")
-    return voiced
 
 
 def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
