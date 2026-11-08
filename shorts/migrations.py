@@ -150,8 +150,11 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             kind TEXT NOT NULL,
             pos BIGINT NOT NULL,
             value TEXT NOT NULL,
+            -- ключ — отпечаток значения: сюжет (JSON со словами новости) бывает длиннее 2,7 КБ, а столько
+            -- не влезает в индекс PostgreSQL (на сервере так упал первый запуск миграции 005)
+            vhash TEXT GENERATED ALWAYS AS (md5(value)) STORED,
             added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (kind, value)
+            PRIMARY KEY (kind, vhash)
         );
         CREATE INDEX IF NOT EXISTS idx_ai_post_history_kind ON ai_post_history(kind, pos);
     """, _copy_history),

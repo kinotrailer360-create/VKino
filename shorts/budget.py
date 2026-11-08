@@ -45,7 +45,11 @@ PRICES: dict[str, float | None] = {
     "gemini_in_per_m": _env_float("PRICE_GEMINI_IN_PER_M", 0.0),     # платный 2.5 Flash: 0.30
     "gemini_out_per_m": _env_float("PRICE_GEMINI_OUT_PER_M", 0.0),   # платный 2.5 Flash: 2.50
     "image": _env_float("AI_COST_IMAGE_USD", 0.045),                 # 0.039–0.045 за картинку до 1K
-    "lumean_llm_call": _env_float("PRICE_LUMEAN_LLM_CALL"),          # не проверено — сверка по журналу
+    # ИИ Lumean (gpt-5.6): подобрано по кабинету Lumean за 29.10–08.11.2026 — 31,66 LUMC за 5,98 млн входных и
+    # 0,39 млн выходных токенов; 1 LUMC = 10 ₽, 1 $ ≈ 82 ₽ (курс пополнения). Это оценка, а не тариф Lumean
+    "lumean_in_per_m": _env_float("PRICE_LUMEAN_IN_PER_M", 0.24),
+    "lumean_out_per_m": _env_float("PRICE_LUMEAN_OUT_PER_M", 5.8),
+    "lumean_llm_call": _env_float("PRICE_LUMEAN_LLM_CALL"),          # запасная цена за вызов, если нет токенов
     "lumean_tts_per_1k": _env_float("PRICE_LUMEAN_TTS_PER_1K_CHARS"),  # не проверено — сверка по журналу
     "lumean_music_track": _env_float("PRICE_LUMEAN_MUSIC_TRACK"),    # не проверено
     "search_call": _env_float("PRICE_SEARCH_CALL", 0.0),             # Tavily/Яндекс — в бесплатных лимитах
@@ -149,6 +153,10 @@ async def guard(pool: str, op: str, estimate: float, provider: str = "") -> Asyn
         await r.settle(None)
 
 
+def lumean_cost(tokens_in: int, tokens_out: int) -> float:
+    return tokens_in / 1e6 * price("lumean_in_per_m") + tokens_out / 1e6 * price("lumean_out_per_m")
+
+
 def gemini_cost(tokens_in: int, tokens_out: int) -> float:
     return tokens_in / 1e6 * price("gemini_in_per_m") + tokens_out / 1e6 * price("gemini_out_per_m")
 
@@ -160,7 +168,7 @@ async def status_lines() -> list[str]:
         used = await spent(pool)
         out.append(f"💵 {POOL_NAMES[pool]}: ≈{used:.2f}$ из {limit:g}$ за месяц"
                    + (" — лимит исчерпан" if used >= limit else ""))
-    missing = [n for n in ("lumean_llm_call", "lumean_tts_per_1k", "lumean_music_track") if not priced(n)]
+    missing = [n for n in ("lumean_tts_per_1k", "lumean_music_track") if not priced(n)]
     if missing:
         out.append("ℹ️ Цены Lumean ещё не заданы (" + ", ".join(missing) + ") — эти вызовы считаются, но по 0$. "
                    "После 10–20 вызовов сверим с кабинетом Lumean и впишем цены в .env.")

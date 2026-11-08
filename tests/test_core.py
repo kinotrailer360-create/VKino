@@ -445,3 +445,9 @@ def test_fsm_storage_rejects_non_json():
     s = fsm_pg.PgStorage(lambda: Pool())
     with pytest.raises(fsm_pg.FSMDataError):
         asyncio.run(s.set_data(StorageKey(bot_id=1, chat_id=1, user_id=1), {"img": b"\x89PNG"}))
+
+
+def test_history_key_is_hash_not_long_value():
+    from shorts import migrations
+    sql = next(m[2] for m in migrations.MIGRATIONS if m[0] == 5)
+    assert "PRIMARY KEY (kind, vhash)" in sql and "md5(value)" in sql  # длинный сюжет не влезал в индекс
