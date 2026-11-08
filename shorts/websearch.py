@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
-from . import netsafe
+from . import budget, netsafe
 
 log = logging.getLogger("shorts")
 
@@ -83,7 +83,8 @@ async def tavily(query: str, n: int = 6) -> list[dict[str, str]]:
     if not TAVILY_KEY:
         return []
     body = {"query": query[:400], "max_results": n, "search_depth": "advanced", "include_answer": False}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with budget.guard("ai", "search", budget.price("search_call"), "tavily"), \
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.post(TAVILY_URL, json=body, headers={"Authorization": f"Bearer {TAVILY_KEY}"}) as resp:
             data = await _json_or_error("Tavily", resp)
     return [{"title": str(r.get("title") or ""), "url": str(r.get("url") or ""),
@@ -95,7 +96,8 @@ async def yandex(query: str, n: int = 6) -> list[dict[str, str]]:
         return []
     body = {"query": {"searchType": "SEARCH_TYPE_RU", "queryText": query[:400]}, "folderId": YANDEX_FOLDER,
             "responseFormat": "FORMAT_XML", "groupSpec": {"groupsOnPage": str(n)}}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with budget.guard("ai", "search", budget.price("search_call"), "yandex"), \
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.post(YANDEX_URL, json=body, headers={"Authorization": f"Api-Key {YANDEX_KEY}"}) as resp:
             data = await _json_or_error("Яндекс", resp)
     root = ET.fromstring(base64.b64decode(data.get("rawData") or ""))

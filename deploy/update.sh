@@ -55,6 +55,19 @@ healthy() {
   return 1
 }
 
+# копия базы ПЕРЕД обновлением: новая версия может применить миграции (shorts/migrations.py). Миграции только
+# добавляют таблицы, а откат версии ниже их не трогает, но копия — на случай худшего. Хранится 5 последних.
+# Восстановить: docker compose exec -T db pg_restore -U vkino -d vkino --clean < /opt/vkino-backups/pre-update-….dump
+mkdir -p /opt/vkino-backups && chmod 700 /opt/vkino-backups
+pre=/opt/vkino-backups/pre-update-$old.dump
+if ! docker compose exec -T db pg_dump -U vkino -Fc vkino > "$pre.tmp" || [ ! -s "$pre.tmp" ]; then
+  rm -f "$pre.tmp"
+  echo "$(date '+%F %T') копия базы перед обновлением не удалась — обновление отложено"
+  exit 0
+fi
+mv "$pre.tmp" "$pre"
+ls -1t /opt/vkino-backups/pre-update-*.dump 2>/dev/null | tail -n +6 | xargs -r rm -f
+
 if bash "$DIR/deploy/install.sh" >/tmp/vkino-update.out 2>&1 && healthy; then
   status="✅ Бот обновлён автоматически"
 else

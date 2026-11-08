@@ -22,6 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
+from . import budget
 from . import usage as usage_log
 from . import websearch
 
@@ -142,10 +143,15 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
         body = {"model": model, "temperature": 0.3, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": "Отвечай только валидным JSON, без пояснений."},
                              {"role": "user", "content": content}]}
-        async with session.post(f"{LUMEAN_LLM_URL}/chat/completions", json=body,
-                                headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
-            data = await resp.json(content_type=None)
-            status = resp.status
+        # платный вызов — через бюджет (цена за вызов из .env; не задана — считается, но по 0$)
+        async with budget.guard("ai", "lumean_llm", budget.price("lumean_llm_call"), f"lumean:{model}") as r:
+            async with session.post(f"{LUMEAN_LLM_URL}/chat/completions", json=body,
+                                    headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
+                data = await resp.json(content_type=None)
+                status = resp.status
+            used = (data.get("usage") or {}) if isinstance(data, dict) else {}
+            await r.settle(None if status == 200 else 0.0, {"http": status, "in": used.get("prompt_tokens"),
+                                                             "out": used.get("completion_tokens")})
     if status == 200:
         _count_lumean(data)
     if status != 200:
@@ -252,6 +258,27 @@ def gemini_keys(key: str) -> list[str]:
     return list(dict.fromkeys(k for k in (key, *EXTRA_KEYS) if k))
 
 
+async def _gemini_call(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any]) -> tuple[int, Any]:
+    """Один запрос к Gemini через бюджет: оценка резервируется до запроса, после ответа — пересчёт по токенам
+    (usageMetadata). Повторы при перегрузке — тоже отдельные запросы и тоже через бюджет."""
+    est_in = len(json.dumps(body, ensure_ascii=False)) // 4
+    pool, op = ("ai", "gemini_image") if "image" in model else ("ai", "gemini")
+    estimate = budget.price("image") if op == "gemini_image" else budget.gemini_cost(est_in, 2000)
+    async with budget.guard(pool, op, estimate, model) as r:
+        async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
+            status, data = resp.status, await resp.json(content_type=None)
+        meta = (data.get("usageMetadata") or {}) if isinstance(data, dict) else {}
+        t_in, t_out = int(meta.get("promptTokenCount") or 0), int(meta.get("candidatesTokenCount") or 0) + int(
+            meta.get("thoughtsTokenCount") or 0)
+        if status != 200:
+            await r.settle(0.0, {"http": status})  # отказ (лимит, ошибка) Google не тарифицирует
+        elif op == "gemini_image":
+            await r.settle(estimate, {"in": t_in, "out": t_out})
+        else:
+            await r.settle(budget.gemini_cost(t_in, t_out) if meta else None, {"in": t_in, "out": t_out})
+    return status, data
+
+
 async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict[str, Any],
                 wait_minute: bool = True) -> tuple[int, Any]:
     """Запрос к модели; при перегрузке ждём и повторяем; кончился лимит в минуту — ждём, сколько просит Google
@@ -264,15 +291,13 @@ async def _post(session: aiohttp.ClientSession, key: str, model: str, body: dict
             if pause > 0:
                 await asyncio.sleep(pause)
             _gemini_last = time.monotonic()
-        async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
-            status, data = resp.status, await resp.json(content_type=None)
+        status, data = await _gemini_call(session, key, model, body)
         kind, wait = _quota(status, data)
         while kind == "minute" and minute_waits:
             minute_waits -= 1
             log.info("shorts: Gemini per-minute limit, waiting %.0fs", wait)
             await asyncio.sleep(wait)
-            async with session.post(API.format(model=model), json=body, headers={"x-goog-api-key": key}) as resp:
-                status, data = resp.status, await resp.json(content_type=None)
+            status, data = await _gemini_call(session, key, model, body)
             kind, wait = _quota(status, data)
         if status not in BUSY or delay is None or kind:
             return status, data
