@@ -9538,6 +9538,7 @@ async def custom_ask(message: Message, state: FSMContext, video: bool) -> None:
 async def show_plan(message: Message, state: FSMContext, title: str, films: list[dict[str, Any]]) -> None:
     wait = await message.answer("🔎 Ищу фильмы на Кинопоиске…")
     items = await shorts_copycat.resolve(kp._get, films)
+    await _tmdb_fill(items, films)
     await wait.delete()
     found = [it for it in items if it["id"]]
     await state.update_data(cs_title=title, cs_items=items, cs_notes=None)
@@ -9622,6 +9623,7 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
                 if film:
                     it.update(id=int(film["id"]), label=shorts_daily._title(film) + (
                         f" ({film['year']})" if film.get("year") else ""))
+        await _tmdb_fill(items, plan["films"])
         await _fill_notes(wait, plan["films"], items)
     except Exception as exc:
         logging.exception("Custom post parsing failed")
@@ -9647,6 +9649,24 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
              + (f" Ваших фото/видео: {len(media)} — ИИ поставит их к нужным фильмам." if media else "")]
     await message.answer("\n".join(rows))
     await start_custom(message, state, plan["title"], [it["id"] for it, _ in found], [n for _, n in found])
+
+
+async def _tmdb_fill(items: list[dict[str, Any]], films: list[dict[str, Any]]) -> None:
+    """Фильма нет на Кинопоиске (свежая зарубежная новинка, корейское кино) — берём его с TMDB: название, год,
+    рейтинг TMDB, жанры, актёры, кадры. В подборке он остаётся, а не пропускается."""
+    for it, f in zip(items, films):
+        if it["id"]:
+            continue
+        try:
+            card = await shorts_daily.tmdb.find_kp_like(
+                TMDB_API_KEY, [f.get("ru") or "", f.get("en") or ""], f.get("year"), f.get("series"),
+                bool(f.get("fresh")))
+        except Exception:  # noqa: BLE001
+            logging.exception("Custom: TMDB lookup %s failed", f.get("ru") or f.get("en"))
+            continue
+        if card:
+            it.update(id=card["id"], label=f"{card['name']}" + (f" ({card['year']})" if card.get("year") else "")
+                      + " · TMDB")
 
 
 async def _fill_notes(wait: Message, films: list[dict[str, Any]], items: list[dict[str, Any]]) -> None:

@@ -244,3 +244,14 @@ def test_same_name_rejects_other_films():
     assert not _same_name("Что, если любовь", {"name": "Что, если...?", "enName": "What If...?"})
     assert _same_name("Black Doves", {"name": "Чёрные голуби", "enName": "Black Doves"})
     assert _same_name("Черные голуби", {"name": "Чёрные голуби"})
+
+
+def test_tmdb_card_looks_like_kinopoisk():
+    from shorts import daily, tmdb
+    card = tmdb._kp_like("movie", {"id": 7, "title": "Что, если любовь", "original_title": "Possible Love",
+                                   "release_date": "2025-11-05", "vote_average": 7.46, "vote_count": 120,
+                                   "genres": [{"name": "драма"}], "poster_path": "/p.jpg",
+                                   "credits": {"cast": [{"name": "Чо Ин-сон"}], "crew": []}})
+    assert card["id"] == "tmdb:movie:7" and card["year"] == 2025
+    assert daily._title(card) == "Что, если любовь" and daily._actors(card) == ["Чо Ин-сон"]
+    assert daily._best_rating(card) == (7.5, "TMDB") and daily._genres(card) == ["драма"]

@@ -121,10 +121,10 @@ def _poster_url(item: dict[str, Any]) -> str | None:
 
 
 def _best_rating(item: dict[str, Any]) -> tuple[float, str]:
-    """Больший из рейтингов IMDb и Кинопоиска (0 — рейтинга нет)."""
+    """Больший из рейтингов IMDb и Кинопоиска (0 — рейтинга нет); у фильма с TMDB — рейтинг TMDB."""
     r = item.get("rating") or {}
     best, label = 0.0, ""
-    for key, name in (("imdb", "IMDb"), ("kp", "КП")):
+    for key, name in (("imdb", "IMDb"), ("kp", "КП"), ("tmdb", "TMDB")):
         try:
             v = float(r.get(key) or 0)
         except (TypeError, ValueError):
@@ -2148,7 +2148,14 @@ async def make_custom_short(fetch: Fetch, work: Path, title: str, film_ids: list
     if not CUSTOM_MIN <= len(film_ids) <= CUSTOM_MAX:
         raise RuntimeError(f"в подборке должно быть от {CUSTOM_MIN} до {CUSTOM_MAX} фильмов")
     await _progress(5, "Загружаю фильмы")
-    films = [await fetch(f"/movie/{i}") for i in film_ids]
+    films = []
+    for i in film_ids:  # фильм с TMDB («tmdb:movie:123») — его нет на Кинопоиске
+        film = (await tmdb.kp_like_by_id(tmdb_key, str(i)) if str(i).startswith(tmdb.TMDB_PREFIX)
+                else await fetch(f"/movie/{i}"))
+        if film:
+            films.append(film)
+    if len(films) < CUSTOM_MIN:
+        raise RuntimeError("не загрузились карточки фильмов — попробуй ещё раз")
     result = await _list_short(work, custom_theme(title, len(films)), films, music, tmdb_key, trailer_clips,
                                notes, user_media, gemini_key)
     add_english_seo(result)
