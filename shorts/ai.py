@@ -144,14 +144,16 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
                 "messages": [{"role": "system", "content": "Отвечай только валидным JSON, без пояснений."},
                              {"role": "user", "content": content}]}
         # платный вызов — через бюджет (цена за вызов из .env; не задана — считается, но по 0$)
-        async with budget.guard("ai", "lumean_llm", budget.price("lumean_llm_call"), f"lumean:{model}") as r:
+        estimate = budget.lumean_cost(len(json.dumps(body, ensure_ascii=False)) // 3, max_tokens)
+        async with budget.guard("ai", "lumean_llm", estimate, f"lumean:{model}") as r:
             async with session.post(f"{LUMEAN_LLM_URL}/chat/completions", json=body,
                                     headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
                 data = await resp.json(content_type=None)
                 status = resp.status
             used = (data.get("usage") or {}) if isinstance(data, dict) else {}
-            await r.settle(None if status == 200 else 0.0, {"http": status, "in": used.get("prompt_tokens"),
-                                                             "out": used.get("completion_tokens")})
+            t_in, t_out = int(used.get("prompt_tokens") or 0), int(used.get("completion_tokens") or 0)
+            actual = 0.0 if status != 200 else (budget.lumean_cost(t_in, t_out) if used else None)
+            await r.settle(actual, {"http": status, "in": t_in, "out": t_out})
     if status == 200:
         _count_lumean(data)
     if status != 200:
