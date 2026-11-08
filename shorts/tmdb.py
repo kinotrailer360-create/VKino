@@ -375,6 +375,7 @@ def _kp_like(kind: str, d: dict[str, Any]) -> dict[str, Any]:
         "poster": {"url": f"{IMG}w780{d['poster_path']}"} if d.get("poster_path") else None,
         "backdrop": {"url": f"{IMG}w1280{d['backdrop_path']}"} if d.get("backdrop_path") else None,
         "rating": {"tmdb": round(float(d.get("vote_average") or 0), 1)} if int(d.get("vote_count") or 0) >= 20 else {},
+        "votes": {"tmdb": int(d.get("vote_count") or 0)},
         "genres": [{"name": str(g.get("name") or "")} for g in d.get("genres") or [] if g.get("name")],
         "persons": [{"name": str(c.get("name") or ""), "enProfession": "actor"} for c in cast if c.get("name")]
         + [{"name": str(c.get("name") or ""), "enProfession": "director"} for c in crew if c.get("name")],
@@ -429,6 +430,22 @@ async def find_kp_like(key: str, names: list[str], year: int | None = None, seri
                     if d.get("id"):
                         return _kp_like(kind, d)
     return None
+
+
+async def rating_for(key: str, item: dict[str, Any]) -> tuple[float, int] | None:
+    """Рейтинг TMDB (средняя оценка, число голосов) для карточки Кинопоиска: по id TMDB/IMDb или точному
+    названию и году. None — не нашёлся."""
+    if not key:
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        found = await _resolve(session, key, item)
+        if not found:
+            return None
+        kind, tid = found
+        d = await _get(session, key, f"/{kind}/{tid}")
+    if not d.get("id"):
+        return None
+    return round(float(d.get("vote_average") or 0), 1), int(d.get("vote_count") or 0)
 
 
 async def popular_pool(key: str, page: int = 1) -> list[dict[str, Any]]:

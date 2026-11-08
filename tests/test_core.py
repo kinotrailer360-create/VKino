@@ -255,3 +255,11 @@ def test_tmdb_card_looks_like_kinopoisk():
     assert card["id"] == "tmdb:movie:7" and card["year"] == 2025
     assert daily._title(card) == "Что, если любовь" and daily._actors(card) == ["Чо Ин-сон"]
     assert daily._best_rating(card) == (7.5, "TMDB") and daily._genres(card) == ["драма"]
+
+
+def test_tmdb_rating_preferred_when_enough_votes():
+    from shorts import daily
+    film = {"rating": {"kp": 8.4, "imdb": 8.1, "tmdb": 7.9}, "votes": {"kp": 900000, "tmdb": 5000}}
+    assert daily._best_rating(film) == (7.9, "TMDB")
+    few = {"rating": {"kp": 8.4, "imdb": 8.1, "tmdb": 9.5}, "votes": {"kp": 900000, "tmdb": 4}}
+    assert daily._best_rating(few) == (8.4, "КП")  # мало голосов на TMDB — как раньше

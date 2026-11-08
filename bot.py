@@ -395,6 +395,7 @@ class PoiskKino:
         self.cache: dict[str, tuple[float, Any]] = {}
         self.hits = self.misses = self.fallbacks = 0
         self.last_error = ""
+        self.tmdb_ratings: dict[int, tuple[float, tuple[float, int] | None]] = {}
 
     def _count(self, token: str) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -403,6 +404,33 @@ class PoiskKino:
         self.calls[token] = self.calls.get(token, 0) + 1
 
     async def _get(self, path: str, **params: Any) -> dict[str, Any]:
+        data = await self._get_raw(path, **params)
+        if re.fullmatch(r"/movie/\d+", path) and isinstance(data, dict) and data.get("id"):
+            await self._add_tmdb_rating(data)
+        return data
+
+    async def _add_tmdb_rating(self, film: dict[str, Any]) -> None:
+        """В карточку фильма — рейтинг TMDB (rating.tmdb, votes.tmdb): его бот показывает в карточках и постах.
+        Запоминаем на сутки по id фильма, чтобы не спрашивать TMDB каждый раз."""
+        fid = int(film["id"])
+        cached = self.tmdb_ratings.get(fid)
+        if not cached or time.time() - cached[0] > 86400:
+            try:
+                got = await shorts_daily.tmdb.rating_for(os.getenv("TMDB_API_KEY", "").strip(), film)
+            except Exception as exc:  # noqa: BLE001 — без рейтинга TMDB останется Кинопоиск/IMDb
+                logging.info("TMDB rating for %s failed: %s", fid, exc)
+                got = None
+            if len(self.tmdb_ratings) > 5000:
+                self.tmdb_ratings.clear()
+            cached = self.tmdb_ratings[fid] = (time.time(), got)
+        if cached[1]:
+            value, votes = cached[1]
+            film.setdefault("rating", {})["tmdb"] = value
+            if not isinstance(film.get("votes"), dict):
+                film["votes"] = {}
+            film["votes"]["tmdb"] = votes
+
+    async def _get_raw(self, path: str, **params: Any) -> dict[str, Any]:
         key = path + "?" + urlencode(sorted((k, str(v)) for k, v in params.items()))
         cached = self.cache.get(key)
         if cached and time.time() - cached[0] < self.CACHE_TTL and not path.startswith(self.NO_CACHE):
@@ -10709,7 +10737,8 @@ def _trusted_rating(f: dict[str, Any]) -> tuple[float, str]:
     """Рейтинг, если за ним достаточно оценок; иначе (0, "")."""
     votes = f.get("votes") or {}
     try:
-        enough = max(int(votes.get("kp") or 0), int(votes.get("imdb") or 0)) >= RATING_MIN_VOTES
+        enough = max(int(votes.get("kp") or 0), int(votes.get("imdb") or 0)) >= RATING_MIN_VOTES or (
+            shorts_daily._best_rating(f)[1] == "TMDB")  # TMDB: _best_rating сам проверил число голосов
     except (TypeError, ValueError):
         enough = False
     return shorts_daily._best_rating(f) if enough else (0.0, "")
