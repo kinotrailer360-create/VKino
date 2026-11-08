@@ -35,7 +35,8 @@ def _env_float(name: str, default: float | None = None) -> float | None:
 
 # лимиты в месяц, $ — решение владельца канала (ноябрь 2026): посты/ИИ — 10$, озвучка — отдельный кошелёк
 LIMITS = {"ai": _env_float("AI_MONTHLY_BUDGET_USD", 10.0) or 10.0,
-          "tts": _env_float("TTS_MONTHLY_BUDGET_USD", 10.0) or 10.0}
+          # озвучка: подписка Lumean Start — 99 ₽ за 100 000 токенов в месяц ≈ 1,2 $; лимит = объём подписки
+          "tts": _env_float("TTS_MONTHLY_BUDGET_USD", 1.2) or 1.2}
 POOL_NAMES = {"ai": "ИИ, картинки, музыка", "tts": "озвучка"}
 WARN_SHARE = 0.8  # с 80 % — предупреждение автору (раз в месяц на кошелёк)
 
@@ -50,8 +51,12 @@ PRICES: dict[str, float | None] = {
     "lumean_in_per_m": _env_float("PRICE_LUMEAN_IN_PER_M", 0.24),
     "lumean_out_per_m": _env_float("PRICE_LUMEAN_OUT_PER_M", 5.8),
     "lumean_llm_call": _env_float("PRICE_LUMEAN_LLM_CALL"),          # запасная цена за вызов, если нет токенов
-    "lumean_tts_per_1k": _env_float("PRICE_LUMEAN_TTS_PER_1K_CHARS"),  # не проверено — сверка по журналу
-    "lumean_music_track": _env_float("PRICE_LUMEAN_MUSIC_TRACK"),    # не проверено
+    # озвучка: по кабинету Lumean 08.11.2026 заказ шортса стоит 433–988 токенов подписки — ≈1 токен на символ
+    # (журнал бота: 5 854 симв. за день при ~3 400 токенах успешных заказов + компенсированные); 1 токен =
+    # 99 ₽ / 100 000 = 0,001 ₽ → 1000 символов ≈ 1 ₽ ≈ 0,012 $ (1 $ ≈ 82 ₽). Оценка, уточняется в .env
+    "lumean_tts_per_1k": _env_float("PRICE_LUMEAN_TTS_PER_1K_CHARS", 0.012),
+    # музыка: 94 токена за заказ из 2 вариантов ≈ 0,1 ₽ → ≈ 0,0006 $ за трек
+    "lumean_music_track": _env_float("PRICE_LUMEAN_MUSIC_TRACK", 0.0006),
     "search_call": _env_float("PRICE_SEARCH_CALL", 0.0),             # Tavily/Яндекс — в бесплатных лимитах
 }
 IMAGE_USD = PRICES["image"] or 0.0
@@ -168,6 +173,12 @@ async def status_lines() -> list[str]:
         used = await spent(pool)
         out.append(f"💵 {POOL_NAMES[pool]}: ≈{used:.2f}$ из {limit:g}$ за месяц"
                    + (" — лимит исчерпан" if used >= limit else ""))
+    tts_limit = LIMITS["tts"]
+    per_1k = price("lumean_tts_per_1k")
+    if per_1k:
+        left = max(0.0, tts_limit - await spent("tts"))
+        out.append(f"🗣 Озвучки осталось ≈ {int(left / per_1k * 1000):,} символов в этом месяце".replace(",", " ")
+                   + " (≈ столько же токенов подписки Lumean)")
     missing = [n for n in ("lumean_tts_per_1k", "lumean_music_track") if not priced(n)]
     if missing:
         out.append("ℹ️ Цены Lumean ещё не заданы (" + ", ".join(missing) + ") — эти вызовы считаются, но по 0$. "
