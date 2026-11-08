@@ -3463,7 +3463,8 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Telegram-канал: посты ▸", callback_data="pt:menu")],
         [InlineKeyboardButton(text="▶️ YouTube и видео: шортсы, выпуски ▸", callback_data="sh:menu")],
-        [InlineKeyboardButton(text="📈 Статистика бота", callback_data="st:home")],
+        [InlineKeyboardButton(text="📈 Статистика бота", callback_data="st:home"),
+         InlineKeyboardButton(text="💵 Расходы", callback_data="ad:spend")],
         [InlineKeyboardButton(text="➕ Фильм", callback_data="admin:add:movie"),
          InlineKeyboardButton(text="➕ Серия", callback_data="admin:add:episode"),
          InlineKeyboardButton(text="📋 Источники", callback_data="admin:list")],
@@ -6964,6 +6965,15 @@ async def admin_delete_source(
         )
 
 
+@router.callback_query(F.data == "ad:spend")
+async def admin_spend(callback: CallbackQuery) -> None:
+    """«💵 Расходы» из админки."""
+    await callback.answer()
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        return
+    await expenses_action(callback.message)
+
+
 @router.callback_query(F.data == "admin:home")
 async def admin_home(
     callback: CallbackQuery,
@@ -7976,6 +7986,36 @@ async def clips_command(
     )
 
 
+async def expenses_rows() -> list[str]:
+    """Расходы: озвучка, ИИ Lumean, музыка за сегодня / 7 / 30 дней, кошельки бюджета, журнал Lumean для сверки."""
+    rows: list[str] = []
+    rows.append("\n📊 <b>Расходы (сохраняются и после обновлений)</b>")
+    for label, days in (("Сегодня", 1), ("7 дней", 7), ("30 дней", 30)):
+        s = shorts_usage.summary(days)
+        def num(v: Any) -> str:  # 12345 → «12 345»
+            return f"{int(v or 0):,}".replace(",", " ")
+        rows.append(f"{label}: ИИ Lumean — {num(s.get('llm_calls'))} запр. ({num(s.get('llm_tokens'))} ток.), "
+                    f"озвучка — {num(s.get('tts_chars'))} симв. ({num(s.get('tts_orders'))} заказ.), "
+                    f"музыка — {num(s.get('music_tracks'))} тр.")
+    week = shorts_usage.summary(7)["tasks"]
+    if week:
+        rows.append("ИИ за 7 дней на что: " + ", ".join(
+            f"{escape(t)} — {n}" for t, n in sorted(week.items(), key=lambda kv: -kv[1])[:6]))
+    rows.append("Цену символа и запроса смотри в кабинете Lumean — так можно посчитать стоимость ролика.")
+    rows += await shorts_budget.status_lines()
+    lumean_rows = await shorts_budget.lumean_check()
+    if lumean_rows:
+        rows.append("Lumean за 30 дней по журналу (для сверки цен с кабинетом): " + "; ".join(lumean_rows))
+    return rows
+
+
+async def expenses_action(message: Message) -> None:
+    """«💵 Расходы» в админке — сразу, без пробных запросов к ИИ."""
+    await message.answer("\n".join(["💵 <b>Расходы</b>"] + await expenses_rows()),
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [_btn("🤖 Проверить ИИ и режим Lumean", "sh:ai")], [_btn("⬅️ Админка", "admin:home")]]))
+
+
 async def ai_status_action(message: Message) -> None:
     """Какие ИИ подключены; Gemini (и с поиском Google) и Groq — пробный запрос, BeatAPI — ключ, баланс
     и бесплатные модели (без платных запросов)."""
@@ -8027,22 +8067,7 @@ async def ai_status_action(message: Message) -> None:
     else:
         rows.append("Сегодня запросов к Lumean не было (считается с последнего запуска бота).")
     rows.append("Озвучка клоном голоса тоже идёт с баланса Lumean: выпуск на 6–8 минут — самое дорогое.")
-    rows.append("\n📊 <b>Расходы (сохраняются и после обновлений)</b>")
-    for label, days in (("Сегодня", 1), ("7 дней", 7), ("30 дней", 30)):
-        s = shorts_usage.summary(days)
-        rows.append(f"{label}: ИИ Lumean — {int(s.get('llm_calls', 0))} запр. "
-                    f"({int(s.get('llm_tokens', 0)):,} ток.), озвучка — {int(s.get('tts_chars', 0)):,} симв. "
-                    f"({int(s.get('tts_orders', 0))} заказ.), музыка — {int(s.get('music_tracks', 0))} тр."
-                    .replace(",", " "))
-    week = shorts_usage.summary(7)["tasks"]
-    if week:
-        rows.append("ИИ за 7 дней на что: " + ", ".join(
-            f"{escape(t)} — {n}" for t, n in sorted(week.items(), key=lambda kv: -kv[1])[:6]))
-    rows.append("Цену символа и запроса смотри в кабинете Lumean — так можно посчитать стоимость ролика.")
-    rows += await shorts_budget.status_lines()
-    lumean_rows = await shorts_budget.lumean_check()
-    if lumean_rows:
-        rows.append("Lumean за 30 дней по журналу (для сверки цен с кабинетом): " + "; ".join(lumean_rows))
+    rows += await expenses_rows()
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
