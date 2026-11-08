@@ -10224,10 +10224,12 @@ async def _post_meta(chat_id: int, first: int) -> dict[str, Any]:
                                                                                    "poll": []}
 
 
-def post_keyboard(first: int, more: str = "", yt: bool = False) -> InlineKeyboardMarkup:
+def post_keyboard(first: int, more: str = "", yt: bool = False, facts: bool = False) -> InlineKeyboardMarkup:
     rows = [[_btn(f"📢 Опубликовать в {POST_CHANNEL}", f"pt:p:{first}")],
             [_btn("⏰ Позже", f"pt:t:{first}"), _btn("✏️ Поправить текст", f"pt:e:{first}")],
             [_btn("🖼 Заменить или добавить фото/видео", f"pt:m:{first}")]]
+    if facts:  # новость с проверкой фактов: доказательства и повторная проверка
+        rows.append([_btn("📚 Источники", f"pt:src:{first}"), _btn("🔁 Перепроверить", f"pt:rc:{first}")])
     if yt:  # шортс: YouTube — первой кнопкой, а публикация в канал подписана явно, чтобы не перепутать
         rows[0] = [_btn(f"✈️ Только в Telegram-канал {POST_CHANNEL}", f"pt:p:{first}")]
         rows.insert(0, [_btn("▶️ Загрузить на YouTube", f"yt:{first}")])
@@ -10244,8 +10246,47 @@ async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: st
     await save_post(chat_id, ids, kind, poll, question, quiz, extra)
     await bot.send_message(chat_id, f"👆 {what}"
                            + (f". После публикации в канале добавлю опрос «{escape(question)}»." if poll else ".")
-                           + note, reply_markup=post_keyboard(ids[0], more, bool((extra or {}).get("yt"))),
+                           + note, reply_markup=post_keyboard(ids[0], more, bool((extra or {}).get("yt")),
+                                                              bool((extra or {}).get("check"))),
                            disable_web_page_preview=True)
+
+
+async def save_claims(chat_id: int, first: int, claims: list[dict[str, Any]] | None, actor: int | None = None) -> None:
+    """Результат проверки фактов — в ai_claims (прошлый заменяется) и в журнал."""
+    try:
+        async with db().acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM ai_claims WHERE chat_id = $1 AND first_id = $2", chat_id, first)
+            for k, c in enumerate(claims or []):
+                await conn.execute("INSERT INTO ai_claims (chat_id, first_id, idx, claim, status, sources, note) "
+                                   "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)", chat_id, first, k, c["claim"],
+                                   c["status"], json.dumps(c["sources"]), c["note"])
+    except Exception:  # noqa: BLE001
+        logging.exception("Claims save failed")
+    await audit(chat_id, first, actor, "fact_check" if claims else "review_required",
+                {"claims": len(claims or [])})
+
+
+async def claims_text(chat_id: int, first: int) -> str:
+    """«📚 Источники»: каждое утверждение — статус, пояснение, ссылки; и последние действия с постом."""
+    rows = await db().fetch("SELECT claim, status, sources, note, checked_at FROM ai_claims "
+                            "WHERE chat_id = $1 AND first_id = $2 ORDER BY idx", chat_id, first)
+    out = ["📚 <b>Проверка фактов</b>"]
+    if not rows:
+        out.append("Проверки нет или она не состоялась — нажми «🔁 Перепроверить».")
+    for r in rows:
+        srcs = json.loads(r["sources"]) if isinstance(r["sources"], str) else list(r["sources"] or [])
+        out.append(f"\n{shorts_ai.CLAIM_STATUSES.get(r['status'], r['status'])} — {escape(r['claim'])}"
+                   + (f"\n<i>{escape(r['note'])}</i>" if r["note"] else "")
+                   + "".join(f'\n• <a href="{escape(u)}">{escape(urlparse(u).netloc or u)[:40]}</a>' for u in srcs))
+    log_rows = await db().fetch("SELECT actor, action, at FROM ai_audit_log WHERE chat_id = $1 AND first_id = $2 "
+                                "ORDER BY at DESC LIMIT 6", chat_id, first)
+    names = {"draft": "черновик", "fact_check": "проверка фактов", "review_required": "проверка не состоялась",
+             "recheck": "перепроверка", "published": "опубликован", "publish_failed": "ошибка публикации"}
+    if log_rows:
+        out.append("\n🧾 <b>Журнал</b>")
+        out += [f"{r['at'].astimezone(POST_TZ):%d.%m %H:%M} — {names.get(r['action'], r['action'])}"
+                + (" (вы)" if r["actor"] else "") for r in log_rows]
+    return "\n".join(out)[:4000]
 
 
 async def _unqueue(chat_id: int, first: int) -> bool:
@@ -10749,10 +10790,16 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 res.get("status") or "")
             if status:
                 seen += f"\n\n🏷 Достоверность: {status}"
+            # проверка фактов с доказательствами: утверждения поста, статус и ссылки (кнопка «📚 Источники»)
+            material = "\n\n".join(f"[{p.get('url') or ''}]\n{p.get('text') or ''}" for p in sources)[:6000]
+            claims = await shorts_ai.check_claims(GEMINI_API_KEY, res["post"], material)
+            seen += "\n\n" + escape(shorts_ai.claims_summary(claims))
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
                 await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
-                                 note=_sources_note(sources) + seen)
+                                 note=_sources_note(sources) + seen,
+                                 extra={"check": {"post": res["post"], "material": material}})
+                await save_claims(chat_id, ids[0], claims)
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return res["topic"] or "пост"
@@ -12846,6 +12893,21 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             pass
         return
     await callback.answer()
+    if kind == "src" and arg.isdigit():  # «📚 Источники»: утверждения поста со статусами и ссылками, журнал
+        await message.answer(await claims_text(chat_id, int(arg)), disable_web_page_preview=True)
+        return
+    if kind == "rc" and arg.isdigit():  # «🔁 Перепроверить» факты черновика
+        check = (await _post_meta(chat_id, int(arg))).get("check") or {}
+        if not check.get("post"):
+            await message.answer("Для этого поста нет данных для проверки (старый черновик).")
+            return
+        wait = await message.answer("🔁 Перепроверяю факты — до минуты…")
+        claims = await shorts_ai.check_claims(GEMINI_API_KEY, check["post"], check.get("material") or "")
+        await save_claims(chat_id, int(arg), claims, callback.from_user.id)
+        await audit(chat_id, int(arg), callback.from_user.id, "recheck")
+        await wait.edit_text(escape(shorts_ai.claims_summary(claims)), reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[_btn("📚 Источники", f"pt:src:{arg}")]]))
+        return
     if kind == "t" and arg.isdigit():  # «⏰ Позже»: сначала час (ближайшие 24 часа, время автора)
         now = datetime.now(POST_TZ)
         hours = _hour_slots(now)
