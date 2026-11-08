@@ -22,7 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageEnhance, ImageOps
 
-from . import ai, clips, daily, pronounce, tmdb
+from . import ai, clips, daily, project, pronounce, tmdb
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -558,6 +558,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     has_cta = dynamic and any("телеграм" in ln.lower() for ln in lines)
     spoken = lines if mourning or has_cta else lines[:-1] + [daily.with_outro(lines[-1])]
     voice, starts, voiced, spans = await daily.synthesize(spoken, work)
+    voice_meta = dict(daily.last_voice)
     await _progress(30, "Субтитры по слову")
     words = await daily.word_timeline(voice, starts, spans) if voiced else []
 
@@ -748,6 +749,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     err = await errors
     if proc.returncode:
         raise RuntimeError(f"монтаж упал: {err.decode(errors='ignore')[-800:]}")
+    project.save(work, "lore", "shorts.make_lore", cfg_path.name, cfg["output"], voice_meta,
+                 {"fn": "lore", "script": script, "music": project._rel(music, work) if music else None,
+                  "media": [project._rel(m, work) for m in user_media or []],
+                  "pins": {str(k): v for k, v in (user_pins or {}).items()}})
 
     cover_src = Image.open(work / pool[order[0]][0]).convert("RGB")
     if news:

@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from . import boxchart, daily, lumean, motion, netsafe, tmdb
+from . import boxchart, daily, lumean, motion, netsafe, project, tmdb
 from . import music as musiclib
 from .cards import ASSETS, _cover, _font
 
@@ -602,6 +603,13 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     clock = 0.0
     notes: list[str] = []
     phrases: list[list[Any]] = []  # [секунда в выпуске, текст фразы] — для «🎙 Переозвучить только звук»
+    voiced: dict[int, dict[str, Any]] = {}  # номер куска → его озвучка и музыка (для «🎙 Только звук»)
+
+    def remember(folder: Path, music: Path | None, total: float, start: float) -> None:
+        meta = dict(daily.last_voice)
+        meta["file"] = str((folder / meta.get("file", "voice.wav")).relative_to(work))
+        voiced[len(segments) - 1] = {"voice": meta, "music": str(music) if music else None,
+                                     "total": round(total, 3), "start": round(start, 3)}
     first_img: Image.Image | None = None
 
     daily.stressed.clear()
@@ -660,6 +668,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     main_music = musiclib.pick("новости кино") or ASSETS / "music.mp3"  # общая тема выпуска: вступление и финал
     phrases += [[round(clock + t, 2), line] for t, line in zip(starts, script["intro"])]
     segments.append(await _segment(work, "intro", slides, None, voice, dur + 0.4, main_music))
+    remember(work / "v_intro", main_music, dur + 0.4, clock)
     clock += dur + 0.4
 
     whoosh = ASSETS / "whoosh.wav"
@@ -689,6 +698,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
         for t0, clip, length in await _graphics(work, n, story, starts, total, bg, tmdb_key):
             slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
         segments.append(await _segment(work, f"story{n}", slides, over, voice, total, story_music))
+        remember(work / f"v{n}", story_music, total, clock)
         clock += total
         cuts.append([round(story_start, 2), round(clock, 2), story["headline"]])  # для нарезки на шортсы
 
@@ -703,6 +713,7 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
     # финал — карточка с вопросом зрителям (повтор кадров выпуска автору не понравился)
     segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail, main_music))
+    remember(work / "v_outro", main_music, dur + tail, clock)
     chapters.append((clock, "Итоги и вопрос зрителям"))
     if OUTRO_CLIP.exists():  # «Спасибо, что смотрите!» и кнопка «Подписаться»
         try:
@@ -713,6 +724,13 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     await daily._progress(88, "Склейка и музыка")
     body = work / "body.mp4"
     await _concat(segments, body, work)
+    # звук каждого куска — отдельно: «🎙 Только звук» пересмешает только куски с исправленными фразами и склеит
+    # дорожку так же, как склеивался ролик (время совпадёт до кадра)
+    pieces = []
+    for k, seg in enumerate(segments):
+        name = f"audio_{k}.m4a"
+        await _run("ffmpeg", "-v", "error", "-y", "-i", str(seg), "-vn", "-c:a", "copy", str(work / name))
+        pieces.append({"audio": name, **voiced.get(k, {})})
     for seg in segments:
         seg.unlink(missing_ok=True)
     final = work / "episode.mp4"  # музыка уже в каждом куске (своя у каждой новости)
@@ -721,30 +739,16 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     length = await _duration(final)
 
     await daily._progress(93, "Превью для Telegram")
-    preview: Path | None = work / "preview.mp4"
-    kbps = max(250, int(PREVIEW_MB * 8 * 1024 / max(length, 1)) - 72)
-    if final.stat().st_size <= PREVIEW_MB * 1024 * 1024:  # сам выпуск влезает в Telegram — шлём его
-        preview = final
-    else:
-        try:  # качество ограничено и размером (crf), и потолком битрейта — превью влезает в 50 МБ
-            for scale, crf, rate in (("854:480", "27", kbps), ("640:360", "30", int(kbps * 0.7))):
-                await _run("ffmpeg", "-v", "error", "-y", "-i", str(final), "-vf", f"scale={scale}", "-c:v",
-                           "libx264", "-preset", "veryfast", "-crf", crf, "-maxrate", f"{rate}k", "-bufsize",
-                           f"{rate * 2}k", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-movflags", "+faststart",
-                           str(preview))
-                if preview.stat().st_size <= 49 * 1024 * 1024:
-                    break  # не влезло в 480p — второй заход в 360p
-            else:
-                preview = None
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: weekly preview failed: %s", exc)
-            preview = None
+    preview = await make_preview(final, work / "preview.mp4", length)
 
     cover = work / "cover.jpg"
     await asyncio.to_thread(lambda: thumbnail(first_img, stories[0]["headline"], date_label).save(cover, quality=92))
     seo = build_seo(script, chapters, date_label)
     seo["cuts"] = json.dumps(cuts, ensure_ascii=False)
     seo["phrases"] = json.dumps(phrases, ensure_ascii=False)
+    (work / "project.json").write_text(json.dumps({"kind": "weekly", "pieces": pieces, "script": script,
+                                                   "label": date_label}, ensure_ascii=False, default=str),
+                                       encoding="utf-8")
     if notes:
         seo["warning"] = "\n".join(notes)
     if daily.voice_issues:  # контроль озвучки: места, где распознавание услышало не то, что в тексте
@@ -840,3 +844,97 @@ def cut_seo(headline: str, episode_seo: dict[str, str]) -> dict[str, str]:
                            f"📢 Telegram: {daily.TELEGRAM_URL}\n\n#shorts #новостикино #кино",
             "tags": episode_seo.get("tags", ""),
             "pinned": "Что думаешь об этой новости? 👇"}
+
+
+async def make_preview(final: Path, preview: Path, length: float) -> Path | None:
+    """Превью для Telegram (до 50 МБ): сам выпуск, если влезает, иначе 480p, а не влезло — 360p."""
+    if final.stat().st_size <= PREVIEW_MB * 1024 * 1024:  # сам выпуск влезает в Telegram — шлём его
+        return final
+    kbps = max(250, int(PREVIEW_MB * 8 * 1024 / max(length, 1)) - 72)
+    try:  # качество ограничено и размером (crf), и потолком битрейта — превью влезает в 50 МБ
+        for scale, crf, rate in (("854:480", "27", kbps), ("640:360", "30", int(kbps * 0.7))):
+            await _run("ffmpeg", "-v", "error", "-y", "-i", str(final), "-vf", f"scale={scale}", "-c:v",
+                       "libx264", "-preset", "veryfast", "-crf", crf, "-maxrate", f"{rate}k", "-bufsize",
+                       f"{rate * 2}k", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-movflags", "+faststart",
+                       str(preview))
+            if preview.stat().st_size <= 49 * 1024 * 1024:
+                return preview  # не влезло в 480p — второй заход в 360p
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: weekly preview failed: %s", exc)
+    return None
+
+
+PROJECT_KEEP = ("project.json", "cover.jpg", "audio_*.m4a", "v_*/voice.wav", "v[0-9]*/voice.wav")
+
+
+def keep_project(work: Path, dest: Path) -> bool:
+    """Из папки сборки выпуска — только то, что нужно для «🎙 Только звук» (без картинок и кусков видео)."""
+    if not (work / "project.json").exists():
+        return False
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    for pattern in PROJECT_KEEP:
+        for f in work.glob(pattern):
+            target = dest / f.relative_to(work)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(f, target)
+    return True
+
+
+async def _piece_audio(voice: Path, music: str | None, total: float, out: Path) -> None:
+    """Звук куска выпуска — как в _segment: голос + музыка новости (плавно входит и уходит)."""
+    if music and Path(music).exists():
+        fade = max(0.0, total - 0.8)
+        args = ["-i", str(voice), "-stream_loop", "-1", "-i", music, "-filter_complex",
+                f"[0:a]aresample=48000,apad[v];[1:a]aresample=48000,volume={MUSIC_DB}dB,afade=t=in:d=0.6,"
+                f"afade=t=out:st={fade:.3f}:d=0.8[m];[v][m]amix=inputs=2:duration=first:dropout_transition=0,"
+                "volume=2[a]", "-map", "[a]"]
+    else:
+        args = ["-i", str(voice), "-af", "apad"]
+    await _run("ffmpeg", "-v", "error", "-y", *args, "-t", f"{total:.3f}", "-c:a", "aac", "-b:a", "160k",
+               "-ar", "48000", "-ac", "2", str(out))
+
+
+async def revoice(folder: Path, video: Path, sure: bool = False) -> tuple[Path, list[tuple[float, str]], list[str]]:
+    """«🎙 Только звук» для выпуска: исправленные фразы — в свои куски, куски пересмешиваются, звук склеивается
+    как раньше и ставится на ту же картинку. Возвращает новый ролик (в папке проекта), [(таймкод, фраза)] и
+    предупреждения. Проект обновляется — следующая правка ляжет поверх."""
+    proj = json.loads((folder / "project.json").read_text(encoding="utf-8"))
+    pieces = proj["pieces"]
+    tmp = folder / "revoice_tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    try:
+        plan = []
+        for k, piece in enumerate(pieces):
+            if piece.get("voice"):
+                speak, todo = await project.changed(piece["voice"])
+                if todo:
+                    plan.append((k, speak, todo))
+        count = sum(len(todo) for _, _, todo in plan)
+        if not count:
+            raise project.NothingToFix()
+        if count > project.ASK_OVER and not sure:
+            total = sum(len(p["voice"]["lines"]) for p in pieces if p.get("voice"))
+            raise project.TooMany(count, total, sum(len(sp[i]) for _, sp, todo in plan for i in todo))
+        fixed, notes = [], []
+        for k, speak, todo in plan:
+            piece, voice = pieces[k], pieces[k]["voice"]
+            await daily.synthesize([speak[i] for i in todo], tmp / f"p{k}", voice.get("pause"), True, prepared=True)
+            parts = {i: tmp / f"p{k}" / f"voice_{j}.mp3" for j, i in enumerate(todo)}
+            old = folder / voice["file"]
+            new = tmp / f"voice_{k}.wav"
+            notes += await project.patch_voice(old, voice, parts, new, float(piece["total"]))
+            shutil.move(str(new), old)
+            await _piece_audio(old, piece.get("music"), float(piece["total"]), folder / piece["audio"])
+            fixed += [(float(piece["start"]) + float(voice["starts"][i]), voice["lines"][i]) for i in todo]
+        lst = tmp / "audio.txt"
+        lst.write_text("".join(f"file '{(folder / p['audio']).resolve()}'\n" for p in pieces), encoding="utf-8")
+        audio = tmp / "audio.m4a"
+        await _run("ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy",
+                   str(audio))
+        out = folder / "episode.mp4"
+        await project.mux(video, audio, out)
+        return out, sorted(fixed), notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

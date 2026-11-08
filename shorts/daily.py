@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, lumean, news, pronounce, stressdb, tgsearch, tmdb, wiki
+from . import ai, clips, lumean, news, pronounce, project, stressdb, tgsearch, tmdb, wiki
 from . import music as musiclib
 from .cards import card_overlay, make_card, make_cover
 
@@ -1102,6 +1102,7 @@ VOICE_CACHE = DATA_DIR / "voice_cache"
 VOICE_CACHE_MAX = 4000  # фраз (~150 МБ); старые удаляем
 voice_cache_hits = 0  # сколько фраз последней озвучки взято из кэша (не оплачено заново)
 voice_fresh: list[int] = []  # номера фраз последней озвучки, озвученных заново (не из кэша)
+last_voice: dict[str, Any] = {}  # разметка последней озвучки (synthesize) — сохраняется в проект ролика
 SPOKEN_CACHE = DATA_DIR / "spoken_cache.json"
 SPOKEN_CACHE_MAX = 6000  # фраз; старые выкидываем
 
@@ -1318,6 +1319,10 @@ async def synthesize(lines: list[str], work: Path, pause: float | None = None, c
         f"concat=n={len(parts)}:v=0:a=1[out]"
     voice = work / "voice.wav"
     await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
+    global last_voice
+    # разметка озвучки — для «🎙 Переозвучить только звук»: какие фразы, где начинаются и сколько звучат
+    last_voice = {"file": voice.name, "lines": list(lines), "prepared": prepared, "careful": careful,
+                  "pause": pause, "starts": starts, "speech": [sp["speech"] for sp in spans]}
     return voice, starts, voiced, spans
 
 
@@ -1730,7 +1735,12 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     Звуки: «вжух» на каждом переходе, «бум» перед слайдом boom_slide (номер один в отсчёте).
     """
     await _progress(40, "Озвучка")
+    # для «🔁 Полностью»: те же карточки и текст — до того, как ниже их поменяем
+    rerun = {"fn": "render", "cover": cover_path.name, "cards": json.loads(json.dumps(cards)), "lines": list(lines),
+             "tag": tag, "header": header, "question": question, "music": project._rel(music, work) if music else None,
+             "boom_slide": boom_slide}
     voice, starts, voiced, spans = await synthesize(lines, work)
+    voice_meta = dict(last_voice)
     # субтитры по слову; текст, который и так звучит (караоке), на карточке тогда не дублируем
     words = await word_timeline(voice, starts, spans) if voiced else []
     for i, card in enumerate(cards, 1):  # слайд 0 — обложка
@@ -1780,6 +1790,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
         await _progress(50, "Монтаж встал — собираю без отрывков трейлеров")
         await _run_render(cfg_path, "Монтаж без отрывков")
+    project.save(work, "short", "shorts.make_short", cfg_path.name, cfg["output"], voice_meta, rerun)
     await _progress(98, "Видео готово")
     return voiced
 

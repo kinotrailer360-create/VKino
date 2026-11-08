@@ -20,7 +20,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageDraw, ImageFilter
 
-from . import ai, clips, daily, tmdb
+from . import ai, clips, daily, project, tmdb
 from . import music as musiclib
 from .daily import (
     ASSETS,
@@ -405,6 +405,7 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
 
     await _progress(8, f"«{t}»: озвучка (ваш текст ≈{sum(len(s['text']) for s in sections)} символов)")
     voice, starts, voiced, spans = await daily.synthesize([s["text"] for s in sections], work, SECTION_PAUSE)
+    voice_meta = dict(daily.last_voice)
     speech_end = await daily._duration(voice)
     ends = starts[1:] + [speech_end]
 
@@ -550,6 +551,9 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
     err = await errors
     if proc.returncode:
         raise RuntimeError(f"монтаж обзора упал: {err.decode(errors='ignore')[-800:]}")
+    project.save(work, "review", "shorts.make_review", cfg_path.name, cfg["output"], voice_meta,
+                 {"fn": "review", "script": script, "music": project._rel(music, work) if music else None,
+                  "media": [project._rel(m, work) for m in user_media or []]})
 
     best = max((float(r.get(k) or 0), name) for k, name in (("kp", "КП"), ("imdb", "IMDb")))
     thumb_src = Image.open(work / images[0]).convert("RGB")
