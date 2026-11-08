@@ -220,3 +220,19 @@ def test_whatweknow_drops_stale_news(monkeypatch):
     assert got["lines"][0] == "Что мы знаем о «Мстителях: Судный день» (2026) за 41 день до премьеры?"
     assert "Но радоваться рано." in got["lines"] and got["lines"][-1].startswith("Инсайдер")
     assert any("телеграм" in ln for ln in got["lines"])
+
+
+def test_compact_list_keeps_every_film():
+    import os
+    for name, value in {"BOT_TOKEN": "123456:TEST", "ADMIN_IDS": "1", "KINOPOISK_TOKEN": "test",
+                        "DATABASE_URL": "postgresql://test@localhost/test"}.items():
+        os.environ.setdefault(name, value)
+    import bot
+    films = [f"{k}️⃣ «Фильм номер {k}» (2026) ⭐ 7.{k}\n" + "Очень длинное описание фильма о героях и событиях " * 3
+             for k in range(1, 9)]
+    post = "🎬 НОВИНКИ НЕДЕЛИ\n🎬 Подборка от KinoMir360\n\nВводная фраза про вечер.\n\n" + "\n\n".join(films) \
+        + "\n\n❤️ — смотрю 🔥 — в список\n#кино #новинки"
+    out = bot._compact_list(post, 900)
+    assert len(out) <= 900
+    assert all(f"«Фильм номер {k}»" in out for k in range(1, 9))
+    assert "#кино #новинки" in out

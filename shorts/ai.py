@@ -618,13 +618,15 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
     prompt = (
         source + "Вытащи:\n"
         "1) title — короткую тему ролика по-русски, 3–6 слов, без эмодзи (например «Онлайн-премьеры недели»);\n"
-        f"2) films — до {max_films} фильмов и сериалов в том же порядке, что у автора: ru — название по-русски "
-        "(как в тексте или официальное), en — оригинальное название, если знаешь, year — год, если указан или "
-        "известен, note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если "
+        f"2) films — ВСЕ фильмы и сериалы автора (до {max_films}), в том же порядке, ни одного не пропускай: "
+        "ru — название по-русски (как в тексте или официальное), en — оригинальное название, если знаешь, "
+        "year — год ТОЛЬКО если он написан у автора, иначе null (не угадывай: новинки бывают 2026 года), "
+        "series — true, если это сериал (есть «сезон», «серия», «сериал»), season — номер сезона, если указан, "
+        "note — одна-две короткие фразы для озвучки (до 150 символов): сезон и где выходит, если "
         "указано, " + about + "Названия сервисов пиши как у автора (Netflix, Apple TV). Не выдумывай фильмы, "
         "которых у автора нет." + GRAMMAR +
-        '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": 2025, '
-        '"note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
+        '\n\nОтветь только JSON: {"title": "...", "films": [{"ru": "...", "en": "...", "year": null, '
+        '"series": false, "season": null, "note": "..."}]}' + ("\n\nТЕКСТ:\n" + text.strip()[:9000] if text.strip() else "")
     )
     if images:
         parts: list[dict[str, Any]] = [{"text": prompt}]
@@ -637,8 +639,11 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
     for f in (data.get("films") if isinstance(data, dict) else None) or []:
         if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
             year = f.get("year")
+            season = f.get("season")
             films.append({"ru": str(f.get("ru") or "").strip(" «»\""), "en": str(f.get("en") or "").strip(" «»\""),
                           "year": int(year) if str(year or "").isdigit() else None,
+                          "series": bool(f.get("series")) or bool(str(season or "").isdigit()),
+                          "season": int(season) if str(season or "").isdigit() else None,
                           "note": re.sub(r"\s+", " ", str(f.get("note") or "")).strip()[:220]})
     if len(films) < 3:
         raise AIError("ИИ не нашёл " + ("на картинках" if images else "в тексте") + " хотя бы 3 фильма или сериала")
@@ -1218,7 +1223,9 @@ async def write_list_post(key: str, title: str, films: list[str], posts: str = "
         + ("\n".join(f"— {t}" for t in (recent or [])[-40:]) or "—")
         + (f"\n\nО ЧЁМ ПОДБОРКА: {hint}" if hint else "")
         + ("\n\nВАЖНО: это подборка автора — бери ТОЛЬКО фильмы и сериалы из списка кандидатов, все и в том же "
-           "порядке, ничего не добавляй и не убирай." if only else
+           f"порядке, ничего не добавляй и не убирай. Их {n} — у каждого фраза не длиннее "
+           f"{max(40, 560 // max(n, 1))} символов, чтобы ВСЕ {n} влезли в пост. Год пиши только тот, что указан у "
+           "кандидата; у сериала — сезон, без года старта." if only else
            "\n\nКандидаты идут от самых популярных и обсуждаемых — их бери в первую очередь; у каждого из них в "
            "посте — 1 короткая фраза, о чём он.")
         + "\n\nНапиши пост точно в стиле образца: заголовок КАПСОМ с эмодзи, под ним строка «🎬 Подборка от "
