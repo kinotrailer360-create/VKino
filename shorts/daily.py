@@ -1041,33 +1041,23 @@ async def _piper_to_file(text: str, path: Path) -> list[float]:
     return []
 
 
-last_engine = "edge"  # каким голосом озвучена последняя фраза (для /voice)
+last_engine = "lumean"  # каким голосом озвучена последняя фраза (для /voice)
 lumean_error = ""  # почему не сработал голос ElevenLabs (Lumean) — для /voice
 
 
 async def say_to_file(text: str, path: Path) -> list[float]:
-    """Озвучить фразу в mp3 (время слов в ответе): основной голос, при сбое — запасной Piper."""
+    """Озвучить фразу в mp3 голосом ElevenLabs (Lumean) — других голосов больше нет."""
     global last_engine, lumean_error
-    lumean_error = "" if lumean.enabled() else "нет переменной LUMEAN_API_KEY"
-    if lumean.enabled():
-        try:
-            await lumean.synthesize([_for_lumean(text)], [path], path.parent)
-            last_engine = "lumean"
-            return []
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: Lumean TTS failed (%s), using Edge", exc)
-            lumean_error = str(exc)[:300]
+    if not lumean.enabled():
+        lumean_error = "нет переменной LUMEAN_API_KEY"
+        raise RuntimeError("голос Lumean не подключён: бот не видит LUMEAN_API_KEY в .env")
     try:
-        words = await _edge_to_file(text, path)
-        last_engine = "edge"
-        return words
-    except Exception as exc:  # noqa: BLE001
-        if not piper_ready():
-            raise
-        log.warning("shorts: Edge TTS failed (%r), using Piper", exc)
-        words = await _piper_to_file(text, path)
-        last_engine = f"piper ({str(exc).rstrip('.') or type(exc).__name__})"
-        return words
+        await lumean.synthesize([_for_lumean(text)], [path], path.parent)
+    except Exception as exc:
+        lumean_error = str(exc)[:300]
+        raise
+    lumean_error, last_engine = "", "lumean"
+    return []
 
 
 stressed: dict[str, int] = {}  # слова со знаком ударения в последней озвучке (выпуск шлёт их автору на проверку)
@@ -1259,63 +1249,20 @@ async def synthesize(lines: list[str], work: Path, pause: float | None = None, c
     words: list[list[float]] = []
     failed: list[int] = []
     dropped: list[str] = []
-    lumean_note = ""
-    if lumean.enabled():
-        # основной голос — ElevenLabs через Lumean; не вышло — как раньше, голос Microsoft
-        try:
-            await _lumean_cached(speak, parts, work, pause or lumean.PAUSE)
-            words = [[] for _ in speak]
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: Lumean TTS failed: %s", exc)
-            lumean_note = f"🗣 Голос ElevenLabs (Lumean) не сработал ({str(exc)[:200]}) — озвучено голосом Microsoft."
+    # голос — только ElevenLabs через Lumean: запасные (Microsoft, Piper) звучали заметно хуже,
+    # и ролик с роботизированным голосом всё равно приходилось пересобирать
+    if not lumean.enabled():
+        raise RuntimeError("голос Lumean не подключён: бот не видит LUMEAN_API_KEY в .env")
     try:
-        for i, text in enumerate(speak if not words else []):
-            if i:
-                await asyncio.sleep(TTS_PAUSE)
-            try:
-                words.append(await _edge_to_file(text, parts[i]))
-                continue
-            except Exception as exc:  # noqa: BLE001
-                if not words:
-                    raise  # первая же фраза не озвучилась — сервис недоступен целиком
-                log.warning("shorts: Edge TTS rejected phrase %d (%r), cooling down", i + 1, exc)
-            await asyncio.sleep(TTS_COOLDOWN)  # чаще всего это временное ограничение частых запросов
-            try:
-                words.append(await _say_once(text, parts[i]))
-                continue
-            except Exception as exc:  # noqa: BLE001
-                # сервис работает, но эта фраза ему не нравится — озвучиваем её по кусочкам
-                log.warning("shorts: Edge TTS rejected phrase %d (%r), trying pieces", i + 1, exc)
-                got, lost = await _edge_pieces(text, parts[i], work / f"voice_{i}")
-                words.append(got)
-                dropped += lost
+        await _lumean_cached(speak, parts, work, pause or lumean.PAUSE)
+        words = [[] for _ in speak]
     except Exception as exc:  # noqa: BLE001
-        bad = len(words)
-        reason = f"{str(exc).rstrip('.') or type(exc).__name__}; фраза №{bad + 1}: «{speak[bad][:60]}»"
-        log.warning("shorts: Edge TTS failed (%s)", reason)
-        words = []
-        if piper_ready():
-            # весь ролик одним голосом: переозвучиваем все фразы запасным
-            tts_note = f"🗣 Голос Microsoft тоже не ответил ({reason[:220]}) — озвучено запасным голосом Piper."
-            try:
-                await _piper_batch(list(zip(speak, parts)))
-                words = [[] for _ in speak]
-            except Exception as exc2:  # noqa: BLE001
-                log.exception("shorts: Piper failed too")
-                reason, words = f"{reason}; запасной голос: {exc2}", []
-        if len(words) < len(speak):
-            tts_error, failed, words = reason[:250], list(range(len(speak))), [[] for _ in speak]
-            for i, text in enumerate(lines):
-                sec = max(2.5, min(len(text) / 14, 8.0))  # примерно столько звучала бы фраза
-                await _run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-                           "-t", f"{sec:.2f}", str(parts[i]))
+        log.warning("shorts: Lumean TTS failed: %s", exc)
+        raise RuntimeError(f"голос Lumean не сработал ({str(exc)[:200]}). Обычно это очередь или сбой у "
+                           "Lumean — попробуй собрать ещё раз через 30–60 минут") from exc
     voiced = not failed
-    if lumean_note:  # причину отказа Lumean показываем всегда — иначе не понять, почему не основной голос
-        tts_note = f"{lumean_note}\n{tts_note}" if tts_note else lumean_note
-    elif tts_note and not lumean.enabled():
-        tts_note += "\n🗣 Голос Lumean не подключён: бот не видит LUMEAN_API_KEY в .env."
-    if dropped and not tts_note:
-        tts_note = ("🗣 Основной голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
+    if dropped:
+        tts_note = ("🗣 Голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
                     + "; ".join(f"«{d[:60]}»" for d in dropped[:3]))
 
     starts, spans, t = [], [], 0.0
