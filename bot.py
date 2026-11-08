@@ -9616,7 +9616,9 @@ async def custom_from_post(message: Message, state: FSMContext, text: str,
         items = await shorts_copycat.resolve(kp._get, plan["films"])
         for it, f in zip(items, plan["films"]):
             if not it["id"]:
-                film, _ = await shorts_daily.find_film_smart(kp._get, f["ru"] or f["en"], GEMINI_API_KEY)
+                film, _ = await shorts_daily.find_film_smart(
+                    kp._get, f["ru"] or f["en"], GEMINI_API_KEY,
+                    upcoming=bool(f.get("fresh")) and not f.get("year"), exact=True)
                 if film:
                     it.update(id=int(film["id"]), label=shorts_daily._title(film) + (
                         f" ({film['year']})" if film.get("year") else ""))

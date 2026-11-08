@@ -236,3 +236,11 @@ def test_compact_list_keeps_every_film():
     assert len(out) <= 900
     assert all(f"«Фильм номер {k}»" in out for k in range(1, 9))
     assert "#кино #новинки" in out
+
+
+def test_same_name_rejects_other_films():
+    from shorts.daily import _same_name
+    assert not _same_name("Черные голуби", {"name": "Черные паруса", "enName": "Black Sails"})
+    assert not _same_name("Что, если любовь", {"name": "Что, если...?", "enName": "What If...?"})
+    assert _same_name("Black Doves", {"name": "Чёрные голуби", "enName": "Black Doves"})
+    assert _same_name("Черные голуби", {"name": "Чёрные голуби"})

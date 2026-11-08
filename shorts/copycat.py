@@ -59,7 +59,7 @@ async def resolve(fetch: Fetch, films: list[dict[str, Any]]) -> list[dict[str, A
             try:
                 # «сериал» в запросе — сериал первым; новинка — сначала этого года и позже, а не классика
                 found = await find_film(fetch, f"{q} сериал" if f.get("series") else q,
-                                        upcoming=bool(f.get("fresh")) and not f.get("year"))
+                                        upcoming=bool(f.get("fresh")) and not f.get("year"), exact=True)
             except Exception as exc:  # noqa: BLE001
                 log.warning("shorts: film lookup %r failed: %s", q, exc)
             if found:

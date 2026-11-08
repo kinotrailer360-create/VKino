@@ -2051,7 +2051,16 @@ def is_upcoming(item: dict[str, Any]) -> bool:
     return bool(dates) and min(dates) > today
 
 
-async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[str, Any] | None:
+def _same_name(name: str, film: dict[str, Any]) -> bool:
+    """Название совпадает с одним из названий фильма (с учётом мелких отличий написания): «Черные голуби» ≠
+    «Черные паруса», «Что, если любовь» ≠ «Что, если...?»."""
+    from .tmdb import similar
+    titles = [film.get("name"), film.get("alternativeName"), film.get("enName")]
+    titles += [x.get("name") for x in film.get("names") or [] if isinstance(x, dict)]
+    return any(similar(name, str(t)) >= 0.85 for t in titles if t)
+
+
+async def find_film(fetch: Fetch, query: str, upcoming: bool = False, exact: bool = False) -> dict[str, Any] | None:
     """Фильм по «Название» или «Название 2018»: самый известный из найденных (полная карточка).
     upcoming=True — сначала те, что выходят в этом году или позже (новый сериал, а не старый фильм).
     Слово «сериал» или «фильм» в запросе — уточнение: ищем без него, но такой тип — первым."""
@@ -2067,6 +2076,8 @@ async def find_film(fetch: Fetch, query: str, upcoming: bool = False) -> dict[st
     name = query[: year_m.start()].strip() if year_m else query
     data = await fetch("/movie/search", query=name, page=1, limit=10)
     cands = [x for x in data.get("docs") or [] if isinstance(x, dict) and x.get("id")]
+    if exact:  # только с тем же названием: самый известный из найденных бывает совсем другим фильмом
+        cands = [c for c in cands if _same_name(name, c)]
     if year:
         cands = [c for c in cands if c.get("year") in (year - 1, year, year + 1)] or cands
     if not cands:
@@ -2096,10 +2107,10 @@ def renamed(film: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",
-                          upcoming: bool = False) -> tuple[dict[str, Any] | None, str]:
+                          upcoming: bool = False, exact: bool = False) -> tuple[dict[str, Any] | None, str]:
     """find_film, а если Кинопоиск не нашёл — ИИ по интернету и Telegram-каналам узнаёт, как фильм называется
     официально («Глиноликий» → «Клейфейс» / Clayface 2026), и ищем снова. (фильм | None, заметка автору)."""
-    film = await find_film(fetch, query, upcoming)
+    film = await find_film(fetch, query, upcoming, exact)
     if film or not ai.available(gemini_key) or query.startswith("id:"):
         return film, ""
     name = re.sub(r"[\s(]+(19\d\d|20\d\d)\)?$", "", query).strip()
@@ -2108,7 +2119,7 @@ async def find_film_smart(fetch: Fetch, query: str, gemini_key: str = "",
         y = f" {guess['year']}" if guess["year"] else ""
         for q in dict.fromkeys(x for x in (guess["ru"] + y, guess["en"] + y, guess["ru"], guess["en"]) if x.strip()):
             try:
-                film = await find_film(fetch, q, upcoming)
+                film = await find_film(fetch, q, upcoming, exact)
             except Exception as exc:  # noqa: BLE001
                 log.warning("shorts: film lookup %r failed: %s", q, exc)
                 continue
