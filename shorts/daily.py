@@ -1069,8 +1069,15 @@ async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
     # даты и порядковые («4 сезон» → «четвёртый сезон», «2-й» → «второй») — сразу, до ИИ: ИИ их иногда
     # читает количественными («четыре сезон»)
     texts = [pronounce.dates(pronounce.numbers(pronounce.apply(text))) for text in lines]
-    # ИИ правит все фразы: числа и латиница — словами, а ещё ставит ударения в именах и редких словах
-    todo = list(range(len(texts)))
+    # ИИ правит все фразы: числа и латиница — словами, а ещё ставит ударения в именах и редких словах.
+    # Ответ ИИ запоминается по фразе: при переозвучке та же фраза даёт тот же текст для голоса — и берётся из
+    # кэша озвучки бесплатно, а заново ИИ и голос делают только фразы, которые исправили (/say, правка текста)
+    cache = _spoken_cache()
+    keys = [_spoken_key(text, careful) for text in texts]
+    todo = [i for i, key in enumerate(keys) if key not in cache]
+    for i, key in enumerate(keys):
+        if key in cache:
+            texts[i] = cache[key]
     if todo:
         try:  # не задерживаем сборку, если ИИ тормозит
             fixed = await asyncio.wait_for(ai.spoken_form([texts[i] for i in todo], premium=careful),
@@ -1079,6 +1086,9 @@ async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
             fixed = None
         for i, text in zip(todo, fixed or []):
             texts[i] = pronounce.apply(text)  # ИИ мог потерять знак ударения из словаря — ставим снова
+            cache[keys[i]] = texts[i]
+        if fixed:
+            _save_spoken_cache(cache)
     out = [_speakable(pronounce.plain_russian(text)) for text in texts]
     # на проверку автору — ударения ИИ и словаря (имена, редкие слова); от нейросети во всех словах — не шлём
     for text in out:
@@ -1091,6 +1101,32 @@ DATA_DIR = Path(os.getenv("VKINO_DATA", "/tmp/kinomir_data"))  # в Docker — �
 VOICE_CACHE = DATA_DIR / "voice_cache"
 VOICE_CACHE_MAX = 4000  # фраз (~150 МБ); старые удаляем
 voice_cache_hits = 0  # сколько фраз последней озвучки взято из кэша (не оплачено заново)
+voice_fresh: list[int] = []  # номера фраз последней озвучки, озвученных заново (не из кэша)
+SPOKEN_CACHE = DATA_DIR / "spoken_cache.json"
+SPOKEN_CACHE_MAX = 6000  # фраз; старые выкидываем
+
+
+def _spoken_key(text: str, careful: bool) -> str:
+    return hashlib.sha1(f"s1|{int(careful)}|{text}".encode("utf-8")).hexdigest()
+
+
+def _spoken_cache() -> dict[str, str]:
+    try:
+        data = json.loads(SPOKEN_CACHE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_spoken_cache(cache: dict[str, str]) -> None:
+    items = list(cache.items())[-SPOKEN_CACHE_MAX:]  # словарь хранит порядок добавления — старые в начале
+    try:
+        SPOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SPOKEN_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(dict(items), ensure_ascii=False), encoding="utf-8")
+        tmp.replace(SPOKEN_CACHE)
+    except OSError as exc:
+        log.info("shorts: spoken cache write failed: %s", exc)
 
 
 def _voice_key(text: str, pause: float) -> Path:
@@ -1104,7 +1140,7 @@ async def _lumean_cached(speak: list[str], parts: list[Path], work: Path, pause:
     """Озвучка Lumean с кэшем по фразам: уже оплаченная фраза (тот же текст, голос и ударения) берётся из кэша,
     заказываются только новые или исправленные. Перемонтаж выпуска после правки одного слова — это одна-две
     фразы, а не весь выпуск."""
-    global voice_cache_hits
+    global voice_cache_hits, voice_fresh
     texts = [_for_lumean(t) for t in speak]
     keys = [_voice_key(t, pause) for t in texts]
     todo = []
@@ -1115,6 +1151,7 @@ async def _lumean_cached(speak: list[str], parts: list[Path], work: Path, pause:
         else:
             todo.append(i)
     voice_cache_hits = len(speak) - len(todo)
+    voice_fresh = list(todo)
     if not todo:
         return
     await lumean.synthesize([texts[i] for i in todo], [parts[i] for i in todo], work, pause)

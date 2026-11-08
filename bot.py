@@ -12919,6 +12919,11 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         _run_job(lambda: episode_cuts_job(message.bot, chat_id, int(arg)))
         return
+    if kind == "wvvoice" and arg.split(":")[0].isdigit():  # выпуск → только исправленные фразы голоса
+        await callback.answer()
+        first, sure = int(arg.split(":")[0]), arg.endswith(":go")
+        _run_job(lambda: episode_revoice_job(message.bot, chat_id, first, sure))
+        return
     if kind == "p" and arg.isdigit():  # опубликовать сейчас
         done = (await _post_meta(chat_id, int(arg))).get("published")
         if done:
@@ -15634,6 +15639,7 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [_btn("▶️ Загрузить на YouTube", f"yt:{msg.message_id}")],
             [_btn("✂️ Нарезать на шортсы (по новости)", f"pt:wvcut:{msg.message_id}")],
+            [_btn("🎙 Переозвучить только звук (без монтажа)", f"pt:wvvoice:{msg.message_id}")],
             [_btn("🔁 Переозвучить и перемонтировать", "pt:wvre")],
             [_btn("🔕 Не собирать по ср и вс" if on else "🔔 Собирать по ср и вс в 10:00",
                   "pt:wvoff" if on else "pt:wvon")]]))
@@ -15646,7 +15652,8 @@ async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any]) 
         await bot.send_message(chat_id, "🎧 <b>Послушай эти места</b> — распознавание услышало не то, что в тексте "
                                         "(часто это искажённое имя или окончание):\n" + escape(seo["listen"][:3500])
                                + "\n\nЕсли слово и правда звучит неверно — <code>/say слово = как читать</code> и "
-                                 "«🔁 Переозвучить»: заново оплатятся только эти фразы.")
+                                 "«🎙 Переозвучить только звук»: пришлю только исправленные фразы с таймкодом, "
+                                 "заново оплатятся только они.")
     if seo.get("cache"):
         await bot.send_message(chat_id, f"💾 Озвучка: {seo['cache']} фраз взято из уже оплаченных — заново "
                                         "озвучено только новое и исправленное.")
@@ -15714,6 +15721,79 @@ async def episode_cuts_job(bot: Bot, chat_id: int, first: int) -> None:
         shutil.rmtree(work, ignore_errors=True)
     await status.edit_text(f"✅ Готово: {done} шортсов из выпуска. Под каждым — «▶️ Загрузить на YouTube». "
                            "Совет: выкладывай по 1–2 в день, а не все сразу.")
+
+
+def _tc(sec: float) -> str:
+    return f"{int(sec) // 60}:{sec % 60:04.1f}"
+
+
+REVOICE_ASK = 12  # больше стольких фраз заново — сначала спросить (это уже заметная часть озвучки выпуска)
+
+
+async def episode_revoice_job(bot: Bot, chat_id: int, first: int, sure: bool = False) -> None:
+    """«🎙 Переозвучить только звук»: фразы выпуска заново проходят словарь произношения (/say); те, что
+    зазвучат иначе, озвучиваются и приходят отдельными файлами с таймкодом — автор сам меняет звук в монтаже.
+    Видео не пересобирается; неизменные фразы не оплачиваются (их текст и голос — из кэша)."""
+    seo_file = READY_DIR / f"{chat_id}_{first}.json"
+    if not seo_file.exists():
+        await bot.send_message(chat_id, f"Данных этого выпуска уже нет на сервере (храню {READY_DAYS} дня).")
+        return
+    phrases = json.loads(json.loads(seo_file.read_text()).get("phrases") or "[]")
+    if not phrases:
+        await bot.send_message(chat_id, "Этот выпуск собран до обновления — в нём нет разметки фраз по времени. "
+                                        "Для него — «🔁 Переозвучить и перемонтировать»; у следующих выпусков "
+                                        "переозвучка только звука заработает.")
+        return
+    if shorts_lock.locked():
+        await bot.send_message(chat_id, "⏳ Сейчас собирается другой ролик — нажми «🎙 Переозвучить» через пару минут.")
+        return
+    status = await bot.send_message(chat_id, "🎙 Сверяю фразы выпуска со словарём произношения…")
+    work = SHORTS_DIR / f"revoice_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        async with shorts_lock:
+            await load_pronunciations()
+            await load_voice()
+            texts = [str(p[1]) for p in phrases]
+            speak = await shorts_daily.spoken_lines(texts, careful=True)
+            pause = shorts_lumean.PAUSE
+            todo = [i for i, t in enumerate(speak)
+                    if not shorts_daily._voice_key(shorts_daily._for_lumean(t), pause).exists()]
+            if not todo:
+                await status.edit_text(
+                    "✅ Все фразы прозвучат так же, как в выпуске, — переозвучивать нечего.\nСначала исправь "
+                    "слово: <code>/say слово = как читать</code> (ударную гласную — заглавной: "
+                    "<code>/say среду = срЕду</code>), потом жми «🎙 Переозвучить только звук» снова.")
+                return
+            if len(todo) > REVOICE_ASK and not sure:
+                chars = sum(len(speak[i]) for i in todo)
+                await status.edit_text(
+                    f"⚠️ Заново озвучить придётся {len(todo)} фраз из {len(texts)} (≈{chars} символов). Обычно "
+                    "так бывает, если выпуск собран до обновления или сменились настройки голоса. Озвучить?",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [_btn(f"🎙 Да, озвучить {len(todo)} фраз", f"pt:wvvoice:{first}:go")]]))
+                return
+            await status.edit_text(f"🎙 Озвучиваю {len(todo)} исправленных фраз…")
+            await shorts_daily.synthesize([speak[i] for i in todo], work, careful=True, prepared=True)
+            for k, i in enumerate(todo):
+                part = work / f"voice_{k}.mp3"
+                if not part.exists():
+                    continue
+                start = float(phrases[i][0])
+                length = await shorts_weekly._duration(part)
+                caption = (f"⏱ <b>{_tc(start)}</b> — фраза {i + 1}, новая длина {length:.1f} с\n"
+                           f"«{escape(texts[i][:700])}»")
+                await bot.send_audio(chat_id, FSInputFile(part, filename=f"fraza_{i + 1}_{_tc(start).replace(':', '-')}.mp3"),
+                                     caption=caption, title=f"Фраза {i + 1} ({_tc(start)})", performer="KinoMir360")
+        await status.edit_text(
+            f"✅ Переозвучено фраз: {len(todo)}. В монтаже поставь каждую на свой таймкод (⏱ — где фраза "
+            "начинается в выпуске) вместо старой. Новая фраза может быть чуть длиннее или короче — подвинь "
+            "соседний кусок или подрежь паузу.")
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Episode revoice failed")
+        await status.edit_text(f"❌ Переозвучка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 rt_watch_busy = asyncio.Lock()
