@@ -1728,7 +1728,7 @@ def add_english_seo(result: ShortResult) -> None:
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
                   tag: str, header: str, question: str, music: Path | None,
-                  boom_slide: int | None = None) -> bool:
+                  boom_slide: int | None = None, scene_plan: bool = False) -> bool:
     """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить.
 
     Карточки с "karaoke": True получают время слов для подсветки текста.
