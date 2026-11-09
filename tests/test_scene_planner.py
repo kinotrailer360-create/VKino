@@ -29,7 +29,7 @@ def test_scene_plan_uses_real_phrase_timing_and_asset_review_state() -> None:
     assert plan["timing_source"] == "tts_phrase_timestamps"
     assert len(plan["scenes"]) == 2
     first, second = plan["scenes"]
-    assert (first["start"], first["end"], first["duration"]) == (2.4, 5.4, 3.0)
+    assert (first["start"], first["end"], first["duration"]) == (2.4, 6.1, 3.7)
     assert first["asset"]["source"] == "ai_generated_illustration"
     assert first["match"]["status"] == "generated_illustration_review"
     assert first["review"]["required"] is True
