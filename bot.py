@@ -15858,6 +15858,7 @@ async def keep_project(chat_id: int, message_id: int, work: Path, send: dict[str
 
 async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
     folder = proj_dir(chat_id, first)
+    proj = shorts_project.load(folder) or {}
     plan_path = folder / "scene_plan.json"
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
