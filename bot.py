@@ -15870,9 +15870,11 @@ async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
         return
     await bot.send_message(chat_id, f"🖼 <b>Проверка визуального ряда</b> — {len(scenes)} сцен. "
                          "Посмотри изображения. Любой кадр можно заменить своим фото.")
+    cards = (proj.get("rerun") or {}).get("cards") or []
     for index, scene in enumerate(scenes):
         asset = scene.get("asset") or {}
-        path = Path(str(asset.get("path") or ""))
+        card_path = str(cards[index].get("image") or "") if index < len(cards) else ""
+        path = Path(card_path or str(asset.get("path") or ""))
         if not path.is_absolute():
             path = folder / path
         caption = (f"Сцена {index + 1} · {float(scene.get('start') or 0):.1f}–"
