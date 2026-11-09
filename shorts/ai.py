@@ -873,6 +873,54 @@ async def match_images(key: str, texts: list[str], images: list[Image.Image]) ->
     return [c if 0 <= c < len(images) else -1 for c in choices]
 
 
+async def rank_image_candidates(key: str, texts: list[str], images: list[Image.Image]) -> list[dict[str, Any]] | None:
+    """Semantic image ranking with explicit confidence; -1 means no suitable image."""
+    if not available(key) or not texts or not images:
+        return None
+    task = (
+        "Для каждого факта выбери наиболее подходящий кадр. Оцени соответствие по шкале 0–100: "
+        "90–100 — явно показан объект/персонаж/место из факта; 70–89 — хорошее прямое соответствие; "
+        "40–69 — лишь косвенная связь; 0–39 — не подходит. Не путай просто кадр из того же фильма "
+        "с кадром, подтверждающим конкретный факт. Если подходящего кадра нет, index=-1 и score=0. "
+        "Не повторяй один кадр для разных фактов, если есть альтернативы. Ответ строго JSON: "
+        "{\"choices\":[{\"index\":0,\"score\":90,\"reason\":\"краткое объяснение\"}]}."
+    )
+    facts = "Факты:\\n" + "\\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    parts: list[dict[str, Any]] = [{"text": (
+        "Ты монтажёр коротких роликов о кино. Ниже пронумерованные кадры и факты. " + task)}]
+    for i, img in enumerate(images):
+        parts += [{"text": f"Кадр {i}:"}, _thumb(img)]
+    parts.append({"text": facts})
+    prompt = ("Ты монтажёр коротких роликов о кино. На листе кадры с номерами. " + task + "\\n\\n" + facts)
+    try:
+        data = await _with_reserve(key, parts, prompt, _sheet(images) if RESERVE_KEY else None)
+        raw = list(data.get("choices") or [])[:len(texts)]
+    except Exception as exc:  # noqa: BLE001
+        global last_error
+        last_error = str(exc)[:300]
+        log.warning("shorts: AI rank_image_candidates failed: %s", exc)
+        return None
+    ranked: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            ranked.append({"index": -1, "score": 0, "reason": ""})
+            continue
+        try:
+            index = int(item.get("index", -1))
+            score = max(0, min(100, int(item.get("score", 0))))
+        except (TypeError, ValueError):
+            index, score = -1, 0
+        if index < 0 or index >= len(images) or index in used:
+            index, score = -1, 0
+        if index >= 0:
+            used.add(index)
+        ranked.append({"index": index, "score": score,
+                       "reason": str(item.get("reason") or "")[:160]})
+    ranked += [{"index": -1, "score": 0, "reason": ""}] * (len(texts) - len(ranked))
+    return ranked
+
+
 async def retell_news(key: str, items: list[tuple[str, str, str]]) -> list[str] | None:
     """(заголовок, лид, источник) -> текст для озвучки своими словами, 1–2 предложения."""
     if not available(key) or not items:
