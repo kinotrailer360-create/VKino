@@ -2075,7 +2075,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     # Генерация ограничена только фактами без подтверждённого кадра; чужие лица/постеры не имитируем.
     if not review and not rumors and ai.available(gemini_key):
         missing = [i for i, meta in visual_matches.items() if meta.get("status") == "fallback_unverified"]
-        for i in missing:
+        # Ограничиваем число платных генераций на один ролик; остальные кадры останутся на ручную замену.
+        for i in missing[:5]:
             try:
                 await _progress(34, f"Создаю иллюстрацию к факту {i + 1}/{n}")
                 raw_image = await ai.generate_illustration(gemini_key, facts[i], _title(film))
