@@ -885,13 +885,13 @@ async def rank_image_candidates(key: str, texts: list[str], images: list[Image.I
         "Не повторяй один кадр для разных фактов, если есть альтернативы. Ответ строго JSON: "
         "{\"choices\":[{\"index\":0,\"score\":90,\"reason\":\"краткое объяснение\"}]}."
     )
-    facts = "Факты:\\n" + "\\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    facts = "Факты:\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     parts: list[dict[str, Any]] = [{"text": (
         "Ты монтажёр коротких роликов о кино. Ниже пронумерованные кадры и факты. " + task)}]
     for i, img in enumerate(images):
         parts += [{"text": f"Кадр {i}:"}, _thumb(img)]
     parts.append({"text": facts})
-    prompt = ("Ты монтажёр коротких роликов о кино. На листе кадры с номерами. " + task + "\\n\\n" + facts)
+    prompt = ("Ты монтажёр коротких роликов о кино. На листе кадры с номерами. " + task + "\n\n" + facts)
     try:
         data = await _with_reserve(key, parts, prompt, _sheet(images) if RESERVE_KEY else None)
         raw = list(data.get("choices") or [])[:len(texts)]
@@ -911,7 +911,7 @@ async def rank_image_candidates(key: str, texts: list[str], images: list[Image.I
             score = max(0, min(100, int(item.get("score", 0))))
         except (TypeError, ValueError):
             index, score = -1, 0
-        if index < 0 or index >= len(images) or index in used:
+        if index < 0 or index >= len(images) or index in used or score < 40:
             index, score = -1, 0
         if index >= 0:
             used.add(index)
