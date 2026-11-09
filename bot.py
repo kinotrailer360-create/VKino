@@ -293,6 +293,10 @@ class FactsState(StatesGroup):
     media = State()
 
 
+class SceneReviewState(StatesGroup):
+    replacement = State()
+
+
 class CustomState(StatesGroup):
     text = State()
     video = State()
@@ -7277,8 +7281,17 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     keep_for_upload(chat_id, video.message_id, result)
     has_project = await keep_project(chat_id, video.message_id, result.video.parent,
                                      {"mode": "short", "caption": post_caption(short_caption(result)), "seo": seo})
-    await offer_post(bot, chat_id, [video.message_id], "caption", what="Шортс готов и для Telegram-канала",
-                     extra={"yt": True})
+    source_plan = result.video.parent / "scene_plan.json"
+    plan_path = proj_dir(chat_id, video.message_id) / "scene_plan.json"
+    if source_plan.exists():
+        if has_project and plan_path.exists():
+            await bot.send_message(chat_id, "🖼 Перед публикацией проверь визуальный ряд кнопкой ниже.")
+        else:
+            await bot.send_message(chat_id, "⚠️ План визуальной проверки не удалось сохранить. Публикацию не предлагаю, "
+                                 "чтобы не пропустить обязательную проверку сцен.")
+    else:
+        await offer_post(bot, chat_id, [video.message_id], "caption", what="Шортс готов и для Telegram-канала",
+                         extra={"yt": True})
     for label, key in (
         ("Название", "title"),
         ("Описание", "description"),
@@ -9435,6 +9448,45 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             shorts_daily.on_progress = None
             await clear_running()
             shutil.rmtree(work, ignore_errors=True)
+
+
+@router.message(SceneReviewState.replacement, F.photo)
+async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return
+    data = await state.get_data()
+    first, index = data.get("scene_review_first"), data.get("scene_review_index")
+    if not isinstance(first, int) or not isinstance(index, int):
+        await state.clear()
+        await message.answer("Сессия замены истекла. Открой проверку сцен заново.")
+        return
+    folder = proj_dir(message.chat.id, first)
+    proj = shorts_project.load(folder)
+    cards = (proj or {}).get("rerun", {}).get("cards") or []
+    if not proj or not 0 <= index < len(cards):
+        await state.clear()
+        await message.answer("Проект не найден. Открой проверку сцен заново.")
+        return
+    photo = message.photo[-1]
+    if (photo.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("Фото слишком большое. Пришли сжатую версию.")
+        return
+    path = folder / f"scene_replacement_{index + 1}.jpg"
+    await message.bot.download(photo.file_id, destination=path)
+    cards[index]["image"] = path.name
+    cards[index].pop("clip", None)
+    cards[index].pop("overlay", None)
+    cards[index]["asset_source"] = "user_replacement"
+    cards[index]["visual_match"] = {
+        "status": "user_replacement_review", "score": None,
+        "reason": "Изображение заменено автором; ожидает подтверждения",
+    }
+    proj["rerun"]["scene_plan_enabled"] = True
+    (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
+    await state.clear()
+    await message.answer("✅ Изображение принято. Перемонтирую ролик с заменённой сценой…")
+    _run_job(lambda: project_remake_job(message.bot, message.chat.id, first))
 
 
 @router.message(FactsState.title, F.text, ~F.text.startswith("/"))
@@ -12927,6 +12979,27 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     message, action = callback.message, (callback.data or "")[3:]
     chat_id = message.chat.id
     kind, _, arg = action.partition(":")
+    if kind == "vis" and arg.isdigit():
+        await callback.answer()
+        await show_scene_review(message.bot, chat_id, int(arg))
+        return
+    if kind == "va" and arg.isdigit():
+        await callback.answer()
+        await approve_scene_review(message.bot, chat_id, int(arg))
+        return
+    if kind == "vr" and re.fullmatch(r"\d+:\d+", arg):
+        await callback.answer()
+        first, index = map(int, arg.split(":"))
+        folder = proj_dir(chat_id, first)
+        proj = shorts_project.load(folder) or {}
+        cards = (proj.get("rerun") or {}).get("cards") or []
+        if not 0 <= index < len(cards):
+            await message.answer("Эта сцена уже недоступна. Открой проверку ещё раз.")
+            return
+        await state.set_state(SceneReviewState.replacement)
+        await state.update_data(scene_review_first=first, scene_review_index=index)
+        await message.answer(f"📷 Пришли новое изображение для сцены №{index + 1}. /cancel — отмена.")
+        return
     if kind == "wvcut" and arg.isdigit():  # выпуск → вертикальные шортсы по новостям
         await callback.answer()
         _run_job(lambda: episode_cuts_job(message.bot, chat_id, int(arg)))
@@ -15788,12 +15861,73 @@ async def keep_project(chat_id: int, message_id: int, work: Path, send: dict[str
         return False
 
 
+async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
+    folder = proj_dir(chat_id, first)
+    proj = shorts_project.load(folder) or {}
+    plan_path = folder / "scene_plan.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        await bot.send_message(chat_id, "План сцен не найден. Открой проверку ещё раз.")
+        return
+    scenes = plan.get("scenes") or []
+    if not scenes:
+        await bot.send_message(chat_id, "В плане пока нет сцен для проверки.")
+        return
+    await bot.send_message(chat_id, f"🖼 <b>Проверка визуального ряда</b> — {len(scenes)} сцен. "
+                         "Посмотри изображения. Любой кадр можно заменить своим фото.")
+    cards = (proj.get("rerun") or {}).get("cards") or []
+    for index, scene in enumerate(scenes):
+        asset = scene.get("asset") or {}
+        card_path = str(cards[index].get("image") or "") if index < len(cards) else ""
+        path = Path(card_path or str(asset.get("path") or ""))
+        if not path.is_absolute():
+            path = folder / path
+        caption = (f"Сцена {index + 1} · {float(scene.get('start') or 0):.1f}–"
+                   f"{float(scene.get('end') or 0):.1f} сек.\n{str(scene.get('text') or '')[:650]}\n"
+                   f"Источник: {asset.get('source') or 'неизвестен'} · "
+                   f"статус: {(scene.get('match') or {}).get('status') or 'не проверено'}")
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🔄 Заменить изображение", f"pt:vr:{first}:{index}")]])
+        if path.is_file():
+            await bot.send_photo(chat_id, FSInputFile(path), caption=caption[:1000], reply_markup=markup)
+        else:
+            await bot.send_message(chat_id, caption[:1000] + "\n⚠️ Файл изображения не найден.", reply_markup=markup)
+    await bot.send_message(chat_id, "Когда все сцены устраивают, подтверди визуальный ряд:",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                               [_btn("✅ Подтвердить все сцены", f"pt:va:{first}")]]))
+
+
+async def approve_scene_review(bot: Bot, chat_id: int, first: int) -> None:
+    folder = proj_dir(chat_id, first)
+    plan_path = folder / "scene_plan.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        await bot.send_message(chat_id, "План сцен не найден. Открой проверку ещё раз.")
+        return
+    if plan.get("review_mode") == "approved":
+        await bot.send_message(chat_id, "Этот визуальный ряд уже подтверждён.")
+        return
+    for scene in plan.get("scenes") or []:
+        scene.setdefault("review", {})["approved"] = True
+        scene["review"]["approved_at"] = datetime.now(MSK).isoformat()
+    plan["review_mode"] = "approved"
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    await bot.send_message(chat_id, "✅ Визуальный ряд подтверждён. Теперь можно публиковать ролик.")
+    await offer_post(bot, chat_id, [first], "caption", what="Проверенный шортс готов для Telegram-канала",
+                     extra={"yt": True})
+
+
 async def fix_buttons(bot: Bot, chat_id: int, first: int, weekly: bool = False, note: str = "") -> None:
+    rows = _fix_rows(first, weekly)
+    if (proj_dir(chat_id, first) / "scene_plan.json").exists():
+        rows.insert(0, [_btn("🖼 Проверить сцены и заменить кадры", f"pt:vis:{first}")])
     await bot.send_message(
         chat_id, (note + "\n\n" if note else "") + "🛠 <b>Поправить ролик:</b>\n• 🎙 <b>Только звук</b> — переозвучатся "
         "только исправленные фразы и встанут на свои места, картинка та же. Платно только исправленное.\n"
         "• 🔁 <b>Полностью</b> — тот же текст, озвучка и монтаж заново (неизменные фразы — бесплатно из кэша).\n\n"
-        + SAY_HINT, reply_markup=InlineKeyboardMarkup(inline_keyboard=_fix_rows(first, weekly)))
+        + SAY_HINT, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 async def send_fixed(bot: Bot, chat_id: int, folder: Path, video: Path, note: str) -> None:
@@ -15807,8 +15941,19 @@ async def send_fixed(bot: Bot, chat_id: int, folder: Path, video: Path, note: st
     if send.get("seo"):
         keep_for_upload(chat_id, msg.message_id, SimpleNamespace(video=video, seo=send["seo"]))
     await keep_project(chat_id, msg.message_id, folder, send)
-    if not review:
+    plan_path = folder / "scene_plan.json"
+    review_pending = False
+    if plan_path.exists():
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            review_pending = any(not (scene.get("review") or {}).get("approved")
+                                 for scene in plan.get("scenes") or [])
+        except (OSError, ValueError):
+            review_pending = True
+    if not review and not review_pending:
         await offer_post(bot, chat_id, [msg.message_id], "caption", what="Исправленный шортс", extra={"yt": True})
+    elif review_pending:
+        await bot.send_message(chat_id, "🖼 Перед публикацией проверь визуальный ряд кнопкой ниже.")
     await fix_buttons(bot, chat_id, msg.message_id, note=note)
 
 
@@ -15888,7 +16033,8 @@ async def project_remake_job(bot: Bot, chat_id: int, first: int) -> None:
             shorts_daily.on_progress, shorts_daily.last_stage = progress_updater(status), ""
             if rr["fn"] == "render":
                 job = shorts_daily._render(work, work / rr["cover"], rr["cards"], rr["lines"], rr["tag"], rr["header"],
-                                           rr["question"], local(rr.get("music")), rr.get("boom_slide"))
+                                           rr["question"], local(rr.get("music")), rr.get("boom_slide"),
+                                           scene_plan=bool(rr.get("scene_plan_enabled")))
             elif rr["fn"] == "lore":
                 job = shorts_lore.make_lore(work, rr["script"], local(rr.get("music")),
                                             [work / m for m in rr.get("media") or []], GEMINI_API_KEY,

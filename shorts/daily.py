@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, lumean, news, pronounce, project, stressdb, tgsearch, tmdb, wiki
+from . import ai, clips, lumean, news, pronounce, project, scene_planner, stressdb, tgsearch, tmdb, wiki
 from . import music as musiclib
 from .cards import card_overlay, make_card, make_cover
 
@@ -1728,7 +1728,7 @@ def add_english_seo(result: ShortResult) -> None:
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
                   tag: str, header: str, question: str, music: Path | None,
-                  boom_slide: int | None = None) -> bool:
+                  boom_slide: int | None = None, scene_plan: bool = False) -> bool:
     """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить.
 
     Карточки с "karaoke": True получают время слов для подсветки текста.
@@ -1741,6 +1741,13 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
              "boom_slide": boom_slide}
     voice, starts, voiced, spans = await synthesize(lines, work)
     voice_meta = dict(last_voice)
+    plan_path: str | None = None
+    if scene_plan:
+        rerun["scene_plan_enabled"] = True
+        plan = scene_planner.build_scene_plan(lines, starts, spans, cards)
+        plan_file = work / "scene_plan.json"
+        plan_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        plan_path = plan_file.name
     # субтитры по слову; текст, который и так звучит (караоке), на карточке тогда не дублируем
     words = await word_timeline(voice, starts, spans) if voiced else []
     for i, card in enumerate(cards, 1):  # слайд 0 — обложка
@@ -1790,6 +1797,8 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
         await _progress(50, "Монтаж встал — собираю без отрывков трейлеров")
         await _run_render(cfg_path, "Монтаж без отрывков")
+    if plan_path:
+        rerun["scene_plan"] = plan_path
     project.save(work, "short", "shorts.make_short", cfg_path.name, cfg["output"], voice_meta, rerun)
     await _progress(98, "Видео готово")
     return voiced
@@ -1876,10 +1885,11 @@ async def _own_for_facts(files: list[Path], facts: list[str], work: Path, gemini
             log.warning("shorts: own material %s skipped: %s", path.name, exc)
     if not items:
         return {}, {}
-    choices = await ai.match_images(gemini_key, facts, [im for im, _ in items]) if gemini_key else None
+    ranked = await ai.rank_image_candidates(gemini_key, facts, [im for im, _ in items]) if gemini_key else None
     used: set[int] = set()
     at: dict[int, int] = {}
-    for i, c in enumerate(choices or []):
+    for i, item in enumerate(ranked or []):
+        c = int(item.get("index", -1))
         if c >= 0 and c not in used:
             at[i] = c
             used.add(c)
@@ -2031,15 +2041,58 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
     stills = [i for i in rest if i not in videos]
     await _progress(32, "ИИ подбирает кадры")
-    choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
+    ranked = await ai.rank_image_candidates(gemini_key, [facts[i] for i in stills], images) if stills else None
     used: set[int] = set()
     picked: dict[int, Image.Image] = {**portraits, **own}
+    visual_matches: dict[int, dict[str, Any]] = {}
+    visual_sources: dict[int, str] = {i: "user_or_channel_media" for i in own}
+    visual_sources.update({i: "person_portrait" for i in portraits})
     for k, i in enumerate(stills + [v for v in videos if v not in own]):  # у фактов с видео кадр — запасной
-        c = choices[k] if choices and k < len(stills) else -1
-        if c < 0 or c in used:
+        match = ranked[k] if ranked and k < len(stills) else {"index": -1, "score": 0, "reason": ""}
+        c = int(match.get("index", -1))
+        if i in videos:
             c = next((j for j in range(len(images)) if j not in used), k % len(images))
+            visual_matches[i] = {
+                "status": "trailer_clip_review", "score": None,
+                "reason": "Для сцены выбран фрагмент трейлера; проверьте его содержание",
+            }
+        elif c < 0 or c in used:
+            c = next((j for j in range(len(images)) if j not in used), k % len(images))
+            visual_matches[i] = {"status": "fallback_unverified", "score": None,
+                                 "reason": "ИИ не подтвердил подходящий кадр; использован запасной"}
+        else:
+            score = int(match.get("score", 0))
+            visual_matches[i] = {
+                "status": "matched" if score >= 70 else "needs_review",
+                "score": score,
+                "reason": str(match.get("reason") or "")[:160],
+            }
         used.add(c)
         picked[i] = images[c]
+        visual_sources[i] = "trailer_clip" if i in videos else "film_frame_pool"
+
+    # Если ни один исходный кадр не подошёл, создаём отдельную символическую иллюстрацию.
+    # Генерация ограничена только фактами без подтверждённого кадра; чужие лица/постеры не имитируем.
+    if not review and not rumors and ai.available(gemini_key):
+        missing = [i for i, meta in visual_matches.items() if meta.get("status") == "fallback_unverified"]
+        # Ограничиваем число платных генераций на один ролик; остальные кадры останутся на ручную замену.
+        for i in missing[:5]:
+            try:
+                await _progress(34, f"Создаю иллюстрацию к факту {i + 1}/{n}")
+                raw_image = await ai.generate_illustration(gemini_key, facts[i], _title(film))
+                if not raw_image:
+                    continue
+                illustration = Image.open(io.BytesIO(raw_image)).convert("RGB")
+                if illustration.width < 32 or illustration.height < 32:
+                    continue
+                picked[i] = illustration if illustration.width >= illustration.height * 1.2 else _portrait(illustration)
+                visual_sources[i] = "ai_generated_illustration"
+                visual_matches[i] = {
+                    "status": "generated_illustration_review", "score": None,
+                    "reason": "Создана оригинальная символическая иллюстрация; это не кадр из фильма",
+                }
+            except Exception as exc:  # noqa: BLE001 — генерация не должна ломать сборку ролика
+                log.warning("shorts: illustration for fact %s failed: %s", i + 1, exc)
 
     for i, fact in enumerate(facts, 1):
         # название уже в заголовке слайда — на карточке не повторяем
@@ -2052,14 +2105,19 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         if (i - 1) in videos:
             card_overlay("", i, n, None, "IMDb", None, badge, FACT_CARD_H).save(work / f"overlay{i}.png")
             video = {"clip": videos[i - 1], "overlay": f"overlay{i}.png"}
-        cards.append({"image": path.name, "caption": fact, "karaoke": True, **video})
+        match_meta = visual_matches.get(i - 1, {
+            "status": "special_source_unverified", "score": None,
+            "reason": "Портрет, пользовательский или видеоматериал требует проверки источника и соответствия",
+        })
+        cards.append({"image": path.name, "caption": fact, "karaoke": True,
+                      "visual_match": match_meta, "asset_source": visual_sources.get(i - 1, "unknown"), **video})
 
     cover = await asyncio.to_thread(make_cover, cover_src, label, cover_text)
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
     lines = [intro] + facts + [f"{outro_line} {SAVE_AND_SUBSCRIBE}"]
-    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music)
+    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music, scene_plan=not review and not rumors)
     seo = build_review_seo(film, facts) if review else build_rumors_seo(film, facts) if rumors \
         else build_facts_seo(film, facts)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
