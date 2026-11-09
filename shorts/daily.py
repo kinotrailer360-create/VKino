@@ -2050,7 +2050,13 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     for k, i in enumerate(stills + [v for v in videos if v not in own]):  # у фактов с видео кадр — запасной
         match = ranked[k] if ranked and k < len(stills) else {"index": -1, "score": 0, "reason": ""}
         c = int(match.get("index", -1))
-        if c < 0 or c in used:
+        if i in videos:
+            c = next((j for j in range(len(images)) if j not in used), k % len(images))
+            visual_matches[i] = {
+                "status": "trailer_clip_review", "score": None,
+                "reason": "Для сцены выбран фрагмент трейлера; проверьте его содержание",
+            }
+        elif c < 0 or c in used:
             c = next((j for j in range(len(images)) if j not in used), k % len(images))
             visual_matches[i] = {"status": "fallback_unverified", "score": None,
                                  "reason": "ИИ не подтвердил подходящий кадр; использован запасной"}
