@@ -2044,6 +2044,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     used: set[int] = set()
     picked: dict[int, Image.Image] = {**portraits, **own}
     visual_matches: dict[int, dict[str, Any]] = {}
+    visual_sources: dict[int, str] = {i: "user_or_channel_media" for i in own}
+    visual_sources.update({i: "person_portrait" for i in portraits})
     for k, i in enumerate(stills + [v for v in videos if v not in own]):  # у фактов с видео кадр — запасной
         match = ranked[k] if ranked and k < len(stills) else {"index": -1, "score": 0, "reason": ""}
         c = int(match.get("index", -1))
@@ -2060,6 +2062,29 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
             }
         used.add(c)
         picked[i] = images[c]
+        visual_sources[i] = "film_frame_pool"
+
+    # Если ни один исходный кадр не подошёл, создаём отдельную символическую иллюстрацию.
+    # Генерация ограничена только фактами без подтверждённого кадра; чужие лица/постеры не имитируем.
+    if not review and not rumors and ai.available(gemini_key):
+        missing = [i for i, meta in visual_matches.items() if meta.get("status") == "fallback_unverified"]
+        for i in missing:
+            try:
+                await _progress(34, f"Создаю иллюстрацию к факту {i + 1}/{n}")
+                raw_image = await ai.generate_illustration(gemini_key, facts[i], _title(film))
+                if not raw_image:
+                    continue
+                illustration = Image.open(io.BytesIO(raw_image)).convert("RGB")
+                if illustration.width < 32 or illustration.height < 32:
+                    continue
+                picked[i] = illustration if illustration.width >= illustration.height * 1.2 else _portrait(illustration)
+                visual_sources[i] = "ai_generated_illustration"
+                visual_matches[i] = {
+                    "status": "generated_illustration_review", "score": None,
+                    "reason": "Создана оригинальная символическая иллюстрация; это не кадр из фильма",
+                }
+            except Exception as exc:  # noqa: BLE001 — генерация не должна ломать сборку ролика
+                log.warning("shorts: illustration for fact %s failed: %s", i + 1, exc)
 
     for i, fact in enumerate(facts, 1):
         # название уже в заголовке слайда — на карточке не повторяем
@@ -2077,7 +2102,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
             "reason": "Портрет, пользовательский или видеоматериал требует проверки источника и соответствия",
         })
         cards.append({"image": path.name, "caption": fact, "karaoke": True,
-                      "visual_match": match_meta, "asset_source": "film_or_user_media_pool", **video})
+                      "visual_match": match_meta, "asset_source": visual_sources.get(i - 1, "unknown"), **video})
 
     cover = await asyncio.to_thread(make_cover, cover_src, label, cover_text)
     cover_path = work / "cover.jpg"
