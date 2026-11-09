@@ -2052,13 +2052,13 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
             visual_matches[i] = {"status": "fallback_unverified", "score": None,
                                  "reason": "ИИ не подтвердил подходящий кадр; использован запасной"}
         else:
-            used.add(c)
             score = int(match.get("score", 0))
             visual_matches[i] = {
                 "status": "matched" if score >= 70 else "needs_review",
                 "score": score,
                 "reason": str(match.get("reason") or "")[:160],
             }
+        used.add(c)
         picked[i] = images[c]
 
     for i, fact in enumerate(facts, 1):
