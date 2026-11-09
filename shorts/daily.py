@@ -1743,6 +1743,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     voice_meta = dict(last_voice)
     plan_path: str | None = None
     if scene_plan:
+        rerun["scene_plan_enabled"] = True
         plan = scene_planner.build_scene_plan(lines, starts, spans, cards)
         plan_file = work / "scene_plan.json"
         plan_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
