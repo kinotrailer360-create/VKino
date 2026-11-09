@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, lumean, news, pronounce, project, stressdb, tgsearch, tmdb, wiki
+from . import ai, clips, lumean, news, pronounce, project, scene_planner, stressdb, tgsearch, tmdb, wiki
 from . import music as musiclib
 from .cards import card_overlay, make_card, make_cover
 
@@ -1741,6 +1741,12 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
              "boom_slide": boom_slide}
     voice, starts, voiced, spans = await synthesize(lines, work)
     voice_meta = dict(last_voice)
+    plan_path: str | None = None
+    if scene_plan:
+        plan = scene_planner.build_scene_plan(lines, starts, spans, cards)
+        plan_file = work / "scene_plan.json"
+        plan_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        plan_path = plan_file.name
     # субтитры по слову; текст, который и так звучит (караоке), на карточке тогда не дублируем
     words = await word_timeline(voice, starts, spans) if voiced else []
     for i, card in enumerate(cards, 1):  # слайд 0 — обложка
@@ -1790,6 +1796,8 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
         await _progress(50, "Монтаж встал — собираю без отрывков трейлеров")
         await _run_render(cfg_path, "Монтаж без отрывков")
+    if plan_path:
+        rerun["scene_plan"] = plan_path
     project.save(work, "short", "shorts.make_short", cfg_path.name, cfg["output"], voice_meta, rerun)
     await _progress(98, "Видео готово")
     return voiced
@@ -2059,7 +2067,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     cover.save(cover_path, quality=93)
 
     lines = [intro] + facts + [f"{outro_line} {SAVE_AND_SUBSCRIBE}"]
-    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music)
+    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music, scene_plan=not review and not rumors)
     seo = build_review_seo(film, facts) if review else build_rumors_seo(film, facts) if rumors \
         else build_facts_seo(film, facts)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
