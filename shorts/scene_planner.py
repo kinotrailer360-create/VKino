@@ -39,6 +39,9 @@ def build_scene_plan(
         asset_type = "clip" if clip else "still" if image else "missing"
         asset_path = clip or image
         source = card.get("source") or card.get("asset_source") or "unknown"
+        visual_match = card.get("visual_match") or {}
+        match_status = str(visual_match.get("status") or "unverified")
+        match_score = visual_match.get("score")
         scenes.append({
             "id": f"scene-{card_index + 1:02d}",
             "line_index": line_index,
@@ -47,7 +50,8 @@ def build_scene_plan(
             "end": round(end, 3),
             "duration": round(max(0.0, end - start), 3),
             "asset": {"type": asset_type, "path": asset_path, "source": source},
-            "match": {"status": "unverified", "score": None},
+            "match": {"status": match_status, "score": match_score,
+                      "reason": str(visual_match.get("reason") or "")[:160]},
             "review": {"required": bool(require_review), "approved": False, "replacement": None},
         })
     return {
