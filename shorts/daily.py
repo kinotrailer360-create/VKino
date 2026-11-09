@@ -2063,7 +2063,7 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
             }
         used.add(c)
         picked[i] = images[c]
-        visual_sources[i] = "film_frame_pool"
+        visual_sources[i] = "trailer_clip" if i in videos else "film_frame_pool"
 
     # Если ни один исходный кадр не подошёл, создаём отдельную символическую иллюстрацию.
     # Генерация ограничена только фактами без подтверждённого кадра; чужие лица/постеры не имитируем.
