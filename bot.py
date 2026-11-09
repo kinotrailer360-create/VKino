@@ -7281,12 +7281,17 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     keep_for_upload(chat_id, video.message_id, result)
     has_project = await keep_project(chat_id, video.message_id, result.video.parent,
                                      {"mode": "short", "caption": post_caption(short_caption(result)), "seo": seo})
+    source_plan = result.video.parent / "scene_plan.json"
     plan_path = proj_dir(chat_id, video.message_id) / "scene_plan.json"
-    if not (has_project and plan_path.exists()):
+    if source_plan.exists():
+        if has_project and plan_path.exists():
+            await bot.send_message(chat_id, "🖼 Перед публикацией проверь визуальный ряд кнопкой ниже.")
+        else:
+            await bot.send_message(chat_id, "⚠️ План визуальной проверки не удалось сохранить. Публикацию не предлагаю, "
+                                 "чтобы не пропустить обязательную проверку сцен.")
+    else:
         await offer_post(bot, chat_id, [video.message_id], "caption", what="Шортс готов и для Telegram-канала",
                          extra={"yt": True})
-    else:
-        await bot.send_message(chat_id, "🖼 Перед публикацией проверь визуальный ряд кнопкой ниже.")
     for label, key in (
         ("Название", "title"),
         ("Описание", "description"),
@@ -15900,6 +15905,9 @@ async def approve_scene_review(bot: Bot, chat_id: int, first: int) -> None:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         await bot.send_message(chat_id, "План сцен не найден. Открой проверку ещё раз.")
+        return
+    if plan.get("review_mode") == "approved":
+        await bot.send_message(chat_id, "Этот визуальный ряд уже подтверждён.")
         return
     for scene in plan.get("scenes") or []:
         scene.setdefault("review", {})["approved"] = True
