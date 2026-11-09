@@ -1884,10 +1884,11 @@ async def _own_for_facts(files: list[Path], facts: list[str], work: Path, gemini
             log.warning("shorts: own material %s skipped: %s", path.name, exc)
     if not items:
         return {}, {}
-    choices = await ai.match_images(gemini_key, facts, [im for im, _ in items]) if gemini_key else None
+    ranked = await ai.rank_image_candidates(gemini_key, facts, [im for im, _ in items]) if gemini_key else None
     used: set[int] = set()
     at: dict[int, int] = {}
-    for i, c in enumerate(choices or []):
+    for i, item in enumerate(ranked or []):
+        c = int(item.get("index", -1))
         if c >= 0 and c not in used:
             at[i] = c
             used.add(c)
@@ -2039,14 +2040,25 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     # остальные — кадр, который Gemini выбрал по смыслу; без ИИ — по очереди
     stills = [i for i in rest if i not in videos]
     await _progress(32, "ИИ подбирает кадры")
-    choices = await ai.match_images(gemini_key, [facts[i] for i in stills], images) if stills else None
+    ranked = await ai.rank_image_candidates(gemini_key, [facts[i] for i in stills], images) if stills else None
     used: set[int] = set()
     picked: dict[int, Image.Image] = {**portraits, **own}
+    visual_matches: dict[int, dict[str, Any]] = {}
     for k, i in enumerate(stills + [v for v in videos if v not in own]):  # у фактов с видео кадр — запасной
-        c = choices[k] if choices and k < len(stills) else -1
+        match = ranked[k] if ranked and k < len(stills) else {"index": -1, "score": 0, "reason": ""}
+        c = int(match.get("index", -1))
         if c < 0 or c in used:
             c = next((j for j in range(len(images)) if j not in used), k % len(images))
-        used.add(c)
+            visual_matches[i] = {"status": "fallback_unverified", "score": None,
+                                 "reason": "ИИ не подтвердил подходящий кадр; использован запасной"}
+        else:
+            used.add(c)
+            score = int(match.get("score", 0))
+            visual_matches[i] = {
+                "status": "matched" if score >= 70 else "needs_review",
+                "score": score,
+                "reason": str(match.get("reason") or "")[:160],
+            }
         picked[i] = images[c]
 
     for i, fact in enumerate(facts, 1):
@@ -2060,7 +2072,12 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         if (i - 1) in videos:
             card_overlay("", i, n, None, "IMDb", None, badge, FACT_CARD_H).save(work / f"overlay{i}.png")
             video = {"clip": videos[i - 1], "overlay": f"overlay{i}.png"}
-        cards.append({"image": path.name, "caption": fact, "karaoke": True, **video})
+        match_meta = visual_matches.get(i - 1, {
+            "status": "special_source_unverified", "score": None,
+            "reason": "Портрет, пользовательский или видеоматериал требует проверки источника и соответствия",
+        })
+        cards.append({"image": path.name, "caption": fact, "karaoke": True,
+                      "visual_match": match_meta, "asset_source": "film_or_user_media_pool", **video})
 
     cover = await asyncio.to_thread(make_cover, cover_src, label, cover_text)
     cover_path = work / "cover.jpg"
