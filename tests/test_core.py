@@ -560,3 +560,93 @@ def test_project_revoice_only_fixed_phrase(tmp_path, monkeypatch):
     assert fixed == [(1, 2.2, "два")] and notes == []
     assert abs(asyncio.run(daily._duration(video)) - before) < 0.1  # длина ролика та же
     assert abs(asyncio.run(daily._duration(tmp_path / "voice.wav")) - 6.6) < 0.1  # фраза ужата в своё место
+
+
+def test_oconnor_pronunciation():
+    from shorts import pronounce
+    assert pronounce.apply("Джоша О'Коннора") == "Джоша Око́ннора"
+    assert pronounce.apply("О Коннор умеет") == "Око́ннор умеет"
+    assert pronounce.apply("о Конноре думаю") == "о Конноре думаю"  # «про Коннора» — не трогаем
+    assert pronounce.apply("Коннор Макгрегор") == "Коннор Макгрегор"
+
+
+def test_weekly_blocks_build_fix_and_assemble(tmp_path, monkeypatch):
+    """Выпуск по кускам: вступление, новость, финал собираются отдельно; «🎙 Звук» меняет только звук куска
+    (картинка та же); склейка даёт выпуск с таймкодами и звуком по кускам."""
+    import asyncio
+    import shutil
+    import subprocess
+
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нет ffmpeg")
+    from PIL import Image
+
+    from shorts import daily, project, weekly
+
+    async def synth(lines, work, pause=None, careful=False, prepared=False):
+        work.mkdir(parents=True, exist_ok=True)
+        starts, t = [], 0.0
+        for _ in lines:
+            starts.append(t)
+            t += 1.2
+        voice = work / "voice.wav"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=f=440:d={t:.1f}", "-ar", "48000",
+                        str(voice)], check=True)
+        if prepared:
+            for k, _ in enumerate(lines):
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=900:d=1", str(work / f"voice_{k}.mp3")],
+                               check=True)
+        daily.last_voice = {"file": "voice.wav", "lines": list(lines), "prepared": prepared, "careful": careful,
+                            "pause": pause, "starts": starts, "speech": [1.0] * len(lines)}
+        daily.voice_cache_hits = 0
+        return voice, starts, True, [{"speech": 1.0, "words": [], "text": x} for x in lines]
+
+    async def spoken(lines, careful=False):
+        return [x + "!" if x == "Фраза два." else x for x in lines]
+
+    class Key:
+        def __init__(self, text):
+            self.text = text
+
+        def exists(self):
+            return self.text != "Фраза два.!"
+
+    monkeypatch.setattr(daily, "synthesize", synth)
+    monkeypatch.setattr(daily, "spoken_lines", spoken)
+    monkeypatch.setattr(daily, "_voice_key", lambda t, p: Key(t))
+    monkeypatch.setattr(weekly, "W", 320)
+    monkeypatch.setattr(weekly, "H", 180)
+    monkeypatch.setattr(weekly, "INTRO_CLIP", tmp_path / "none.mp4")
+    monkeypatch.setattr(weekly, "OUTRO_CLIP", tmp_path / "none.mp4")
+    img = Image.new("RGB", (640, 360), (90, 30, 30))
+    script = {"intro": ["Привет."], "outro": ["Пока."], "title": "T", "description": "D", "tags": "",
+              "stories": [{"headline": "НОВОСТЬ", "lines": ["Фраза один.", "Фраза два."], "mourning": False,
+                           "graphics": [], "money": {}}]}
+    music = weekly.ASSETS / "music.mp3"
+
+    async def run():
+        blocks = [await weekly.build_intro(tmp_path, script, [img], img, "1–2 ноября", music),
+                  await weekly.build_story(tmp_path, script["stories"][0], 1, 1, [img], img, "", music),
+                  await weekly.build_outro(tmp_path, script, img, music)]
+        story = blocks[1]
+        before = (tmp_path / story["pieces"][1]["segment"]).stat().st_size
+        fixed = await weekly.revoice_block(tmp_path, story)
+        assert [x[1] for x in fixed] == ["Фраза два."] and fixed[0][0] > weekly.CARD_SEC  # время — внутри куска
+        assert (tmp_path / story["pieces"][1]["segment"]).stat().st_size != before
+        with pytest.raises(project.NothingToFix):
+            monkeypatch.setattr(daily, "_voice_key", lambda t, p: type("K", (), {"exists": lambda s: True})())
+            await weekly.revoice_block(tmp_path, story)
+        ep = await weekly.assemble(tmp_path, script, blocks, "1–2 ноября", img)
+        length = await weekly._duration(ep.video)
+        assert abs(length - sum(b["length"] for b in blocks)) < 0.5
+        assert "Вступление" in ep.seo["description"] and ep.seo["cuts"].count("НОВОСТЬ") == 1
+
+    asyncio.run(run())
+
+
+def test_weekly_episode_single_story_allowed():
+    """«✍️ Переписать» просит у ИИ одну новость — одна новость в ответе не считается браком."""
+    import inspect
+    from shorts import ai
+    assert "min(3, n)" in inspect.getsource(ai.write_weekly_episode)
