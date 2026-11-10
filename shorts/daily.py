@@ -676,11 +676,7 @@ async def _tg_clip(item: dict[str, Any], out: Path) -> bool:
 
 async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]], work: Path,
                      gemini_key: str) -> tuple[dict[int, str], str]:
-    """Для фактов — фрагменты трейлера, где видно то, о чём факт: ({номер факта: файл клипа}, пояснение).
-
-    Трейлер с Rutube качается целиком, режется на кадры, Gemini выбирает кадр под каждый факт
-    (или «ничего не подходит»), вокруг выбранного момента вырезается CLIP_SECONDS.
-    """
+    """Подбирает только подтверждённые ИИ фрагменты трейлера и не допускает почти одинаковые отрезки."""
     titles = [str(item.get(k) or "") for k in ("name", "alternativeName", "enName")]
     trailer_dir = work / "trailer"
     try:
@@ -690,24 +686,39 @@ async def _fact_clips(item: dict[str, Any], facts_by_idx: list[tuple[int, str]],
             return {}, "трейлер на Rutube не нашёлся"
         trailer_dir.mkdir(exist_ok=True)
         src = await clips.download_full(found["url"], trailer_dir)
-        frames = await clips.sample_frames(src, trailer_dir, duration=found["duration"])
+        frames = await clips.sample_frames(src, trailer_dir, every=5.0, duration=found["duration"])
         if not frames:
             return {}, "не удалось нарезать кадры из трейлера"
         thumbs = [Image.open(path).convert("RGB") for _, path in frames]
-        choices = await ai.match_images(gemini_key, [text for _, text in facts_by_idx], thumbs)
-        if not choices:
+        ranked = await ai.rank_image_candidates(gemini_key, [text for _, text in facts_by_idx], thumbs)
+        if ranked is None:
             return {}, f"ИИ не ответил ({ai.last_error or 'без подробностей'})"
+
+        # Берём только прямое соответствие (>=75/100). Соседние моменты одного эпизода
+        # не должны превращаться в несколько почти одинаковых клипов.
+        proposals: list[tuple[int, int, int]] = []
+        for (fact_index, _), match in zip(facts_by_idx, ranked):
+            frame_index = int(match.get("index", -1))
+            score = int(match.get("score", 0))
+            if 0 <= frame_index < len(frames) and score >= 75:
+                proposals.append((score, fact_index, frame_index))
+
         out: dict[int, str] = {}
-        used: set[int] = set()
-        for (i, _), c in zip(facts_by_idx, choices):
-            if c < 0 or c in used:
+        used_times: list[float] = []
+        min_separation = CLIP_SECONDS + 2.0
+        for score, fact_index, frame_index in sorted(proposals, reverse=True):
+            timestamp = float(frames[frame_index][0])
+            if any(abs(timestamp - used) < min_separation for used in used_times):
+                log.info("shorts: skip near-duplicate trailer moment for fact %s (score %s)",
+                         fact_index + 1, score)
                 continue
-            used.add(c)
-            clip = work / f"fclip{i}.mp4"
-            # момент чуть раньше выбранного кадра — чтобы действие успело начаться в кадре
-            await clips.cut_clip(src, clip, frames[c][0] - 1.5, CLIP_SECONDS)
-            out[i] = clip.name
-        return out, "" if out else f"в трейлере «{found['title'][:60]}» нет моментов под эти факты"
+            clip = work / f"fclip{fact_index}.mp4"
+            await clips.cut_clip(src, clip, max(0.0, timestamp - 1.5), CLIP_SECONDS)
+            if clip.exists() and clip.stat().st_size:
+                out[fact_index] = clip.name
+                used_times.append(timestamp)
+        note = "" if out else f"в трейлере «{found['title'][:60]}» нет достаточно точных и разных моментов"
+        return out, note
     except Exception as exc:  # noqa: BLE001 — без трейлера будут фото и кадры
         log.warning("shorts: trailer clips for facts about %s failed: %s", _title(item), exc)
         return {}, f"ошибка: {type(exc).__name__}: {str(exc)[:150]}"
@@ -2047,29 +2058,38 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     visual_matches: dict[int, dict[str, Any]] = {}
     visual_sources: dict[int, str] = {i: "user_or_channel_media" for i in own}
     visual_sources.update({i: "person_portrait" for i in portraits})
-    for k, i in enumerate(stills + [v for v in videos if v not in own]):  # у фактов с видео кадр — запасной
-        match = ranked[k] if ranked and k < len(stills) else {"index": -1, "score": 0, "reason": ""}
+    for k, i in enumerate(stills):
+        match = ranked[k] if ranked and k < len(ranked) else {"index": -1, "score": 0, "reason": ""}
         c = int(match.get("index", -1))
-        if i in videos:
-            c = next((j for j in range(len(images)) if j not in used), k % len(images))
+        score = int(match.get("score", 0))
+        if c < 0 or c >= len(images) or c in used or score < 70:
+            # Не подставляем случайный кадр только ради заполнения сцены.
+            # Нейтральный постер фильма лучше, чем визуал, противоречащий озвучке.
+            picked[i] = cover_src.copy()
             visual_matches[i] = {
-                "status": "trailer_clip_review", "score": None,
-                "reason": "Для сцены выбран фрагмент трейлера; проверьте его содержание",
+                "status": "fallback_unverified", "score": score or None,
+                "reason": "Нет кадра с подтверждённым соответствием этой фразе; использован постер фильма",
             }
-        elif c < 0 or c in used:
-            c = next((j for j in range(len(images)) if j not in used), k % len(images))
-            visual_matches[i] = {"status": "fallback_unverified", "score": None,
-                                 "reason": "ИИ не подтвердил подходящий кадр; использован запасной"}
-        else:
-            score = int(match.get("score", 0))
-            visual_matches[i] = {
-                "status": "matched" if score >= 70 else "needs_review",
-                "score": score,
-                "reason": str(match.get("reason") or "")[:160],
-            }
+            visual_sources[i] = "film_poster_fallback"
+            continue
         used.add(c)
         picked[i] = images[c]
-        visual_sources[i] = "trailer_clip" if i in videos else "film_frame_pool"
+        visual_matches[i] = {
+            "status": "matched", "score": score,
+            "reason": str(match.get("reason") or "")[:160],
+        }
+        visual_sources[i] = "film_frame_pool"
+
+    for i in videos:
+        if i in own:
+            continue
+        # Сам видеоклип — основной материал; постер используется только как запасной стоп-кадр.
+        picked[i] = cover_src.copy()
+        visual_matches[i] = {
+            "status": "trailer_clip_review", "score": None,
+            "reason": "Проверьте, что выбранный фрагмент трейлера действительно иллюстрирует фразу",
+        }
+        visual_sources[i] = "trailer_clip"
 
     # Если ни один исходный кадр не подошёл, создаём отдельную символическую иллюстрацию.
     # Генерация ограничена только фактами без подтверждённого кадра; чужие лица/постеры не имитируем.
