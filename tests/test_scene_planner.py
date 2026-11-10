@@ -1,5 +1,8 @@
 """Regression tests for Smart Visuals scene-plan timing and review metadata."""
 
+from PIL import Image
+
+from shorts.make_short import ClipReader
 from shorts.scene_planner import build_scene_plan
 
 
@@ -51,3 +54,21 @@ def test_scene_plan_marks_unknown_asset_without_auto_approval() -> None:
     assert scene["asset"]["source"] == "unknown"
     assert scene["match"]["status"] == "unverified"
     assert scene["review"]["approved"] is False
+
+
+
+def test_clip_reader_holds_last_frame_instead_of_looping(tmp_path) -> None:
+    first = tmp_path / "f0001.jpg"
+    second = tmp_path / "f0002.jpg"
+    Image.new("RGB", (8, 8), (240, 10, 10)).save(first, quality=100)
+    Image.new("RGB", (8, 8), (10, 10, 240)).save(second, quality=100)
+
+    reader = ClipReader(tmp_path)
+    frames = [reader.next() for _ in range(4)]
+
+    assert all(frame is not None for frame in frames)
+    colors = [frame.getpixel((4, 4)) for frame in frames]
+    assert colors[0][0] > 180 and colors[0][2] < 80
+    assert colors[1][2] > 180 and colors[1][0] < 80
+    assert colors[2] == colors[1]
+    assert colors[3] == colors[1]
