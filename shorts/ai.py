@@ -2348,7 +2348,7 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
                         "year": _num(s.get("year")), "money": _money(s.get("money")),
                         "graphics": [g for g in s.get("graphics") or [] if isinstance(g, dict)][:3],
                         "lines": lines[:12], "media": media})
-    if len(stories) < 3:
+    if len(stories) < min(3, n):
         return None
     stories.sort(key=lambda st: not st["mourning"])  # смерть звезды — всегда первой
     return {"title": strip_citations(str(data.get("title") or "")).strip()[:100],
@@ -2358,6 +2358,27 @@ async def write_weekly_episode(key: str, listing: str, today: str, recent: str =
             "outro": phrases(data.get("outro"))[:4] or
             ["Какая новость удивила вас больше всего? Пишите в комментариях и подписывайтесь. До встречи!"],
             "stories": stories[:9]}
+
+
+async def write_weekly_bookends(key: str, headlines: list[str], next_day: str) -> dict[str, list[str]] | None:
+    """Вступление и финал выпуска заново — когда автор заменил новости (анонс должен говорить о тех, что в
+    выпуске). Простая задача — без сильной модели."""
+    if not available(key) or not headlines:
+        return None
+    prompt = (WEEKLY_STYLE + " Напиши вступление и финал выпуска «Новости кино». intro — 2–3 фразы: приветствие "
+              "(«Привет! С вами KinoMir360…») и анонс 2–3 главных тем из списка ниже (первая — самая важная; если "
+              "есть смерть звезды — она первой и бережно). outro — 2–3 фразы: какая новость удивила больше всего — "
+              f"пишите в комментариях, подпишитесь, до встречи {next_day}. Без латиницы, эмодзи и ссылок; название "
+              "канала — KinoMir360." + GRAMMAR + '\n\nОтветь только JSON: {"intro": ["…"], "outro": ["…"]}\n\n'
+              "НОВОСТИ ВЫПУСКА:\n" + "\n".join(f"{i}. {h}" for i, h in enumerate(headlines, 1)))
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        out = {k: [strip_citations(re.sub(r"\s+", " ", str(x))).strip() for x in data.get(k) or [] if str(x).strip()][:4]
+               for k in ("intro", "outro")}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI weekly bookends failed: %s", exc)
+        return None
+    return out if out["intro"] and out["outro"] else None
 
 
 EDITOR_VERSION = 2  # правила редактора поменялись — сохранённый выпуск при перемонтаже вычитывается заново

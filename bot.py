@@ -7423,6 +7423,13 @@ async def report_interrupted_short(bot: Bot) -> None:
             )
     except Exception:
         logging.exception("Failed to report interrupted short")
+    try:  # выпуск по шагам монтировался — продолжаем с недостающих кусков (готовые лежат в томе /data)
+        draft = await wd_load()
+        if draft and draft.get("stage") == "video" and any(k not in draft["blocks"] for k in wd_keys(draft)):
+            await bot.send_message(draft["chat"], "▶️ Бот перезапустился — продолжаю монтаж новостей выпуска.")
+            wd_start_video(bot)
+    except Exception:  # noqa: BLE001
+        logging.exception("Weekly draft resume failed")
 
 
 async def shorts_daily_loop(
@@ -15553,9 +15560,8 @@ async def make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | Non
         raise RuntimeError("выпуск уже собирается — дождись его, он придёт сюда")
     weekly_busy = True
     try:
+        # новый выпуск дальше идёт по шагам с утверждением автора — время выпуска запишет итоговая склейка
         await _make_weekly_video(bot, chat_ids, status, remake)
-        if not remake:  # перемонтаж — тот же выпуск: период следующего считаем от настоящего выпуска
-            await set_shorts_setting("weekly_video_at", str(time.time()))
     finally:
         weekly_busy = False
 
@@ -15661,11 +15667,16 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
         await asyncio.sleep(mins * 60)
     if not script:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
-    await _render_weekly(bot, chat_ids, status, script, pool[:len(listing)], label)
+    if remake:
+        await _render_weekly(bot, chat_ids, status, script, pool[:len(listing)], label)
+        return
+    # новый выпуск — по шагам: тексты новостей на утверждение, потом каждая новость роликом, потом склейка
+    await _edit_script(script, status)
+    await start_weekly_draft(bot, chat_ids, script, pool[:len(listing)], label, "\n\n".join(listing),
+                             f"{today.day} {months[today.month - 1]} {today.year}", period, next_day)
 
 
-async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, script: dict[str, Any],
-                         pool: list[dict[str, Any]], label: str) -> None:
+async def _edit_script(script: dict[str, Any], status: Message | None) -> None:
     # номера фраз («2. …»), которые редактор раньше оставлял в тексте, — голос читал их вслух
     for lines in [script.get("intro") or [], script.get("outro") or []] + [st["lines"] for st in script["stories"]]:
         lines[:] = [shorts_ai._unnumber(x) for x in lines]
@@ -15675,6 +15686,11 @@ async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, 
         fixes = await shorts_ai.edit_episode(GEMINI_API_KEY, script)
         if fixes is not None:
             script["fixes"] = fixes
+
+
+async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, script: dict[str, Any],
+                         pool: list[dict[str, Any]], label: str) -> None:
+    await _edit_script(script, status)
     if status and shorts_lock.locked():
         await _edit_quiet(status, "⏳ Сценарий готов. Жду, пока соберётся другой ролик, потом монтирую выпуск…")
     async with shorts_lock:
@@ -15704,6 +15720,426 @@ async def _render_weekly(bot: Bot, chat_ids: list[int], status: Message | None, 
             shorts_daily.on_progress = None
             await clear_running()
             shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- выпуск по шагам: тексты → ролики → склейка
+# 1) каждая новость текстом: «✅ Принять», «✍️ Переписать», «🔄 Другая новость»; вступление и финал — так же;
+# 2) все тексты приняты — каждая новость монтируется отдельным роликом: «✅ Принять», «🎙 Звук», «🎞 Видео»;
+#    «Звук» — только исправленные фразы (картинка та же), «Видео» — другие картинки (голос тот же, из кэша);
+# 3) все ролики приняты — склейка в выпуск. Черновик — в базе (weekly_draft), куски — в томе /data: обновление
+#    или перезапуск бота ничего не теряет, монтаж продолжается с того куска, где остановился.
+
+WEEKLY_DRAFT_DIR = shorts_daily.DATA_DIR / "weekly_draft"
+weekly_draft_lock = asyncio.Lock()
+weekly_draft_job: asyncio.Task | None = None
+
+
+async def wd_load() -> dict[str, Any] | None:
+    raw = await shorts_setting("weekly_draft")
+    try:
+        draft = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return draft if isinstance(draft, dict) and draft.get("script") else None
+
+
+async def wd_update(change: Any) -> dict[str, Any] | None:
+    """Прочитать черновик, поменять (change(draft)) и записать — под замком: кнопки и монтаж не затрут друг друга."""
+    async with weekly_draft_lock:
+        draft = await wd_load()
+        if draft is None:
+            return None
+        change(draft)
+        await set_shorts_setting("weekly_draft", json.dumps(draft, ensure_ascii=False, default=str))
+        return draft
+
+
+def wd_keys(draft: dict[str, Any]) -> list[str]:
+    return ["i"] + [str(n) for n in range(1, len(draft["script"]["stories"]) + 1)] + ["o"]
+
+
+def _wd_sources(draft: dict[str, Any], story: dict[str, Any]) -> str:
+    out = []
+    for i in story.get("media") or []:
+        if 1 <= i <= len(draft["pool"]):
+            post = draft["pool"][i - 1]
+            out.append(post.get("label") if post.get("label") and "НАШ" not in post["label"] else
+                       f"t.me/{post.get('channel')}" if post.get("channel") else "")
+    out = [x for x in dict.fromkeys(out) if x]
+    return ("📎 Источники: " + ", ".join(escape(x) for x in out[:4])) if out else "📎 Источник не указан — проверь факт"
+
+
+def _wd_text(draft: dict[str, Any], key: str) -> str:
+    script, ok = draft["script"], draft["text_ok"].get(key)
+    mark = "✅ Принято" if ok else "⏳ Ждёт решения"
+    if key == "i":
+        return (f"🎙 <b>Вступление и финал</b> — {mark}\n\n<b>Вступление:</b> {escape(' '.join(script['intro']))}\n\n"
+                f"<b>Финал:</b> {escape(' '.join(script['outro']))}")
+    n = int(key)
+    story = script["stories"][n - 1]
+    body = escape(" ".join(story["lines"]))
+    return (f"📰 <b>Новость {n} из {len(script['stories'])}: {escape(story['headline'])}</b> — {mark}\n\n{body}\n\n"
+            + _wd_sources(draft, story))[:4000]
+
+
+def _wd_text_kb(key: str) -> InlineKeyboardMarkup:
+    row = [_btn("✅ Принять", f"wd:ta:{key}"), _btn("✍️ Переписать", f"wd:tr:{key}")]
+    rows = [row] + ([[_btn("🔄 Другая новость", f"wd:tn:{key}")]] if key not in ("i", "o") else [])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _wd_video_kb(key: str) -> InlineKeyboardMarkup:
+    row = [_btn("✅ Принять", f"wd:va:{key}"), _btn("🎙 Звук", f"wd:vs:{key}")]
+    if key not in ("i", "o"):
+        row.append(_btn("🎞 Видео", f"wd:vv:{key}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+async def start_weekly_draft(bot: Bot, chat_ids: list[int], script: dict[str, Any], pool: list[dict[str, Any]],
+                             label: str, listing: str, today: str, period: str, next_day: str) -> None:
+    """Шаг 1: тексты новостей — по одной, с кнопками. Монтаж начнётся, когда всё принято."""
+    old = await wd_load()
+    if old:
+        shutil.rmtree(WEEKLY_DRAFT_DIR / str(old.get("id")), ignore_errors=True)
+    draft = {"id": str(time.time_ns()), "chats": chat_ids, "chat": chat_ids[0], "script": script,
+             "pool": _saved_pool(pool), "label": label, "listing": listing[:30000], "today": today,
+             "period": period, "next_day": next_day, "stage": "text", "text_ok": {}, "rejected": [],
+             "blocks": {}, "video_ok": {}, "urls": {}}
+    await set_shorts_setting("weekly_draft", json.dumps(draft, ensure_ascii=False, default=str))
+    chat = draft["chat"]
+    await bot.send_message(chat, f"🗞 <b>Выпуск «Новости кино» ({escape(label)}) — шаг 1 из 3: тексты.</b>\n"
+                                 "Прочитай каждую новость: «✅ Принять», «✍️ Переписать» (та же новость, новый текст) "
+                                 "или «🔄 Другая новость» (устарела или неинтересна). Когда всё принято — смонтирую "
+                                 "каждую новость отдельным роликом.")
+    for key in ["i"] + [str(n) for n in range(1, len(script["stories"]) + 1)]:
+        await bot.send_message(chat, _wd_text(draft, key), reply_markup=_wd_text_kb(key),
+                               disable_web_page_preview=True)
+
+
+async def _wd_rewrite(draft: dict[str, Any], key: str, other: bool) -> dict[str, Any]:
+    """Новый текст той же новости или другая новость из тех же источников недели (с вычиткой редактора)."""
+    script = draft["script"]
+    if key == "i":
+        got = await shorts_ai.write_weekly_bookends(GEMINI_API_KEY, [s["headline"] for s in script["stories"]],
+                                                    draft["next_day"])
+        if not got:
+            raise RuntimeError(shorts_ai.last_error or "ИИ не написал вступление")
+        return got
+    story = script["stories"][int(key) - 1]
+    if other:
+        busy = [s["headline"] for s in script["stories"]] + draft["rejected"]
+        new = await shorts_ai.write_weekly_episode(GEMINI_API_KEY, draft["listing"], draft["today"],
+                                                   "\n".join(busy), n=3, period=draft["period"],
+                                                   next_day=draft["next_day"])
+        cands = [s for s in (new or {}).get("stories") or [] if s["headline"] not in busy]
+    else:
+        keep = f"{story['headline']}: {' '.join(story['lines'][:2])}"
+        new = await shorts_ai.write_weekly_episode(GEMINI_API_KEY, draft["listing"], draft["today"], n=1,
+                                                   period=draft["period"], next_day=draft["next_day"], keep=keep)
+        cands = (new or {}).get("stories") or []
+    if not cands:
+        raise RuntimeError(shorts_ai.last_error or ("ИИ не нашёл другой новости" if other else "ИИ не переписал"))
+    fresh = cands[0]
+    fresh["lines"] = [shorts_ai._unnumber(x) for x in fresh["lines"]]
+    edited = await shorts_ai.edit_lines(GEMINI_API_KEY, fresh["lines"])
+    if edited:
+        fresh["lines"] = edited[0]
+    return fresh
+
+
+async def wd_text_action(callback: CallbackQuery, action: str, key: str) -> None:
+    message = callback.message
+    if action == "ta":
+        def accept(d: dict[str, Any]) -> None:
+            d["text_ok"][key] = True
+        draft = await wd_update(accept)
+        if not draft:
+            await callback.answer("Черновик выпуска не найден — собери выпуск заново", show_alert=True)
+            return
+        await callback.answer("✅ Принято")
+        await _edit_quiet_markup(message, _wd_text(draft, key), _wd_text_kb(key))
+        if draft["stage"] == "text" and all(draft["text_ok"].get(k) for k in wd_keys(draft) if k != "o"):
+            await wd_update(lambda d: d.update(stage="video"))
+            await message.answer("✅ Все тексты приняты. <b>Шаг 2 из 3:</b> монтирую каждую новость отдельным роликом "
+                                 "— присылаю по мере готовности (обычно 2–4 минуты на новость).")
+            wd_start_video(message.bot)
+        return
+    await callback.answer("✍️ Пишу заново…" if action == "tr" else "🔄 Ищу другую новость…")
+    draft = await wd_load()
+    if not draft or draft["stage"] != "text":
+        await message.answer("Тексты уже утверждены — менять новость можно до начала монтажа.")
+        return
+    try:
+        fresh = await _wd_rewrite(draft, key, action == "tn")
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+        return
+
+    def put(d: dict[str, Any]) -> None:
+        d["text_ok"][key] = False
+        if key == "i":
+            d["script"]["intro"], d["script"]["outro"] = fresh["intro"], fresh["outro"]
+            return
+        old = d["script"]["stories"][int(key) - 1]
+        if action == "tn":
+            d["rejected"].append(old["headline"])
+            d["text_ok"]["i"] = False  # анонс во вступлении говорил о старой новости
+        d["script"]["stories"][int(key) - 1] = fresh
+
+    draft = await wd_update(put)
+    await _edit_quiet_markup(message, _wd_text(draft, key), _wd_text_kb(key))
+    if action == "tn":  # вступление — заново под новый набор новостей
+        try:
+            ends = await _wd_rewrite(draft, "i", False)
+            draft = await wd_update(lambda d: d["script"].update(intro=ends["intro"], outro=ends["outro"]))
+            await message.answer("🔄 Новость заменена — вступление переписано под новый набор, проверь его:\n\n"
+                                 + _wd_text(draft, "i"), reply_markup=_wd_text_kb("i"))
+        except Exception as exc:  # noqa: BLE001
+            logging.info("Weekly bookends rewrite failed: %s", exc)
+
+
+async def _edit_quiet_markup(message: Message | None, text: str, kb: InlineKeyboardMarkup) -> None:
+    if message is None:
+        return
+    try:
+        if message.text is not None:
+            await message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        else:
+            await message.edit_caption(caption=text[:1000], reply_markup=kb)
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc):
+            logging.info("Draft edit failed: %s", exc)
+
+
+def wd_start_video(bot: Bot) -> None:
+    """Монтаж недостающих кусков — одной задачей (повторное нажатие не запустит вторую)."""
+    global weekly_draft_job
+    if weekly_draft_job and not weekly_draft_job.done():
+        return
+    weekly_draft_job = asyncio.create_task(wd_video_job(bot))
+    shorts_jobs.add(weekly_draft_job)
+    weekly_draft_job.add_done_callback(shorts_jobs.discard)
+
+
+def _wd_caption(draft: dict[str, Any], key: str, block: dict[str, Any], note: str = "") -> str:
+    total = len(draft["script"]["stories"])
+    name = {"i": "Вступление", "o": "Финал"}.get(key) or f"Новость {key} из {total}: {block['title']}"
+    mins = f"{int(block['length']) // 60}:{int(block['length']) % 60:02d}"
+    mark = "✅ Принято" if draft["video_ok"].get(key) else "⏳ Посмотри и реши"
+    text = f"🎞 <b>{escape(name)}</b> ({mins}) — {mark}"
+    if note:
+        text += "\n" + note
+    if block.get("listen"):
+        text += "\n🎧 Послушай: " + escape("; ".join(block["listen"][:3]))
+    return text[:1000]
+
+
+async def _wd_send_block(bot: Bot, draft: dict[str, Any], key: str, note: str = "") -> None:
+    work = WEEKLY_DRAFT_DIR / draft["id"]
+    block = draft["blocks"][key]
+    preview = await shorts_weekly.block_preview(work, block, work / f"preview_{key}.mp4")
+    if preview is None:
+        await bot.send_message(draft["chat"], _wd_caption(draft, key, block, note) + "\n(превью не влезло в Telegram)",
+                               reply_markup=_wd_video_kb(key))
+        return
+    try:
+        await bot.send_video(draft["chat"], FSInputFile(preview, filename=f"novost_{key}.mp4"),
+                             caption=_wd_caption(draft, key, block, note), reply_markup=_wd_video_kb(key),
+                             width=854, height=480, supports_streaming=True, request_timeout=600)
+    finally:
+        preview.unlink(missing_ok=True)
+
+
+async def _wd_pictures(draft: dict[str, Any], work: Path) -> tuple[list[list[Any]], Any]:
+    """Картинки всех новостей (с прошлого раза — из папки черновика) и главная картинка выпуска."""
+    from PIL import Image as PILImage
+    script = draft["script"]
+    pictures, urls = await shorts_weekly.gather_pictures(script, draft["pool"], TMDB_API_KEY)
+    draft_urls = {str(k + 1): u for k, u in enumerate(urls)}
+    await wd_update(lambda d: d["urls"].update({k: v for k, v in draft_urls.items() if k not in d["urls"]}))
+    first = next((imgs[0] for imgs in pictures if imgs), None)
+    if first is not None:
+        first.convert("RGB").save(work / "first.jpg", quality=92)
+    for k, imgs in enumerate(pictures[:4]):
+        if imgs:
+            imgs[0].convert("RGB").save(work / f"teaser_src_{k}.jpg", quality=90)
+    if first is None and (work / "first.jpg").exists():
+        first = PILImage.open(work / "first.jpg").convert("RGB")
+    return pictures, first
+
+
+async def wd_video_job(bot: Bot) -> None:
+    """Шаг 2: каждый кусок выпуска (вступление, новости, финал) — отдельным роликом; готовые не пересобираются."""
+    global weekly_busy
+    draft = await wd_load()
+    if not draft or draft["stage"] != "video":
+        return
+    chat = draft["chat"]
+    work = WEEKLY_DRAFT_DIR / draft["id"]
+    work.mkdir(parents=True, exist_ok=True)
+    todo = [k for k in wd_keys(draft) if k not in draft["blocks"]]
+    if not todo:
+        return
+    status = await bot.send_message(chat, f"⏳ Монтирую {len(todo)} кусков выпуска…")
+    weekly_busy = True
+    try:
+        async with shorts_lock:
+            await load_pronunciations()
+            await load_voice()
+            await set_shorts_setting("running", json.dumps({"chats": [chat], "theme": "новости выпуска по одной"}))
+            shorts_daily.on_progress, shorts_daily.last_stage = progress_updater(status, "новости выпуска"), ""
+            pictures, first = await _wd_pictures(draft, work)
+            script, music = draft["script"], shorts_weekly.main_music()
+            total = len(script["stories"])
+            for key in todo:
+                if key == "i":
+                    teaser = [imgs[0] for imgs in pictures[:4] if imgs]
+                    job = shorts_weekly.build_intro(work, script, teaser, first, draft["label"], music)
+                elif key == "o":
+                    job = shorts_weekly.build_outro(work, script, first, music)
+                else:
+                    n = int(key)
+                    job = shorts_weekly.build_story(work, script["stories"][n - 1], n, total, pictures[n - 1], first,
+                                                    TMDB_API_KEY, music)
+                block = await asyncio.wait_for(job, timeout=20 * 60)
+                draft = await wd_update(lambda d, k=key, b=block: d["blocks"].update({k: b}))
+                await _wd_send_block(bot, draft, key)
+        await status.delete()
+        await bot.send_message(chat, "👆 Все куски выпуска готовы. Прими каждый — после этого склею выпуск.")
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Weekly draft video failed")
+        await _edit_quiet(status, f"❌ Монтаж остановился: <code>{escape(_safe_err(exc)[:300])}</code>\n"
+                                  "Готовые куски сохранены — продолжу с этого места.")
+        await bot.send_message(chat, "Продолжить монтаж выпуска?", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[_btn("▶️ Продолжить монтаж", "wd:go:0")]]))
+    finally:
+        shorts_daily.on_progress = None
+        await clear_running()
+        weekly_busy = False
+
+
+async def wd_block_job(bot: Bot, key: str, mode: str, sure: bool = False) -> None:
+    """«🎙 Звук» (только исправленные фразы) или «🎞 Видео» (другие картинки, голос из кэша) у одного куска."""
+    draft = await wd_load()
+    if not draft or key not in draft.get("blocks", {}):
+        await bot.send_message(draft["chat"] if draft else ADMIN_IDS and sorted(ADMIN_IDS)[0],
+                               "Этот кусок выпуска не найден — собери выпуск заново.")
+        return
+    chat = draft["chat"]
+    if shorts_lock.locked():
+        await bot.send_message(chat, "⏳ Сейчас идёт другой монтаж — нажми через пару минут.")
+        return
+    work = WEEKLY_DRAFT_DIR / draft["id"]
+    status = await bot.send_message(chat, "🎙 Переозвучиваю исправленные фразы…" if mode == "vs"
+                                    else "🎞 Подбираю другие картинки и монтирую заново (голос тот же)…")
+    try:
+        async with shorts_lock:
+            await load_pronunciations()
+            await load_voice()
+            block = draft["blocks"][key]
+            if mode == "vs":
+                fixed = await shorts_weekly.revoice_block(work, block, sure)
+                note = f"🎙 Переозвучено фраз: {len(fixed)}, картинка та же."
+            else:
+                n = int(key)
+                story = draft["script"]["stories"][n - 1]
+                used: list[str] = []
+                avoid = set(draft["urls"].get(key) or [])
+                imgs = await shorts_weekly.story_images(story, draft["pool"], TMDB_API_KEY, avoid=avoid, used=used)
+                from PIL import Image as PILImage
+                first = PILImage.open(work / "first.jpg").convert("RGB") if (work / "first.jpg").exists() else None
+                block = await asyncio.wait_for(shorts_weekly.build_story(
+                    work, story, n, len(draft["script"]["stories"]), imgs, first, TMDB_API_KEY,
+                    shorts_weekly.main_music()), timeout=20 * 60)
+                note = "🎞 Другие картинки, голос тот же."
+                await wd_update(lambda d: d["urls"].update({key: list(avoid | set(used))}))
+
+            def put(d: dict[str, Any]) -> None:
+                d["blocks"][key] = block
+                d["video_ok"][key] = False
+            draft = await wd_update(put)
+            await status.delete()
+            await _wd_send_block(bot, draft, key, note)
+    except Exception as exc:  # noqa: BLE001
+        if not await _revoice_guard(bot, chat, status, exc, f"wd:vs:{key}:go"):
+            logging.exception("Weekly draft block fix failed")
+            await _edit_quiet(status, f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+
+
+async def wd_assemble_job(bot: Bot) -> None:
+    """Шаг 3: все куски приняты — склейка выпуска, обложка, SEO, отправка как обычно."""
+    global weekly_busy
+    draft = await wd_load()
+    if not draft:
+        return
+    chat, work = draft["chat"], WEEKLY_DRAFT_DIR / draft["id"]
+    status = await bot.send_message(chat, "✅ Все куски приняты. <b>Шаг 3 из 3:</b> склеиваю выпуск…")
+    weekly_busy = True
+    try:
+        async with shorts_lock:
+            from PIL import Image as PILImage
+            first = PILImage.open(work / "first.jpg").convert("RGB") if (work / "first.jpg").exists() else None
+            shorts_daily.on_progress, shorts_daily.last_stage = progress_updater(status, "выпуск"), ""
+            blocks = [draft["blocks"][k] for k in wd_keys(draft)]
+            ep = await shorts_weekly.assemble(work, draft["script"], blocks, draft["label"], first)
+            script = draft["script"]
+            await set_shorts_setting("weekly_last", shorts_weekly.headlines(script))
+            await set_shorts_setting("weekly_video_at", str(time.time()))
+            await set_shorts_setting("weekly_saved", json.dumps(
+                {"script": script, "pool": draft["pool"], "label": draft["label"], "at": time.time()},
+                ensure_ascii=False))
+            for chat_id in draft["chats"]:
+                await send_episode(bot, chat_id, ep, script)
+        await status.delete()
+        await set_shorts_setting("weekly_draft", None)
+        shutil.rmtree(work, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Weekly draft assemble failed")
+        await _edit_quiet(status, f"❌ Склейка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
+        await bot.send_message(chat, "Куски сохранены. Склеить ещё раз?", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[_btn("🔗 Склеить выпуск", "wd:as:0")]]))
+    finally:
+        shorts_daily.on_progress = None
+        weekly_busy = False
+
+
+@router.callback_query(F.data.startswith("wd:"))
+async def weekly_draft_buttons(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    parts = (callback.data or "").split(":")
+    action, key = parts[1], parts[2] if len(parts) > 2 else ""
+    sure = parts[-1] == "go" and len(parts) > 3
+    if action in ("ta", "tr", "tn"):
+        await wd_text_action(callback, action, key)
+        return
+    draft = await wd_load()
+    if not draft:
+        await callback.answer("Черновик выпуска не найден — собери выпуск заново", show_alert=True)
+        return
+    bot = callback.message.bot
+    if action == "go":
+        await callback.answer("▶️ Продолжаю")
+        wd_start_video(bot)
+    elif action == "as":
+        await callback.answer("🔗 Склеиваю")
+        _run_job(lambda: wd_assemble_job(bot))
+    elif action in ("vs", "vv"):
+        await callback.answer("Принято в работу")
+        _run_job(lambda: wd_block_job(bot, key, action, sure))
+    elif action == "va":
+        if key not in draft["blocks"]:
+            await callback.answer("Этот кусок ещё монтируется")
+            return
+        draft = await wd_update(lambda d: d["video_ok"].update({key: True}))
+        await callback.answer("✅ Принято")
+        await _edit_quiet_markup(callback.message, _wd_caption(draft, key, draft["blocks"][key]), _wd_video_kb(key))
+        if all(draft["video_ok"].get(k) for k in wd_keys(draft)) and draft.get("stage") != "assemble":
+            await wd_update(lambda d: d.update(stage="assemble"))
+            _run_job(lambda: wd_assemble_job(bot))
+    else:
+        await callback.answer()
 
 
 async def send_episode(bot: Bot, chat_id: int, ep: Any, script: dict[str, Any], brief: str = "") -> None:

@@ -110,7 +110,7 @@ async def _download(session: aiohttp.ClientSession, url: str, mourning: bool = F
 
 
 async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_key: str,
-                       limit: int = 6) -> list[Image.Image]:
+                       limit: int = 6, avoid: set[str] | None = None, used: list[str] | None = None) -> list[Image.Image]:
     """Картинки к новости: фото людей, кадры и постер фильма с TMDB, фото из постов-источников."""
     person = story.get("person_en") or story.get("person")
 
@@ -182,10 +182,21 @@ async def story_images(story: dict[str, Any], posts: list[dict[str, Any]], tmdb_
                     [p["image"]] if p.get("image") else [])
             if len(urls) >= limit:
                 break
-    wanted = list(dict.fromkeys(urls))[:limit + 3]  # с запасом на битые
+    fresh = [u for u in dict.fromkeys(urls) if u not in (avoid or set())]
+    if avoid and len(fresh) < 2:  # «🎞 Видео»: другие картинки — добираем ещё кадры фильма и фото человека
+        more = []
+        for i in story.get("media") or []:
+            if 1 <= i <= len(posts):
+                more += [m["image"] for m in posts[i - 1].get("media") or [] if m.get("image")]
+        fresh += [u for u in dict.fromkeys(more) if u not in avoid and u not in fresh]
+        fresh = fresh or list(dict.fromkeys(urls))[::-1]  # других нет — те же в другом порядке
+    wanted = fresh[:limit + 3]  # с запасом на битые
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=HEADERS) as session:
         got = await asyncio.gather(*(_download(session, u, bool(story.get("mourning"))) for u in wanted))
-    return [img for img in got if img][:limit]
+    pairs = [(u, img) for u, img in zip(wanted, got) if img][:limit]
+    if used is not None:
+        used += [u for u, _ in pairs]
+    return [img for _, img in pairs]
 
 
 def _int(value: Any) -> int:
@@ -592,147 +603,217 @@ async def _voice(lines: list[str], work: Path) -> tuple[Path, list[float], float
                        "и собери выпуск снова")
 
 
-async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]], tmdb_key: str,
-                 date_label: str) -> Episode:
-    """Собрать выпуск: заставка, вступление, новости с заставками «Новость N», финал; музыка; превью; SEO."""
-    stories = script["stories"]
-    total_n = len(stories)
-    segments: list[Path] = []
-    chapters: list[tuple[float, str]] = []
-    cuts: list[list[Any]] = []  # [начало, конец, заголовок] каждой новости — для «✂️ Нарезать на шортсы»
-    clock = 0.0
-    notes: list[str] = []
-    phrases: list[list[Any]] = []  # [секунда в выпуске, текст фразы] — для «🎙 Переозвучить только звук»
-    voiced: dict[int, dict[str, Any]] = {}  # номер куска → его озвучка и музыка (для «🎙 Только звук»)
+def _card_file(bg: Image.Image | None, top: str, big: str, small: str, path: Path, mourning: bool = False) -> Path:
+    slide_image(title_card(bg, top, big, small, mourning)).save(path, quality=90)
+    return path
 
-    def remember(folder: Path, music: Path | None, total: float, start: float) -> None:
-        meta = dict(daily.last_voice)
-        meta["file"] = str((folder / meta.get("file", "voice.wav")).relative_to(work))
-        voiced[len(segments) - 1] = {"voice": meta, "music": str(music) if music else None,
-                                     "total": round(total, 3), "start": round(start, 3)}
-    first_img: Image.Image | None = None
 
-    daily.stressed.clear()
+def _save_slides(work: Path, imgs: list[Image.Image], prefix: str) -> list[Path]:
+    out = []
+    for i, img in enumerate(imgs):
+        path = work / f"{prefix}_{i}.jpg"
+        slide_image(img).save(path, quality=88)
+        out.append(path)
+    return out
+
+
+async def _block_done(work: Path, block: dict[str, Any], segments: list[Path], voiced_at: dict[int, dict[str, Any]],
+                      cache: list[int]) -> dict[str, Any]:
+    """Кусок выпуска готов: звук каждого сегмента — отдельным файлом (для «🎙 Звук»), замечания по озвучке."""
+    pieces = []
+    for k, seg in enumerate(segments):
+        audio = f"{seg.stem}.m4a"
+        await _run("ffmpeg", "-v", "error", "-y", "-i", str(seg), "-vn", "-c:a", "copy", str(work / audio))
+        pieces.append({"segment": seg.name, "audio": audio, "length": round(await _duration(seg), 3),
+                       **voiced_at.get(k, {})})
+    block["pieces"] = pieces
+    block["length"] = round(sum(p["length"] for p in pieces), 3)
+    block["listen"] = [f"«{x['want']}» → слышно «{x['got']}» (фраза: {x['text'][:60]}…)" for x in daily.voice_issues[:8]]
+    block["stress"] = sorted(daily.stressed)
+    block["cache"] = cache
+    return block
+
+
+async def _voiced(lines: list[str], folder: Path, work: Path) -> tuple[Path, list[float], float, bool, dict[str, Any]]:
+    voice, starts, dur, ok = await _voice(lines, folder)
+    meta = dict(daily.last_voice)
+    meta["file"] = str((folder / meta.get("file", "voice.wav")).relative_to(work))
+    return voice, starts, dur, ok, meta
+
+
+async def build_intro(work: Path, script: dict[str, Any], teaser: list[Image.Image], first_img: Image.Image | None,
+                      date_label: str, music: Path) -> dict[str, Any]:
+    """Вступление: заставка выпуска, под приветствие и анонс — кадры главных новостей."""
     daily.voice_issues.clear()
-    cache_stats[:] = [0, 0]
-    await daily._progress(3, "Картинки к новостям")
-    pictures: list[list[Image.Image]] = []
-    for k, story in enumerate(stories):
-        imgs = await story_images(story, posts, tmdb_key)
-        pictures.append(imgs)
-        first_img = first_img or (imgs[0] if imgs else None)
-        await daily._progress(3 + round(12 * (k + 1) / total_n), "Картинки к новостям")
-
-    def card_file(bg: Image.Image | None, top: str, big: str, small: str, path: Path,
-                  mourning: bool = False) -> Path:
-        slide_image(title_card(bg, top, big, small, mourning)).save(path, quality=90)
-        return path
-
-    def overlay_file(headline: str, n: int, total: int, mourning: bool, path: Path) -> Path:
-        overlay(headline, n, total, mourning).save(path)
-        return path
-
-    # тяжёлые операции с картинками (размытие, текст) — в отдельном потоке, иначе бот на это время «замирает»
-    def save_slides(imgs: list[Image.Image], prefix: str) -> list[Path]:
-        out = []
-        for i, img in enumerate(imgs):
-            path = work / f"{prefix}_{i}.jpg"
-            slide_image(img).save(path, quality=88)
-            out.append(path)
-        return out
-
-    # вступление: заставка выпуска под голос приветствия
-    await daily._progress(16, "Озвучка вступления")
-    voice, starts, dur, voiced = await _voice(script["intro"], work / "v_intro")
-    if not voiced:
-        notes.append(daily.no_voice_note(voiced))
+    daily.stressed.clear()
+    voice, starts, dur, ok, meta = await _voiced(script["intro"], work / "v_intro", work)
+    hits = daily.voice_cache_hits
     intro_card = work / "intro_card.jpg"
-    await asyncio.to_thread(card_file, first_img, "KINOMIR360", "НОВОСТИ КИНО", date_label, intro_card)
-    chapters.append((0.0, "Вступление"))
-    if INTRO_CLIP.exists():  # анимированная заставка с логотипом — самое начало выпуска
-        try:
-            segments.append(await _brand_clip(INTRO_CLIP, work / "brand_intro.mp4"))
-            clock += await _duration(segments[-1])
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: weekly intro clip skipped: %s", exc)
-    # под приветствие и анонс — не одна заставка, а кадры главных новостей выпуска (что сегодня будет)
-    teaser = [imgs[0] for imgs in pictures[:4] if imgs]
-    teaser_paths = await asyncio.to_thread(save_slides, teaser, "teaser") if teaser else []
+    await asyncio.to_thread(_card_file, first_img, "KINOMIR360", "НОВОСТИ КИНО", date_label, intro_card)
+    teaser_paths = await asyncio.to_thread(_save_slides, work, teaser, "teaser") if teaser else []
     slides = [(intro_card, min(3.0, dur + 0.4))]
     rest = dur + 0.4 - slides[0][1]
     if teaser_paths and rest > 1.5:
-        each = rest / len(teaser_paths)
-        slides += [(path, each) for path in teaser_paths]
+        slides += [(path, rest / len(teaser_paths)) for path in teaser_paths]
     else:
         slides = [(intro_card, dur + 0.4)]
-    main_music = musiclib.pick("новости кино") or ASSETS / "music.mp3"  # общая тема выпуска: вступление и финал
-    phrases += [[round(clock + t, 2), line] for t, line in zip(starts, script["intro"])]
-    segments.append(await _segment(work, "intro", slides, None, voice, dur + 0.4, main_music))
-    remember(work / "v_intro", main_music, dur + 0.4, clock)
-    clock += dur + 0.4
+    seg = await _segment(work, "intro", slides, None, voice, dur + 0.4, music)
+    block = {"key": "i", "title": "Вступление", "chapter": "Вступление", "voiced": ok,
+             "phrases": [[round(t, 2), line] for t, line in zip(starts, script["intro"])]}
+    return await _block_done(work, block, [seg], {0: {"voice": meta, "music": str(music), "total": round(dur + 0.4, 3)}},
+                             [hits, len(script["intro"])])
 
+
+async def build_story(work: Path, story: dict[str, Any], n: int, total_n: int, imgs: list[Image.Image],
+                      first_img: Image.Image | None, tmdb_key: str, main_music: Path) -> dict[str, Any]:
+    """Новость N: заставка «Новость N» и сама новость (голос, фото, графики, плашка заголовка, своя музыка).
+    Повторная сборка с другими картинками берёт голос из кэша — звук тот же и бесплатно."""
+    daily.voice_issues.clear()
+    daily.stressed.clear()
+    bg = imgs[0] if imgs else first_img
+    card = work / f"card{n}.jpg"
+    await asyncio.to_thread(_card_file, bg, f"НОВОСТЬ {n}", story["headline"], "", card, story["mourning"])
+    # своя музыка у каждой новости — по её настроению (смерть — спокойная драма, хоррор — мрачная, …)
+    music = musiclib.pick(story["headline"], " ".join(story["lines"])) or main_music
     whoosh = ASSETS / "whoosh.wav"
-    for k, story in enumerate(stories):
-        n = k + 1
-        await daily._progress(18 + round(64 * k / total_n), f"Новость {n} из {total_n}: озвучка и монтаж")
-        imgs = pictures[k]
-        bg = imgs[0] if imgs else first_img
-        card = work / f"card{n}.jpg"
-        await asyncio.to_thread(card_file, bg, f"НОВОСТЬ {n}", story["headline"], "", card, story["mourning"])
-        # своя музыка у каждой новости — по её настроению (смерть — спокойная драма, хоррор — мрачная, …)
-        story_music = musiclib.pick(story["headline"], " ".join(story["lines"])) or main_music
-        segments.append(await _segment(work, f"card{n}", [(card, CARD_SEC)], None,
-                                       whoosh if whoosh.exists() else None, CARD_SEC, story_music))
-        story_start = clock
-        chapters.append((clock, story.get("chapter") or story["headline"].capitalize()))
-        clock += CARD_SEC
-        voice, starts, dur, voiced = await _voice(story["lines"], work / f"v{n}")
-        phrases += [[round(clock + t, 2), line] for t, line in zip(starts, story["lines"])]
-        if not voiced and not notes:
-            notes.append(daily.no_voice_note(voiced))
-        paths = await asyncio.to_thread(save_slides, imgs, f"st{n}") or [card]
-        over = work / f"over{n}.png"
-        await asyncio.to_thread(overlay_file, story["headline"], n, total_n, story["mourning"], over)
-        total = dur + 0.5
-        slides = _even_slides(paths, starts, total)
-        for t0, clip, length in await _graphics(work, n, story, starts, total, bg, tmdb_key):
-            slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
-        segments.append(await _segment(work, f"story{n}", slides, over, voice, total, story_music))
-        remember(work / f"v{n}", story_music, total, clock)
-        clock += total
-        cuts.append([round(story_start, 2), round(clock, 2), story["headline"]])  # для нарезки на шортсы
+    seg_card = await _segment(work, f"card{n}", [(card, CARD_SEC)], None, whoosh if whoosh.exists() else None,
+                              CARD_SEC, music)
+    voice, starts, dur, ok, meta = await _voiced(story["lines"], work / f"v{n}", work)
+    hits = daily.voice_cache_hits
+    paths = await asyncio.to_thread(_save_slides, work, imgs, f"st{n}") or [card]
+    over = work / f"over{n}.png"
+    await asyncio.to_thread(lambda: overlay(story["headline"], n, total_n, story["mourning"]).save(over))
+    total = dur + 0.5
+    slides = _even_slides(paths, starts, total)
+    for t0, clip, length in await _graphics(work, n, story, starts, total, bg, tmdb_key):
+        slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
+    seg_story = await _segment(work, f"story{n}", slides, over, voice, total, music)
+    block = {"key": str(n), "title": story["headline"], "voiced": ok,
+             "chapter": story.get("chapter") or story["headline"].capitalize(),
+             "phrases": [[round(CARD_SEC + t, 2), line] for t, line in zip(starts, story["lines"])]}
+    return await _block_done(work, block, [seg_card, seg_story],
+                             {1: {"voice": meta, "music": str(music), "total": round(total, 3)}},
+                             [hits, len(story["lines"])])
 
-    await daily._progress(84, "Финал выпуска")
-    voice, starts, dur, voiced = await _voice(script["outro"], work / "v_outro")
-    phrases += [[round(clock + t, 2), line] for t, line in zip(starts, script["outro"])]
+
+async def build_outro(work: Path, script: dict[str, Any], first_img: Image.Image | None, music: Path) -> dict[str, Any]:
+    """Финал — карточка с вопросом зрителям («Спасибо, что смотрите!» говорит анимированная концовка)."""
+    daily.voice_issues.clear()
+    daily.stressed.clear()
+    voice, starts, dur, ok, meta = await _voiced(script["outro"], work / "v_outro", work)
+    hits = daily.voice_cache_hits
     outro_card = work / "outro_card.jpg"
-    # «Спасибо, что смотрите!» говорит анимированная концовка — здесь вопрос зрителям, без повтора
-    await asyncio.to_thread(card_file, first_img, "НОВЫЕ ВЫПУСКИ ПО СРЕДАМ И ВОСКРЕСЕНЬЯМ",
-                            "КАКАЯ НОВОСТЬ УДИВИЛА ВАС БОЛЬШЕ ВСЕГО?", "Пишите в комментариях",
-                            outro_card)
+    await asyncio.to_thread(_card_file, first_img, "НОВЫЕ ВЫПУСКИ ПО СРЕДАМ И ВОСКРЕСЕНЬЯМ",
+                            "КАКАЯ НОВОСТЬ УДИВИЛА ВАС БОЛЬШЕ ВСЕГО?", "Пишите в комментариях", outro_card)
     tail = 0.6 if OUTRO_CLIP.exists() else 2.0  # с анимированной концовкой карточку долго не держим
-    # финал — карточка с вопросом зрителям (повтор кадров выпуска автору не понравился)
-    segments.append(await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail, main_music))
-    remember(work / "v_outro", main_music, dur + tail, clock)
-    chapters.append((clock, "Итоги и вопрос зрителям"))
-    if OUTRO_CLIP.exists():  # «Спасибо, что смотрите!» и кнопка «Подписаться»
-        try:
-            segments.append(await _brand_clip(OUTRO_CLIP, work / "brand_outro.mp4"))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shorts: weekly outro clip skipped: %s", exc)
+    seg = await _segment(work, "outro", [(outro_card, dur + tail)], None, voice, dur + tail, music)
+    block = {"key": "o", "title": "Финал", "chapter": "Итоги и вопрос зрителям", "voiced": ok,
+             "phrases": [[round(t, 2), line] for t, line in zip(starts, script["outro"])]}
+    return await _block_done(work, block, [seg], {0: {"voice": meta, "music": str(music), "total": round(dur + tail, 3)}},
+                             [hits, len(script["outro"])])
 
-    await daily._progress(88, "Склейка и музыка")
+
+def main_music() -> Path:
+    return musiclib.pick("новости кино") or ASSETS / "music.mp3"  # общая тема выпуска: вступление и финал
+
+
+async def block_preview(work: Path, block: dict[str, Any], out: Path) -> Path | None:
+    """Кусок выпуска одним файлом для Telegram (до 50 МБ)."""
+    raw = work / f"{out.stem}_raw.mp4"
+    await _concat([work / p["segment"] for p in block["pieces"]], raw, work)
+    try:
+        return await make_preview(raw, out, block["length"]) if raw.stat().st_size > PREVIEW_MB * 1024 * 1024 \
+            else raw.replace(out)
+    finally:
+        raw.unlink(missing_ok=True)
+
+
+async def revoice_block(work: Path, block: dict[str, Any], sure: bool = False) -> list[tuple[float, str]]:
+    """«🎙 Звук» у куска выпуска: исправленные фразы (/say) — в свою дорожку, звук сегмента пересмешан и поставлен
+    на ту же картинку (видео не пересобирается). Ничего не изменилось — project.NothingToFix."""
+    plan = []
+    for piece in block["pieces"]:
+        if piece.get("voice"):
+            speak, todo = await project.changed(piece["voice"])
+            if todo:
+                plan.append((piece, speak, todo))
+    count = sum(len(todo) for _, _, todo in plan)
+    if not count:
+        raise project.NothingToFix()
+    if count > project.ASK_OVER and not sure:
+        raise project.TooMany(count, sum(len(p["voice"]["lines"]) for p in block["pieces"] if p.get("voice")),
+                              sum(len(sp[i]) for _, sp, todo in plan for i in todo))
+    tmp = work / f"revoice_{block['key']}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    fixed: list[tuple[float, str]] = []
+    offset = 0.0
+    try:
+        for piece in block["pieces"]:
+            match = next((x for x in plan if x[0] is piece), None)
+            if match:
+                _, speak, todo = match
+                voice = piece["voice"]
+                await daily.synthesize([speak[i] for i in todo], tmp, voice.get("pause"), True, prepared=True)
+                parts = {i: tmp / f"voice_{j}.mp3" for j, i in enumerate(todo)}
+                old = work / voice["file"]
+                new = tmp / "voice_new.wav"
+                await project.patch_voice(old, voice, parts, new, float(piece["total"]))
+                shutil.move(str(new), old)
+                await _piece_audio(old, piece.get("music"), float(piece["total"]), work / piece["audio"])
+                seg = work / piece["segment"]
+                out = tmp / "seg.mp4"
+                await _run("ffmpeg", "-v", "error", "-y", "-i", str(seg), "-i", str(work / piece["audio"]),
+                           "-map", "0:v", "-map", "1:a", "-c", "copy", str(out))
+                shutil.move(str(out), seg)
+                fixed += [(offset + float(voice["starts"][i]), voice["lines"][i]) for i in todo]
+            offset += float(piece["length"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return fixed
+
+
+async def assemble(work: Path, script: dict[str, Any], blocks: list[dict[str, Any]], date_label: str,
+                   first_img: Image.Image | None) -> Episode:
+    """Склеить готовые куски (вступление, новости, финал) с анимированными заставкой и концовкой в выпуск:
+    таймкоды, нарезка на шортсы, звук по кускам (для «🎙 Только звук»), превью, обложка, SEO."""
+    segments: list[Path] = []
+    pieces: list[dict[str, Any]] = []
+    chapters: list[tuple[float, str]] = []
+    cuts: list[list[Any]] = []
+    phrases: list[list[Any]] = []
+    clock = 0.0
+
+    async def brand(src: Path, name: str) -> None:
+        nonlocal clock
+        if not src.exists():
+            return
+        try:
+            seg = await _brand_clip(src, work / name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: weekly %s skipped: %s", name, exc)
+            return
+        audio = f"{seg.stem}.m4a"
+        await _run("ffmpeg", "-v", "error", "-y", "-i", str(seg), "-vn", "-c:a", "copy", str(work / audio))
+        length = await _duration(seg)
+        segments.append(seg)
+        pieces.append({"audio": audio, "length": round(length, 3)})
+        clock += length
+
+    await daily._progress(88, "Склейка выпуска")
+    await brand(INTRO_CLIP, "brand_intro.mp4")
+    for block in blocks:
+        start = clock
+        chapters.append((0.0 if block["key"] == "i" else clock, block["chapter"]))
+        phrases += [[round(clock + t, 2), line] for t, line in block["phrases"]]
+        for piece in block["pieces"]:
+            segments.append(work / piece["segment"])
+            pieces.append({**piece, "start": round(clock, 3)})
+            clock += float(piece["length"])
+        if block["key"] not in ("i", "o"):
+            cuts.append([round(start, 2), round(clock, 2), block["title"]])  # для нарезки на шортсы
+    await brand(OUTRO_CLIP, "brand_outro.mp4")
     body = work / "body.mp4"
     await _concat(segments, body, work)
-    # звук каждого куска — отдельно: «🎙 Только звук» пересмешает только куски с исправленными фразами и склеит
-    # дорожку так же, как склеивался ролик (время совпадёт до кадра)
-    pieces = []
-    for k, seg in enumerate(segments):
-        name = f"audio_{k}.m4a"
-        await _run("ffmpeg", "-v", "error", "-y", "-i", str(seg), "-vn", "-c:a", "copy", str(work / name))
-        pieces.append({"audio": name, **voiced.get(k, {})})
-    for seg in segments:
-        seg.unlink(missing_ok=True)
     final = work / "episode.mp4"  # музыка уже в каждом куске (своя у каждой новости)
     await _run("ffmpeg", "-v", "error", "-y", "-i", str(body), "-c", "copy", "-movflags", "+faststart", str(final))
     body.unlink(missing_ok=True)
@@ -740,8 +821,8 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
 
     await daily._progress(93, "Превью для Telegram")
     preview = await make_preview(final, work / "preview.mp4", length)
-
     cover = work / "cover.jpg"
+    stories = script["stories"]
     await asyncio.to_thread(lambda: thumbnail(first_img, stories[0]["headline"], date_label).save(cover, quality=92))
     seo = build_seo(script, chapters, date_label)
     seo["cuts"] = json.dumps(cuts, ensure_ascii=False)
@@ -749,18 +830,53 @@ async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]]
     (work / "project.json").write_text(json.dumps({"kind": "weekly", "pieces": pieces, "script": script,
                                                    "label": date_label}, ensure_ascii=False, default=str),
                                        encoding="utf-8")
-    if notes:
-        seo["warning"] = "\n".join(notes)
-    if daily.voice_issues:  # контроль озвучки: места, где распознавание услышало не то, что в тексте
-        seo["listen"] = "\n".join(f"«{x['want']}» → слышно «{x['got']}» (фраза: {x['text'][:60]}…)"
-                                  for x in daily.voice_issues[:15])
-    if cache_stats[0]:
-        seo["cache"] = f"{cache_stats[0]} из {cache_stats[1]}"
+    if not all(b.get("voiced", True) for b in blocks):
+        seo["warning"] = daily.no_voice_note(False)
+    listen = [x for b in blocks for x in b.get("listen") or []]
+    if listen:  # контроль озвучки: места, где распознавание услышало не то, что в тексте
+        seo["listen"] = "\n".join(listen[:15])
+    hits, total = sum(b["cache"][0] for b in blocks), sum(b["cache"][1] for b in blocks)
+    if hits:
+        seo["cache"] = f"{hits} из {total}"
+    stress = sorted({w for b in blocks for w in b.get("stress") or []}, key=str.lower)
     # знаки ударения уходят голосу только в режимах names/all — без них список на проверку не нужен
-    if daily.stressed and daily.stress_mode != "off":
-        seo["stress"] = ", ".join(sorted(daily.stressed, key=str.lower))
+    if stress and daily.stress_mode != "off":
+        seo["stress"] = ", ".join(stress)
     await daily._progress(98, "Готово")
     return Episode(final, preview, cover, seo, length)
+
+
+async def gather_pictures(script: dict[str, Any], posts: list[dict[str, Any]], tmdb_key: str,
+                          avoid: dict[int, set[str]] | None = None) -> tuple[list[list[Image.Image]], list[list[str]]]:
+    """Картинки ко всем новостям (и их адреса — чтобы «🎞 Видео» подобрал другие)."""
+    stories = script["stories"]
+    pictures, urls = [], []
+    for k, story in enumerate(stories):
+        used: list[str] = []
+        pictures.append(await story_images(story, posts, tmdb_key, avoid=(avoid or {}).get(k), used=used))
+        urls.append(used)
+        await daily._progress(3 + round(12 * (k + 1) / len(stories)), "Картинки к новостям")
+    return pictures, urls
+
+
+async def render(work: Path, script: dict[str, Any], posts: list[dict[str, Any]], tmdb_key: str,
+                 date_label: str) -> Episode:
+    """Собрать выпуск целиком: заставка, вступление, новости с заставками «Новость N», финал; превью; SEO."""
+    stories = script["stories"]
+    total_n = len(stories)
+    await daily._progress(3, "Картинки к новостям")
+    pictures, _ = await gather_pictures(script, posts, tmdb_key)
+    first_img = next((imgs[0] for imgs in pictures if imgs), None)
+    music = main_music()
+    await daily._progress(16, "Озвучка вступления")
+    blocks = [await build_intro(work, script, [imgs[0] for imgs in pictures[:4] if imgs], first_img, date_label,
+                                music)]
+    for k, story in enumerate(stories):
+        await daily._progress(18 + round(64 * k / total_n), f"Новость {k + 1} из {total_n}: озвучка и монтаж")
+        blocks.append(await build_story(work, story, k + 1, total_n, pictures[k], first_img, tmdb_key, music))
+    await daily._progress(84, "Финал выпуска")
+    blocks.append(await build_outro(work, script, first_img, music))
+    return await assemble(work, script, blocks, date_label, first_img)
 
 
 def build_seo(script: dict[str, Any], chapters: list[tuple[float, str]], date_label: str) -> dict[str, str]:
@@ -864,7 +980,7 @@ async def make_preview(final: Path, preview: Path, length: float) -> Path | None
     return None
 
 
-PROJECT_KEEP = ("project.json", "cover.jpg", "audio_*.m4a", "v_*/voice.wav", "v[0-9]*/voice.wav")
+PROJECT_KEEP = ("project.json", "cover.jpg", "*.m4a", "v_*/voice.wav", "v[0-9]*/voice.wav")
 
 
 def keep_project(work: Path, dest: Path) -> bool:
