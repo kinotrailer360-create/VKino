@@ -197,10 +197,13 @@ class ClipReader:
 
     def next(self) -> Image.Image | None:
         if self.frames:
-            with Image.open(self.frames[self.k % len(self.frames)]) as im:
+            # Не зацикливаем короткий клип: после последнего кадра удерживаем его
+            # до конца реплики. Повтор с первого кадра выглядит как визуальный скачок.
+            index = min(self.k, len(self.frames) - 1)
+            with Image.open(self.frames[index]) as im:
                 self.last = im.convert("RGB")
             self.k += 1
-        return self.last  # кадров нет — держим последний (или None — тогда статичная карточка)
+        return self.last  # после окончания клипа удерживаем последний кадр
 
     def close(self):
         self.frames = []
