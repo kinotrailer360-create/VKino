@@ -84,6 +84,7 @@ from shorts import dub as shorts_dub
 from shorts import lore as shorts_lore
 from shorts import review as shorts_review
 from shorts import project as shorts_project
+from shorts import plan as shorts_plan
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
@@ -7444,11 +7445,65 @@ async def report_interrupted_short(bot: Bot) -> None:
         logging.exception("Weekly draft resume failed")
 
 
+PLAN_HOUR = 11  # МСК: напоминание о ролике по контент-плану (публиковать 12:00–15:00)
+
+
+def plan_text(day: date) -> tuple[str, InlineKeyboardMarkup | None]:
+    item, long_video = shorts_plan.today(day), shorts_plan.long_today(day)
+    if not item and not long_video:
+        return "📅 На сегодня в контент-плане ничего нет.", None
+    rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать 12:00–15:00 МСК):"]
+    if item:
+        kind, topic = item
+        label, data, hint = shorts_plan.KINDS[kind]
+        lines.append(f"🎬 Shorts: <b>{escape(topic)}</b>" + (f"\n💡 {escape(hint)}" if hint else ""))
+        rows.append([_btn(f"{label} — собрать", data)])
+    if long_video:
+        lines.append(f"🎞 Длинное видео (суббота): <b>{escape(long_video)}</b>")
+        rows.append([_btn("🎞 Выпуск «Новости кино»", "pt:wv")])
+    lines.append("\nНазвание: запрос + названия фильмов + эмоция. Слухи — «по данным …».")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def plan_reminder(bot: Bot) -> None:
+    """Раз в день в PLAN_HOUR — напоминание админам, что по плану, с кнопкой сборки."""
+    now = datetime.now(MSK)
+    if now.hour < PLAN_HOUR or await shorts_setting("plan_last") == now.date().isoformat():
+        return
+    await set_shorts_setting("plan_last", now.date().isoformat())
+    text, kb = plan_text(now.date())
+    if kb is None:
+        return
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception:  # noqa: BLE001
+            logging.exception("Plan reminder to %s failed", admin_id)
+
+
+@router.message(Command("plan"))
+async def plan_command(message: Message) -> None:
+    """/plan — что по контент-плану сегодня и на неделю вперёд."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    today = datetime.now(MSK).date()
+    text, kb = plan_text(today)
+    rows = []
+    for day, item, long_video in shorts_plan.week(today + timedelta(days=1), 6):
+        part = escape(item[1]) if item else "—"
+        rows.append(f"• {day:%d.%m}: {part}" + (f"\n   🎞 {escape(long_video)}" if long_video else ""))
+    await message.answer(text + "\n\n<b>Дальше:</b>\n" + "\n".join(rows), reply_markup=kb)
+
+
 async def shorts_daily_loop(
     bot: Bot,
 ) -> None:
     await report_interrupted_short(bot)
     while True:
+        try:
+            await plan_reminder(bot)
+        except Exception:  # noqa: BLE001 — напоминание не должно мешать шортсам
+            logging.exception("Plan reminder failed")
         try:
             now = datetime.now(MSK)
             today = now.date().isoformat()
