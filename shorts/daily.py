@@ -1233,9 +1233,13 @@ STRESS_MODES = ("names", "all", "off")
 stress_mode = "names" if os.getenv("LUMEAN_STRESS", "0") == "1" else "off"
 
 
+stress_style = os.getenv("STRESS_STYLE", "caps")  # как отдать ударение голосу: caps / plus / acute (/stress)
+
+
 def _for_lumean(text: str) -> str:
     # режим off — ударения ИИ голосу не отдаём (он от них сбивался), но ударения из словаря (/say) — всегда
-    return pronounce.keep_dictionary_stress(text) if stress_mode == "off" else text
+    text = pronounce.keep_dictionary_stress(text) if stress_mode == "off" else text
+    return pronounce.render_stress(text, stress_style)
 
 
 def _speakable(text: str) -> str:
