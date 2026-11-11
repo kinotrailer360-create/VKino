@@ -906,3 +906,14 @@ def test_list_titles_name_the_films() -> None:
     long = [{"name": "Очень длинное название фильма " * 2} for _ in range(5)]
     assert len(list_title(online, long)) <= 100
     assert list_title(online, []) == f"{online.seo_title} #shorts"
+
+
+def test_plan_ready_scripts_fit_shorts():
+    from datetime import date
+
+    from shorts import plan
+    for day, (title, body) in plan.SCRIPTS.items():
+        assert plan.today(date.fromisoformat(day))[0] == "own"
+        words = len(body.split())
+        assert 60 <= words <= 120, (day, words)  # ≈30–45 с озвучки
+        assert "[" not in body and "кадр" not in body.lower()  # без монтажных указаний

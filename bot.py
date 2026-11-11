@@ -7453,11 +7453,18 @@ def plan_text(day: date) -> tuple[str, InlineKeyboardMarkup | None]:
     if not item and not long_video:
         return "📅 На сегодня в контент-плане ничего нет.", None
     rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать 12:00–15:00 МСК):"]
+    ready = shorts_plan.script(day)
     if item:
         kind, topic = item
         label, data, hint = shorts_plan.KINDS[kind]
-        lines.append(f"🎬 Shorts: <b>{escape(topic)}</b>" + (f"\n💡 {escape(hint)}" if hint else ""))
-        rows.append([_btn(f"{label} — собрать", data)])
+        if ready:  # готовый сценарий из контент-пакета — монтаж по нему одной кнопкой
+            lines.append(f"🎬 Shorts: <b>{escape(ready[0])}</b>\n💡 Сценарий готов. Приложи видео сцены или свои "
+                         "кадры, если есть, — ролик соберётся по смыслу фраз.")
+            rows.append([_btn("🎬 Собрать по готовому сценарию", f"pl:go:{day.isoformat()}")])
+            rows.append([_btn("📄 Показать текст", f"pl:txt:{day.isoformat()}")])
+        else:
+            lines.append(f"🎬 Shorts: <b>{escape(topic)}</b>" + (f"\n💡 {escape(hint)}" if hint else ""))
+            rows.append([_btn(f"{label} — собрать", data)])
     if long_video:
         lines.append(f"🎞 Длинное видео (суббота): <b>{escape(long_video)}</b>")
         rows.append([_btn("🎞 Выпуск «Новости кино»", "pt:wv")])
@@ -7479,6 +7486,31 @@ async def plan_reminder(bot: Bot) -> None:
             await bot.send_message(admin_id, text, reply_markup=kb)
         except Exception:  # noqa: BLE001
             logging.exception("Plan reminder to %s failed", admin_id)
+
+
+@router.callback_query(F.data.startswith("pl:"))
+async def plan_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    """Кнопки напоминания о контент-плане: собрать ролик по готовому сценарию дня или показать текст."""
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    _, action, day = (callback.data or "").split(":", 2)
+    try:
+        ready = shorts_plan.script(date.fromisoformat(day))
+    except ValueError:
+        ready = None
+    await callback.answer()
+    if not ready:
+        await callback.message.answer("Готового сценария на этот день нет.")
+        return
+    title, body = ready
+    if action == "txt":
+        await callback.message.answer(f"📄 <b>{escape(title)}</b>\n\n{escape(body)}")
+        return
+    # дальше — как «🎬 Свой сценарий»: показ текста, кнопки «📎 Свои картинки и видео», «✅ Собрать шортс»
+    await state.update_data(own_scripts=[(title, f"**Заголовок:** {title}\n{body}")], own_pick=0, lore_kind="own",
+                            lore_name=title, lore_hook="", lore_script=None, lore_media=[])
+    await own_generate(callback.message, state)
 
 
 @router.message(Command("plan"))
