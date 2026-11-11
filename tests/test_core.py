@@ -650,3 +650,158 @@ def test_weekly_episode_single_story_allowed():
     import inspect
     from shorts import ai
     assert "min(3, n)" in inspect.getsource(ai.write_weekly_episode)
+
+
+def _fake_session(responses, calls):
+    """Подмена aiohttp.ClientSession: отдаёт заранее заданные ответы (статус, json, заголовки) и пишет запросы."""
+    class Resp:
+        def __init__(self, status, data, headers):
+            self.status, self._data, self.headers = status, data, headers
+
+        async def json(self, content_type=None):
+            return self._data
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Session:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            calls.append(json)
+            status, data, hdrs = responses.pop(0)
+            return Resp(status, data, hdrs)
+
+    return Session
+
+
+def test_reserve_429_too_big_prompt_is_shrunk_once(monkeypatch):
+    """Qwen 429 «Limit 6000, Requested 8000» — задание ужимается под лимит и уходит один раз, без серии повторов."""
+    import asyncio
+    from shorts import ai
+    calls = []
+    ok = {"choices": [{"message": {"content": '{"a": 1}'}}], "usage": {"prompt_tokens": 5000, "completion_tokens": 10}}
+    too_big = {"error": {"message": "Rate limit reached for model on tokens per minute (TPM): Limit 6000, "
+                                    "Requested 8000, please try again in 1.2s"}}
+    monkeypatch.setattr(ai.aiohttp, "ClientSession", _fake_session([(429, too_big, {}), (200, ok, {})], calls))
+    ai._cool.clear()
+    assert asyncio.run(ai._ask_reserve("x" * 14000)) == {"a": 1}
+    assert len(calls) == 2
+    assert len(calls[1]["messages"][0]["content"][0]["text"]) < len(calls[0]["messages"][0]["content"][0]["text"])
+
+
+def test_reserve_429_long_limit_pauses_provider(monkeypatch):
+    """Qwen 429 с долгим ожиданием — один запрос, провайдер на паузе, следующий вызов его пропускает."""
+    import asyncio
+
+    import pytest
+    from shorts import ai
+    calls = []
+    busy = {"error": {"message": "Rate limit reached ... (TPD): Limit 500000, Used 499000, Requested 3000. "
+                                 "Please try again in 14m3s"}}
+    monkeypatch.setattr(ai.aiohttp, "ClientSession", _fake_session([(429, busy, {})], calls))
+    ai._cool.clear()
+    with pytest.raises(ai.AIError):
+        asyncio.run(ai._ask_reserve("короткое задание"))
+    assert len(calls) == 1
+    assert ai.cooling("reserve") and 14 <= ai.retry_in() / 60 <= 15
+
+
+def test_with_reserve_switches_skips_paused_and_reports_retry(monkeypatch):
+    """Gemini 429 → Qwen 429 → Lumean тайм-аут: ошибка AllBusy со временем, когда освободится ближайший ИИ;
+    второй вызов не дёргает провайдеров на паузе; после паузы провайдер снова используется."""
+    import asyncio
+    import time
+
+    import pytest
+    from shorts import ai
+    asked = []
+
+    async def gemini(key, parts, search=False):
+        asked.append("gemini")
+        ai._quota_until[(key, False)] = time.monotonic() + 3600
+        raise ai.AIError("Gemini: ключ 1: лимит исчерпан")
+
+    async def reserve(prompt, image=None):
+        asked.append("reserve")
+        ai.cooldown("reserve", 600, "лимит в минуту")
+        raise ai.AIError("резервный ИИ HTTP 429")
+
+    async def lumean(prompt, image=None, max_tokens=4000):
+        asked.append("lumean")
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(ai, "_ask", gemini)
+    monkeypatch.setattr(ai, "_ask_reserve", reserve)
+    monkeypatch.setattr(ai, "_ask_lumean", lumean)
+    monkeypatch.setattr(ai, "RESERVE_KEY", "r")
+    monkeypatch.setattr(ai, "BEAT_KEY", "")
+    monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "l")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    ai._cool.clear()
+    ai._quota_until.clear()
+    with pytest.raises(ai.AllBusy) as err:
+        asyncio.run(ai._with_reserve("k", [{"text": "x"}], "x"))
+    assert asked == ["gemini", "reserve", "lumean"]
+    assert "не ответил за" in str(err.value) and 9 <= err.value.retry_in / 60 <= 10
+    asked.clear()
+    with pytest.raises(ai.AllBusy):
+        asyncio.run(ai._with_reserve("k", [{"text": "x"}], "x"))
+    assert "reserve" not in asked  # на паузе — не тратим запрос
+    # пауза кончилась — резервный ИИ снова в деле
+    ai._cool["reserve"] = (time.monotonic() - 1, "")
+
+    async def reserve_ok(prompt, image=None):
+        asked.append("reserve_ok")
+        return {"ok": True}
+    monkeypatch.setattr(ai, "_ask_reserve", reserve_ok)
+    assert asyncio.run(ai._with_reserve("k", [{"text": "x"}], "x")) == {"ok": True}
+    ai._cool.clear()
+    ai._quota_until.clear()
+
+
+def test_lumean_timeout_grows_for_big_tasks():
+    from shorts import ai
+    assert ai.lumean_timeout("x" * 1000) == 150
+    assert ai.lumean_timeout("x" * 30000) == 300 and ai.lumean_timeout("x", 12000) == 300
+    assert ai._retry_after({}, {}, "try again in 1m30.5s") == 90.5
+
+
+def test_say_many_pairs_in_one_line():
+    """/say несколькими парами в одну строку — каждая пара отдельно (раньше голос читал весь список)."""
+    from shorts import pronounce
+    pairs = pronounce.parse_pairs("Средиземье = средИземье Кольца власти = кОльца влАсти критики = крИтики\n"
+                                  "Prime Video = прайм вИдео")
+    assert pairs == [("Средиземье", "средИземье"), ("Кольца власти", "кОльца влАсти"), ("критики", "крИтики"),
+                     ("Prime Video", "прайм вИдео")]
+    assert pronounce.repair({"Средиземье": "средИземье критики = крИтики", "IMAX": "Аймакс"}) == \
+        {"Средиземье": "средИземье", "критики": "крИтики", "IMAX": "Аймакс"}
+
+
+def test_patch_voice_refuses_overlap(tmp_path):
+    """Новая фраза намного длиннее старой — не накладываем на соседние, а просим пересобрать кусок заново."""
+    import asyncio
+    import shutil
+    import subprocess
+
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нет ффмпег")
+    from shorts import project
+    for name, d in (("old.wav", 4.4), ("new.mp3", 6.0)):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=f=440:d={d}", str(tmp_path / name)],
+                       check=True)
+    voice = {"starts": [0, 2.2], "speech": [2, 2]}
+    with pytest.raises(project.TooLong):
+        asyncio.run(project.patch_voice(tmp_path / "old.wav", voice, {0: tmp_path / "new.mp3"}, tmp_path / "o.wav"))

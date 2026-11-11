@@ -257,6 +257,10 @@ MAIN_MENU_LABELS = {
 }
 
 
+class WeeklyEditState(StatesGroup):
+    text = State()  # автор присылает свой текст новости выпуска (кнопка «📝 Свой текст»)
+
+
 class SearchState(StatesGroup):
     query = State()
     describe = State()
@@ -7208,7 +7212,12 @@ async def load_pronunciations() -> dict[str, str]:
         table = json.loads(raw) if raw else {}
     except ValueError:
         table = {}
-    shorts_pronounce.CUSTOM = table if isinstance(table, dict) else {}
+    table = table if isinstance(table, dict) else {}
+    fixed = shorts_pronounce.repair(table)
+    if fixed != table:  # запись «а = б В = г» одной строкой — разложить на пары и сохранить
+        table = fixed
+        await set_shorts_setting("pronounce", json.dumps(table, ensure_ascii=False))
+    shorts_pronounce.CUSTOM = table
     mode = await shorts_setting("stress_mode")
     if mode in shorts_daily.STRESS_MODES:
         shorts_daily.stress_mode = mode
@@ -7793,7 +7802,9 @@ async def say_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
-    await say_action(message, (message.text or "").partition(" ")[2].strip())
+    # «/say» и пары с новой строки: делим по любому пробелу или переносу, а не только по пробелу
+    parts = (message.text or "").split(maxsplit=1)
+    await say_action(message, parts[1].strip() if len(parts) > 1 else "")
 
 
 async def say_action(message: Message, arg: str) -> None:
@@ -7807,16 +7818,15 @@ async def say_action(message: Message, arg: str) -> None:
         await message.answer(f"✅ Удалено: {escape(word)}")
         return
     if "=" in arg:
-        word, _, spoken = (x.strip() for x in arg.partition("="))
-        if not word or not spoken:
-            await message.answer("Формат: <code>/say IMAX = Аймакс</code>")
+        pairs = shorts_pronounce.parse_pairs(arg)
+        if not pairs:
+            await message.answer("Формат: <code>/say IMAX = Аймакс</code> (несколько слов — каждое с новой строки)")
             return
-        table[word] = spoken
+        table.update(pairs)
         await set_shorts_setting("pronounce", json.dumps(table, ensure_ascii=False))
-        await message.answer(
-            f"✅ «{escape(word)}» теперь читается как «{escape(shorts_pronounce.mark_stress(spoken))}».\n"
-            f"Проверить: <code>/voice {escape(word)}</code>"
-        )
+        rows = [f"• «{escape(w)}» → «{escape(shorts_pronounce.mark_stress(v))}»" for w, v in pairs]
+        await message.answer("✅ Теперь читается так:\n" + "\n".join(rows)
+                             + f"\nПроверить: <code>/voice {escape(pairs[0][0])}</code>")
         return
 
     lines = ["🗣 <b>Произношение в озвучке</b>"]
@@ -8092,6 +8102,12 @@ async def ai_status_action(message: Message) -> None:
     else:
         rows.append("Сегодня запросов к Lumean не было (считается с последнего запуска бота).")
     rows.append("Озвучка клоном голоса тоже идёт с баланса Lumean: выпуск на 6–8 минут — самое дорогое.")
+    paused = [w for w in (shorts_ai.cooling(n) for n in shorts_ai.NAMES) if w]
+    stats = [f"{shorts_ai.NAMES.get(n, n)}: ✅ {st['ok']} / ❌ {st['fail']} (последний: {st['last']})"
+             for n, st in shorts_ai.provider_stats.items()]
+    if paused or stats:
+        rows.append("\n🔁 <b>ИИ с запуска бота</b> (переключений на запасной: " + str(shorts_ai.switches) + ")\n"
+                    + "\n".join(escape(x) for x in stats + [f"⏸ {w}" for w in paused]))
     rows += await expenses_rows()
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
@@ -15784,15 +15800,62 @@ def _wd_text(draft: dict[str, Any], key: str) -> str:
 
 def _wd_text_kb(key: str) -> InlineKeyboardMarkup:
     row = [_btn("✅ Принять", f"wd:ta:{key}"), _btn("✍️ Переписать", f"wd:tr:{key}")]
-    rows = [row] + ([[_btn("🔄 Другая новость", f"wd:tn:{key}")]] if key not in ("i", "o") else [])
+    rows = [row, [_btn("📝 Свой текст", f"wd:te:{key}")]
+            + ([_btn("🔄 Другая новость", f"wd:tn:{key}")] if key not in ("i", "o") else [])]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _wd_phrases(text: str) -> list[str]:
+    """Текст автора → фразы для голоса (по предложениям), без пустых и служебных строк."""
+    text = re.sub(r"📎 Источник.*", "", text, flags=re.S)
+    return [x.strip() for x in re.split(r"(?<=[.!?…])\s+|\n+", text) if len(x.strip()) >= 2]
+
+
+@router.message(WeeklyEditState.text, F.text, ~F.text.startswith("/"))
+async def weekly_own_text(message: Message, state: FSMContext) -> None:
+    """Свой текст новости (или вступления и финала): заменяет текст ИИ как есть, без переписывания."""
+    data = await state.get_data()
+    await state.clear()
+    key = str(data.get("wd_key") or "")
+    text = message.text or ""
+    head = re.match(r"\s*📰[^\n]*\n+", text)  # скопировали сообщение целиком — шапку отрезаем
+    if head:
+        text = text[head.end():]
+    if key == "i":
+        intro_part, _, outro_part = re.sub(r"^\s*🎙[^\n]*\n+", "", text).partition("Финал:")
+        intro = _wd_phrases(intro_part.replace("Вступление:", ""))
+        outro = _wd_phrases(outro_part)
+        if not intro:
+            await message.answer("Не вижу текста вступления — нажми «📝 Свой текст» ещё раз.")
+            return
+    else:
+        lines = _wd_phrases(text)
+        if len(lines) < 2:
+            await message.answer("Слишком коротко для новости — нажми «📝 Свой текст» ещё раз и пришли текст целиком.")
+            return
+
+    def put(d: dict[str, Any]) -> None:
+        d["text_ok"][key] = False
+        if key == "i":
+            d["script"]["intro"] = intro
+            if outro:
+                d["script"]["outro"] = outro
+        else:
+            d["script"]["stories"][int(key) - 1]["lines"] = lines
+
+    draft = await wd_update(put)
+    if not draft or draft.get("stage") != "text":
+        await message.answer("Черновик выпуска уже не на шаге текстов — свой текст можно прислать до монтажа.")
+        return
+    await message.answer("✅ Текст заменён на твой. Проверь и нажми «✅ Принять»:\n\n" + _wd_text(draft, key),
+                         reply_markup=_wd_text_kb(key), disable_web_page_preview=True)
 
 
 def _wd_video_kb(key: str) -> InlineKeyboardMarkup:
     row = [_btn("✅ Принять", f"wd:va:{key}"), _btn("🎙 Звук", f"wd:vs:{key}")]
     if key not in ("i", "o"):
         row.append(_btn("🎞 Видео", f"wd:vv:{key}"))
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=[row, [_btn("🔁 Заново: голос и видео", f"wd:vf:{key}")]])
 
 
 async def start_weekly_draft(bot: Bot, chat_ids: list[int], script: dict[str, Any], pool: list[dict[str, Any]],
@@ -15872,7 +15935,10 @@ async def wd_text_action(callback: CallbackQuery, action: str, key: str) -> None
     try:
         fresh = await _wd_rewrite(draft, key, action == "tn")
     except Exception as exc:  # noqa: BLE001
-        await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+        wait = getattr(exc, "retry_in", None)
+        await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>"
+                             + (f"\n⏸ Все ИИ на лимитах — ближайший освободится через ≈{max(1, round(wait / 60))} мин. "
+                                "Тексты и принятые новости сохранены, нажми кнопку снова позже." if wait else ""))
         return
 
     def put(d: dict[str, Any]) -> None:
@@ -16030,28 +16096,43 @@ async def wd_block_job(bot: Bot, key: str, mode: str, sure: bool = False) -> Non
         await bot.send_message(chat, "⏳ Сейчас идёт другой монтаж — нажми через пару минут.")
         return
     work = WEEKLY_DRAFT_DIR / draft["id"]
-    status = await bot.send_message(chat, "🎙 Переозвучиваю исправленные фразы…" if mode == "vs"
-                                    else "🎞 Подбираю другие картинки и монтирую заново (голос тот же)…")
+    status = await bot.send_message(chat, {"vs": "🎙 Переозвучиваю исправленные фразы…",
+                                           "vv": "🎞 Подбираю другие картинки и монтирую заново (голос тот же)…"}.get(
+        mode, "🔁 Записываю голос заново и монтирую кусок с другими картинками…"))
     try:
         async with shorts_lock:
             await load_pronunciations()
             await load_voice()
             block = draft["blocks"][key]
+            from PIL import Image as PILImage
+            first = PILImage.open(work / "first.jpg").convert("RGB") if (work / "first.jpg").exists() else None
+            script = draft["script"]
+            if mode == "vf":  # голос заново: озвученные фразы куска — из кэша вон, Lumean запишет их снова
+                lines = script["intro"] if key == "i" else script["outro"] if key == "o" else \
+                    script["stories"][int(key) - 1]["lines"]
+                for text in await shorts_daily.spoken_lines(lines, careful=True):
+                    shorts_daily._voice_key(shorts_daily._for_lumean(text), shorts_lumean.PAUSE).unlink(missing_ok=True)
             if mode == "vs":
                 fixed = await shorts_weekly.revoice_block(work, block, sure)
                 note = f"🎙 Переозвучено фраз: {len(fixed)}, картинка та же."
+            elif key in ("i", "o"):
+                music = shorts_weekly.main_music()
+                if key == "i":
+                    teaser = [PILImage.open(f).convert("RGB") for f in sorted(work.glob("teaser_src_*.jpg"))]
+                    block = await shorts_weekly.build_intro(work, script, teaser, first, draft["label"], music)
+                else:
+                    block = await shorts_weekly.build_outro(work, script, first, music)
+                note = "🔁 Голос записан заново."
             else:
                 n = int(key)
                 story = draft["script"]["stories"][n - 1]
                 used: list[str] = []
                 avoid = set(draft["urls"].get(key) or [])
                 imgs = await shorts_weekly.story_images(story, draft["pool"], TMDB_API_KEY, avoid=avoid, used=used)
-                from PIL import Image as PILImage
-                first = PILImage.open(work / "first.jpg").convert("RGB") if (work / "first.jpg").exists() else None
                 block = await asyncio.wait_for(shorts_weekly.build_story(
                     work, story, n, len(draft["script"]["stories"]), imgs, first, TMDB_API_KEY,
                     shorts_weekly.main_music()), timeout=20 * 60)
-                note = "🎞 Другие картинки, голос тот же."
+                note = "🔁 Голос записан заново, другие картинки." if mode == "vf" else "🎞 Другие картинки, голос тот же."
                 await wd_update(lambda d: d["urls"].update({key: list(avoid | set(used))}))
 
             def put(d: dict[str, Any]) -> None:
@@ -16061,7 +16142,10 @@ async def wd_block_job(bot: Bot, key: str, mode: str, sure: bool = False) -> Non
             await status.delete()
             await _wd_send_block(bot, draft, key, note)
     except Exception as exc:  # noqa: BLE001
-        if not await _revoice_guard(bot, chat, status, exc, f"wd:vs:{key}:go"):
+        if isinstance(exc, shorts_project.TooLong):
+            await _edit_quiet(status, f"⚠️ {escape(str(exc))}.\nНажми «🔁 Заново: голос и видео» — кусок соберётся "
+                                      "под новую озвучку без наложений.")
+        elif not await _revoice_guard(bot, chat, status, exc, f"wd:vs:{key}:go"):
             logging.exception("Weekly draft block fix failed")
             await _edit_quiet(status, f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
 
@@ -16104,7 +16188,7 @@ async def wd_assemble_job(bot: Bot) -> None:
 
 
 @router.callback_query(F.data.startswith("wd:"))
-async def weekly_draft_buttons(callback: CallbackQuery) -> None:
+async def weekly_draft_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user.id not in ADMIN_IDS or not callback.message:
         await callback.answer()
         return
@@ -16113,6 +16197,15 @@ async def weekly_draft_buttons(callback: CallbackQuery) -> None:
     sure = parts[-1] == "go" and len(parts) > 3
     if action in ("ta", "tr", "tn"):
         await wd_text_action(callback, action, key)
+        return
+    if action == "te":
+        await callback.answer()
+        await state.set_state(WeeklyEditState.text)
+        await state.update_data(wd_key=key)
+        await callback.message.answer(
+            "📝 Пришли свой текст " + ("вступления (а после строки «Финал:» — текст финала)" if key == "i"
+                                       else f"новости {key}") + " одним сообщением. Удобно: скопируй текст выше, "
+            "поправь и отправь — заменю как есть, без переписывания ИИ. Отмена — /cancel.")
         return
     draft = await wd_load()
     if not draft:
@@ -16125,7 +16218,7 @@ async def weekly_draft_buttons(callback: CallbackQuery) -> None:
     elif action == "as":
         await callback.answer("🔗 Склеиваю")
         _run_job(lambda: wd_assemble_job(bot))
-    elif action in ("vs", "vv"):
+    elif action in ("vs", "vv", "vf"):
         await callback.answer("Принято в работу")
         _run_job(lambda: wd_block_job(bot, key, action, sure))
     elif action == "va":
@@ -16564,15 +16657,21 @@ async def weekly_video_job(bot: Bot) -> None:
         week = now.date().isoformat()  # попытки — на этот день выпуска
         tries = await shorts_setting("weekly_video_tries") or ""
         n = int(tries.split(":")[1]) if tries.startswith(week + ":") else 0
-        retry = n < 1 and "уже собирается" not in str(exc)
+        # все ИИ на лимитах — повтор, когда освободится ближайший (а не через 30 минут в тот же отказ)
+        wait = getattr(exc, "retry_in", None)
+        retry = (n < 1 or wait is not None and n < 3) and "уже собирается" not in str(exc)
+        delay = min(max((wait or 0) + 120, 1800), 6 * 3600)
         await set_shorts_setting("weekly_video_tries", f"{week}:{n + 1}")
         if retry:
-            await set_shorts_setting("weekly_video_retry_at", str(time.time() + 1800))
+            await set_shorts_setting("weekly_video_retry_at", str(time.time() + delay))
             await set_shorts_setting("weekly_video_done", None)
+        when = (datetime.now(POST_TZ) + timedelta(seconds=delay)).strftime("%H:%M")
         for admin_id in admins:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
-                                                 "</code>\n" + ("Попробую ещё раз через 30 минут. " if retry else "")
+                                                 "</code>\n" + (f"Все ИИ сейчас на лимитах — сам повторю в {when} "
+                                                                 f"({POST_TZ_NAME}). " if retry and wait else
+                                                                 "Попробую ещё раз через 30 минут. " if retry else "")
                                        + "Собрать вручную — ▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass

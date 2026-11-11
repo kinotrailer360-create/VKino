@@ -30,3 +30,10 @@ def test_every_button_prefix_has_handler() -> None:
 def test_static_button_data_fits_telegram() -> None:
     for data in re.findall(r'_btn\([^\n]*?,\s*"([^"{}]+)"\)', SRC):
         assert len(data.encode()) <= 64, data
+
+
+def test_weekly_own_text_split() -> None:
+    """«📝 Свой текст»: скопированное сообщение новости → фразы для голоса, без шапки-ссылок на источники."""
+    import bot
+    text = "Первая фраза. Вторая фраза!\nТретья фраза?\n\n📎 Источники: t.me/a, t.me/b"
+    assert bot._wd_phrases(text) == ["Первая фраза.", "Вторая фраза!", "Третья фраза?"]
