@@ -89,6 +89,33 @@ class FitSlide:
         return img
 
 
+class FillSlide:
+    """Кадр на весь экран 9:16: чёрные полосы кино-кадра срезаны, середина по центру, камера медленно наезжает
+    (как в роликах, где картинка не «бегает» и не стоит в узкой полосе)."""
+
+    ZOOM = 0.08
+
+    def __init__(self, path: Path, reverse: bool):
+        img = Image.open(path).convert("RGB")
+        gray = img.convert("L").resize((32, img.height))
+        rows = [sum(gray.crop((0, y, 32, y + 1)).getdata()) / 32 for y in range(gray.height)]
+        top = next((y for y, v in enumerate(rows) if v > 14), 0)
+        bottom = next((y for y, v in enumerate(reversed(rows)) if v > 14), 0)
+        if top + bottom < img.height * 0.5:
+            img = img.crop((0, top, img.width, img.height - bottom))
+        s = max(W / img.width, H / img.height) * (1 + self.ZOOM)
+        self.img = img.resize((round(img.width * s) + 1, round(img.height * s) + 1), Image.LANCZOS)
+        self.reverse = reverse
+
+    def frame(self, t: float, dur: float) -> Image.Image:
+        k = min(max(t / max(dur, 0.1), 0.0), 1.0)
+        k = k * k * (3 - 2 * k)
+        z = (1 + self.ZOOM * ((1 - k) if self.reverse else k)) / (1 + self.ZOOM)
+        cw, ch = round(W / z), round(H / z)
+        x, y = (self.img.width - cw) // 2, (self.img.height - ch) // 2
+        return self.img.crop((x, y, x + cw, y + ch)).resize((W, H), Image.BILINEAR)
+
+
 class ClipSlide:
     """Отрезок трейлера (уже 1080×1920, 30 к/с, без звука): кадры читаются из ffmpeg по ходу монтажа, в памяти —
     только текущий. Кончился отрезок — держим последний кадр (на время перехода к следующей картинке)."""
@@ -267,9 +294,9 @@ def render(cfg: dict, base: Path) -> Path:
             kinds[k] = TRANSITIONS[len(kinds) % len(TRANSITIONS)]
     ends = [s["start"] for s in slides[1:]] + [speech_end]
 
-    loaded: dict[int, PanSlide | ClipSlide] = {}
+    loaded: dict[int, PanSlide | FitSlide | FillSlide | ClipSlide] = {}
 
-    def slide(k: int) -> PanSlide | ClipSlide:
+    def slide(k: int) -> PanSlide | FitSlide | FillSlide | ClipSlide:
         if k not in loaded:
             for old in [j for j in loaded if j < k - 1]:
                 gone = loaded.pop(old)
@@ -282,7 +309,8 @@ def render(cfg: dict, base: Path) -> Path:
                 with Image.open(path) as probe:
                     wide = probe.width > probe.height * 1.05
                 # широкий кадр — целиком с размытым фоном; высокий (постер, страница комикса) — едет камера
-                loaded[k] = (FitSlide if wide else PanSlide)(path, reverse=k % 3 == 2)
+                kind = FillSlide if cfg.get("fill") and wide else FitSlide if wide else PanSlide
+                loaded[k] = kind(path, reverse=k % 3 == 2)
         return loaded[k]
 
     outro = OutroSlide(cfg, p(cfg.get("outro_image") or slides[0]["image"]), logo)
