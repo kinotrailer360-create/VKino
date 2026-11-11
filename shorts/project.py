@@ -33,6 +33,10 @@ class NothingToFix(RuntimeError):
     """Все фразы звучат так же, как в ролике."""
 
 
+class TooLong(RuntimeError):
+    """Новая фраза не помещается на место старой — нужна пересборка с новой озвучкой, а не вставка."""
+
+
 class TooMany(RuntimeError):
     def __init__(self, n: int, total: int, chars: int) -> None:
         super().__init__(f"{n} из {total}")
@@ -113,6 +117,10 @@ async def patch_voice(old: Path, voice: dict[str, Any], parts: dict[int, Path], 
         nxt = starts[i + 1] if i + 1 < len(starts) else end_all
         room = max(slot, nxt - start - 0.05)  # до начала следующей фразы (пауза между ними тоже наша)
         new = await daily._duration(part)
+        if new > room * FIT_MAX + 0.5:  # не влезет даже ускоренной — наложится на соседние фразы, так не вставляем
+            raise TooLong(f"фраза {i + 1} стала намного длиннее ({new:.1f} с вместо {slot:.1f} с) — вставить её "
+                          "без наложения на соседние нельзя. Проверь словарь /say (не попало ли туда лишнее) "
+                          "или пересобери с новой озвучкой целиком")
         tempo = 1.0
         if new > room:
             tempo = min(new / room, FIT_MAX)

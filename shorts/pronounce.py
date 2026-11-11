@@ -281,6 +281,40 @@ def _keep_case(original: str, spoken: str) -> str:
     return spoken
 
 
+def parse_pairs(text: str) -> list[tuple[str, str]]:
+    """/say: пары «слово = как читать». Каждая строка — пара; несколько пар в одной строке
+    («Средиземье = средИземье Кольца власти = кОльца влАсти») делим так: в значении столько слов, сколько в
+    слове слева (произношение того же слова), остальное — следующее слово. Раньше вся строка после первого «=»
+    становилась одним значением, и голос зачитывал весь список."""
+    pairs: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        parts = [x.strip() for x in line.split("=")]
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        for seg in parts[1:-1]:
+            words = seg.split()
+            n = max(1, len(key.split()))
+            value, nxt = " ".join(words[:n]), " ".join(words[n:])
+            if key and value:
+                pairs.append((key, value))
+            key = nxt
+        if key and parts[-1]:
+            pairs.append((key, parts[-1]))
+    return pairs
+
+
+def repair(table: dict[str, str]) -> dict[str, str]:
+    """Словарь, в который попало «слово = а Б = в» одной записью, — разложить на пары."""
+    fixed: dict[str, str] = {}
+    for key, value in table.items():
+        if "=" in value:
+            fixed.update(parse_pairs(f"{key} = {value}"))
+        else:
+            fixed[key] = value
+    return fixed
+
+
 def apply(text: str, extra: dict[str, str] | None = None) -> str:
     """Заменяет слова на их произношение; длинные варианты — первыми (HBO Max раньше HBO)."""
     table = {**DEFAULT, **CUSTOM, **(extra or {})}

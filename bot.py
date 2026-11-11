@@ -7212,7 +7212,12 @@ async def load_pronunciations() -> dict[str, str]:
         table = json.loads(raw) if raw else {}
     except ValueError:
         table = {}
-    shorts_pronounce.CUSTOM = table if isinstance(table, dict) else {}
+    table = table if isinstance(table, dict) else {}
+    fixed = shorts_pronounce.repair(table)
+    if fixed != table:  # запись «а = б В = г» одной строкой — разложить на пары и сохранить
+        table = fixed
+        await set_shorts_setting("pronounce", json.dumps(table, ensure_ascii=False))
+    shorts_pronounce.CUSTOM = table
     mode = await shorts_setting("stress_mode")
     if mode in shorts_daily.STRESS_MODES:
         shorts_daily.stress_mode = mode
@@ -7811,16 +7816,15 @@ async def say_action(message: Message, arg: str) -> None:
         await message.answer(f"✅ Удалено: {escape(word)}")
         return
     if "=" in arg:
-        word, _, spoken = (x.strip() for x in arg.partition("="))
-        if not word or not spoken:
-            await message.answer("Формат: <code>/say IMAX = Аймакс</code>")
+        pairs = shorts_pronounce.parse_pairs(arg)
+        if not pairs:
+            await message.answer("Формат: <code>/say IMAX = Аймакс</code> (несколько слов — каждое с новой строки)")
             return
-        table[word] = spoken
+        table.update(pairs)
         await set_shorts_setting("pronounce", json.dumps(table, ensure_ascii=False))
-        await message.answer(
-            f"✅ «{escape(word)}» теперь читается как «{escape(shorts_pronounce.mark_stress(spoken))}».\n"
-            f"Проверить: <code>/voice {escape(word)}</code>"
-        )
+        rows = [f"• «{escape(w)}» → «{escape(shorts_pronounce.mark_stress(v))}»" for w, v in pairs]
+        await message.answer("✅ Теперь читается так:\n" + "\n".join(rows)
+                             + f"\nПроверить: <code>/voice {escape(pairs[0][0])}</code>")
         return
 
     lines = ["🗣 <b>Произношение в озвучке</b>"]
@@ -15849,7 +15853,7 @@ def _wd_video_kb(key: str) -> InlineKeyboardMarkup:
     row = [_btn("✅ Принять", f"wd:va:{key}"), _btn("🎙 Звук", f"wd:vs:{key}")]
     if key not in ("i", "o"):
         row.append(_btn("🎞 Видео", f"wd:vv:{key}"))
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=[row, [_btn("🔁 Заново: голос и видео", f"wd:vf:{key}")]])
 
 
 async def start_weekly_draft(bot: Bot, chat_ids: list[int], script: dict[str, Any], pool: list[dict[str, Any]],
@@ -16090,28 +16094,43 @@ async def wd_block_job(bot: Bot, key: str, mode: str, sure: bool = False) -> Non
         await bot.send_message(chat, "⏳ Сейчас идёт другой монтаж — нажми через пару минут.")
         return
     work = WEEKLY_DRAFT_DIR / draft["id"]
-    status = await bot.send_message(chat, "🎙 Переозвучиваю исправленные фразы…" if mode == "vs"
-                                    else "🎞 Подбираю другие картинки и монтирую заново (голос тот же)…")
+    status = await bot.send_message(chat, {"vs": "🎙 Переозвучиваю исправленные фразы…",
+                                           "vv": "🎞 Подбираю другие картинки и монтирую заново (голос тот же)…"}.get(
+        mode, "🔁 Записываю голос заново и монтирую кусок с другими картинками…"))
     try:
         async with shorts_lock:
             await load_pronunciations()
             await load_voice()
             block = draft["blocks"][key]
+            from PIL import Image as PILImage
+            first = PILImage.open(work / "first.jpg").convert("RGB") if (work / "first.jpg").exists() else None
+            script = draft["script"]
+            if mode == "vf":  # голос заново: озвученные фразы куска — из кэша вон, Lumean запишет их снова
+                lines = script["intro"] if key == "i" else script["outro"] if key == "o" else \
+                    script["stories"][int(key) - 1]["lines"]
+                for text in await shorts_daily.spoken_lines(lines, careful=True):
+                    shorts_daily._voice_key(shorts_daily._for_lumean(text), shorts_lumean.PAUSE).unlink(missing_ok=True)
             if mode == "vs":
                 fixed = await shorts_weekly.revoice_block(work, block, sure)
                 note = f"🎙 Переозвучено фраз: {len(fixed)}, картинка та же."
+            elif key in ("i", "o"):
+                music = shorts_weekly.main_music()
+                if key == "i":
+                    teaser = [PILImage.open(f).convert("RGB") for f in sorted(work.glob("teaser_src_*.jpg"))]
+                    block = await shorts_weekly.build_intro(work, script, teaser, first, draft["label"], music)
+                else:
+                    block = await shorts_weekly.build_outro(work, script, first, music)
+                note = "🔁 Голос записан заново."
             else:
                 n = int(key)
                 story = draft["script"]["stories"][n - 1]
                 used: list[str] = []
                 avoid = set(draft["urls"].get(key) or [])
                 imgs = await shorts_weekly.story_images(story, draft["pool"], TMDB_API_KEY, avoid=avoid, used=used)
-                from PIL import Image as PILImage
-                first = PILImage.open(work / "first.jpg").convert("RGB") if (work / "first.jpg").exists() else None
                 block = await asyncio.wait_for(shorts_weekly.build_story(
                     work, story, n, len(draft["script"]["stories"]), imgs, first, TMDB_API_KEY,
                     shorts_weekly.main_music()), timeout=20 * 60)
-                note = "🎞 Другие картинки, голос тот же."
+                note = "🔁 Голос записан заново, другие картинки." if mode == "vf" else "🎞 Другие картинки, голос тот же."
                 await wd_update(lambda d: d["urls"].update({key: list(avoid | set(used))}))
 
             def put(d: dict[str, Any]) -> None:
@@ -16121,7 +16140,10 @@ async def wd_block_job(bot: Bot, key: str, mode: str, sure: bool = False) -> Non
             await status.delete()
             await _wd_send_block(bot, draft, key, note)
     except Exception as exc:  # noqa: BLE001
-        if not await _revoice_guard(bot, chat, status, exc, f"wd:vs:{key}:go"):
+        if isinstance(exc, shorts_project.TooLong):
+            await _edit_quiet(status, f"⚠️ {escape(str(exc))}.\nНажми «🔁 Заново: голос и видео» — кусок соберётся "
+                                      "под новую озвучку без наложений.")
+        elif not await _revoice_guard(bot, chat, status, exc, f"wd:vs:{key}:go"):
             logging.exception("Weekly draft block fix failed")
             await _edit_quiet(status, f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
 
@@ -16194,7 +16216,7 @@ async def weekly_draft_buttons(callback: CallbackQuery, state: FSMContext) -> No
     elif action == "as":
         await callback.answer("🔗 Склеиваю")
         _run_job(lambda: wd_assemble_job(bot))
-    elif action in ("vs", "vv"):
+    elif action in ("vs", "vv", "vf"):
         await callback.answer("Принято в работу")
         _run_job(lambda: wd_block_job(bot, key, action, sure))
     elif action == "va":

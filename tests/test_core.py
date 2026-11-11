@@ -776,3 +776,32 @@ def test_lumean_timeout_grows_for_big_tasks():
     assert ai.lumean_timeout("x" * 1000) == 150
     assert ai.lumean_timeout("x" * 30000) == 300 and ai.lumean_timeout("x", 12000) == 300
     assert ai._retry_after({}, {}, "try again in 1m30.5s") == 90.5
+
+
+def test_say_many_pairs_in_one_line():
+    """/say несколькими парами в одну строку — каждая пара отдельно (раньше голос читал весь список)."""
+    from shorts import pronounce
+    pairs = pronounce.parse_pairs("Средиземье = средИземье Кольца власти = кОльца влАсти критики = крИтики\n"
+                                  "Prime Video = прайм вИдео")
+    assert pairs == [("Средиземье", "средИземье"), ("Кольца власти", "кОльца влАсти"), ("критики", "крИтики"),
+                     ("Prime Video", "прайм вИдео")]
+    assert pronounce.repair({"Средиземье": "средИземье критики = крИтики", "IMAX": "Аймакс"}) == \
+        {"Средиземье": "средИземье", "критики": "крИтики", "IMAX": "Аймакс"}
+
+
+def test_patch_voice_refuses_overlap(tmp_path):
+    """Новая фраза намного длиннее старой — не накладываем на соседние, а просим пересобрать кусок заново."""
+    import asyncio
+    import shutil
+    import subprocess
+
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нет ффмпег")
+    from shorts import project
+    for name, d in (("old.wav", 4.4), ("new.mp3", 6.0)):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=f=440:d={d}", str(tmp_path / name)],
+                       check=True)
+    voice = {"starts": [0, 2.2], "speech": [2, 2]}
+    with pytest.raises(project.TooLong):
+        asyncio.run(project.patch_voice(tmp_path / "old.wav", voice, {0: tmp_path / "new.mp3"}, tmp_path / "o.wav"))
