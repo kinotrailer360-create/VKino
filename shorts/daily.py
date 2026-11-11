@@ -936,10 +936,20 @@ def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
     return " ".join(parts)
 
 
+def _hook(theme: Theme, films: list[dict[str, Any]]) -> str:
+    """Первая фраза: тема и интрига — у номера один высокий рейтинг, досмотри до конца (половина зрителей уходит в
+    первые секунды; «5 свежих премьер» без крючка досматривали на 40–50 %)."""
+    best = films[-1] if films else {}
+    rating, src = _rating(best) if best and not theme.upcoming else (0, "")
+    if rating and rating >= 7.5:
+        return f"{theme.hook}! Номер один — {src} {rating:.1f}, досмотри до конца."
+    return f"{theme.hook}!"
+
+
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
     # короткое начало — первые секунды решают, досмотрят ли ролик; «сохрани» — в конце
     n = len(films)
-    return ([f"{theme.hook}!"]
+    return ([_hook(theme, films)]
             + [_say_film(f, theme, n - i) for i, f in enumerate(films)]
             + [f"Какой посмотришь первым? Пиши в комментариях! {SAVE_AND_SUBSCRIBE}"])
 
@@ -1529,9 +1539,37 @@ async def word_timeline(voice: Path, starts: list[float], spans: list[dict[str, 
 
 # ---------------------------------------------------------------- SEO
 
+# поисковый запрос в начале названия (поиск YouTube — четверть просмотров канала): по теме ролика
+SEARCH_HEAD = {"online": ["Что посмотреть", "Новинки онлайн", "Фильмы на вечер"],
+               "cinema": ["Что посмотреть в кино", "Сейчас в кино", "Новинки кино"],
+               "series": ["Что посмотреть из сериалов", "Новые сериалы", "Сериалы на вечер"],
+               "upcoming": ["Самые ожидаемые фильмы", "Скоро в кино", "Премьеры"],
+               "genre": ["Топ фильмов", "Что посмотреть", "Фильмы на вечер"]}
+
+
+def list_title(theme: Theme, films: list[dict[str, Any]], seed: int | None = None) -> str:
+    """Название подборки: запрос + конкретные названия + эмоция, каждый раз по-разному (YouTube не любит
+    одинаковые шаблонные названия — правило о неоригинальном контенте). Лучшие фильмы — первыми."""
+    names = [_title(f) for f in films[::-1]]  # в ролике №1 последний — в названии первым
+    if len(names) < 2 or theme.key == "custom":  # своя подборка — название автора (оно у вас лучшее)
+        return f"{theme.seo_title} #shorts"
+    rnd = random.Random(seed)
+    head = rnd.choice(SEARCH_HEAD.get(theme.key.split(":")[0], ["Что посмотреть"]))
+    rest = len(names) - 2
+    more = f" и ещё {rest}" if rest > 0 else ""
+    emoji = rnd.choice(["🔥", "🍿", "🤯", "😱", "🎬"])
+    variants = [f"{head}: «{names[0]}», «{names[1]}»{more} {emoji}",
+                f"«{names[0]}», «{names[1]}»{more} — {head.lower()} {emoji}",
+                f"{head} — {theme.hook.lower()}: «{names[0]}» и не только {emoji}"]
+    for title in rnd.sample(variants, len(variants)):
+        if len(title) <= 90:
+            return f"{title} #shorts"
+    return f"{head}: «{names[0][:40]}»{more} {emoji} #shorts"
+
+
 def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
     names = [_title(f) for f in films]
-    title = f"{theme.seo_title} #shorts"
+    title = list_title(theme, films)
     if len(title) > 100:
         title = title[:90].rstrip() + "… #shorts"
 

@@ -866,3 +866,15 @@ def test_own_video_moments_cut_full_screen(tmp_path, monkeypatch):
     probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0",
                             str(tmp_path / got[0][0])], capture_output=True, text=True).stdout.strip()
     assert probe == "1080,1920"
+
+
+def test_list_title_has_query_names_and_varies():
+    from datetime import date
+
+    from shorts import daily
+    theme = daily.theme_for("online", date(2026, 11, 12))
+    films = [{"name": "Фильм В", "rating": {"imdb": 7.0}}, {"name": "Фильм Б"}, {"name": "Фильм А", "rating": {"imdb": 8.4}}]
+    titles = {daily.list_title(theme, films, s) for s in range(12)}
+    assert len(titles) > 1  # не один шаблон на все ролики
+    assert all("«Фильм А»" in t and t.endswith("#shorts") and len(t) <= 100 for t in titles)
+    assert "досмотри до конца" in daily.voice_lines(theme, films)[0]
