@@ -281,6 +281,24 @@ def _keep_case(original: str, spoken: str) -> str:
     return spoken
 
 
+def dictionary_stressed() -> set[str]:
+    """Слова со знаком ударения из словаря (встроенного и своего /say) — их ударение голос получает всегда, даже
+    когда ударения от ИИ выключены (режим off): иначе «/say алая = АлАя» ничего не меняло."""
+    out: set[str] = set()
+    for value in list(DEFAULT.values()) + list(CUSTOM.values()):
+        for word in re.findall(rf"[\w{STRESS}-]+", mark_stress(value)):
+            if STRESS in word:
+                out.add(word.lower())
+    return out
+
+
+def keep_dictionary_stress(text: str) -> str:
+    """Убрать знаки ударения, кроме слов из словаря."""
+    keep = dictionary_stressed()
+    return re.sub(rf"[\w{STRESS}-]+", lambda m: m.group(0) if m.group(0).lower() in keep
+                  else m.group(0).replace(STRESS, ""), text)
+
+
 def parse_pairs(text: str) -> list[tuple[str, str]]:
     """/say: пары «слово = как читать». Каждая строка — пара; несколько пар в одной строке
     («Средиземье = средИземье Кольца власти = кОльца влАсти») делим так: в значении столько слов, сколько в

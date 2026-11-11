@@ -805,3 +805,12 @@ def test_patch_voice_refuses_overlap(tmp_path):
     voice = {"starts": [0, 2.2], "speech": [2, 2]}
     with pytest.raises(project.TooLong):
         asyncio.run(project.patch_voice(tmp_path / "old.wav", voice, {0: tmp_path / "new.mp3"}, tmp_path / "o.wav"))
+
+
+def test_dictionary_stress_survives_stress_off(monkeypatch):
+    """Ударения ИИ выключены (режим off), но ударения из /say голос получает: «Ала́я», «мое́й», «го́ры»."""
+    from shorts import daily, pronounce
+    monkeypatch.setattr(pronounce, "CUSTOM", dict(pronounce.parse_pairs("Алая = АлАя\nмоей = моЕй\nгоры = гОры")))
+    monkeypatch.setattr(daily, "stress_mode", "off")
+    text = pronounce.apply("Алая Ведьма у горы моей") + " сказа́л"
+    assert daily._for_lumean(text) == "Ала́я Ведьма у го́ры мое́й сказал"
