@@ -1234,7 +1234,8 @@ stress_mode = "names" if os.getenv("LUMEAN_STRESS", "0") == "1" else "off"
 
 
 def _for_lumean(text: str) -> str:
-    return text.replace(pronounce.STRESS, "") if stress_mode == "off" else text
+    # режим off — ударения ИИ голосу не отдаём (он от них сбивался), но ударения из словаря (/say) — всегда
+    return pronounce.keep_dictionary_stress(text) if stress_mode == "off" else text
 
 
 def _speakable(text: str) -> str:
