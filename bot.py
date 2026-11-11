@@ -257,6 +257,10 @@ MAIN_MENU_LABELS = {
 }
 
 
+class WeeklyEditState(StatesGroup):
+    text = State()  # автор присылает свой текст новости выпуска (кнопка «📝 Свой текст»)
+
+
 class SearchState(StatesGroup):
     query = State()
     describe = State()
@@ -15790,8 +15794,55 @@ def _wd_text(draft: dict[str, Any], key: str) -> str:
 
 def _wd_text_kb(key: str) -> InlineKeyboardMarkup:
     row = [_btn("✅ Принять", f"wd:ta:{key}"), _btn("✍️ Переписать", f"wd:tr:{key}")]
-    rows = [row] + ([[_btn("🔄 Другая новость", f"wd:tn:{key}")]] if key not in ("i", "o") else [])
+    rows = [row, [_btn("📝 Свой текст", f"wd:te:{key}")]
+            + ([_btn("🔄 Другая новость", f"wd:tn:{key}")] if key not in ("i", "o") else [])]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _wd_phrases(text: str) -> list[str]:
+    """Текст автора → фразы для голоса (по предложениям), без пустых и служебных строк."""
+    text = re.sub(r"📎 Источник.*", "", text, flags=re.S)
+    return [x.strip() for x in re.split(r"(?<=[.!?…])\s+|\n+", text) if len(x.strip()) >= 2]
+
+
+@router.message(WeeklyEditState.text, F.text, ~F.text.startswith("/"))
+async def weekly_own_text(message: Message, state: FSMContext) -> None:
+    """Свой текст новости (или вступления и финала): заменяет текст ИИ как есть, без переписывания."""
+    data = await state.get_data()
+    await state.clear()
+    key = str(data.get("wd_key") or "")
+    text = message.text or ""
+    head = re.match(r"\s*📰[^\n]*\n+", text)  # скопировали сообщение целиком — шапку отрезаем
+    if head:
+        text = text[head.end():]
+    if key == "i":
+        intro_part, _, outro_part = re.sub(r"^\s*🎙[^\n]*\n+", "", text).partition("Финал:")
+        intro = _wd_phrases(intro_part.replace("Вступление:", ""))
+        outro = _wd_phrases(outro_part)
+        if not intro:
+            await message.answer("Не вижу текста вступления — нажми «📝 Свой текст» ещё раз.")
+            return
+    else:
+        lines = _wd_phrases(text)
+        if len(lines) < 2:
+            await message.answer("Слишком коротко для новости — нажми «📝 Свой текст» ещё раз и пришли текст целиком.")
+            return
+
+    def put(d: dict[str, Any]) -> None:
+        d["text_ok"][key] = False
+        if key == "i":
+            d["script"]["intro"] = intro
+            if outro:
+                d["script"]["outro"] = outro
+        else:
+            d["script"]["stories"][int(key) - 1]["lines"] = lines
+
+    draft = await wd_update(put)
+    if not draft or draft.get("stage") != "text":
+        await message.answer("Черновик выпуска уже не на шаге текстов — свой текст можно прислать до монтажа.")
+        return
+    await message.answer("✅ Текст заменён на твой. Проверь и нажми «✅ Принять»:\n\n" + _wd_text(draft, key),
+                         reply_markup=_wd_text_kb(key), disable_web_page_preview=True)
 
 
 def _wd_video_kb(key: str) -> InlineKeyboardMarkup:
@@ -16113,7 +16164,7 @@ async def wd_assemble_job(bot: Bot) -> None:
 
 
 @router.callback_query(F.data.startswith("wd:"))
-async def weekly_draft_buttons(callback: CallbackQuery) -> None:
+async def weekly_draft_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user.id not in ADMIN_IDS or not callback.message:
         await callback.answer()
         return
@@ -16122,6 +16173,15 @@ async def weekly_draft_buttons(callback: CallbackQuery) -> None:
     sure = parts[-1] == "go" and len(parts) > 3
     if action in ("ta", "tr", "tn"):
         await wd_text_action(callback, action, key)
+        return
+    if action == "te":
+        await callback.answer()
+        await state.set_state(WeeklyEditState.text)
+        await state.update_data(wd_key=key)
+        await callback.message.answer(
+            "📝 Пришли свой текст " + ("вступления (а после строки «Финал:» — текст финала)" if key == "i"
+                                       else f"новости {key}") + " одним сообщением. Удобно: скопируй текст выше, "
+            "поправь и отправь — заменю как есть, без переписывания ИИ. Отмена — /cancel.")
         return
     draft = await wd_load()
     if not draft:
