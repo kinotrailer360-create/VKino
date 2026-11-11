@@ -128,6 +128,12 @@ async def _lumean_pick_model(session: aiohttp.ClientSession) -> str:
     raise AIError(f"Lumean ИИ: не нашёл подходящую модель среди {ids[:10]}")
 
 
+def lumean_timeout(prompt: str, max_tokens: int = 4000) -> int:
+    """Большое задание (сценарий выпуска: 30 тыс. знаков новостей и длинный ответ) модель пишет дольше 2,5 минут —
+    раньше бот обрывал его на 150 с («Lumean ИИ не ответил») и платил за пустой запрос."""
+    return 300 if len(prompt) > 20000 or max_tokens > 4000 else 150
+
+
 async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens: int = 4000) -> Any:
     """Запрос к сильной модели через ИИ-шлюз Lumean (OpenAI Chat Completions), ответ — JSON."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -138,7 +144,8 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
         small.convert("RGB").save(buf, "JPEG", quality=82)
         content.append({"type": "image_url", "image_url": {
             "url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}})
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=150)) as session:
+    started = time.monotonic()
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=lumean_timeout(prompt, max_tokens))) as session:
         model = await _lumean_pick_model(session)
         body = {"model": model, "temperature": 0.3, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": "Отвечай только валидным JSON, без пояснений."},
@@ -149,18 +156,27 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
             async with session.post(f"{LUMEAN_LLM_URL}/chat/completions", json=body,
                                     headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
                 data = await resp.json(content_type=None)
-                status = resp.status
+                status, headers = resp.status, resp.headers
             used = (data.get("usage") or {}) if isinstance(data, dict) else {}
             t_in, t_out = int(used.get("prompt_tokens") or 0), int(used.get("completion_tokens") or 0)
             actual = 0.0 if status != 200 else (budget.lumean_cost(t_in, t_out) if used else None)
             await r.settle(actual, {"http": status, "in": t_in, "out": t_out})
+    _track("lumean", model, "ok" if status == 200 else f"http_{status}", started, t_in, t_out)
     if status == 200:
         _count_lumean(data)
     if status != 200:
         err = (data.get("error") or {}) if isinstance(data, dict) else {}
-        raise AIError(f"Lumean ИИ HTTP {status} ({model}): {str(err.get('message') or err.get('code') or data)[:200]}")
+        text = str(err.get('message') or err.get('code') or data)[:200]
+        if status == 429 or status >= 500:  # перегрузка или лимит шлюза — минуты не беспокоим
+            cooldown("lumean", _retry_after(headers, data, text) or 300, f"HTTP {status}")
+        elif status in (401, 402, 403):  # ключ или баланс — само не пройдёт, час не тратим время
+            cooldown("lumean", 3600, "ключ не принят или кончился баланс")
+        raise AIError(f"Lumean ИИ HTTP {status} ({model}): {text}")
     try:
-        return _json_from(data["choices"][0]["message"]["content"])
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "length":
+            raise AIError(f"Lumean ИИ: ответ обрезан на {max_tokens} токенах ({model})")
+        return _json_from(choice["message"]["content"])
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise AIError(f"Lumean ИИ: неожиданный ответ ({exc})") from exc
 
@@ -171,6 +187,76 @@ class AIError(RuntimeError):
 
 last_error: str | None = None  # причина последнего сбоя — бот показывает её админу
 last_engine = ""  # кто ответил в последний раз: gemini / lumean / reserve (слабые запасные: Groq, BeatAPI)
+
+
+class AllBusy(AIError):
+    """Ни один ИИ не ответил; retry_in — через сколько секунд освободится ближайший (None — неизвестно)."""
+
+    def __init__(self, message: str, retry_in: float | None) -> None:
+        super().__init__(message)
+        self.retry_in = retry_in
+
+
+# ---------------------------------------------------------------- состояние провайдеров
+# провайдер упёрся в лимит или сломался — до этого времени (time.monotonic) к нему не ходим: запрос сразу идёт к
+# следующему, а не тратит время и лимит на заведомый отказ
+_cool: dict[str, tuple[float, str]] = {}
+provider_stats: dict[str, dict[str, Any]] = {}  # провайдер → {"ok", "fail", "last", "in", "out"}
+switches = 0  # сколько раз запрос ушёл к следующему провайдеру (с запуска бота)
+NAMES = {"lumean": "Lumean ИИ", "gemini": "Gemini", "reserve": "резервный ИИ", "beat": "BeatAPI"}
+
+
+def cooldown(name: str, seconds: float, reason: str) -> None:
+    seconds = max(30.0, min(seconds, 24 * 3600))
+    _cool[name] = (time.monotonic() + seconds, reason)
+    log.warning("ai_provider_cooldown provider=%s seconds=%.0f reason=%s", name, seconds, reason)
+
+
+def cooling(name: str) -> str | None:
+    """Причина паузы провайдера («лимит, снова через 12 мин») или None — можно спрашивать."""
+    until, why = _cool.get(name, (0.0, ""))
+    left = until - time.monotonic()
+    if left <= 0:
+        return None
+    return f"{NAMES.get(name, name)}: {why}, снова через {max(1, round(left / 60))} мин"
+
+
+def _track(name: str, model: str, outcome: str, started: float, t_in: int = 0, t_out: int = 0) -> None:
+    """Журнал вызова: провайдер, модель, исход, время ответа, токены, когда снова можно, сколько переключений."""
+    st = provider_stats.setdefault(name, {"ok": 0, "fail": 0, "last": "", "in": 0, "out": 0})
+    st["ok" if outcome == "ok" else "fail"] += 1
+    st["last"], st["in"], st["out"] = outcome, st["in"] + t_in, st["out"] + t_out
+    until = _cool.get(name, (0.0, ""))[0] - time.monotonic()
+    log.info("ai_call provider=%s model=%s outcome=%s ms=%d in=%d out=%d next_in_s=%d switches=%d", name, model,
+             outcome, (time.monotonic() - started) * 1000, t_in, t_out, max(0, until), switches)
+
+
+def retry_in() -> float | None:
+    """Через сколько секунд освободится хоть один ИИ (по паузам провайдеров и лимитам ключей Gemini)."""
+    now = time.monotonic()
+    waits = [until - now for until, _ in _cool.values()] + [until - now for until in _quota_until.values()]
+    waits = [w for w in waits if w > 0]
+    return min(waits) if waits else None
+
+
+def _retry_after(headers: Any, data: Any, text: str = "") -> float:
+    """Сколько ждать по ответу провайдера: заголовок Retry-After, «try again in 1m2.5s», retry_after_seconds."""
+    try:
+        if headers and headers.get("retry-after"):
+            return float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        pass
+    err = (data.get("error") or {}) if isinstance(data, dict) else {}
+    if isinstance(err, dict) and err.get("retry_after_seconds"):
+        try:
+            return float(err["retry_after_seconds"])
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", text or json.dumps(data, ensure_ascii=False))
+    if m and any(m.groups()):
+        h, mi, sec = (float(x) if x else 0.0 for x in m.groups())
+        return h * 3600 + mi * 60 + sec
+    return 0.0
 
 
 def _thumb(img: Image.Image, size: int = 448) -> dict[str, Any]:
@@ -469,29 +555,56 @@ def _fit(prompt: str, limit: int = RESERVE_MAX_CHARS) -> str:
 
 
 async def _ask_reserve(prompt: str, image: Image.Image | None = None) -> Any:
-    """Запрос к резервному OpenAI-совместимому ИИ (по умолчанию Groq)."""
-    content: list[dict[str, Any]] = [{"type": "text", "text": _fit(prompt)}]
+    """Запрос к резервному OpenAI-совместимому ИИ (по умолчанию Groq). HTTP 429 не повторяется вслепую:
+    задание больше минутного лимита токенов («Limit 6000, Requested 8123») — один раз ужимаем его под лимит;
+    лимит ненадолго — ждём сколько просят (до 20 с); надолго — пауза провайдера, запрос идёт к следующему."""
+    picture = None
     if image is not None:
         small = image.copy()
         small.thumbnail((1920, 1920))
         buf = io.BytesIO()
         small.save(buf, "JPEG", quality=80)
-        url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-        content.append({"type": "image_url", "image_url": {"url": url}})
-    body = {"model": RESERVE_MODEL, "temperature": 0.2,
-            "messages": [{"role": "user", "content": content}]}
+        picture = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,"
+                                                      + base64.b64encode(buf.getvalue()).decode()}}
+    limit = RESERVE_MAX_CHARS
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for delay in (*RETRY_DELAYS, None):
+        for attempt in range(2):
+            text = _fit(prompt, limit)
+            body = {"model": RESERVE_MODEL, "temperature": 0.2,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": text}] + ([picture] if picture else [])}]}
+            started = time.monotonic()
             async with session.post(RESERVE_URL, json=body,
                                     headers={"Authorization": f"Bearer {RESERVE_KEY}"}) as resp:
-                status, data = resp.status, await resp.json(content_type=None)
-            if status not in BUSY or delay is None:
+                status, data, headers = resp.status, await resp.json(content_type=None), resp.headers
+            used = (data.get("usage") or {}) if isinstance(data, dict) else {}
+            _track("reserve", RESERVE_MODEL, "ok" if status == 200 else f"http_{status}", started,
+                   int(used.get("prompt_tokens") or 0), int(used.get("completion_tokens") or 0))
+            if status == 200:
                 break
-            await asyncio.sleep(delay)
+            msg = str((data.get("error") or {}).get("message") if isinstance(data, dict) else data)
+            if status == 429:
+                wait = _retry_after(headers, data, msg)
+                too_big = re.search(r"Limit (\d+), Requested (\d+)", msg)
+                if attempt == 0 and too_big and int(too_big[2]) > int(too_big[1]):
+                    smaller = int(len(text) * int(too_big[1]) / int(too_big[2]) * 0.85)
+                    if smaller >= len(text) * 0.5:  # ужать можно без потери смысла задания
+                        limit = smaller
+                        await asyncio.sleep(min(wait, 20))
+                        continue
+                if attempt == 0 and 0 < wait <= 20:
+                    await asyncio.sleep(wait)
+                    continue
+                daily = "per day" in msg.lower() or "(tpd)" in msg.lower() or "(rpd)" in msg.lower()
+                cooldown("reserve", wait or (3600 if daily else 120), "лимит " + ("на день" if daily else "в минуту"))
+            elif status in (500, 502, 503) and attempt == 0:
+                await asyncio.sleep(4)
+                continue
+            elif status in (401, 403):
+                cooldown("reserve", 3600, "ключ не принят")
+            break
     if status != 200:
-        msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else data
-        raise AIError(f"резервный ИИ HTTP {status} ({RESERVE_MODEL}): {str(msg)[:200]}")
+        raise AIError(f"резервный ИИ HTTP {status} ({RESERVE_MODEL}): {msg[:200]}")
     try:
         return _json_from(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, ValueError) as exc:
@@ -513,17 +626,35 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
 
     global last_engine
 
+    global switches
+
+    def skip(name: str) -> bool:
+        why = cooling(name)
+        if why:
+            errors.append(why)
+        return bool(why)
+
+    def failed(name: str, exc: BaseException, default: str) -> None:
+        global switches
+        switches += 1
+        errors.append(str(exc) or default)
+        log.warning("shorts: %s failed: %s", name, exc or default)
+
     async def ask_lumean() -> Any:
         global last_engine
+        if skip("lumean"):
+            return None
+        # платная модель: длинное задание урезаем (середина), чтобы один запрос не стоил как десять; важному —
+        # длинный ответ (сценарий выпуска из 7 новостей в 4000 токенов не влезал)
+        text, tokens = _fit(prompt, LUMEAN_MAX_CHARS), 12000 if premium else 4000
+        wait = lumean_timeout(text, tokens) + 10
         try:
-            # платная модель: длинное задание урезаем (середина), чтобы один запрос не стоил как десять
-            result = await asyncio.wait_for(_ask_lumean(_fit(prompt, LUMEAN_MAX_CHARS), image), RESERVE_BUDGET + 60)
+            result = await asyncio.wait_for(_ask_lumean(text, image, tokens), wait)
             log.info("shorts: Lumean LLM answered")
             last_engine = "lumean"
             return result
         except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc) or "Lumean ИИ не ответил")
-            log.warning("shorts: Lumean LLM failed: %s", exc)
+            failed("Lumean LLM", exc, f"Lumean ИИ не ответил за {wait} с")
             return None
 
     if lumean_first:
@@ -536,33 +667,30 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             last_engine = "gemini"
             return result
         except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
-            log.warning("shorts: Gemini failed: %s", exc)
-    if RESERVE_KEY:
+            failed("Gemini", exc, "Gemini не ответил")
+    if RESERVE_KEY and not skip("reserve"):
         try:
             result = await asyncio.wait_for(_ask_reserve(prompt, image), RESERVE_BUDGET)
             log.info("shorts: reserve AI (%s) answered", RESERVE_MODEL)
             last_engine = "reserve"
             return result
         except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc) or f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
-            log.warning("shorts: reserve AI failed: %s", exc)
+            failed("reserve AI", exc, f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
     if not lumean_first and lumean_llm_on() and not blind:  # бесплатные не ответили — платный запасной
         result = await ask_lumean()
         if result is not None:
             return result
-    if BEAT_KEY:
+    if BEAT_KEY and not skip("beat"):
         try:
             result = await asyncio.wait_for(_ask_beat(prompt, image), RESERVE_BUDGET)
             log.info("shorts: BeatAPI (%s) answered", _beat_model or BEAT_MODEL)
             last_engine = "reserve"
             return result
         except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc) or f"BeatAPI не ответил за {RESERVE_BUDGET} с")
-            log.warning("shorts: BeatAPI failed: %s", exc)
+            failed("BeatAPI", exc, f"BeatAPI не ответил за {RESERVE_BUDGET} с")
     if not RESERVE_KEY and not BEAT_KEY:
         errors.append("резервный ИИ не подключён: бот не видит переменную RESERVE_AI_KEY")
-    raise AIError("; ".join(errors))
+    raise AllBusy("; ".join(errors), retry_in())
 
 
 _beat_model = ""
@@ -827,9 +955,12 @@ async def _ask_beat(prompt: str, image: Image.Image | None = None, model: str | 
             async with session.post(f"{BEAT_URL}/chat/completions", json=body, headers=headers) as resp:
                 status, data = resp.status, await resp.json(content_type=None)
             err = (data.get("error") or {}) if isinstance(data, dict) else {}
-            if status == 429 and attempt == 0:  # лимит бесплатной модели — подождать и повторить один раз
-                await asyncio.sleep(min(float(err.get("retry_after_seconds") or 30), 65))
+            wait = _retry_after(resp.headers, data)
+            if status == 429 and attempt == 0 and wait <= 65:  # лимит бесплатной модели — подождать один раз
+                await asyncio.sleep(wait or 30)
                 continue
+            if status == 429:
+                cooldown("beat", wait or 120, "лимит")
             break
     if status != 200:
         raise AIError(f"BeatAPI HTTP {status} {err.get('code') or ''} ({model}): {str(err.get('message') or data)[:200]}")

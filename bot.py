@@ -8092,6 +8092,12 @@ async def ai_status_action(message: Message) -> None:
     else:
         rows.append("Сегодня запросов к Lumean не было (считается с последнего запуска бота).")
     rows.append("Озвучка клоном голоса тоже идёт с баланса Lumean: выпуск на 6–8 минут — самое дорогое.")
+    paused = [w for w in (shorts_ai.cooling(n) for n in shorts_ai.NAMES) if w]
+    stats = [f"{shorts_ai.NAMES.get(n, n)}: ✅ {st['ok']} / ❌ {st['fail']} (последний: {st['last']})"
+             for n, st in shorts_ai.provider_stats.items()]
+    if paused or stats:
+        rows.append("\n🔁 <b>ИИ с запуска бота</b> (переключений на запасной: " + str(shorts_ai.switches) + ")\n"
+                    + "\n".join(escape(x) for x in stats + [f"⏸ {w}" for w in paused]))
     rows += await expenses_rows()
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
@@ -15872,7 +15878,10 @@ async def wd_text_action(callback: CallbackQuery, action: str, key: str) -> None
     try:
         fresh = await _wd_rewrite(draft, key, action == "tn")
     except Exception as exc:  # noqa: BLE001
-        await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+        wait = getattr(exc, "retry_in", None)
+        await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>"
+                             + (f"\n⏸ Все ИИ на лимитах — ближайший освободится через ≈{max(1, round(wait / 60))} мин. "
+                                "Тексты и принятые новости сохранены, нажми кнопку снова позже." if wait else ""))
         return
 
     def put(d: dict[str, Any]) -> None:
@@ -16564,15 +16573,21 @@ async def weekly_video_job(bot: Bot) -> None:
         week = now.date().isoformat()  # попытки — на этот день выпуска
         tries = await shorts_setting("weekly_video_tries") or ""
         n = int(tries.split(":")[1]) if tries.startswith(week + ":") else 0
-        retry = n < 1 and "уже собирается" not in str(exc)
+        # все ИИ на лимитах — повтор, когда освободится ближайший (а не через 30 минут в тот же отказ)
+        wait = getattr(exc, "retry_in", None)
+        retry = (n < 1 or wait is not None and n < 3) and "уже собирается" not in str(exc)
+        delay = min(max((wait or 0) + 120, 1800), 6 * 3600)
         await set_shorts_setting("weekly_video_tries", f"{week}:{n + 1}")
         if retry:
-            await set_shorts_setting("weekly_video_retry_at", str(time.time() + 1800))
+            await set_shorts_setting("weekly_video_retry_at", str(time.time() + delay))
             await set_shorts_setting("weekly_video_done", None)
+        when = (datetime.now(POST_TZ) + timedelta(seconds=delay)).strftime("%H:%M")
         for admin_id in admins:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
-                                                 "</code>\n" + ("Попробую ещё раз через 30 минут. " if retry else "")
+                                                 "</code>\n" + (f"Все ИИ сейчас на лимитах — сам повторю в {when} "
+                                                                 f"({POST_TZ_NAME}). " if retry and wait else
+                                                                 "Попробую ещё раз через 30 минут. " if retry else "")
                                        + "Собрать вручную — ▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
             except Exception:  # noqa: BLE001
                 pass
