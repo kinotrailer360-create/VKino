@@ -7453,11 +7453,18 @@ def plan_text(day: date) -> tuple[str, InlineKeyboardMarkup | None]:
     if not item and not long_video:
         return "📅 На сегодня в контент-плане ничего нет.", None
     rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать 12:00–15:00 МСК):"]
+    ready = shorts_plan.script(day)
     if item:
         kind, topic = item
         label, data, hint = shorts_plan.KINDS[kind]
-        lines.append(f"🎬 Shorts: <b>{escape(topic)}</b>" + (f"\n💡 {escape(hint)}" if hint else ""))
-        rows.append([_btn(f"{label} — собрать", data)])
+        if ready:  # готовый сценарий из контент-пакета — монтаж по нему одной кнопкой
+            lines.append(f"🎬 Shorts: <b>{escape(ready[0])}</b>\n💡 Сценарий готов. Приложи видео сцены или свои "
+                         "кадры, если есть, — ролик соберётся по смыслу фраз.")
+            rows.append([_btn("🎬 Собрать по готовому сценарию", f"pl:go:{day.isoformat()}")])
+            rows.append([_btn("📄 Показать текст", f"pl:txt:{day.isoformat()}")])
+        else:
+            lines.append(f"🎬 Shorts: <b>{escape(topic)}</b>" + (f"\n💡 {escape(hint)}" if hint else ""))
+            rows.append([_btn(f"{label} — собрать", data)])
     if long_video:
         lines.append(f"🎞 Длинное видео (суббота): <b>{escape(long_video)}</b>")
         rows.append([_btn("🎞 Выпуск «Новости кино»", "pt:wv")])
@@ -7479,6 +7486,31 @@ async def plan_reminder(bot: Bot) -> None:
             await bot.send_message(admin_id, text, reply_markup=kb)
         except Exception:  # noqa: BLE001
             logging.exception("Plan reminder to %s failed", admin_id)
+
+
+@router.callback_query(F.data.startswith("pl:"))
+async def plan_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    """Кнопки напоминания о контент-плане: собрать ролик по готовому сценарию дня или показать текст."""
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    _, action, day = (callback.data or "").split(":", 2)
+    try:
+        ready = shorts_plan.script(date.fromisoformat(day))
+    except ValueError:
+        ready = None
+    await callback.answer()
+    if not ready:
+        await callback.message.answer("Готового сценария на этот день нет.")
+        return
+    title, body = ready
+    if action == "txt":
+        await callback.message.answer(f"📄 <b>{escape(title)}</b>\n\n{escape(body)}")
+        return
+    # дальше — как «🎬 Свой сценарий»: показ текста, кнопки «📎 Свои картинки и видео», «✅ Собрать шортс»
+    await state.update_data(own_scripts=[(title, f"**Заголовок:** {title}\n{body}")], own_pick=0, lore_kind="own",
+                            lore_name=title, lore_hook="", lore_script=None, lore_media=[])
+    await own_generate(callback.message, state)
 
 
 @router.message(Command("plan"))
@@ -12663,6 +12695,78 @@ async def _yt_login(message: Message) -> str:
     return refresh
 
 
+YT_MANAGE_HELP = (
+    "▶️ <b>Управление видео на YouTube</b>\n\n"
+    "<code>/yt</code> — последние 15 видео: доступ, просмотры, ID\n"
+    "<code>/yt hide ID [ID…]</code> — скрыть (ограниченный доступ)\n"
+    "<code>/yt unlist ID</code> — доступ по ссылке\n"
+    "<code>/yt show ID</code> — открыть всем\n"
+    "<code>/yt title ID Новое название</code> — переименовать\n\n"
+    "Вместо ID можно ссылку. Пачка правок — одним сообщением, каждая команда с новой строки "
+    "(первая — с /yt):\n<code>/yt hide abc123def45\ntitle xyz789ghi01 Что посмотреть: …</code>")
+
+
+async def _yt_token(message: Message) -> str:
+    refresh = await shorts_setting("yt_refresh") or await _yt_login(message)
+    try:
+        return await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, refresh)
+    except shorts_yt.LoginExpired:
+        await set_shorts_setting("yt_refresh", None)
+        await message.answer("Вход в YouTube устарел — войдём заново.")
+        return await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, await _yt_login(message))
+
+
+@router.message(Command("yt"))
+async def youtube_manage(message: Message) -> None:
+    """Скрыть, открыть или переименовать уже загруженные видео — без YouTube Studio."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
+        await message.answer(YT_SETUP, disable_web_page_preview=True)
+        return
+    text = re.sub(r"^/yt(?:@\w+)?", "", message.text or "", count=1)
+    if text.strip().lower() in ("help", "помощь", "?"):
+        await message.answer(YT_MANAGE_HELP)
+        return
+    actions, errors = shorts_yt.parse_commands(text)
+    if errors and not actions:
+        await message.answer("⚠️ " + "\n".join(escape(e) for e in errors) + "\n\n" + YT_MANAGE_HELP)
+        return
+
+    async def job() -> None:
+        try:
+            token = await _yt_token(message)
+            if not actions:
+                rows = await shorts_yt.recent(token)
+                icon = {"public": "🟢", "unlisted": "🔗", "private": "🔒"}
+                lines = [f"{icon.get(r['privacy'], '❔')} <code>{r['id']}</code> · {r['views']} 👁 · "
+                         f"{escape(r['title'][:70])}" for r in rows]
+                await message.answer("▶️ <b>Последние видео</b>\n\n" + ("\n".join(lines) or "Видео нет.") +
+                                     "\n\n<i>/yt help — команды</i>")
+                return
+            report: list[str] = []
+            for verb, vid, value in actions:
+                try:
+                    if verb == "title":
+                        old = await shorts_yt.set_title(token, vid, value)
+                        report.append(f"✏️ <code>{vid}</code>: {escape(old[:50])} → {escape(value)}")
+                    else:
+                        title = await shorts_yt.set_privacy(token, vid, value)
+                        mark = {"private": "🔒 скрыто", "unlisted": "🔗 по ссылке", "public": "🟢 открыто"}[value]
+                        report.append(f"{mark}: {escape(title[:70])}")
+                except shorts_yt.YouTubeError as exc:
+                    report.append(f"❌ <code>{vid}</code>: {escape(str(exc)[:200])}")
+            report += [f"⚠️ {escape(e)}" for e in errors]
+            await message.answer("\n".join(report))
+        except shorts_yt.YouTubeError as exc:
+            await message.answer(f"❌ {escape(str(exc)[:300])}")
+        except Exception:  # noqa: BLE001 — сообщить, а не молча упасть в фоне
+            logging.exception("YouTube manage failed")
+            await message.answer("❌ Не получилось связаться с YouTube — подробности в логах.")
+
+    _run_job(job)
+
+
 @router.callback_query(F.data.startswith("yt:"))
 async def youtube_button(callback: CallbackQuery) -> None:
     if callback.from_user.id not in ADMIN_IDS or not callback.message:
@@ -17801,6 +17905,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="hype", description="🔥 Инфоповоды: проверить сейчас, /hype on|off"),
         BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
+        BotCommand(command="yt", description="🔒 YouTube: скрыть, открыть, переименовать видео"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),

@@ -1539,32 +1539,45 @@ async def word_timeline(voice: Path, starts: list[float], spans: list[dict[str, 
 
 # ---------------------------------------------------------------- SEO
 
-# поисковый запрос в начале названия (поиск YouTube — четверть просмотров канала): по теме ролика
-SEARCH_HEAD = {"online": ["Что посмотреть", "Новинки онлайн", "Фильмы на вечер"],
-               "cinema": ["Что посмотреть в кино", "Сейчас в кино", "Новинки кино"],
-               "series": ["Что посмотреть из сериалов", "Новые сериалы", "Сериалы на вечер"],
-               "upcoming": ["Самые ожидаемые фильмы", "Скоро в кино", "Премьеры"],
-               "genre": ["Топ фильмов", "Что посмотреть", "Фильмы на вечер"]}
+def _plural(n: int, forms: tuple[str, str, str]) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return forms[0]
+    return forms[1] if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else forms[2]
 
 
-def list_title(theme: Theme, films: list[dict[str, Any]], seed: int | None = None) -> str:
-    """Название подборки: запрос + конкретные названия + эмоция, каждый раз по-разному (YouTube не любит
-    одинаковые шаблонные названия — правило о неоригинальном контенте). Лучшие фильмы — первыми."""
-    names = [_title(f) for f in films[::-1]]  # в ролике №1 последний — в названии первым
-    if len(names) < 2 or theme.key == "custom":  # своя подборка — название автора (оно у вас лучшее)
+_FILM = ("фильм", "фильма", "фильмов")
+# тема → (начало заголовка с поисковым запросом, что считаем после «и ещё N», эмодзи)
+LIST_TITLES: dict[str, tuple[str, tuple[str, str, str] | None, str]] = {
+    "online": ("Что посмотреть", ("онлайн-премьера", "онлайн-премьеры", "онлайн-премьер"), "🔥"),
+    "fresh": ("Только вышло онлайн", ("новинка", "новинки", "новинок"), "🔥"),
+    "cinema": ("Что посмотреть в кино", _FILM, "🍿"),
+    "week": ("Премьеры недели в кино", _FILM, "🍿"),
+    "series": ("Новые сериалы", ("сериал", "сериала", "сериалов"), "📺"),
+    "upcoming": ("Скоро в кино", ("премьера", "премьеры", "премьер"), "⏳"),
+    "films": ("Что посмотреть", ("новый фильм", "новых фильма", "новых фильмов"), "🎬"),
+}
+
+
+def list_title(theme: Theme, films: list[dict[str, Any]]) -> str:
+    """Заголовок подборки с названиями лучших фильмов: у каждого ролика свой, и его находят в поиске.
+    Одинаковые «5 свежих онлайн-премьер» YouTube считает шаблонным контентом, а поиск их не различает."""
+    if theme.key.startswith("genre:"):
+        plural = GENRES.get(theme.key.split(":", 1)[1], ("", "", ""))[2]
+        spec = (f"Лучшие {plural}", None, "🎬") if plural else None
+    else:
+        spec = LIST_TITLES.get(theme.key)
+    names = [_title(f) for f in reversed(films) if _title(f)]  # последний в списке — номер один
+    if not spec or not names:
         return f"{theme.seo_title} #shorts"
-    rnd = random.Random(seed)
-    head = rnd.choice(SEARCH_HEAD.get(theme.key.split(":")[0], ["Что посмотреть"]))
-    rest = len(names) - 2
-    more = f" и ещё {rest}" if rest > 0 else ""
-    emoji = rnd.choice(["🔥", "🍿", "🤯", "😱", "🎬"])
-    variants = [f"{head}: «{names[0]}», «{names[1]}»{more} {emoji}",
-                f"«{names[0]}», «{names[1]}»{more} — {head.lower()} {emoji}",
-                f"{head} — {theme.hook.lower()}: «{names[0]}» и не только {emoji}"]
-    for title in rnd.sample(variants, len(variants)):
-        if len(title) <= 90:
-            return f"{title} #shorts"
-    return f"{head}: «{names[0][:40]}»{more} {emoji} #shorts"
+    lead, forms, emoji = spec
+    for shown in (2, 1):
+        top = ", ".join(f"«{n}»" for n in names[:shown])
+        rest = len(names) - min(shown, len(names))
+        tail = f" и ещё {rest}" + (f" {_plural(rest, forms)}" if forms else "") if rest else ""
+        title = f"{lead}: {top}{tail} {emoji} #shorts"
+        if len(title) <= 100:
+            return title
+    return f"{theme.seo_title} #shorts"
 
 
 def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:

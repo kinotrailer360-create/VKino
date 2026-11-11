@@ -134,3 +134,107 @@ async def set_thumbnail(token: str, video_id: str, image: Path) -> None:
                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "image/jpeg"}) as resp:
             if resp.status not in (200, 201):
                 raise YouTubeError(f"обложка: HTTP {resp.status} {(await resp.text())[:200]}")
+
+
+# ---------------------------------------------------------------- управление уже загруженными видео
+
+API = "https://www.googleapis.com/youtube/v3"
+_ID = re.compile(r"(?:v=|youtu\.be/|shorts/|live/|embed/)([\w-]{11})|^([\w-]{11})$")
+# поля status, которые YouTube сбрасывает, если их не прислать при обновлении
+_STATUS_KEEP = ("privacyStatus", "embeddable", "license", "publicStatsViewable", "selfDeclaredMadeForKids", "publishAt")
+PRIVACY = {"hide": "private", "unlist": "unlisted", "show": "public"}
+
+
+def video_id(text: str) -> str | None:
+    """ID видео из ссылки (watch, youtu.be, shorts, live) или из самого ID."""
+    m = _ID.search(text.strip())
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def parse_commands(text: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Строки «hide <id|ссылка> [ещё…]», «show …», «unlist …», «title <id> <название>» → действия и ошибки.
+    Одна строка — одна команда: так правки можно прислать пачкой одним сообщением."""
+    actions: list[tuple[str, str, str]] = []
+    errors: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        verb, _, rest = line.partition(" ")
+        verb = verb.lower().lstrip("/")
+        if verb == "yt":  # «/yt hide …» в первой строке
+            verb, _, rest = rest.strip().partition(" ")
+            verb = verb.lower()
+        if verb in PRIVACY:
+            ids = [video_id(w) for w in rest.split()]
+            if not ids or None in ids:
+                errors.append(f"не понял ID видео: {line[:80]}")
+                continue
+            actions += [(verb, vid, PRIVACY[verb]) for vid in ids if vid]
+        elif verb == "title":
+            first, _, title = rest.strip().partition(" ")
+            vid, title = video_id(first), title.strip()
+            if not vid or not title:
+                errors.append(f"нужно «title <ID> <название>»: {line[:80]}")
+            elif len(title) > 100:
+                errors.append(f"название длиннее 100 знаков ({len(title)}): {title[:60]}…")
+            else:
+                actions.append(("title", vid, title))
+        elif verb not in ("", "list"):
+            errors.append(f"неизвестная команда «{verb}»")
+    return actions, errors
+
+
+async def _api(token: str, method: str, path: str, params: dict[str, str], body: Any = None) -> dict[str, Any]:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with session.request(method, f"{API}/{path}", params=params, json=body,
+                                   headers={"Authorization": f"Bearer {token}"}) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200:
+                err = (data or {}).get("error") or {}
+                raise YouTubeError(f"YouTube: HTTP {resp.status} {err.get('message') or str(data)[:200]}")
+            return data
+
+
+async def _video(token: str, vid: str) -> dict[str, Any]:
+    items = (await _api(token, "GET", "videos", {"part": "snippet,status", "id": vid})).get("items") or []
+    if not items:
+        raise YouTubeError(f"видео {vid} не найдено на канале")
+    return items[0]
+
+
+async def set_privacy(token: str, vid: str, privacy: str) -> str:
+    """Сменить доступ (private / unlisted / public); возвращает название видео."""
+    item = await _video(token, vid)
+    status = {k: v for k, v in (item.get("status") or {}).items() if k in _STATUS_KEEP}
+    status["privacyStatus"] = privacy
+    if privacy != "private":
+        status.pop("publishAt", None)  # отложенная публикация бывает только у приватных
+    await _api(token, "PUT", "videos", {"part": "status"}, {"id": vid, "status": status})
+    return str(item["snippet"].get("title") or vid)
+
+
+async def set_title(token: str, vid: str, title: str) -> str:
+    """Переименовать видео, сохранив описание, теги и категорию; возвращает старое название."""
+    snippet = (await _video(token, vid))["snippet"]
+    old = str(snippet.get("title") or "")
+    keep = {k: snippet[k] for k in ("description", "tags", "categoryId", "defaultLanguage") if snippet.get(k)}
+    await _api(token, "PUT", "videos", {"part": "snippet"}, {"id": vid, "snippet": {**keep, "title": title}})
+    return old
+
+
+async def recent(token: str, limit: int = 15) -> list[dict[str, str]]:
+    """Последние видео канала: id, название, доступ, просмотры."""
+    channels = (await _api(token, "GET", "channels", {"part": "contentDetails", "mine": "true"})).get("items") or []
+    if not channels:
+        raise YouTubeError("у этого входа нет YouTube-канала")
+    uploads = channels[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    items = (await _api(token, "GET", "playlistItems", {"part": "contentDetails", "playlistId": uploads,
+                                                         "maxResults": str(min(limit, 50))})).get("items") or []
+    ids = ",".join(i["contentDetails"]["videoId"] for i in items)
+    if not ids:
+        return []
+    videos = (await _api(token, "GET", "videos", {"part": "snippet,status,statistics", "id": ids})).get("items") or []
+    return [{"id": v["id"], "title": str(v["snippet"].get("title") or ""),
+             "privacy": str(v["status"].get("privacyStatus") or ""),
+             "views": str((v.get("statistics") or {}).get("viewCount", "—"))} for v in videos]

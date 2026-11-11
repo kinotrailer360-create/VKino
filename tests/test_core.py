@@ -868,23 +868,52 @@ def test_own_video_moments_cut_full_screen(tmp_path, monkeypatch):
     assert probe == "1080,1920"
 
 
-def test_list_title_has_query_names_and_varies():
+def test_list_hook_promises_number_one():
     from datetime import date
 
     from shorts import daily
     theme = daily.theme_for("online", date(2026, 11, 12))
     films = [{"name": "Фильм В", "rating": {"imdb": 7.0}}, {"name": "Фильм Б"}, {"name": "Фильм А", "rating": {"imdb": 8.4}}]
-    titles = {daily.list_title(theme, films, s) for s in range(12)}
-    assert len(titles) > 1  # не один шаблон на все ролики
-    assert all("«Фильм А»" in t and t.endswith("#shorts") and len(t) <= 100 for t in titles)
     assert "досмотри до конца" in daily.voice_lines(theme, films)[0]
-def test_content_plan_every_day_has_a_known_kind():
-    from datetime import date, timedelta
+
+
+def test_yt_commands_parse_links_and_batches() -> None:
+    from shorts.youtube_upload import parse_commands, video_id
+    assert video_id("https://youtube.com/shorts/JjbTFIXuFRw?si=x") == "JjbTFIXuFRw"
+    assert video_id("https://www.youtube.com/watch?v=aQf_nc3evlU&t=3") == "aQf_nc3evlU"
+    assert video_id("https://youtu.be/mx7DG9AUvqY") == "mx7DG9AUvqY"
+    assert video_id("не ссылка") is None
+    actions, errors = parse_commands(" hide mx7DG9AUvqY https://youtu.be/VJ1hI22JSHg\n"
+                                     "title 5yaPAniyNvU 5 фактов об «Одиссее» #shorts\nshow UuLFMg-8WUA\nfoo x")
+    assert actions == [("hide", "mx7DG9AUvqY", "private"), ("hide", "VJ1hI22JSHg", "private"),
+                       ("title", "5yaPAniyNvU", "5 фактов об «Одиссее» #shorts"), ("show", "UuLFMg-8WUA", "public")]
+    assert errors == ["неизвестная команда «foo»"]
+    assert parse_commands("") == ([], [])
+    assert parse_commands("hide bad")[1] and parse_commands("title 5yaPAniyNvU " + "я" * 101)[1]
+
+
+def test_list_titles_name_the_films() -> None:
+    # пять роликов подряд вышли с одинаковым «5 свежих онлайн-премьер 🔥 Что посмотреть»
+    from shorts.daily import list_title, theme_for
+    from datetime import date
+    films = [{"name": n} for n in ("Цикл зверя", "Любовь твоей жизни", "Аватар: Семь убежищ",
+                                    "Доктор Икс", "Любовь под прикрытием")]
+    online = theme_for("online", date(2026, 11, 9))
+    assert list_title(online, films) == \
+        "Что посмотреть: «Любовь под прикрытием», «Доктор Икс» и ещё 3 онлайн-премьеры 🔥 #shorts"
+    assert list_title(online, films[:1]) == "Что посмотреть: «Цикл зверя» 🔥 #shorts"
+    assert list_title(theme_for("genre:триллер", date(2026, 11, 9)), films).startswith("Лучшие триллеры: «Любовь")
+    long = [{"name": "Очень длинное название фильма " * 2} for _ in range(5)]
+    assert len(list_title(online, long)) <= 100
+    assert list_title(online, []) == f"{online.seo_title} #shorts"
+
+
+def test_plan_ready_scripts_fit_shorts():
+    from datetime import date
 
     from shorts import plan
-    day = date(2026, 11, 12)
-    while day <= date(2026, 12, 31):
-        item = plan.today(day)
-        assert item and item[0] in plan.KINDS, day
-        day += timedelta(days=1)
-    assert all(date.fromisoformat(d).weekday() == 5 for d in plan.LONG)  # длинные — по субботам
+    for day, (title, body) in plan.SCRIPTS.items():
+        assert plan.today(date.fromisoformat(day))[0] == "own"
+        words = len(body.split())
+        assert 60 <= words <= 120, (day, words)  # ≈30–45 с озвучки
+        assert "[" not in body and "кадр" not in body.lower()  # без монтажных указаний
