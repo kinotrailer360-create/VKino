@@ -878,3 +878,13 @@ def test_list_title_has_query_names_and_varies():
     assert len(titles) > 1  # не один шаблон на все ролики
     assert all("«Фильм А»" in t and t.endswith("#shorts") and len(t) <= 100 for t in titles)
     assert "досмотри до конца" in daily.voice_lines(theme, films)[0]
+def test_content_plan_every_day_has_a_known_kind():
+    from datetime import date, timedelta
+
+    from shorts import plan
+    day = date(2026, 11, 12)
+    while day <= date(2026, 12, 31):
+        item = plan.today(day)
+        assert item and item[0] in plan.KINDS, day
+        day += timedelta(days=1)
+    assert all(date.fromisoformat(d).weekday() == 5 for d in plan.LONG)  # длинные — по субботам
