@@ -882,3 +882,18 @@ def test_list_titles_name_the_films() -> None:
     long = [{"name": "Очень длинное название фильма " * 2} for _ in range(5)]
     assert len(list_title(online, long)) <= 100
     assert list_title(online, []) == f"{online.seo_title} #shorts"
+
+
+def test_yt_commands_parse_links_and_batches() -> None:
+    from shorts.youtube_upload import parse_commands, video_id
+    assert video_id("https://youtube.com/shorts/JjbTFIXuFRw?si=x") == "JjbTFIXuFRw"
+    assert video_id("https://www.youtube.com/watch?v=aQf_nc3evlU&t=3") == "aQf_nc3evlU"
+    assert video_id("https://youtu.be/mx7DG9AUvqY") == "mx7DG9AUvqY"
+    assert video_id("не ссылка") is None
+    actions, errors = parse_commands(" hide mx7DG9AUvqY https://youtu.be/VJ1hI22JSHg\n"
+                                     "title 5yaPAniyNvU 5 фактов об «Одиссее» #shorts\nshow UuLFMg-8WUA\nfoo x")
+    assert actions == [("hide", "mx7DG9AUvqY", "private"), ("hide", "VJ1hI22JSHg", "private"),
+                       ("title", "5yaPAniyNvU", "5 фактов об «Одиссее» #shorts"), ("show", "UuLFMg-8WUA", "public")]
+    assert errors == ["неизвестная команда «foo»"]
+    assert parse_commands("") == ([], [])
+    assert parse_commands("hide bad")[1] and parse_commands("title 5yaPAniyNvU " + "я" * 101)[1]
