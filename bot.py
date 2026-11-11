@@ -7802,7 +7802,9 @@ async def say_command(
         or message.from_user.id not in ADMIN_IDS
     ):
         return
-    await say_action(message, (message.text or "").partition(" ")[2].strip())
+    # «/say» и пары с новой строки: делим по любому пробелу или переносу, а не только по пробелу
+    parts = (message.text or "").split(maxsplit=1)
+    await say_action(message, parts[1].strip() if len(parts) > 1 else "")
 
 
 async def say_action(message: Message, arg: str) -> None:
