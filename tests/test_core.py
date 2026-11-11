@@ -826,3 +826,43 @@ def test_stress_styles_for_voice(monkeypatch):
     monkeypatch.setattr(daily, "stress_mode", "names")
     monkeypatch.setattr(daily, "stress_style", "caps")
     assert daily._for_lumean(text) == "АлАя у гОры"
+
+
+def test_fill_slide_cuts_letterbox(tmp_path):
+    """Кадр кино с чёрными полосами — на весь экран 9:16 без чёрных полос сверху и снизу."""
+    from PIL import Image
+
+    from shorts import make_lore
+    img = Image.new("RGB", (1280, 720), (0, 0, 0))
+    img.paste(Image.new("RGB", (1280, 520), (180, 60, 60)), (0, 100))
+    img.save(tmp_path / "f.jpg")
+    frame = make_lore.FillSlide(tmp_path / "f.jpg", False).frame(0.0, 3.0)
+    assert frame.size == (make_lore.W, make_lore.H)
+    for y in (2, make_lore.H - 3):  # верх и низ — картинка, а не чёрная полоса
+        assert sum(frame.getpixel((make_lore.W // 2, y))) > 150
+
+
+def test_own_video_moments_cut_full_screen(tmp_path, monkeypatch):
+    """Своё видео автора: ИИ выбирает момент под фразу, отрезок — 1080×1920 на весь экран (полосы срезаны)."""
+    import asyncio
+    import shutil
+    import subprocess
+
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нет ffmpeg")
+    from shorts import ai, lore
+    src = tmp_path / "scene.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=8",
+                    "-vf", "pad=640:480:0:60:black", str(src)], check=True)
+
+    async def pick(key, texts, images):
+        return list(range(len(texts)))
+
+    monkeypatch.setattr(ai, "match_images", pick)
+    got, note = asyncio.run(lore._trailer_clips(tmp_path, [], ["Фраза один.", "Фраза два."], [2.5, 2.5], set(), "k",
+                                                local=[src], full=True))
+    assert len(got) == 2 and not note
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                            str(tmp_path / got[0][0])], capture_output=True, text=True).stdout.strip()
+    assert probe == "1080,1920"

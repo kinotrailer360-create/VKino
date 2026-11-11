@@ -216,10 +216,11 @@ async def download_full(url: str, out_dir: Path, timeout: float = 150) -> Path:
 
 
 async def sample_frames(src: Path, out_dir: Path, every: float = 4.0, duration: float = 0.0,
-                        limit: int = 40) -> list[tuple[float, Path]]:
-    """Кадры трейлера каждые every секунд (без начала с логотипами и финальных титров) для выбора ИИ."""
-    head = max(6.0, duration * 0.08) if duration else 6.0
-    tail = duration * 0.9 if duration else 0.0
+                        limit: int = 40, whole: bool = False) -> list[tuple[float, Path]]:
+    """Кадры трейлера каждые every секунд (без начала с логотипами и финальных титров) для выбора ИИ.
+    whole — видео целиком (своя сцена автора: в ней нет логотипов, важное может быть с первой секунды)."""
+    head = 0.0 if whole else max(6.0, duration * 0.08) if duration else 6.0
+    tail = (duration if whole else duration * 0.9) if duration else 0.0
     if duration and (tail - head) / every > limit:
         every = (tail - head) / limit
     cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{head:.2f}"]

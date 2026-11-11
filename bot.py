@@ -14069,6 +14069,12 @@ async def lore_style() -> str:
     return await shorts_setting("lore_style") or "dynamic"
 
 
+async def lore_media_mode() -> str:
+    """Свои картинки и видео автора: own — ролик только из них; mix — вместе с найденными ботом (ИИ выбирает
+    лучшее под каждую фразу и в своих, и в найденных)."""
+    return await shorts_setting("lore_media_mode") or "own"
+
+
 async def show_lore(message: Message, state: FSMContext, brief: bool = False) -> None:
     data = await state.get_data()
     script = data["lore_script"]
@@ -14089,7 +14095,9 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "lo:go")], [_btn("✏️ Поправить текст", "lo:edit")],
         [_btn("⚡ Монтаж: динамичный (сменить)" if dynamic else "🎞 Монтаж: спокойный (сменить)", "lo:style")],
-        [_btn(f"📎 Свои картинки ({len(media)})" if media else "📎 Добавить свои картинки", "lo:media")],
+        [_btn(f"📎 Свои картинки и видео ({len(media)})" if media else "📎 Добавить свои картинки и видео", "lo:media")],
+        [_btn("🖼 Кадры: только мои (сменить)" if await lore_media_mode() == "own" else
+              "🤝 Кадры: мои + найденные ИИ (сменить)", "lo:mix")],
         [_btn("🔄 Написать заново", "lo:redo")], [_btn("❌ Отмена", "lo:cancel")]])
     await message.answer((head + body)[:4000], reply_markup=markup, disable_web_page_preview=True)
 
@@ -14117,7 +14125,7 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     logging.exception("Lore: user file download failed")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
-            script = dict(data["lore_script"], style=await lore_style())
+            script = dict(data["lore_script"], style=await lore_style(), media_mode=await lore_media_mode())
             result = await asyncio.wait_for(shorts_lore.make_lore(
                 work, script, music, files, GEMINI_API_KEY, pins), timeout=LORE_TIMEOUT)
             shorts_daily.add_english_seo(result)
@@ -14284,16 +14292,19 @@ async def lore_edit(message: Message, state: FSMContext) -> None:
     await show_lore(message, state)
 
 
-@router.message(LoreState.media, F.photo | F.document)
+@router.message(LoreState.media, F.photo | F.document | F.video | F.animation)
 async def lore_media(message: Message, state: FSMContext) -> None:
     if message.photo:
         file, ext = message.photo[-1], ".jpg"
+    elif message.video or message.animation:  # видео сцены — ИИ найдёт в нём моменты под фразы
+        file, ext = message.video or message.animation, ".mp4"
     else:
         doc = message.document
-        if not str(doc.mime_type or "").startswith("image/"):
-            await message.answer("Нужны картинки (страницы комиксов, кадры, арты) — это не картинка.")
+        mime = str(doc.mime_type or "")
+        if not mime.startswith(("image/", "video/")):
+            await message.answer("Нужны картинки или видео (кадры, сцена из фильма, страницы комиксов).")
             return
-        file, ext = doc, Path(doc.file_name or "").suffix.lower() or ".jpg"
+        file, ext = doc, Path(doc.file_name or "").suffix.lower() or (".mp4" if mime.startswith("video/") else ".jpg")
     if (file.file_size or 0) > TG_DOWNLOAD_LIMIT:
         await message.answer("⚠️ Файл больше 20 МБ — бот Telegram не может его скачать.")
         return
@@ -14376,12 +14387,23 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     elif action == "media":
         await state.set_state(LoreState.media)
         await message.answer(
-            "📎 Присылай картинки — страницы комиксов, кадры, арты, по одной или альбомом (до 24). "
-            "ИИ поставит каждую к подходящей фразе, камера проедет по странице сверху вниз.\n\n"
+            "📎 Присылай картинки и видео — кадры, арты, страницы комиксов и <b>видео сцены</b>, о которой ролик "
+            "(например сцена после титров). По одному или альбомом (до 24).\n"
+            "• Из видео ИИ вырежет моменты под каждую фразу — как в роликах, где на экране ровно то, о чём речь.\n"
+            "• Картинки ИИ поставит к подходящим фразам.\n"
+            "• «🖼 Кадры: только мои» — ролик только из твоего; «🤝 мои + найденные» — ИИ выбирает лучшее и из твоего, "
+            "и из найденного сам (трейлер, фото).\n\n"
             "📌 Чтобы картинка встала к определённой фразе, подпиши под ней номер фразы цифрой "
             "(например <b>4</b>). Файлы до 20 МБ.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "lo:media_done")], [_btn("🗑 Убрать все мои картинки", "lo:media_clear")]]))
+    elif action == "mix":
+        mode = "mix" if await lore_media_mode() == "own" else "own"
+        await set_shorts_setting("lore_media_mode", mode)
+        await message.answer("🤝 Кадры: твои + найденные — ИИ ищет нужный момент и в твоих видео и картинках, и в "
+                             "трейлере и фото, которые нашёл сам." if mode == "mix" else
+                             "🖼 Кадры: только твои — найденные ботом фото и трейлер не используются.")
+        await show_lore(message, state, brief=True)
     elif action in ("media_done", "media_clear"):
         if action == "media_clear":
             await state.update_data(lore_media=[])

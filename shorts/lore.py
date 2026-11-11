@@ -296,13 +296,27 @@ def _bright(path: Path) -> bool:
     return sum(px) / len(px) > 28 and sum(v < 25 for v in px) / len(px) < 0.75
 
 
+async def _bars(src: Path, at: float, length: float) -> str:
+    """Фильтр, срезающий чёрные полосы сверху и снизу (кино 2.39:1 в кадре 16:9), или пусто."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-ss", f"{max(0.0, at):.2f}", "-t", f"{min(length, 2.0):.2f}", "-i", str(src),
+        "-vf", "cropdetect=24:2:0", "-f", "null", "-", stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    found = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", err.decode(errors="ignore"))
+    if not found:
+        return ""
+    w, h, x, y = (int(v) for v in found[-1])
+    return f"crop={w}:{h}:{x}:{y}," if w > 100 and h > 100 else ""
+
+
 async def _cut_trailer(work: Path, at: float, src: Path, stem: str, length: float,
                        full: bool = False) -> tuple[str, float] | None:
     """Отрезок трейлера с секунды at, 1080×1920 без звука. full — на весь экран (динамичный монтаж), иначе кадр
     почти целиком по центру, сверху и снизу его размытая копия."""
     length = round(length, 2)
     name = f"{stem}.mp4"
-    vf = ("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" if full else
+    bars = await _bars(src, at, length) if full else ""  # чёрные полосы кино-кадра — срезаем, иначе экран чёрный
+    vf = (f"[0:v]{bars}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" if full else
           "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
           "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
           "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30")
@@ -318,14 +332,16 @@ async def _cut_trailer(work: Path, at: float, src: Path, stem: str, length: floa
     return name, length
 
 
-SEG = 1.8  # динамичный монтаж: новый момент трейлера каждые ~1,8 с
+SEG = 3.0  # динамичный монтаж: новый момент видео каждые ~3 с (чаще — мельтешит, не успеваешь понять кадр)
+VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 
 
 async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[str], durs: list[float], skip: set[int],
                          gemini_key: str, repeats: set[int] | None = None,
                          stills_out: dict[int, str] | None = None,
                          more_out: dict[int, list[tuple[str, float]]] | None = None,
-                         dynamic: bool = False) -> tuple[dict[int, tuple[str, float]], str]:
+                         dynamic: bool = False, local: list[Path] | None = None,
+                         full: bool = False) -> tuple[dict[int, tuple[str, float]], str]:
     """Трейлер фильма → отрезки до CLIP_MAX под фразы: ИИ смотрит кадры трейлера и выбирает момент к фразе;
     фразы без подходящего момента остаются с фото — ролик комбинированный (видео + фото).
     dynamic — как в динамичных шортсах: видео на весь экран, у каждой фразы (кроме своих картинок автора)
@@ -337,6 +353,17 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
     try:
         # несколько фильмов (пересказ франшизы) — трейлер каждого, кадры для ИИ из всех вместе
         frames: list[tuple[float, Path, Path]] = []  # (секунда, миниатюра, файл трейлера)
+        # свои видео автора — первыми и подробнее (кадр каждую секунду): это и есть сцена, о которой ролик
+        for n, src_n in enumerate(local or []):
+            fdir = tdir / f"u{n}"
+            fdir.mkdir(exist_ok=True)
+            try:
+                total = await daily._duration(src_n)
+                frames += [(t, path, src_n) for t, path in
+                           await clips.sample_frames(src_n, fdir, duration=total, limit=80 // max(1, len(local or [])),
+                                                     every=1.0, whole=True)]
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: own video %s failed: %s", src_n.name, exc)
         per = max(10, (60 if dynamic else 30) // max(1, len(films)))
         for n, film in enumerate(films[:3]):
             url = await _trailer_url(film)
@@ -353,7 +380,8 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
             except Exception as exc:  # noqa: BLE001 — один трейлер не скачался — берём остальные
                 log.info("shorts: trailer of %s failed: %s", film.get("title"), exc)
         if not frames:
-            return {}, "🎞 Трейлер фильма не нашёлся или не скачался — в ролике кадры и постеры."
+            return {}, ("🎞 Своё видео не прочиталось — в ролике кадры." if local else
+                        "🎞 Трейлер фильма не нашёлся или не скачался — в ролике кадры и постеры.")
         # тёмные кадры (затемнение, титры «14 октября» на чёрном) ИИ не показываем — в ролике это чёрный экран
         frames = [f for f in frames if _bright(f[1])] or frames
         thumbs = [Image.open(path).convert("RGB") for _, path, _ in frames]
@@ -391,7 +419,7 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
                 continue  # у этой фразы остаётся фото
             # кадр ИИ — в середине отрезка; начало чуть раньше, но не больше чем на 0,4 с
             at, src = frames[c][0] - 0.4, frames[c][2]
-            got = await _cut_trailer(work, at, src, f"tclip{i}", min(seg, max(1.2, durs[i])), dynamic)
+            got = await _cut_trailer(work, at, src, f"tclip{i}", min(seg, max(1.2, durs[i])), dynamic or full)
             if not got:
                 continue
             out[i] = got
@@ -405,7 +433,7 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
                 else:  # моменты кончились — продолжаем тот же кадр трейлера
                     at2, src2 = last_at + last_len, src
                 nxt = await _cut_trailer(work, at2, src2, f"tclip{i}_{len(more.get(i, [])) + 1}",
-                                         min(seg, max(1.0, left)), dynamic)
+                                         min(seg, max(1.0, left)), dynamic or full)
                 if not nxt:
                     break
                 more.setdefault(i, []).append(nxt)
@@ -565,7 +593,11 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     await _progress(40, "Картинки")
     pool: list[tuple[str, Image.Image]] = []  # (файл, миниатюра для ИИ)
     user_at: dict[int, int] = {}  # номер своей картинки -> её место в pool
+    # свои видео автора (сцена, о которой ролик) — ИИ ищет в них моменты под фразы, как в трейлере
+    videos = [m for m in user_media or [] if m.suffix.lower() in VIDEO_EXT]
     for n, path in enumerate(user_media or []):
+        if path in videos:
+            continue
         try:
             img = _frame_ready(Image.open(path))
         except Exception as exc:  # noqa: BLE001
@@ -577,9 +609,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         user_at[n] = len(pool)
         pool.append((out.name, img))
     own = len(pool)
-    # свои картинки автора есть — ролик только из них: найденные ботом фото, логотипы и отрезки трейлера автор
-    # не просил (раньше они подмешивались, если своих меньше, чем фраз)
-    only_own = own > 0
+    # свои картинки или видео автора есть и режим «только мои» — ролик только из них: найденные ботом фото,
+    # логотипы и трейлер автор не просил. Режим «мои + найденные» — ИИ выбирает лучшее из всего вместе
+    only_own = (own > 0 or bool(videos)) and script.get("media_mode", "own") == "own"
     if len(pool) < len(lines) and not only_own:  # своих не хватает — добираем картинками из статьи
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
@@ -622,6 +654,19 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     for n, line in (user_pins or {}).items():  # подпись автора важнее кадра, найденного ботом
         if n in user_at and 1 <= line <= len(lines):
             pinned[line - 1] = user_at[n]
+    if not pool and videos:  # только видео автора — стоп-кадры из него на всякий случай (фразы без момента)
+        for k, frac in enumerate((0.2, 0.5, 0.8)):
+            out = work / f"lvid{k}.jpg"
+            try:
+                at = (await daily._duration(videos[0])) * frac
+                await daily._run("ffmpeg", "-v", "error", "-y", "-ss", f"{at:.2f}", "-i", str(videos[0]),
+                                 "-frames:v", "1", "-vf", "scale=1600:-2", str(out))
+                img = Image.open(out).convert("RGB")
+                img.thumbnail((480, 480))
+                pool.append((out.name, img))
+            except Exception as exc:  # noqa: BLE001
+                log.info("shorts: own video still failed: %s", exc)
+        general = len(pool)
     if not pool:
         raise RuntimeError("нет ни одной картинки: пришли свои (страницы комиксов, кадры) кнопкой «📎»")
 
@@ -656,14 +701,14 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     score = script.get("score") if news else None
     tfilm = script.get("trailer_film") if news else None
     if only_own:
-        tfilm = None  # без отрезков трейлера и карточки оценки
+        tfilm = None  # без трейлера и карточки оценки — только свои видео автора
     if score and tfilm and tfilm.get("poster"):  # рецензия: карточка «МОЯ ОЦЕНКА 8/10» на фразе с оценкой
         try:
             card = await _score_card(tfilm["poster"], str(score["value"]), work / "score.jpg")
             slides[int(score["line"])]["image"] = card.name
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: score card failed: %s", exc)
-    if tfilm and gemini_key:
+    if (tfilm or videos) and gemini_key:
         # отрезки трейлера под фразы: кроме фраз со своими картинками автора и с карточкой оценки
         skip = {line - 1 for line in (user_pins or {}).values()} | ({int(score["line"])} if score else set())
         await _progress(44, "Трейлер: подбираю отрезки")
@@ -677,7 +722,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         if score_line >= 0 and durs[score_line] > 6:
             repeats.add(score_line)  # длинная финальная фраза: после карточки оценки — ещё кадр фильма
         heroes: dict[int, list[tuple[str, float]]] = {}
-        if dynamic and script.get("kind_own"):
+        if dynamic and script.get("kind_own") and tfilm:
             # «Доктор Дум», «Циклоп», «Баки» — кадры из фильмов, где эти герои есть
             await _progress(43, "Трейлеры героев")
             found = await ai.hero_films(gemini_key, lines, str(tfilm.get("title") or ""))
@@ -685,8 +730,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             skip |= set(heroes)
         stills: dict[int, str] = {}
         more: dict[int, list[tuple[str, float]]] = {}
-        got, note = await _trailer_clips(work, script.get("trailer_films") or [tfilm], lines, durs, skip, gemini_key,
-                                         repeats, stills, more, dynamic)
+        films = (script.get("trailer_films") or [tfilm]) if tfilm else []
+        got, note = await _trailer_clips(work, films, lines, durs, skip, gemini_key, repeats, stills, more, dynamic,
+                                         local=videos, full=bool(script.get("kind_own")))
         if note:
             clip_notes.append(note)
         extra = []
@@ -729,6 +775,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         # динамичный — без заставки вовсе: ролик обрывается на последней фразе и идёт по кругу
         "outro_len": 0 if dynamic else 2.0 if script.get("kind_own") else 3.5,
         "style": "dynamic" if dynamic else "calm",
+        "fill": dynamic or bool(script.get("kind_own")),  # кадры на весь экран, без размытых полос
         "words": words,
         "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
         "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
