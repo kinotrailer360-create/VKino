@@ -866,3 +866,19 @@ def test_own_video_moments_cut_full_screen(tmp_path, monkeypatch):
     probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0",
                             str(tmp_path / got[0][0])], capture_output=True, text=True).stdout.strip()
     assert probe == "1080,1920"
+
+
+def test_list_titles_name_the_films() -> None:
+    # пять роликов подряд вышли с одинаковым «5 свежих онлайн-премьер 🔥 Что посмотреть»
+    from shorts.daily import list_title, theme_for
+    from datetime import date
+    films = [{"name": n} for n in ("Цикл зверя", "Любовь твоей жизни", "Аватар: Семь убежищ",
+                                    "Доктор Икс", "Любовь под прикрытием")]
+    online = theme_for("online", date(2026, 11, 9))
+    assert list_title(online, films) == \
+        "Что посмотреть: «Любовь под прикрытием», «Доктор Икс» и ещё 3 онлайн-премьеры 🔥 #shorts"
+    assert list_title(online, films[:1]) == "Что посмотреть: «Цикл зверя» 🔥 #shorts"
+    assert list_title(theme_for("genre:триллер", date(2026, 11, 9)), films).startswith("Лучшие триллеры: «Любовь")
+    long = [{"name": "Очень длинное название фильма " * 2} for _ in range(5)]
+    assert len(list_title(online, long)) <= 100
+    assert list_title(online, []) == f"{online.seo_title} #shorts"

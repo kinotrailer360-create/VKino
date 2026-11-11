@@ -1529,9 +1529,50 @@ async def word_timeline(voice: Path, starts: list[float], spans: list[dict[str, 
 
 # ---------------------------------------------------------------- SEO
 
+def _plural(n: int, forms: tuple[str, str, str]) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return forms[0]
+    return forms[1] if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else forms[2]
+
+
+_FILM = ("фильм", "фильма", "фильмов")
+# тема → (начало заголовка с поисковым запросом, что считаем после «и ещё N», эмодзи)
+LIST_TITLES: dict[str, tuple[str, tuple[str, str, str] | None, str]] = {
+    "online": ("Что посмотреть", ("онлайн-премьера", "онлайн-премьеры", "онлайн-премьер"), "🔥"),
+    "fresh": ("Только вышло онлайн", ("новинка", "новинки", "новинок"), "🔥"),
+    "cinema": ("Что посмотреть в кино", _FILM, "🍿"),
+    "week": ("Премьеры недели в кино", _FILM, "🍿"),
+    "series": ("Новые сериалы", ("сериал", "сериала", "сериалов"), "📺"),
+    "upcoming": ("Скоро в кино", ("премьера", "премьеры", "премьер"), "⏳"),
+    "films": ("Что посмотреть", ("новый фильм", "новых фильма", "новых фильмов"), "🎬"),
+}
+
+
+def list_title(theme: Theme, films: list[dict[str, Any]]) -> str:
+    """Заголовок подборки с названиями лучших фильмов: у каждого ролика свой, и его находят в поиске.
+    Одинаковые «5 свежих онлайн-премьер» YouTube считает шаблонным контентом, а поиск их не различает."""
+    if theme.key.startswith("genre:"):
+        plural = GENRES.get(theme.key.split(":", 1)[1], ("", "", ""))[2]
+        spec = (f"Лучшие {plural}", None, "🎬") if plural else None
+    else:
+        spec = LIST_TITLES.get(theme.key)
+    names = [_title(f) for f in reversed(films) if _title(f)]  # последний в списке — номер один
+    if not spec or not names:
+        return f"{theme.seo_title} #shorts"
+    lead, forms, emoji = spec
+    for shown in (2, 1):
+        top = ", ".join(f"«{n}»" for n in names[:shown])
+        rest = len(names) - min(shown, len(names))
+        tail = f" и ещё {rest}" + (f" {_plural(rest, forms)}" if forms else "") if rest else ""
+        title = f"{lead}: {top}{tail} {emoji} #shorts"
+        if len(title) <= 100:
+            return title
+    return f"{theme.seo_title} #shorts"
+
+
 def build_seo(theme: Theme, films: list[dict[str, Any]]) -> dict[str, str]:
     names = [_title(f) for f in films]
-    title = f"{theme.seo_title} #shorts"
+    title = list_title(theme, films)
     if len(title) > 100:
         title = title[:90].rstrip() + "… #shorts"
 
