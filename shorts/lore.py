@@ -577,7 +577,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         user_at[n] = len(pool)
         pool.append((out.name, img))
     own = len(pool)
-    if len(pool) < len(lines):  # своих не хватает — добираем картинками из статьи
+    # свои картинки автора есть — ролик только из них: найденные ботом фото, логотипы и отрезки трейлера автор
+    # не просил (раньше они подмешивались, если своих меньше, чем фраз)
+    only_own = own > 0
+    if len(pool) < len(lines) and not only_own:  # своих не хватает — добираем картинками из статьи
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
             for url in script.get("images") or []:
@@ -595,7 +598,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 pool.append((out.name, img))
     general = len(pool)
     pinned: dict[int, int] = {}  # фраза -> картинка, привязанная к ней (кто говорит, логотип, памятный портрет)
-    fixed = fixed_lines(script, lines)
+    fixed = {} if only_own else fixed_lines(script, lines)
     if fixed:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
@@ -652,6 +655,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     clip_notes: list[str] = []
     score = script.get("score") if news else None
     tfilm = script.get("trailer_film") if news else None
+    if only_own:
+        tfilm = None  # без отрезков трейлера и карточки оценки
     if score and tfilm and tfilm.get("poster"):  # рецензия: карточка «МОЯ ОЦЕНКА 8/10» на фразе с оценкой
         try:
             card = await _score_card(tfilm["poster"], str(score["value"]), work / "score.jpg")
