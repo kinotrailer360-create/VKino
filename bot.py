@@ -12663,6 +12663,78 @@ async def _yt_login(message: Message) -> str:
     return refresh
 
 
+YT_MANAGE_HELP = (
+    "▶️ <b>Управление видео на YouTube</b>\n\n"
+    "<code>/yt</code> — последние 15 видео: доступ, просмотры, ID\n"
+    "<code>/yt hide ID [ID…]</code> — скрыть (ограниченный доступ)\n"
+    "<code>/yt unlist ID</code> — доступ по ссылке\n"
+    "<code>/yt show ID</code> — открыть всем\n"
+    "<code>/yt title ID Новое название</code> — переименовать\n\n"
+    "Вместо ID можно ссылку. Пачка правок — одним сообщением, каждая команда с новой строки "
+    "(первая — с /yt):\n<code>/yt hide abc123def45\ntitle xyz789ghi01 Что посмотреть: …</code>")
+
+
+async def _yt_token(message: Message) -> str:
+    refresh = await shorts_setting("yt_refresh") or await _yt_login(message)
+    try:
+        return await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, refresh)
+    except shorts_yt.LoginExpired:
+        await set_shorts_setting("yt_refresh", None)
+        await message.answer("Вход в YouTube устарел — войдём заново.")
+        return await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, await _yt_login(message))
+
+
+@router.message(Command("yt"))
+async def youtube_manage(message: Message) -> None:
+    """Скрыть, открыть или переименовать уже загруженные видео — без YouTube Studio."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
+        await message.answer(YT_SETUP, disable_web_page_preview=True)
+        return
+    text = re.sub(r"^/yt(?:@\w+)?", "", message.text or "", count=1)
+    if text.strip().lower() in ("help", "помощь", "?"):
+        await message.answer(YT_MANAGE_HELP)
+        return
+    actions, errors = shorts_yt.parse_commands(text)
+    if errors and not actions:
+        await message.answer("⚠️ " + "\n".join(escape(e) for e in errors) + "\n\n" + YT_MANAGE_HELP)
+        return
+
+    async def job() -> None:
+        try:
+            token = await _yt_token(message)
+            if not actions:
+                rows = await shorts_yt.recent(token)
+                icon = {"public": "🟢", "unlisted": "🔗", "private": "🔒"}
+                lines = [f"{icon.get(r['privacy'], '❔')} <code>{r['id']}</code> · {r['views']} 👁 · "
+                         f"{escape(r['title'][:70])}" for r in rows]
+                await message.answer("▶️ <b>Последние видео</b>\n\n" + ("\n".join(lines) or "Видео нет.") +
+                                     "\n\n<i>/yt help — команды</i>")
+                return
+            report: list[str] = []
+            for verb, vid, value in actions:
+                try:
+                    if verb == "title":
+                        old = await shorts_yt.set_title(token, vid, value)
+                        report.append(f"✏️ <code>{vid}</code>: {escape(old[:50])} → {escape(value)}")
+                    else:
+                        title = await shorts_yt.set_privacy(token, vid, value)
+                        mark = {"private": "🔒 скрыто", "unlisted": "🔗 по ссылке", "public": "🟢 открыто"}[value]
+                        report.append(f"{mark}: {escape(title[:70])}")
+                except shorts_yt.YouTubeError as exc:
+                    report.append(f"❌ <code>{vid}</code>: {escape(str(exc)[:200])}")
+            report += [f"⚠️ {escape(e)}" for e in errors]
+            await message.answer("\n".join(report))
+        except shorts_yt.YouTubeError as exc:
+            await message.answer(f"❌ {escape(str(exc)[:300])}")
+        except Exception:  # noqa: BLE001 — сообщить, а не молча упасть в фоне
+            logging.exception("YouTube manage failed")
+            await message.answer("❌ Не получилось связаться с YouTube — подробности в логах.")
+
+    _run_job(job)
+
+
 @router.callback_query(F.data.startswith("yt:"))
 async def youtube_button(callback: CallbackQuery) -> None:
     if callback.from_user.id not in ADMIN_IDS or not callback.message:
@@ -17801,6 +17873,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="hype", description="🔥 Инфоповоды: проверить сейчас, /hype on|off"),
         BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
+        BotCommand(command="yt", description="🔒 YouTube: скрыть, открыть, переименовать видео"),
         BotCommand(command="short", description="Собрать шортс: /short [тема]"),
         BotCommand(command="review", description="Обзор фильма 16:9: /review [название]"),
         BotCommand(command="dub", description="Русский закадровый перевод трейлера"),
