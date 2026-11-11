@@ -299,6 +299,20 @@ def keep_dictionary_stress(text: str) -> str:
                   else m.group(0).replace(STRESS, ""), text)
 
 
+STRESS_STYLES = {"caps": "заглавная ударная гласная (алАя)", "plus": "плюс перед ударной (ал+ая)",
+                 "acute": "знак ударения (ала́я)"}
+
+
+def render_stress(text: str, style: str) -> str:
+    """Как отдать ударение голосу. Знак U+0301 голос ElevenLabs через Lumean, похоже, не слушает — пробуем
+    заглавную ударную гласную («алАя») или «+» перед ней («ал+ая»), что сработает — выбирает автор (/stress)."""
+    if style == "caps":
+        return re.sub(rf"([{VOWELS}{VOWELS.lower()}]){STRESS}", lambda m: m.group(1).upper(), text)
+    if style == "plus":
+        return re.sub(rf"([{VOWELS}{VOWELS.lower()}]){STRESS}", r"+\1", text)
+    return text
+
+
 def parse_pairs(text: str) -> list[tuple[str, str]]:
     """/say: пары «слово = как читать». Каждая строка — пара; несколько пар в одной строке
     («Средиземье = средИземье Кольца власти = кОльца влАсти») делим так: в значении столько слов, сколько в

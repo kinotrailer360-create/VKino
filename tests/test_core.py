@@ -812,5 +812,17 @@ def test_dictionary_stress_survives_stress_off(monkeypatch):
     from shorts import daily, pronounce
     monkeypatch.setattr(pronounce, "CUSTOM", dict(pronounce.parse_pairs("Алая = АлАя\nмоей = моЕй\nгоры = гОры")))
     monkeypatch.setattr(daily, "stress_mode", "off")
+    monkeypatch.setattr(daily, "stress_style", "acute")
     text = pronounce.apply("Алая Ведьма у горы моей") + " сказа́л"
     assert daily._for_lumean(text) == "Ала́я Ведьма у го́ры мое́й сказал"
+
+
+def test_stress_styles_for_voice(monkeypatch):
+    from shorts import daily, pronounce
+    text = "Ала́я у го́ры"
+    assert pronounce.render_stress(text, "caps") == "АлАя у гОры"
+    assert pronounce.render_stress(text, "plus") == "Ал+ая у г+оры"
+    assert pronounce.render_stress(text, "acute") == text
+    monkeypatch.setattr(daily, "stress_mode", "names")
+    monkeypatch.setattr(daily, "stress_style", "caps")
+    assert daily._for_lumean(text) == "АлАя у гОры"

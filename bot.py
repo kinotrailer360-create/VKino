@@ -7221,6 +7221,9 @@ async def load_pronunciations() -> dict[str, str]:
     mode = await shorts_setting("stress_mode")
     if mode in shorts_daily.STRESS_MODES:
         shorts_daily.stress_mode = mode
+    style = await shorts_setting("stress_style")
+    if style in shorts_pronounce.STRESS_STYLES:
+        shorts_daily.stress_style = style
     return shorts_pronounce.CUSTOM
 
 
@@ -7791,6 +7794,26 @@ async def stress_buttons(callback: CallbackQuery) -> None:
         await callback.message.answer(f"✅ Ударения в озвучке: <b>{STRESS_LABELS[kind]}</b>. Следующие ролики — так.")
         return
     await callback.answer()
+
+
+@router.message(Command("stress"))
+async def stress_style_command(message: Message) -> None:
+    """/stress caps|plus|acute — как отдавать голосу ударение из словаря /say (что голос слушает — проверить /voice)."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    await load_pronunciations()
+    arg = ((message.text or "").split(maxsplit=1)[1:] or [""])[0].strip().lower()
+    if arg in shorts_pronounce.STRESS_STYLES:
+        await set_shorts_setting("stress_style", arg)
+        shorts_daily.stress_style = arg
+        await message.answer(f"✅ Ударение голосу: {escape(shorts_pronounce.STRESS_STYLES[arg])}.\n"
+                             "Послушай: <code>/voice Алая ведьма у горы моей после титров</code>")
+        return
+    rows = [f"{'👉 ' if k == shorts_daily.stress_style else '• '}<code>/stress {k}</code> — {escape(v)}"
+            for k, v in shorts_pronounce.STRESS_STYLES.items()]
+    await message.answer("🗣 <b>Как голос получает ударение из /say</b>\n" + "\n".join(rows)
+                         + "\n\nВыбери способ и послушай <code>/voice фраза</code> — какой голос слушает, тот и "
+                           "оставь. Потом «🎙 Звук» под роликом.")
 
 
 @router.message(Command("say"))
