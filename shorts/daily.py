@@ -1581,11 +1581,15 @@ def list_title(theme: Theme, films: list[dict[str, Any]]) -> str:
     if not spec or not names:
         return f"{theme.seo_title} #shorts"
     lead, forms, emoji = spec
+    if len(names) == 1:
+        title = f"{lead}: «{names[0]}» {emoji} #shorts"
+        return title if len(title) <= 100 else f"{theme.seo_title} #shorts"
+    # ролик — обратный отсчёт до номера один: его в названии не раскрываем, иначе незачем досматривать
     for shown in (2, 1):
-        top = ", ".join(f"«{n}»" for n in names[:shown])
-        rest = len(names) - min(shown, len(names))
-        tail = f" и ещё {rest}" + (f" {_plural(rest, forms)}" if forms else "") if rest else ""
-        title = f"{lead}: {top}{tail} {emoji} #shorts"
+        top = ", ".join(f"«{n}»" for n in names[1:1 + shown])
+        rest = len(names) - 1 - min(shown, len(names) - 1) + 1  # + сам номер один
+        tail = f" и ещё {rest}" + (f" {_plural(rest, forms)}" if forms else "")
+        title = f"{lead}: {top}{tail}. Кто №1? {emoji} #shorts"
         if len(title) <= 100:
             return title
     return f"{theme.seo_title} #shorts"
