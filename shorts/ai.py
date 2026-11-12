@@ -2512,6 +2512,48 @@ async def write_weekly_bookends(key: str, headlines: list[str], next_day: str) -
     return out if out["intro"] and out["outro"] else None
 
 
+async def parse_task(key: str, text: str) -> dict[str, Any] | None:
+    """Задание на ролик, написанное как для человека (сценарий озвучки, список с кадрами и ссылками, план монтажа
+    с надписями, название, описание, хэштеги) → план для бота: фразы голоса, к каждой — ссылка на кадр, что
+    показать и надпись на экране. Текст озвучки не переписываем — только делим на фразы."""
+    if not available(key) or len(text.strip()) < 50:
+        return None
+    prompt = (UNTRUSTED + "Ниже — задание на YouTube Shorts, написанное автором канала. Разбери его в план монтажа "
+              "для бота. Правила:\n"
+              "1. lines — текст озвучки из раздела сценария/озвучки ДОСЛОВНО, без изменений и без своих слов. Не "
+              "включай монтажные указания, таймкоды, ссылки и пояснения. Делит текст на фразы по 1–2 предложения. "
+              "Если в одной фразе перечислены несколько фильмов/проектов, у каждого из которых в задании свой кадр, "
+              "— сделай каждый пункт перечисления отдельной фразой («В список попали…» — отдельно, затем каждое "
+              "название в «ёлочках» отдельной фразой с точкой), чтобы под каждый был свой кадр.\n"
+              "2. Для каждой фразы: url — прямая ссылка на кадр из задания, относящаяся именно к этой фразе (к "
+              "этому фильму/персонажу), иначе пусто; ссылки на поиск (google.com/search) не бери. show — что "
+              "показать по заданию, коротко. label — надпись на экране из плана монтажа для этого момента "
+              "(«11 проектов перед Doomsday»), иначе пусто; до 40 знаков.\n"
+              "3. title, description, hashtags, cover — из раздела оформления, как есть.\n"
+              "4. rules — 3–6 коротких важных указаний автора боту (что нельзя добавлять, что проверить).\n"
+              'Ответ — только JSON: {"title": "", "description": "", "hashtags": "", "cover": "", "rules": [""], '
+              '"lines": [{"text": "", "url": "", "show": "", "label": ""}]}\n\nЗАДАНИЕ:\n' + text[:30000])
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt, premium=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: AI parse_task failed: %s", exc)
+        return None
+    lines = []
+    for row in (data.get("lines") if isinstance(data, dict) else None) or []:
+        if not isinstance(row, dict) or len(str(row.get("text") or "").strip()) < 2:
+            continue
+        url = str(row.get("url") or "").strip()
+        if not url.startswith("http") or "google." in url and "/search" in url:
+            url = ""
+        lines.append({"text": _unnumber(str(row["text"]).strip()), "url": url,
+                      "show": str(row.get("show") or "").strip()[:200], "label": str(row.get("label") or "").strip()[:60]})
+    if len(lines) < 2:
+        return None
+    return {"title": str(data.get("title") or "").strip()[:100], "description": str(data.get("description") or "")[:1500],
+            "hashtags": str(data.get("hashtags") or "")[:300], "cover": str(data.get("cover") or "")[:60],
+            "rules": [str(r)[:200] for r in data.get("rules") or [] if str(r).strip()][:6], "lines": lines[:30]}
+
+
 EDITOR_VERSION = 2  # правила редактора поменялись — сохранённый выпуск при перемонтаже вычитывается заново
 
 
