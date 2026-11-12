@@ -1558,12 +1558,23 @@ LIST_TITLES: dict[str, tuple[str, tuple[str, str, str] | None, str]] = {
 }
 
 
+# жанр → начало заголовка (согласованное: не «Лучшие фантастика») и что считаем после «и ещё N»
+GENRE_TITLES: dict[str, tuple[str, tuple[str, str, str]]] = {
+    "фантастика": ("Лучшая фантастика", _FILM),
+    "ужасы": ("Лучшие фильмы ужасов", _FILM),
+    "триллер": ("Лучшие триллеры", ("триллер", "триллера", "триллеров")),
+    "комедия": ("Лучшие комедии", ("комедия", "комедии", "комедий")),
+    "боевик": ("Лучшие боевики", ("боевик", "боевика", "боевиков")),
+    "детектив": ("Лучшие детективы", ("детектив", "детектива", "детективов")),
+}
+
+
 def list_title(theme: Theme, films: list[dict[str, Any]]) -> str:
     """Заголовок подборки с названиями лучших фильмов: у каждого ролика свой, и его находят в поиске.
     Одинаковые «5 свежих онлайн-премьер» YouTube считает шаблонным контентом, а поиск их не различает."""
     if theme.key.startswith("genre:"):
-        plural = GENRES.get(theme.key.split(":", 1)[1], ("", "", ""))[2]
-        spec = (f"Лучшие {plural}", None, "🎬") if plural else None
+        genre = GENRE_TITLES.get(theme.key.split(":", 1)[1])
+        spec = (genre[0], genre[1], "🎬") if genre else None
     else:
         spec = LIST_TITLES.get(theme.key)
     names = [_title(f) for f in reversed(films) if _title(f)]  # последний в списке — номер один
