@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from PIL import Image
 
-from . import ai, clips, lumean, news, pronounce, project, scene_planner, stressdb, tgsearch, tmdb, wiki
+from . import ai, clips, imgsearch, lumean, news, pronounce, project, scene_planner, stressdb, tgsearch, tmdb, wiki
 from . import music as musiclib
 from .cards import card_overlay, make_card, make_cover
 
@@ -1999,6 +1999,17 @@ def _portrait(img: Image.Image, w: int = 1080, h: int = FACT_CARD_H) -> Image.Im
     return bg
 
 
+WEB_SEARCH_MAX = 4  # столько фактов без кадра ищем в интернете (каждый — поиск и проверка Gemini)
+STOP_WORDS = {"это", "как", "что", "его", "она", "они", "для", "был", "была", "были", "уже", "ещё", "еще", "который",
+              "которая", "которые", "фильм", "фильма", "фильме", "после", "только", "когда", "даже", "очень"}
+
+
+def _fact_query(film: dict[str, Any], fact: str) -> str:
+    """Запрос в поиск картинок: название фильма и главные слова факта (длинный запрос поисковик понимает хуже)."""
+    words = [w for w in re.findall(r"[\w-]{4,}", fact) if w.lower() not in STOP_WORDS]
+    return " ".join([_title(film)] + words[:6])
+
+
 async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: set[int] | None = None,
                            music: Path | None = None, tmdb_key: str = "",
                            gemini_key: str = "", trailer_clips: bool = True,
@@ -2157,6 +2168,28 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
             "reason": "Проверьте, что выбранный фрагмент трейлера действительно иллюстрирует фразу",
         }
         visual_sources[i] = "trailer_clip"
+
+    # Нет подходящего кадра — сначала настоящее фото из поиска картинок (Gemini проверяет, что оно про эту фразу),
+    # и только потом иллюстрация ИИ
+    if ai.available(gemini_key):
+        missing = [i for i, meta in visual_matches.items() if meta.get("status") == "fallback_unverified"]
+        for i in missing[:WEB_SEARCH_MAX]:
+            try:
+                await _progress(33, f"Ищу фото в интернете к факту {i + 1}/{n}")
+                raw_image = await imgsearch.pick(_fact_query(film, facts[i]), facts[i], gemini_key)
+                if not raw_image:
+                    continue
+                found = Image.open(io.BytesIO(raw_image)).convert("RGB")
+                if found.width < 300 or found.height < 200:
+                    continue
+                picked[i] = found if found.width >= found.height * 1.2 else _portrait(found)
+                visual_sources[i] = "web_image_search"
+                visual_matches[i] = {
+                    "status": "web_search_review", "score": None,
+                    "reason": "Фото найдено поиском картинок и выбрано ИИ по смыслу фразы; проверьте источник",
+                }
+            except Exception as exc:  # noqa: BLE001 — поиск не должен ломать сборку ролика
+                log.warning("shorts: web image for fact %s failed: %s", i + 1, exc)
 
     # Если ни один исходный кадр не подошёл, создаём отдельную символическую иллюстрацию.
     # Генерация ограничена только фактами без подтверждённого кадра; чужие лица/постеры не имитируем.

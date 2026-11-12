@@ -9349,6 +9349,7 @@ async def review_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 REVIEW_MEDIA_MAX = 20
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # бот Telegram скачивает файлы до 20 МБ
+TG_UPLOAD_SCENE = 45 * 1024 * 1024  # отрывок сцены на проверку отправляем, если он меньше лимита отправки
 review_media_lock = asyncio.Lock()
 
 
@@ -9584,7 +9585,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             shutil.rmtree(work, ignore_errors=True)
 
 
-@router.message(SceneReviewState.replacement, F.photo)
+@router.message(SceneReviewState.replacement, F.photo | F.video)
 async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         await state.clear()
@@ -9602,15 +9603,28 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer("Проект не найден. Открой проверку сцен заново.")
         return
-    photo = message.photo[-1]
-    if (photo.file_size or 0) > TG_DOWNLOAD_LIMIT:
-        await message.answer("Фото слишком большое. Пришли сжатую версию.")
+    media = message.video or message.photo[-1]
+    if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать. Пришли сжатую версию.")
         return
-    path = folder / f"scene_replacement_{index + 1}.jpg"
-    await message.bot.download(photo.file_id, destination=path)
-    cards[index]["image"] = path.name
-    cards[index].pop("clip", None)
-    cards[index].pop("overlay", None)
+    if message.video:
+        # видео встаёт в сцену как отрывок; рамка с номером — прежняя, если была, иначе новая
+        path = folder / f"scene_replacement_{index + 1}.mp4"
+        await message.bot.download(media.file_id, destination=path)
+        stale = folder / f"scene_replacement_{index + 1}.frames"  # кадры прошлой замены — нарезать заново
+        shutil.rmtree(stale, ignore_errors=True)
+        overlay = str(cards[index].get("overlay") or "")
+        if not overlay or not (folder / overlay).exists():
+            overlay = f"overlay{index + 1}.png"
+            await asyncio.to_thread(lambda: shorts_daily.card_overlay(
+                "", index + 1, len(cards), None, "IMDb", None, None, shorts_daily.FACT_CARD_H).save(folder / overlay))
+        cards[index]["clip"], cards[index]["overlay"] = path.name, overlay
+    else:
+        path = folder / f"scene_replacement_{index + 1}.jpg"
+        await message.bot.download(media.file_id, destination=path)
+        cards[index]["image"] = path.name
+        cards[index].pop("clip", None)
+        cards[index].pop("overlay", None)
     cards[index]["asset_source"] = "user_replacement"
     cards[index]["visual_match"] = {
         "status": "user_replacement_review", "score": None,
@@ -9619,7 +9633,7 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
     proj["rerun"]["scene_plan_enabled"] = True
     (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
     await state.clear()
-    await message.answer("✅ Изображение принято. Перемонтирую ролик с заменённой сценой…")
+    await message.answer("✅ Принято. Перемонтирую ролик с заменённой сценой…")
     _run_job(lambda: project_remake_job(message.bot, message.chat.id, first))
 
 
@@ -13206,7 +13220,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             return
         await state.set_state(SceneReviewState.replacement)
         await state.update_data(scene_review_first=first, scene_review_index=index)
-        await message.answer(f"📷 Пришли новое изображение для сцены №{index + 1}. /cancel — отмена.")
+        await message.answer(f"📷 Пришли фото или видео (до 20 МБ) для сцены №{index + 1}. /cancel — отмена.")
         return
     if kind == "wvcut" and arg.isdigit():  # выпуск → вертикальные шортсы по новостям
         await callback.answer()
@@ -16821,8 +16835,14 @@ async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
                    f"Источник: {asset.get('source') or 'неизвестен'} · "
                    f"статус: {(scene.get('match') or {}).get('status') or 'не проверено'}")
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [_btn("🔄 Заменить изображение", f"pt:vr:{first}:{index}")]])
-        if path.is_file():
+            [_btn("🔄 Заменить (фото или видео)", f"pt:vr:{first}:{index}")]])
+        clip = Path(str(cards[index].get("clip") or "")) if index < len(cards) else Path()
+        if str(clip) not in ("", ".") and not clip.is_absolute():
+            clip = folder / clip
+        if clip.is_file() and clip.stat().st_size <= TG_UPLOAD_SCENE:  # сцена — отрывок: показываем сам отрывок
+            await bot.send_video(chat_id, FSInputFile(clip), caption=("🎞 " + caption)[:1000], reply_markup=markup,
+                                 supports_streaming=True, request_timeout=300)
+        elif path.is_file():
             await bot.send_photo(chat_id, FSInputFile(path), caption=caption[:1000], reply_markup=markup)
         else:
             await bot.send_message(chat_id, caption[:1000] + "\n⚠️ Файл изображения не найден.", reply_markup=markup)
