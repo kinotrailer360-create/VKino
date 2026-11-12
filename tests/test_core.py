@@ -836,10 +836,12 @@ def test_fill_slide_cuts_letterbox(tmp_path):
     img = Image.new("RGB", (1280, 720), (0, 0, 0))
     img.paste(Image.new("RGB", (1280, 520), (180, 60, 60)), (0, 100))
     img.save(tmp_path / "f.jpg")
-    frame = make_lore.FillSlide(tmp_path / "f.jpg", False).frame(0.0, 3.0)
+    slide = make_lore.FillSlide(tmp_path / "f.jpg", False)
+    frame = slide.frame(0.0, 3.0)
     assert frame.size == (make_lore.W, make_lore.H)
-    top = (make_lore.H - make_lore.FRAME_H) // 2
-    for y in (top + 3, top + make_lore.FRAME_H - 4):  # край окна 4:5 — картинка, а не чёрная полоса
+    assert slide.frame_h == round(make_lore.W * 9 / 16)  # панорама без полос — окно 16:9 во всю ширину
+    top = (make_lore.H - slide.frame_h) // 2
+    for y in (top + 3, top + slide.frame_h - 4):  # края кадра — картинка, а не чёрная полоса
         assert sum(frame.getpixel((make_lore.W // 2, y))) > 150
     assert sum(frame.getpixel((make_lore.W // 2, 5))) < sum(frame.getpixel((make_lore.W // 2, top + 3)))  # фон темнее
 
