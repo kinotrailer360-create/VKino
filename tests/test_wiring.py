@@ -100,3 +100,43 @@ def test_task_mode_docx_and_parse(monkeypatch) -> None:
     assert bot.IMG_URL.findall("[арт](https://a.com/x.jpg) и https://b.com/y.png») ") == \
         [("", "https://a.com/x.jpg"), ("", "https://b.com/y.png")]
     assert plan["lines"][0]["label"] == "11 ПРОЕКТОВ"
+
+
+def test_search_link_picks_image_from_ddg(tmp_path, monkeypatch) -> None:
+    """Ссылка на поиск Google: бот ищет в DuckDuckGo, Gemini выбирает картинку по фразе, фотостоки пропускаются."""
+    import asyncio
+    import io
+    import json
+
+    from PIL import Image
+
+    import bot
+
+    def png(color):
+        buf = io.BytesIO()
+        Image.new("RGB", (60, 40), color).save(buf, "PNG")
+        return buf.getvalue()
+
+    results = {"results": [
+        {"image": "https://stock.shutterstock.com/a.jpg", "thumbnail": "https://t/0", "width": 1200},
+        {"image": "https://site/a.jpg", "thumbnail": "https://t/1", "width": 1200},
+        {"image": "https://site/b.jpg", "thumbnail": "https://t/2", "width": 1200}]}
+    pages = {"https://t/1": (png((10, 10, 10)), "image/png"), "https://t/2": (png((200, 0, 0)), "image/png"),
+             "https://site/b.jpg": (png((200, 0, 0)), "image/png")}
+
+    async def fake_get(session, url, limit, trusted):
+        if url.startswith("https://duckduckgo.com/?"):
+            return b"<script>vqd='4-123'</script>", "text/html"
+        if url.startswith("https://duckduckgo.com/i.js"):
+            return json.dumps(results).encode(), "application/json"
+        return pages[url]
+
+    async def pick(key, texts, images):
+        assert len(images) == 2  # фотосток выброшен
+        return [1]
+
+    monkeypatch.setattr(bot.netsafe, "_get", fake_get)
+    monkeypatch.setattr(bot.shorts_ai, "match_images", pick)
+    asyncio.run(bot.fetch_image_url("https://www.google.com/search?tbm=isch&q=Doctor+Doom", tmp_path / "d.jpg",
+                                    "Дум на троне"))
+    assert Image.open(tmp_path / "d.jpg").getpixel((5, 5))[0] > 150  # взята картинка, которую выбрал ИИ
