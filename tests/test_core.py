@@ -945,3 +945,12 @@ def test_fact_query_keeps_title_and_main_words():
     from shorts import daily
     q = daily._fact_query({"name": "Дюна"}, "Это был самый дорогой фильм, который снимали в пустыне Иордании")
     assert q.startswith("Дюна") and "пустыне" in q and "который" not in q and len(q.split()) <= 7
+
+
+def test_post_names_must_come_from_sources():
+    from shorts import ai
+    post = ("📉 «СУПЕРГЁРЛ» СТАЛА КИНОПРОВАЛОМ ГОДА!\n\nФильм с Миллой Йовович в главной роли. "
+            "Хью Джекман, Джеймс Ганн, Тимоти Шаламе и Роберт Дауни-младший молчат. #Супергёрл")
+    src = "Supergirl starring Milly Alcock. Hugh Jackman, James Gunn, Timothee Chalamet, Robert Downey Jr."
+    assert ai.ungrounded_names(post, src) == ["Миллой Йовович"]
+    assert ai.ungrounded_names(post.replace("Миллой Йовович", "Милли Олкок"), src) == []

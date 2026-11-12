@@ -11058,6 +11058,9 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 res.get("status") or "")
             if status:
                 seen += f"\n\n🏷 Достоверность: {status}"
+            if res.get("unverified_names"):
+                seen += ("\n\n⚠️ Этих имён нет в источниках новости — проверь, не перепутал ли ИИ человека: "
+                         + escape(", ".join(res["unverified_names"])))
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
                 await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
