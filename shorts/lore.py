@@ -315,8 +315,17 @@ async def _cut_trailer(work: Path, at: float, src: Path, stem: str, length: floa
     почти целиком по центру, сверху и снизу его размытая копия."""
     length = round(length, 2)
     name = f"{stem}.mp4"
+    try:  # отрезок не заходит в последнюю секунду видео (там часто чёрный экран или титры)
+        total = await daily._duration(src)
+        at = max(0.0, min(at, total - length - 1.0))
+    except Exception:  # noqa: BLE001
+        pass
     bars = await _bars(src, at, length) if full else ""  # чёрные полосы кино-кадра — срезаем, иначе экран чёрный
-    vf = (f"[0:v]{bars}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" if full else
+    # «на весь экран» для широкого кадра — окно 4:5 во всю ширину (видно, что в кадре), сверху и снизу — его размытая
+    # копия; раньше кадр 16:9 обрезался до 9:16 — оставалась треть, «растянуто и непонятно»
+    vf = (f"[0:v]{bars}split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+          "boxblur=20:2,eq=brightness=-0.25[bg];[b]scale=-2:1350,crop=1080:1350[fg];"
+          "[bg][fg]overlay=0:(H-h)/2,fps=30" if full else
           "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
           "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
           "crop=1080:860[fg];[bg][fg]overlay=0:(H-h)/2,fps=30")
