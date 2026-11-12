@@ -903,6 +903,11 @@ def test_list_titles_name_the_films() -> None:
         "Что посмотреть: «Любовь под прикрытием», «Доктор Икс» и ещё 3 онлайн-премьеры 🔥 #shorts"
     assert list_title(online, films[:1]) == "Что посмотреть: «Цикл зверя» 🔥 #shorts"
     assert list_title(theme_for("genre:триллер", date(2026, 11, 9)), films).startswith("Лучшие триллеры: «Любовь")
+    # было «Лучшие фантастика: … и ещё 3 🎬»
+    assert list_title(theme_for("genre:фантастика", date(2026, 11, 9)), films) == \
+        "Лучшая фантастика: «Любовь под прикрытием», «Доктор Икс» и ещё 3 фильма 🎬 #shorts"
+    from shorts.daily import GENRES, GENRE_TITLES
+    assert set(GENRES) == set(GENRE_TITLES)  # новый жанр без заголовка не останется
     long = [{"name": "Очень длинное название фильма " * 2} for _ in range(5)]
     assert len(list_title(online, long)) <= 100
     assert list_title(online, []) == f"{online.seo_title} #shorts"
