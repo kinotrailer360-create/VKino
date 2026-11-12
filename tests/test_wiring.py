@@ -37,3 +37,30 @@ def test_weekly_own_text_split() -> None:
     import bot
     text = "Первая фраза. Вторая фраза!\nТретья фраза?\n\n📎 Источники: t.me/a, t.me/b"
     assert bot._wd_phrases(text) == ["Первая фраза.", "Вторая фраза!", "Третья фраза?"]
+
+
+def test_lore_media_links_and_og_image(tmp_path, monkeypatch) -> None:
+    """Ссылки вместо файлов: «3 https://…» — к фразе 3; страница — её og:image; не картинка — ошибка."""
+    import asyncio
+    import io
+
+    import pytest
+    from PIL import Image
+
+    import bot
+    assert bot.IMG_URL.findall("3 https://a.com/x.jpg?w=1\nhttps://b.com/y.png") == \
+        [("3", "https://a.com/x.jpg?w=1"), ("", "https://b.com/y.png")]
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 20), (200, 0, 0)).save(buf, "PNG")
+    pages = {"https://site.com/page": (b'<meta property="og:image" content="/img.png">', "text/html"),
+             "https://site.com/img.png": (buf.getvalue(), "image/png"),
+             "https://site.com/none": (b"<html></html>", "text/html")}
+
+    async def fake_get(session, url, limit, trusted):
+        return pages[url]
+
+    monkeypatch.setattr(bot.netsafe, "_get", fake_get)
+    asyncio.run(bot.fetch_image_url("https://site.com/page", tmp_path / "a.jpg"))
+    assert Image.open(tmp_path / "a.jpg").size == (40, 20)
+    with pytest.raises(RuntimeError):
+        asyncio.run(bot.fetch_image_url("https://site.com/none", tmp_path / "b.jpg"))

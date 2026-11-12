@@ -18,7 +18,7 @@ from html import escape
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urljoin, urlparse
 
 import aiohttp
 import asyncpg
@@ -14228,6 +14228,29 @@ async def lore_style() -> str:
     return await shorts_setting("lore_style") or "dynamic"
 
 
+IMG_URL = re.compile(r"(?:(?<!\d)(\d{1,2})\s*[.:)\-—]?\s*)?(https?://\S+)")
+
+
+async def fetch_image_url(url: str, path: Path) -> None:
+    """Картинка по ссылке: прямая ссылка на файл — как есть; страница — её главная картинка (og:image)."""
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=40),
+                                    headers={"User-Agent": "Mozilla/5.0 KinoMir360-bot"}) as session:
+        raw, ctype = await netsafe._get(session, url, 15 * 1024 * 1024, "")
+        if not ctype.startswith("image/"):
+            html = raw[:2_000_000].decode("utf-8", errors="ignore")
+            m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html) or \
+                re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', html)
+            if not m:
+                raise RuntimeError("на странице нет картинки")
+            raw, ctype = await netsafe._get(session, urljoin(url, m.group(1).replace("&amp;", "&")),
+                                            15 * 1024 * 1024, "")
+            if not ctype.startswith("image/"):
+                raise RuntimeError("это не картинка")
+    from PIL import Image as PILImage
+    img = PILImage.open(io.BytesIO(raw))
+    img.convert("RGB").save(path.with_suffix(".jpg") if path.suffix != ".jpg" else path, quality=92)
+
+
 async def lore_media_mode() -> str:
     """Свои картинки и видео автора: own — ролик только из них; mix — вместе с найденными ботом (ИИ выбирает
     лучшее под каждую фразу и в своих, и в найденных)."""
@@ -14273,15 +14296,24 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "история персонажа"}))
             files: list[Path] = []
             pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
+            lost: list[str] = []
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
-                    await bot.download(item["file_id"], destination=path)
+                    if item.get("url"):  # картинка по ссылке автора — скачиваем сами
+                        await fetch_image_url(item["url"], path)
+                    else:
+                        await bot.download(item["file_id"], destination=path)
                     if item.get("line"):
                         pins[len(files)] = int(item["line"])
                     files.append(path)
-                except Exception:
-                    logging.exception("Lore: user file download failed")
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
+                    lost.append((f"к фразе {item['line']}: " if item.get("line") else "") + str(item.get("url") or k)[:80])
+            if lost:
+                await bot.send_message(chat_id, "⚠️ Не скачались картинки (ссылка не открылась или это не картинка):\n"
+                                       + "\n".join(f"• {escape(x)}" for x in lost[:10])
+                                       + "\nНа этих фразах будут другие кадры.")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             script = dict(data["lore_script"], style=await lore_style(), media_mode=await lore_media_mode())
@@ -14451,6 +14483,29 @@ async def lore_edit(message: Message, state: FSMContext) -> None:
     await show_lore(message, state)
 
 
+@router.message(LoreState.media, F.text, ~F.text.startswith("/"))
+async def lore_media_links(message: Message, state: FSMContext) -> None:
+    """Ссылки на картинки вместо файлов: «3 https://…» — картинка к фразе 3 (номер можно не писать)."""
+    found = IMG_URL.findall(message.text or "")
+    if not found:
+        await message.answer("Пришли картинку, видео или ссылку на картинку (можно с номером фразы: «3 https://…»).")
+        return
+    async with review_media_lock:
+        media = (await state.get_data()).get("lore_media") or []
+        for num, url in found:
+            if len(media) >= LORE_MEDIA_MAX:
+                break
+            item = {"url": url.rstrip(").,»"), "ext": ".jpg"}
+            if num:
+                item["line"] = int(num)
+            media.append(item)
+        await state.update_data(lore_media=media)
+    pinned = [f"{n} → фраза {n}" for n, _ in found if n]
+    await message.answer(f"🔗 Принято ссылок: {len(found)}" + (f" ({', '.join(pinned[:12])})" if pinned else "")
+                         + f". Всего материалов: {len(media)}. Картинки скачаю при сборке.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✅ Готово", "lo:media_done")]]))
+
+
 @router.message(LoreState.media, F.photo | F.document | F.video | F.animation)
 async def lore_media(message: Message, state: FSMContext) -> None:
     if message.photo:
@@ -14553,7 +14608,8 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "• «🖼 Кадры: только мои» — ролик только из твоего; «🤝 мои + найденные» — ИИ выбирает лучшее и из твоего, "
             "и из найденного сам (трейлер, фото).\n\n"
             "📌 Чтобы картинка встала к определённой фразе, подпиши под ней номер фразы цифрой "
-            "(например <b>4</b>). Файлы до 20 МБ.",
+            "(например <b>4</b>). Файлы до 20 МБ.\n"
+            "🔗 Нет файлов — пришли ссылки на картинки, можно списком: «3 https://…» по строке на каждую.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "lo:media_done")], [_btn("🗑 Убрать все мои картинки", "lo:media_clear")]]))
     elif action == "mix":
