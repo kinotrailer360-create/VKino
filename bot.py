@@ -12642,7 +12642,9 @@ async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> N
 
 YT_CLIENT_ID = os.getenv("YT_CLIENT_ID", "").strip()
 YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET", "").strip()
-READY_DIR = SHORTS_DIR / "ready"  # готовые шортсы ждут загрузки на YouTube 3 дня
+# готовые ролики и их проекты («🎙 Только звук», «🔁 Полностью») — в томе /data, а не во /tmp контейнера: иначе
+# каждое обновление бота стирало их, и кнопки под вчерашним роликом отвечали «проекта нет»
+READY_DIR = shorts_daily.DATA_DIR / "ready"
 READY_DAYS = 3
 yt_lock = asyncio.Lock()
 
