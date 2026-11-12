@@ -954,3 +954,30 @@ def test_post_names_must_come_from_sources():
     src = "Supergirl starring Milly Alcock. Hugh Jackman, James Gunn, Timothee Chalamet, Robert Downey Jr."
     assert ai.ungrounded_names(post, src) == ["Миллой Йовович"]
     assert ai.ungrounded_names(post.replace("Миллой Йовович", "Милли Олкок"), src) == []
+
+
+def test_fast_site_page_finds_its_feed_and_article_images(monkeypatch):
+    import asyncio
+    import time as _t
+    from shorts import fastnews, netsafe
+    now = _t.strftime("%a, %d %b %Y %H:%M:%S +0000", _t.gmtime())
+    feed = (f'<?xml version="1.0"?><rss><channel><title>Empire</title><item><title>Avengers: Doomsday poster</title>'
+            f'<link>https://www.empireonline.com/movies/news/doomsday-poster/</link><pubDate>{now}</pubDate>'
+            '<description>Exclusive first look</description></item></channel></rss>').encode()
+    home = b'<html><head><link rel="alternate" type="application/rss+xml" href="/feed/rss"></head></html>'
+    pages = {"https://www.empireonline.com/": home, "https://www.empireonline.com/feed/rss": feed}
+
+    async def fake_download(session, url):
+        return pages[url]
+
+    async def fake_page(session, url, limit=0):
+        return '<meta property="og:image" content="https://img.example/poster.jpg">', "text/html"
+
+    monkeypatch.setattr(fastnews, "_download", fake_download)
+    monkeypatch.setattr(netsafe, "fetch_page", fake_page)
+    fastnews._found_feed.clear()
+    posts = asyncio.run(fastnews.latest(["https://www.empireonline.com/"]))
+    assert posts and posts[0]["text"].startswith("Avengers: Doomsday poster")
+    assert posts[0]["image"] == "https://img.example/poster.jpg"
+    assert fastnews._found_feed["https://www.empireonline.com/"] == "https://www.empireonline.com/feed/rss"
+    assert "site%3Aempireonline.com" in fastnews.google_news("empireonline.com")
