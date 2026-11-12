@@ -838,8 +838,23 @@ def test_fill_slide_cuts_letterbox(tmp_path):
     img.save(tmp_path / "f.jpg")
     frame = make_lore.FillSlide(tmp_path / "f.jpg", False).frame(0.0, 3.0)
     assert frame.size == (make_lore.W, make_lore.H)
-    for y in (2, make_lore.H - 3):  # верх и низ — картинка, а не чёрная полоса
+    top = (make_lore.H - make_lore.FRAME_H) // 2
+    for y in (top + 3, top + make_lore.FRAME_H - 4):  # край окна 4:5 — картинка, а не чёрная полоса
         assert sum(frame.getpixel((make_lore.W // 2, y))) > 150
+    assert sum(frame.getpixel((make_lore.W // 2, 5))) < sum(frame.getpixel((make_lore.W // 2, top + 3)))  # фон темнее
+
+
+def test_focus_window_follows_the_subject():
+    """Окно 4:5 из широкого кадра встаёт туда, где главное (детали), а не всегда в центр."""
+    from PIL import Image, ImageDraw
+
+    from shorts import make_lore
+    img = Image.new("RGB", (1920, 1080), (40, 40, 40))
+    d = ImageDraw.Draw(img)
+    for k in range(0, 500, 20):  # «герой» справа — много контуров
+        d.rectangle((1350 + k // 2, 200 + k, 1500 + k // 2, 260 + k), outline=(255, 255, 255), width=4)
+    x = make_lore._focus_x(img, 864)
+    assert x > 600 and x + 864 >= 1700  # окно накрывает героя справа
 
 
 def test_own_video_moments_cut_full_screen(tmp_path, monkeypatch):

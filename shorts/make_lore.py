@@ -89,11 +89,36 @@ class FitSlide:
         return img
 
 
-class FillSlide:
-    """Кадр на весь экран 9:16: чёрные полосы кино-кадра срезаны, середина по центру, камера медленно наезжает
-    (как в роликах, где картинка не «бегает» и не стоит в узкой полосе)."""
+FRAME_H = 1350  # кадр 16:9 в вертикальном ролике: окно 4:5 во всю ширину, сверху и снизу — его размытая копия
 
-    ZOOM = 0.08
+
+def _focus_x(img: Image.Image, crop_w: int) -> int:
+    """Где по горизонтали главное в кадре: окно ширины crop_w с наибольшей «детальностью» (лица, фигуры, надписи
+    дают много контуров, небо и стены — мало). Без нейросетей: контуры по уменьшенной копии."""
+    small_w = 160
+    k = small_w / img.width
+    small = img.convert("L").resize((small_w, max(1, round(img.height * k)))).filter(ImageFilter.FIND_EDGES)
+    cols = [sum(small.crop((x, 0, x + 1, small.height)).getdata()) for x in range(small_w)]
+    win = max(1, round(crop_w * k))
+    if win >= small_w:
+        return 0
+    best, best_x, acc = -1.0, 0, sum(cols[:win])
+    centre = (small_w - win) / 2
+    for x in range(small_w - win + 1):
+        if x:
+            acc += cols[x + win - 1] - cols[x - 1]
+        score = acc * (1 - 0.15 * abs(x - centre) / max(centre, 1))  # при равенстве — ближе к центру
+        if score > best:
+            best, best_x = score, x
+    return round(best_x / k)
+
+
+class FillSlide:
+    """Широкий кадр в вертикальном ролике: окно 4:5 во всю ширину экрана там, где главное (лица, фигуры), сверху и
+    снизу — размытая копия; чёрные полосы кино-кадра срезаны, камера медленно наезжает. Раньше кадр растягивался
+    на весь экран 9:16 — от него оставалась треть, и было непонятно, что в кадре."""
+
+    ZOOM = 0.06
 
     def __init__(self, path: Path, reverse: bool):
         img = Image.open(path).convert("RGB")
@@ -103,17 +128,29 @@ class FillSlide:
         bottom = next((y for y, v in enumerate(reversed(rows)) if v > 14), 0)
         if top + bottom < img.height * 0.5:
             img = img.crop((0, top, img.width, img.height - bottom))
-        s = max(W / img.width, H / img.height) * (1 + self.ZOOM)
-        self.img = img.resize((round(img.width * s) + 1, round(img.height * s) + 1), Image.LANCZOS)
+        bg = img.copy()
+        s = max(W / bg.width, H / bg.height)
+        bg = bg.resize((round(bg.width * s) + 1, round(bg.height * s) + 1), Image.LANCZOS)
+        bg = bg.crop(((bg.width - W) // 2, (bg.height - H) // 2, (bg.width - W) // 2 + W, (bg.height - H) // 2 + H))
+        self.bg = ImageEnhance.Brightness(bg.filter(ImageFilter.GaussianBlur(30))).enhance(0.5)
+        # окно 4:5 по высоте кадра; если кадр не такой широкий — во всю его ширину
+        crop_w = min(img.width, round(img.height * W / FRAME_H))
+        x = _focus_x(img, crop_w)
+        win = img.crop((x, 0, x + crop_w, img.height))
+        s = max(W / win.width, FRAME_H / win.height) * (1 + self.ZOOM)
+        self.fg = win.resize((round(win.width * s) + 1, round(win.height * s) + 1), Image.LANCZOS)
         self.reverse = reverse
 
     def frame(self, t: float, dur: float) -> Image.Image:
         k = min(max(t / max(dur, 0.1), 0.0), 1.0)
         k = k * k * (3 - 2 * k)
         z = (1 + self.ZOOM * ((1 - k) if self.reverse else k)) / (1 + self.ZOOM)
-        cw, ch = round(W / z), round(H / z)
-        x, y = (self.img.width - cw) // 2, (self.img.height - ch) // 2
-        return self.img.crop((x, y, x + cw, y + ch)).resize((W, H), Image.BILINEAR)
+        cw, ch = min(round(W / z), self.fg.width), min(round(FRAME_H / z), self.fg.height)
+        x, y = (self.fg.width - cw) // 2, (self.fg.height - ch) // 2
+        fg = self.fg.crop((x, y, x + cw, y + ch)).resize((W, FRAME_H), Image.BILINEAR)
+        img = self.bg.copy()
+        img.paste(fg, (0, (H - FRAME_H) // 2))
+        return img
 
 
 class ClipSlide:
