@@ -677,6 +677,25 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             except Exception as exc:  # noqa: BLE001
                 log.info("shorts: own video still failed: %s", exc)
         general = len(pool)
+    if not pool:  # ни своих, ни из статьи — ищем сами по теме ролика (DuckDuckGo / Bing)
+        from . import imgsearch
+        topic = script.get("name") or script.get("title") or (lines[0] if lines else "")
+        found = await imgsearch.search(str(topic), 8) if topic else []
+        from . import netsafe
+        async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=30), headers=imgsearch.BROWSER) as session:
+            for item in found:
+                if len(pool) >= 6:
+                    break
+                try:  # адреса из выдачи поиска — только публичный интернет, с потолком размера
+                    raw, _ = await netsafe._get(session, item["image"], 15 * 1024 * 1024, "")
+                    img = _frame_ready(Image.open(io.BytesIO(raw)))
+                except Exception:  # noqa: BLE001, S112
+                    continue
+                out = work / f"lsearch{len(pool)}.jpg"
+                img.save(out, quality=90)
+                img.thumbnail((480, 480))
+                pool.append((out.name, img))
+        general = len(pool)
     if not pool:
         raise RuntimeError("нет ни одной картинки: пришли свои (страницы комиксов, кадры) кнопкой «📎»")
 

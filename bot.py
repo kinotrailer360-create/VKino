@@ -85,6 +85,7 @@ from shorts import lore as shorts_lore
 from shorts import review as shorts_review
 from shorts import project as shorts_project
 from shorts import plan as shorts_plan
+from shorts import imgsearch as shorts_imgsearch
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
@@ -9348,6 +9349,7 @@ async def review_buttons(callback: CallbackQuery, state: FSMContext) -> None:
 
 REVIEW_MEDIA_MAX = 20
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # бот Telegram скачивает файлы до 20 МБ
+TG_UPLOAD_SCENE = 45 * 1024 * 1024  # отрывок сцены на проверку отправляем, если он меньше лимита отправки
 review_media_lock = asyncio.Lock()
 
 
@@ -9583,7 +9585,7 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             shutil.rmtree(work, ignore_errors=True)
 
 
-@router.message(SceneReviewState.replacement, F.photo)
+@router.message(SceneReviewState.replacement, F.photo | F.video)
 async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         await state.clear()
@@ -9601,15 +9603,28 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer("Проект не найден. Открой проверку сцен заново.")
         return
-    photo = message.photo[-1]
-    if (photo.file_size or 0) > TG_DOWNLOAD_LIMIT:
-        await message.answer("Фото слишком большое. Пришли сжатую версию.")
+    media = message.video or message.photo[-1]
+    if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать. Пришли сжатую версию.")
         return
-    path = folder / f"scene_replacement_{index + 1}.jpg"
-    await message.bot.download(photo.file_id, destination=path)
-    cards[index]["image"] = path.name
-    cards[index].pop("clip", None)
-    cards[index].pop("overlay", None)
+    if message.video:
+        # видео встаёт в сцену как отрывок; рамка с номером — прежняя, если была, иначе новая
+        path = folder / f"scene_replacement_{index + 1}.mp4"
+        await message.bot.download(media.file_id, destination=path)
+        stale = folder / f"scene_replacement_{index + 1}.frames"  # кадры прошлой замены — нарезать заново
+        shutil.rmtree(stale, ignore_errors=True)
+        overlay = str(cards[index].get("overlay") or "")
+        if not overlay or not (folder / overlay).exists():
+            overlay = f"overlay{index + 1}.png"
+            await asyncio.to_thread(lambda: shorts_daily.card_overlay(
+                "", index + 1, len(cards), None, "IMDb", None, None, shorts_daily.FACT_CARD_H).save(folder / overlay))
+        cards[index]["clip"], cards[index]["overlay"] = path.name, overlay
+    else:
+        path = folder / f"scene_replacement_{index + 1}.jpg"
+        await message.bot.download(media.file_id, destination=path)
+        cards[index]["image"] = path.name
+        cards[index].pop("clip", None)
+        cards[index].pop("overlay", None)
     cards[index]["asset_source"] = "user_replacement"
     cards[index]["visual_match"] = {
         "status": "user_replacement_review", "score": None,
@@ -9618,7 +9633,7 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
     proj["rerun"]["scene_plan_enabled"] = True
     (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
     await state.clear()
-    await message.answer("✅ Изображение принято. Перемонтирую ролик с заменённой сценой…")
+    await message.answer("✅ Принято. Перемонтирую ролик с заменённой сценой…")
     _run_job(lambda: project_remake_job(message.bot, message.chat.id, first))
 
 
@@ -13205,7 +13220,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             return
         await state.set_state(SceneReviewState.replacement)
         await state.update_data(scene_review_first=first, scene_review_index=index)
-        await message.answer(f"📷 Пришли новое изображение для сцены №{index + 1}. /cancel — отмена.")
+        await message.answer(f"📷 Пришли фото или видео (до 20 МБ) для сцены №{index + 1}. /cancel — отмена.")
         return
     if kind == "wvcut" and arg.isdigit():  # выпуск → вертикальные шортсы по новостям
         await callback.answer()
@@ -14244,70 +14259,6 @@ def search_query(url: str) -> str:
     return (params.get("q") or params.get("text") or "").strip()
 
 
-STOCK = ("shutterstock", "alamy", "gettyimages", "istockphoto", "dreamstime", "depositphotos", "123rf", "adobe.com",
-         "pinterest", "vecteezy")  # фотостоки с водяными знаками и Pinterest (уменьшенные копии)
-
-
-async def ddg_images(session: aiohttp.ClientSession, query: str, limit: int = 12) -> list[dict[str, str]]:
-    """Картинки DuckDuckGo по запросу (без ключа): [{"image", "thumb", "title"}], без фотостоков с водяными
-    знаками. DuckDuckGo иногда отказывает частым запросам — тогда пусто."""
-    page, _ = await netsafe._get(session, "https://duckduckgo.com/?ia=images&iax=images&q=" + quote_plus(query),
-                                 2 * 1024 * 1024, "")
-    m = re.search(rb"vqd=[\"']?([\d-]+)", page)
-    if not m:
-        return []
-    api = ("https://duckduckgo.com/i.js?l=wt-wt&o=json&f=,,,,,&p=1&q=" + quote_plus(query)
-           + "&vqd=" + m.group(1).decode())
-    raw, _ = await netsafe._get(session, api, 3 * 1024 * 1024, "")
-    out = []
-    for r in json.loads(raw.decode("utf-8", "ignore")).get("results") or []:
-        image, thumb = str(r.get("image") or ""), str(r.get("thumbnail") or "")
-        if not image.startswith("http") or any(x in (image + str(r.get("url") or "")).lower() for x in STOCK):
-            continue
-        if int(r.get("width") or 0) and int(r.get("width") or 0) < 500:
-            continue  # маленькая картинка в ролике будет мылом
-        out.append({"image": image, "thumb": thumb or image, "title": str(r.get("title") or "")})
-        if len(out) >= limit:
-            break
-    return out
-
-
-async def pick_searched_image(session: aiohttp.ClientSession, query: str, phrase: str) -> bytes | None:
-    """Как человек в поиске картинок: смотрим выдачу и берём ту, что подходит к фразе (выбирает Gemini по
-    миниатюрам). Ничего не подошло — None."""
-    from PIL import Image as PILImage
-    try:
-        found = await ddg_images(session, query)
-    except Exception as exc:  # noqa: BLE001
-        logging.info("DDG images %s failed: %s", query, exc)
-        return None
-    thumbs, cands = [], []
-    for item in found:
-        try:
-            raw, ctype = await netsafe._get(session, item["thumb"], 2 * 1024 * 1024, "")
-            thumbs.append(PILImage.open(io.BytesIO(raw)).convert("RGB"))
-            cands.append(item)
-        except Exception:  # noqa: BLE001
-            continue
-    if not cands:
-        return None
-    order = list(range(len(cands)))
-    choice = await shorts_ai.match_images(GEMINI_API_KEY, [phrase or query], thumbs)
-    if choice and 0 <= choice[0] < len(cands):
-        order.remove(choice[0])
-        order.insert(0, choice[0])
-    elif choice is not None:
-        return None  # ИИ посмотрел и сказал, что ни одна не подходит
-    for k in order[:3]:  # лучшая; не скачалась — следующая
-        try:
-            raw, ctype = await netsafe._get(session, cands[k]["image"], 15 * 1024 * 1024, "")
-            if ctype.startswith("image/"):
-                return raw
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
 async def commons_image(session: aiohttp.ClientSession, query: str) -> str:
     """Картинка по запросу из Wikimedia Commons (бесплатные лицензии): адрес первой подходящей jpg/png."""
     api = ("https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=6"
@@ -14337,13 +14288,14 @@ async def fetch_image_url(url: str, path: Path, phrase: str = "") -> None:
         query = search_query(url)
         raw = b""
         if query:  # ссылка на поиск Google — Google ботов не пускает: ищем в DuckDuckGo и выбираем по фразе
-            raw = await pick_searched_image(session, query, phrase) or b""
+            raw = await shorts_imgsearch.pick(query, phrase, GEMINI_API_KEY) or b""
             if raw:
                 ctype = "image/"
             else:  # запасной — Wikimedia Commons (только если в названии файла слова запроса)
                 found = await commons_image(session, query)
                 if not found:
-                    raise RuntimeError(f"по запросу «{query}» подходящей картинки не нашлось")
+                    why = f" ({shorts_imgsearch.last_error})" if shorts_imgsearch.last_error else ""
+                    raise RuntimeError(f"по запросу «{query}» подходящей картинки не нашлось{why}")
                 url = found
         if not raw:
             raw, ctype = await netsafe._get(session, url, 15 * 1024 * 1024, "")
@@ -14422,7 +14374,8 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     files.append(path)
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
-                    lost.append((f"к фразе {item['line']}: " if item.get("line") else "") + str(item.get("url") or k)[:80])
+                    lost.append((f"к фразе {item['line']}: " if item.get("line") else "")
+                                + (str(exc)[:160] if item.get("url") else str(k)))
             if lost:
                 await bot.send_message(chat_id, "⚠️ Не скачались картинки (ссылка не открылась или это не картинка):\n"
                                        + "\n".join(f"• {escape(x)}" for x in lost[:10])
@@ -16882,8 +16835,14 @@ async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
                    f"Источник: {asset.get('source') or 'неизвестен'} · "
                    f"статус: {(scene.get('match') or {}).get('status') or 'не проверено'}")
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [_btn("🔄 Заменить изображение", f"pt:vr:{first}:{index}")]])
-        if path.is_file():
+            [_btn("🔄 Заменить (фото или видео)", f"pt:vr:{first}:{index}")]])
+        clip = Path(str(cards[index].get("clip") or "")) if index < len(cards) else Path()
+        if str(clip) not in ("", ".") and not clip.is_absolute():
+            clip = folder / clip
+        if clip.is_file() and clip.stat().st_size <= TG_UPLOAD_SCENE:  # сцена — отрывок: показываем сам отрывок
+            await bot.send_video(chat_id, FSInputFile(clip), caption=("🎞 " + caption)[:1000], reply_markup=markup,
+                                 supports_streaming=True, request_timeout=300)
+        elif path.is_file():
             await bot.send_photo(chat_id, FSInputFile(path), caption=caption[:1000], reply_markup=markup)
         else:
             await bot.send_message(chat_id, caption[:1000] + "\n⚠️ Файл изображения не найден.", reply_markup=markup)

@@ -939,3 +939,9 @@ def test_plan_ready_scripts_fit_shorts():
         words = len(body.split())
         assert 60 <= words <= 120, (day, words)  # ≈30–45 с озвучки
         assert "[" not in body and "кадр" not in body.lower()  # без монтажных указаний
+
+
+def test_fact_query_keeps_title_and_main_words():
+    from shorts import daily
+    q = daily._fact_query({"name": "Дюна"}, "Это был самый дорогой фильм, который снимали в пустыне Иордании")
+    assert q.startswith("Дюна") and "пустыне" in q and "который" not in q and len(q.split()) <= 7
