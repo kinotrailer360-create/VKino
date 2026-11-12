@@ -85,6 +85,7 @@ from shorts import lore as shorts_lore
 from shorts import review as shorts_review
 from shorts import project as shorts_project
 from shorts import plan as shorts_plan
+from shorts import imgsearch as shorts_imgsearch
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
 
@@ -14244,70 +14245,6 @@ def search_query(url: str) -> str:
     return (params.get("q") or params.get("text") or "").strip()
 
 
-STOCK = ("shutterstock", "alamy", "gettyimages", "istockphoto", "dreamstime", "depositphotos", "123rf", "adobe.com",
-         "pinterest", "vecteezy")  # фотостоки с водяными знаками и Pinterest (уменьшенные копии)
-
-
-async def ddg_images(session: aiohttp.ClientSession, query: str, limit: int = 12) -> list[dict[str, str]]:
-    """Картинки DuckDuckGo по запросу (без ключа): [{"image", "thumb", "title"}], без фотостоков с водяными
-    знаками. DuckDuckGo иногда отказывает частым запросам — тогда пусто."""
-    page, _ = await netsafe._get(session, "https://duckduckgo.com/?ia=images&iax=images&q=" + quote_plus(query),
-                                 2 * 1024 * 1024, "")
-    m = re.search(rb"vqd=[\"']?([\d-]+)", page)
-    if not m:
-        return []
-    api = ("https://duckduckgo.com/i.js?l=wt-wt&o=json&f=,,,,,&p=1&q=" + quote_plus(query)
-           + "&vqd=" + m.group(1).decode())
-    raw, _ = await netsafe._get(session, api, 3 * 1024 * 1024, "")
-    out = []
-    for r in json.loads(raw.decode("utf-8", "ignore")).get("results") or []:
-        image, thumb = str(r.get("image") or ""), str(r.get("thumbnail") or "")
-        if not image.startswith("http") or any(x in (image + str(r.get("url") or "")).lower() for x in STOCK):
-            continue
-        if int(r.get("width") or 0) and int(r.get("width") or 0) < 500:
-            continue  # маленькая картинка в ролике будет мылом
-        out.append({"image": image, "thumb": thumb or image, "title": str(r.get("title") or "")})
-        if len(out) >= limit:
-            break
-    return out
-
-
-async def pick_searched_image(session: aiohttp.ClientSession, query: str, phrase: str) -> bytes | None:
-    """Как человек в поиске картинок: смотрим выдачу и берём ту, что подходит к фразе (выбирает Gemini по
-    миниатюрам). Ничего не подошло — None."""
-    from PIL import Image as PILImage
-    try:
-        found = await ddg_images(session, query)
-    except Exception as exc:  # noqa: BLE001
-        logging.info("DDG images %s failed: %s", query, exc)
-        return None
-    thumbs, cands = [], []
-    for item in found:
-        try:
-            raw, ctype = await netsafe._get(session, item["thumb"], 2 * 1024 * 1024, "")
-            thumbs.append(PILImage.open(io.BytesIO(raw)).convert("RGB"))
-            cands.append(item)
-        except Exception:  # noqa: BLE001
-            continue
-    if not cands:
-        return None
-    order = list(range(len(cands)))
-    choice = await shorts_ai.match_images(GEMINI_API_KEY, [phrase or query], thumbs)
-    if choice and 0 <= choice[0] < len(cands):
-        order.remove(choice[0])
-        order.insert(0, choice[0])
-    elif choice is not None:
-        return None  # ИИ посмотрел и сказал, что ни одна не подходит
-    for k in order[:3]:  # лучшая; не скачалась — следующая
-        try:
-            raw, ctype = await netsafe._get(session, cands[k]["image"], 15 * 1024 * 1024, "")
-            if ctype.startswith("image/"):
-                return raw
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
 async def commons_image(session: aiohttp.ClientSession, query: str) -> str:
     """Картинка по запросу из Wikimedia Commons (бесплатные лицензии): адрес первой подходящей jpg/png."""
     api = ("https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=6"
@@ -14337,13 +14274,14 @@ async def fetch_image_url(url: str, path: Path, phrase: str = "") -> None:
         query = search_query(url)
         raw = b""
         if query:  # ссылка на поиск Google — Google ботов не пускает: ищем в DuckDuckGo и выбираем по фразе
-            raw = await pick_searched_image(session, query, phrase) or b""
+            raw = await shorts_imgsearch.pick(query, phrase, GEMINI_API_KEY) or b""
             if raw:
                 ctype = "image/"
             else:  # запасной — Wikimedia Commons (только если в названии файла слова запроса)
                 found = await commons_image(session, query)
                 if not found:
-                    raise RuntimeError(f"по запросу «{query}» подходящей картинки не нашлось")
+                    why = f" ({shorts_imgsearch.last_error})" if shorts_imgsearch.last_error else ""
+                    raise RuntimeError(f"по запросу «{query}» подходящей картинки не нашлось{why}")
                 url = found
         if not raw:
             raw, ctype = await netsafe._get(session, url, 15 * 1024 * 1024, "")
@@ -14422,7 +14360,8 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     files.append(path)
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
-                    lost.append((f"к фразе {item['line']}: " if item.get("line") else "") + str(item.get("url") or k)[:80])
+                    lost.append((f"к фразе {item['line']}: " if item.get("line") else "")
+                                + (str(exc)[:160] if item.get("url") else str(k)))
             if lost:
                 await bot.send_message(chat_id, "⚠️ Не скачались картинки (ссылка не открылась или это не картинка):\n"
                                        + "\n".join(f"• {escape(x)}" for x in lost[:10])
