@@ -755,7 +755,11 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 extra.append({"start": round(at, 3), "image": image, "hard": True})
         slides = sorted(slides + extra, key=lambda sl: sl["start"])
     labels: list[dict[str, Any]] = []
-    if news and gemini_key and script.get("kind_own"):
+    fixed_labels = script.get("screen_labels") or []  # надписи из задания автора — как есть, по фразам
+    if any(fixed_labels):
+        labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": str(t)[:60]}
+                  for i, t in enumerate(fixed_labels[:len(lines)]) if t]
+    elif news and gemini_key and script.get("kind_own"):
         texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
         labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts)
                   if t and not (score and i == int(score["line"]))]  # на карточке оценки надпись уже есть
@@ -885,7 +889,7 @@ def parse_script(text: str) -> dict[str, Any]:
             if not row or row.startswith(("#", "**", "---", "|", ">", "~", "- ")) or row.lower().startswith("формула"):
                 continue
             lines.append(re.sub(r"^\s*\d+[.)]\s*", "", row))
-    return {"title": title, "lines": [ln for ln in lines if len(ln) >= 3][:20], "screens": screens}
+    return {"title": title, "lines": [ln for ln in lines if len(ln) >= 3][:30], "screens": screens}
 
 
 _SCORE_WORDS = {"единиц": 1, "двойк": 2, "тройк": 3, "четвёрк": 4, "четверк": 4, "пятёрк": 5, "пятерк": 5,

@@ -18,7 +18,7 @@ from html import escape
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urljoin, urlparse
 
 import aiohttp
 import asyncpg
@@ -14228,6 +14228,29 @@ async def lore_style() -> str:
     return await shorts_setting("lore_style") or "dynamic"
 
 
+IMG_URL = re.compile(r"(?:(?<!\d)(\d{1,2})\s*[.:)\-—]?\s*)?(https?://\S+)")
+
+
+async def fetch_image_url(url: str, path: Path) -> None:
+    """Картинка по ссылке: прямая ссылка на файл — как есть; страница — её главная картинка (og:image)."""
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=40),
+                                    headers={"User-Agent": "Mozilla/5.0 KinoMir360-bot"}) as session:
+        raw, ctype = await netsafe._get(session, url, 15 * 1024 * 1024, "")
+        if not ctype.startswith("image/"):
+            html = raw[:2_000_000].decode("utf-8", errors="ignore")
+            m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html) or \
+                re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', html)
+            if not m:
+                raise RuntimeError("на странице нет картинки")
+            raw, ctype = await netsafe._get(session, urljoin(url, m.group(1).replace("&amp;", "&")),
+                                            15 * 1024 * 1024, "")
+            if not ctype.startswith("image/"):
+                raise RuntimeError("это не картинка")
+    from PIL import Image as PILImage
+    img = PILImage.open(io.BytesIO(raw))
+    img.convert("RGB").save(path.with_suffix(".jpg") if path.suffix != ".jpg" else path, quality=92)
+
+
 async def lore_media_mode() -> str:
     """Свои картинки и видео автора: own — ролик только из них; mix — вместе с найденными ботом (ИИ выбирает
     лучшее под каждую фразу и в своих, и в найденных)."""
@@ -14273,15 +14296,24 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             await set_shorts_setting("running", json.dumps({"chats": [chat_id], "theme": "история персонажа"}))
             files: list[Path] = []
             pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
+            lost: list[str] = []
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
-                    await bot.download(item["file_id"], destination=path)
+                    if item.get("url"):  # картинка по ссылке автора — скачиваем сами
+                        await fetch_image_url(item["url"], path)
+                    else:
+                        await bot.download(item["file_id"], destination=path)
                     if item.get("line"):
                         pins[len(files)] = int(item["line"])
                     files.append(path)
-                except Exception:
-                    logging.exception("Lore: user file download failed")
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
+                    lost.append((f"к фразе {item['line']}: " if item.get("line") else "") + str(item.get("url") or k)[:80])
+            if lost:
+                await bot.send_message(chat_id, "⚠️ Не скачались картинки (ссылка не открылась или это не картинка):\n"
+                                       + "\n".join(f"• {escape(x)}" for x in lost[:10])
+                                       + "\nНа этих фразах будут другие кадры.")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             script = dict(data["lore_script"], style=await lore_style(), media_mode=await lore_media_mode())
@@ -14360,12 +14392,15 @@ async def own_script_text(message: Message, state: FSMContext) -> None:
     text = message.text or ""
     if message.document:
         name = (message.document.file_name or "").lower()
-        if not name.endswith((".md", ".txt")) or (message.document.file_size or 0) > 1024 * 1024:
-            await message.answer("Нужен файл .md или .txt до 1 МБ — или вставь сценарий сообщением.")
+        if not name.endswith((".md", ".txt", ".docx")) or (message.document.file_size or 0) > 5 * 1024 * 1024:
+            await message.answer("Нужен файл .md, .txt или .docx до 5 МБ — или вставь сценарий сообщением.")
             return
         buf = io.BytesIO()
         await message.bot.download(message.document.file_id, destination=buf)
-        text = buf.getvalue().decode("utf-8", "ignore")
+        text = docx_text(buf.getvalue()) if name.endswith(".docx") else buf.getvalue().decode("utf-8", "ignore")
+    if looks_like_task(text) or (await state.get_data()).get("task_buf"):
+        await task_collect(message, state, text)  # задание целиком (озвучка + кадры + надписи) — разбирает ИИ
+        return
     scripts = shorts_lore.split_scripts(text)
     if not any(len(shorts_lore.parse_script(body)["lines"]) >= 2 for _, body in scripts):
         await message.answer("Не нашёл фраз. Пришли таблицей «Время | Голос | На экране» или фразу на строку.")
@@ -14378,6 +14413,92 @@ async def own_script_text(message: Message, state: FSMContext) -> None:
         return
     await message.answer("В файле несколько сценариев — какой собрать?", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[_btn(f"🎬 {head[:50]}", f"lo:ownpick:{k}")] for k, (head, _) in enumerate(scripts[:10])]))
+
+
+def docx_text(raw: bytes) -> str:
+    """Текст из .docx без лишних библиотек: абзацы и ячейки таблиц, ссылки-гиперссылки — адресом."""
+    import zipfile
+    from xml.etree import ElementTree
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+          "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        doc = ElementTree.fromstring(z.read("word/document.xml"))
+        links = {}
+        if "word/_rels/document.xml.rels" in z.namelist():
+            for rel in ElementTree.fromstring(z.read("word/_rels/document.xml.rels")):
+                links[rel.get("Id")] = rel.get("Target") or ""
+    out = []
+    for p in doc.iter(f"{{{ns['w']}}}p"):
+        parts = []
+        for node in p:
+            if node.tag == f"{{{ns['w']}}}hyperlink":
+                label = "".join(t.text or "" for t in node.iter(f"{{{ns['w']}}}t"))
+                url = links.get(node.get(f"{{{ns['r']}}}id") or "", "")
+                parts.append(f"{label} {url}".strip() if url and url not in label else label)
+            else:
+                parts.append("".join(t.text or "" for t in node.iter(f"{{{ns['w']}}}t")))
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
+def looks_like_task(text: str) -> bool:
+    """Задание на ролик, а не голый текст: длинное, со сценарием озвучки и указаниями к кадрам или ссылками."""
+    low = text.lower()
+    return len(text) > 700 and any(w in low for w in ("озвучк", "сценари")) and \
+        any(w in low for w in ("http", "кадр", "монтаж", "надпис"))
+
+
+task_tokens: dict[int, int] = {}  # чат → номер последней части задания (длинное сообщение Telegram режет на части)
+
+
+async def task_collect(message: Message, state: FSMContext, text: str) -> None:
+    """Части задания копим 6 с: длинный текст приходит несколькими сообщениями; потом разбираем целиком."""
+    buf = ((await state.get_data()).get("task_buf") or "") + "\n" + text
+    await state.update_data(task_buf=buf[-60000:])
+    chat = message.chat.id
+    token = task_tokens.get(chat, 0) + 1
+    task_tokens[chat] = token
+    await asyncio.sleep(6)
+    if task_tokens.get(chat) != token:
+        return  # пришла ещё часть — разберёт она
+    task = (await state.get_data()).get("task_buf") or ""
+    await state.update_data(task_buf="")
+    await state.set_state(None)
+    await task_build(message, state, task)
+
+
+async def task_build(message: Message, state: FSMContext, task: str) -> None:
+    wait = await message.answer("📋 Читаю задание: озвучка, кадры по ссылкам, надписи, оформление…")
+    plan = await shorts_ai.parse_task(GEMINI_API_KEY, task)
+    if not plan:
+        await wait.edit_text("❌ Не смог разобрать задание (ИИ не ответил или не нашёл текст озвучки). "
+                             "Попробуй ещё раз или пришли только текст озвучки — фраза на строку.")
+        return
+    lines = plan["lines"]
+    title = plan["title"] or "Свой сценарий"
+    body = f"**Заголовок:** {title}\n" + "\n".join(x["text"] for x in lines)
+    media = [{"url": x["url"], "ext": ".jpg", "line": k} for k, x in enumerate(lines, 1) if x["url"]]
+    await state.update_data(own_scripts=[(title, body)], own_pick=0, lore_kind="own", lore_name=title,
+                            lore_hook="", lore_script=None, lore_media=media,
+                            task_labels=[x["label"] for x in lines])
+    rows = [f"{k}. {escape(x['text'][:70])}" + (" 🔗" if x["url"] else "") + (f" 🏷 {escape(x['label'])}" if x["label"] else "")
+            for k, x in enumerate(lines, 1)]
+    await wait.edit_text(
+        f"📋 <b>Задание разобрано:</b> {len(lines)} фраз, кадров по ссылкам — {len(media)}, "
+        f"надписей — {sum(1 for x in lines if x['label'])}.\n\n" + "\n".join(rows)[:3000]
+        + (("\n\n<b>Указания:</b>\n" + "\n".join(f"• {escape(r)}" for r in plan["rules"])) if plan["rules"] else ""))
+    pack = [f"<b>Название:</b> {escape(plan['title'])}" if plan["title"] else "",
+            f"<b>Обложка:</b> {escape(plan['cover'])}" if plan["cover"] else "",
+            f"<b>Описание:</b>\n{escape(plan['description'])}" if plan["description"] else "",
+            f"<b>Хэштеги:</b> {escape(plan['hashtags'])}" if plan["hashtags"] else ""]
+    if any(pack):
+        await message.answer("📦 Для YouTube (скопируй при загрузке):\n" + "\n".join(x for x in pack if x))
+    await own_generate(message, state)
+    data = await state.get_data()
+    if data.get("lore_script") and data.get("task_labels"):
+        await state.update_data(lore_script={**data["lore_script"], "screen_labels": data["task_labels"]})
+    await message.answer("🔗 Кадры по ссылкам уже прикреплены к своим фразам (📎 в списке). Можно добавить видео "
+                         "с материалами — «📎 Свои картинки и видео», бот найдёт в нём моменты для остальных фраз.")
 
 
 async def own_generate(message: Message, state: FSMContext) -> None:
@@ -14451,6 +14572,29 @@ async def lore_edit(message: Message, state: FSMContext) -> None:
     await show_lore(message, state)
 
 
+@router.message(LoreState.media, F.text, ~F.text.startswith("/"))
+async def lore_media_links(message: Message, state: FSMContext) -> None:
+    """Ссылки на картинки вместо файлов: «3 https://…» — картинка к фразе 3 (номер можно не писать)."""
+    found = IMG_URL.findall(message.text or "")
+    if not found:
+        await message.answer("Пришли картинку, видео или ссылку на картинку (можно с номером фразы: «3 https://…»).")
+        return
+    async with review_media_lock:
+        media = (await state.get_data()).get("lore_media") or []
+        for num, url in found:
+            if len(media) >= LORE_MEDIA_MAX:
+                break
+            item = {"url": url.rstrip(").,»"), "ext": ".jpg"}
+            if num:
+                item["line"] = int(num)
+            media.append(item)
+        await state.update_data(lore_media=media)
+    pinned = [f"{n} → фраза {n}" for n, _ in found if n]
+    await message.answer(f"🔗 Принято ссылок: {len(found)}" + (f" ({', '.join(pinned[:12])})" if pinned else "")
+                         + f". Всего материалов: {len(media)}. Картинки скачаю при сборке.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✅ Готово", "lo:media_done")]]))
+
+
 @router.message(LoreState.media, F.photo | F.document | F.video | F.animation)
 async def lore_media(message: Message, state: FSMContext) -> None:
     if message.photo:
@@ -14506,6 +14650,9 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "таблицей «Время | Голос | На экране» или просто фраза на строку. Голосом прочитаю фразы как есть, "
             "ничего не переписывая; кадры подберу к фильмам и сериалам, названным в «ёлочках». Если в файле "
             "несколько сценариев — дам выбрать. Дальше можно поправить текст и добавить свои картинки.\n\n"
+            "📋 Можно прислать <b>задание целиком</b>, как ИИ-помощнику (текстом, .md, .txt или .docx): озвучка, "
+            "список кадров со ссылками, план с надписями, название и хэштеги. Бот возьмёт озвучку дословно, "
+            "скачает кадры по ссылкам к своим фразам и поставит надписи.\n\n"
             "<i>Передумал — /cancel</i>")
         return
     if action == "wwk":
@@ -14553,7 +14700,8 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "• «🖼 Кадры: только мои» — ролик только из твоего; «🤝 мои + найденные» — ИИ выбирает лучшее и из твоего, "
             "и из найденного сам (трейлер, фото).\n\n"
             "📌 Чтобы картинка встала к определённой фразе, подпиши под ней номер фразы цифрой "
-            "(например <b>4</b>). Файлы до 20 МБ.",
+            "(например <b>4</b>). Файлы до 20 МБ.\n"
+            "🔗 Нет файлов — пришли ссылки на картинки, можно списком: «3 https://…» по строке на каждую.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn("✅ Готово", "lo:media_done")], [_btn("🗑 Убрать все мои картинки", "lo:media_clear")]]))
     elif action == "mix":
