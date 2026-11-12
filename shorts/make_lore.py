@@ -114,9 +114,9 @@ def _focus_x(img: Image.Image, crop_w: int) -> int:
 
 
 class FillSlide:
-    """Широкий кадр в вертикальном ролике: окно 4:5 во всю ширину экрана там, где главное (лица, фигуры), сверху и
-    снизу — размытая копия; чёрные полосы кино-кадра срезаны, камера медленно наезжает. Раньше кадр растягивался
-    на весь экран 9:16 — от него оставалась треть, и было непонятно, что в кадре."""
+    """Широкий кадр в вертикальном ролике: целиком во всю ширину экрана, сверху и снизу — его размытая копия; чёрные
+    полосы кино-кадра срезаны, камера медленно наезжает. Обрезка до 9:16 (а потом и до 4:5) оставляла от кадра
+    часть — автор: «не видно всей картины, кадры кривые»."""
 
     ZOOM = 0.06
 
@@ -133,23 +133,26 @@ class FillSlide:
         bg = bg.resize((round(bg.width * s) + 1, round(bg.height * s) + 1), Image.LANCZOS)
         bg = bg.crop(((bg.width - W) // 2, (bg.height - H) // 2, (bg.width - W) // 2 + W, (bg.height - H) // 2 + H))
         self.bg = ImageEnhance.Brightness(bg.filter(ImageFilter.GaussianBlur(30))).enhance(0.5)
-        # окно 4:5 по высоте кадра; если кадр не такой широкий — во всю его ширину
-        crop_w = min(img.width, round(img.height * W / FRAME_H))
-        x = _focus_x(img, crop_w)
-        win = img.crop((x, 0, x + crop_w, img.height))
-        s = max(W / win.width, FRAME_H / win.height) * (1 + self.ZOOM)
-        self.fg = win.resize((round(win.width * s) + 1, round(win.height * s) + 1), Image.LANCZOS)
+        # кадр целиком во всю ширину экрана («видно всю картину»); очень широкий (панорама 2.4:1) — окно 16:9 там,
+        # где главное, чтобы он не стал узкой полоской
+        if img.width / img.height > 1.95:
+            crop_w = round(img.height * 16 / 9)
+            x = _focus_x(img, crop_w)
+            img = img.crop((x, 0, x + crop_w, img.height))
+        self.frame_h = min(FRAME_H, round(W * img.height / img.width))
+        s = max(W / img.width, self.frame_h / img.height) * (1 + self.ZOOM)
+        self.fg = img.resize((round(img.width * s) + 1, round(img.height * s) + 1), Image.LANCZOS)
         self.reverse = reverse
 
     def frame(self, t: float, dur: float) -> Image.Image:
         k = min(max(t / max(dur, 0.1), 0.0), 1.0)
         k = k * k * (3 - 2 * k)
         z = (1 + self.ZOOM * ((1 - k) if self.reverse else k)) / (1 + self.ZOOM)
-        cw, ch = min(round(W / z), self.fg.width), min(round(FRAME_H / z), self.fg.height)
+        cw, ch = min(round(W / z), self.fg.width), min(round(self.frame_h / z), self.fg.height)
         x, y = (self.fg.width - cw) // 2, (self.fg.height - ch) // 2
-        fg = self.fg.crop((x, y, x + cw, y + ch)).resize((W, FRAME_H), Image.BILINEAR)
+        fg = self.fg.crop((x, y, x + cw, y + ch)).resize((W, self.frame_h), Image.BILINEAR)
         img = self.bg.copy()
-        img.paste(fg, (0, (H - FRAME_H) // 2))
+        img.paste(fg, (0, (H - self.frame_h) // 2))
         return img
 
 

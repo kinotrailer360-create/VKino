@@ -321,10 +321,10 @@ async def _cut_trailer(work: Path, at: float, src: Path, stem: str, length: floa
     except Exception:  # noqa: BLE001
         pass
     bars = await _bars(src, at, length) if full else ""  # чёрные полосы кино-кадра — срезаем, иначе экран чёрный
-    # «на весь экран» для широкого кадра — окно 4:5 во всю ширину (видно, что в кадре), сверху и снизу — его размытая
-    # копия; раньше кадр 16:9 обрезался до 9:16 — оставалась треть, «растянуто и непонятно»
+    # «на весь экран» для широкого кадра — кадр целиком во всю ширину, сверху и снизу — его размытая копия (обрезка
+    # до 9:16 и до 4:5 оставляла от кадра часть: «не видно всей картины»)
     vf = (f"[0:v]{bars}split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-          "boxblur=20:2,eq=brightness=-0.25[bg];[b]scale=-2:1350,crop=1080:1350[fg];"
+          "boxblur=20:2,eq=brightness=-0.25[bg];[b]scale=1080:-2[fg];"
           "[bg][fg]overlay=0:(H-h)/2,fps=30" if full else
           "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
           "boxblur=20:2,eq=brightness=-0.18[bg];[b]scale=1080:860:force_original_aspect_ratio=increase,"
@@ -343,6 +343,7 @@ async def _cut_trailer(work: Path, at: float, src: Path, stem: str, length: floa
 
 SEG = 3.0  # динамичный монтаж: новый момент видео каждые ~3 с (чаще — мельтешит, не успеваешь понять кадр)
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
+CTA = re.compile(r"подпис|в комментари|сохрани|ставь лайк|пиши", re.I)
 
 
 async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[str], durs: list[float], skip: set[int],
@@ -763,6 +764,13 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             if starts[i] + durs[i] > at + 0.8:  # и всё ещё не хватило — кадр, а не стоп-кадр
                 extra.append({"start": round(at, 3), "image": image, "hard": True})
         slides = sorted(slides + extra, key=lambda sl: sl["start"])
+    # последняя фраза — призыв («пиши в комментариях», «подписывайся»): к ней нет своего кадра, и ИИ брал конец
+    # видео (чёрный экран с титрами) — ставим кадр, с которого ролик начался
+    if len(slides) > 2 and CTA.search(lines[-1]):
+        last = starts[-1]
+        slides = [sl for sl in slides if sl["start"] < last - 0.05]
+        first = next((sl for sl in slides if sl["start"] <= starts[0] + 0.05), slides[0])
+        slides.append({k: v for k, v in first.items() if k in ("clip", "image")} | {"start": last})
     labels: list[dict[str, Any]] = []
     fixed_labels = script.get("screen_labels") or []  # надписи из задания автора — как есть, по фразам
     if any(fixed_labels):
