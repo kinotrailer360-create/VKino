@@ -1227,11 +1227,71 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
             continue
         if 0 <= i < len(posts) and i not in media:
             media.append(i)
-    return {"post": post[:1020], "topic": str(data.get("topic") or "").strip()[:80], "media": media,
+    # имена людей — только из источников новости: ИИ путает похожие имена (Милли Олкок → «Милла Йовович»)
+    sources = "\n\n".join(posts[i]["text"] for i in media) or listing
+    wrong = ungrounded_names(post, sources)
+    if wrong:
+        log.warning("shorts: write_post names not in sources: %s", wrong)
+        post = await fix_names(key, post, sources, wrong)
+        wrong = ungrounded_names(post, sources)
+    return {"post": post[:1020], "unverified_names": wrong, "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
             "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
             "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true",
             "status": str(data.get("status") or "").strip().lower()}
+
+
+_LAT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+                ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "i", "k", "l", "m", "n", "o", "p", "r", "s", "t",
+                 "u", "f", "h", "ts", "ch", "sh", "sch", "", "y", "", "e", "yu", "ya"]))
+
+
+def _skeleton(word: str) -> str:
+    """Согласные имени латиницей — чтобы «Олкок» совпал с Alcock, а «Йовович» с Jovovich."""
+    w = "".join(_LAT.get(ch, ch) for ch in word.lower())
+    w = re.sub(r"(?<=[aeiou])w", "", w)  # Downey ~ Дауни, Crowe ~ Кроу
+    for a, b in (("tch", "ch"), ("dzh", "g"), ("zh", "g"), ("sch", "6"), ("sh", "6"), ("ch", "6"), ("kh", "h"),
+                 ("th", "t"), ("ph", "f"), ("ck", "k"), ("c", "k"), ("q", "k"), ("w", "v"), ("x", "ks"), ("j", "g")):
+        w = w.replace(a, b)
+    w = re.sub(r"[aeiouy]", "", w)
+    return re.sub(r"(.)\1+", r"\1", w)
+
+
+def ungrounded_names(post: str, sources: str) -> list[str]:
+    """Имена людей (Имя Фамилия) из поста, которых нет в источниках ни по-русски, ни латиницей: так ИИ
+    превращает Милли Олкок в «Миллу Йовович». Названия в «ёлочках» и хэштеги не проверяем."""
+    text = re.sub(r"«[^»]*»|#\S+", " ", post)
+    src = sources.lower().replace("ё", "е")
+    stems = {w[:5] for w in re.findall(r"[а-яе]{4,}", src)}
+    skels = {_skeleton(w) for w in re.findall(r"[a-zа-яе]{4,}", src)}
+    out = []
+    for m in re.finditer(r"\b([A-ZА-ЯЁ][a-zа-яё]+(?:-[A-ZА-ЯЁ][a-zа-яё]+)?)\s+([A-ZА-ЯЁ][a-zа-яё]{3,}"
+                         r"(?:-[A-ZА-ЯЁ][a-zа-яё]+)?)", text):
+        last = m.group(2).lower().replace("ё", "е")
+        found = last[:5] in stems if not last.isascii() else last in src
+        sk = _skeleton(re.sub(r"(ой|ом|ым|им|ых|ую|ей|ем|у|а|ы|е|ю)$", "", last))
+        found = found or (sk in skels if len(sk) < 3 else
+                          any(x.startswith(sk) or (len(x) >= 3 and sk.startswith(x)) for x in skels))
+        if not found and m.group(0) not in out:
+            out.append(m.group(0))
+    return out
+
+
+async def fix_names(key: str, post: str, sources: str, names: list[str]) -> str:
+    """Имена, которых нет в источниках: ИИ исправляет их по источникам или убирает. Не вышло — пост как был."""
+    prompt = (UNTRUSTED + "Ты редактор-фактчекер. В посте есть имена, которых НЕТ в источниках новости: "
+              + ", ".join(names) + ". Скорее всего ИИ перепутал человека (например, Милли Олкок → Милла Йовович). "
+              "Замени каждое такое имя на правильное ИЗ ИСТОЧНИКОВ (по-русски, в нужном падеже) или убери фразу, "
+              "если в источниках его нет. Хэштеги с этим именем тоже исправь. Больше НИЧЕГО не меняй."
+              + '\n\nОтветь только JSON: {"post": "исправленный пост"}\n\nИСТОЧНИКИ:\n' + sources[:6000]
+              + "\n\nПОСТ:\n" + post)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: name fix failed: %s", exc)
+        return post
+    fixed = str((data or {}).get("post") or "").strip() if isinstance(data, dict) else ""
+    return fixed[:1020] if len(fixed) >= 80 and same_story(post, fixed) else post
 
 
 async def guess_films(key: str, description: str) -> list[dict[str, Any]]:

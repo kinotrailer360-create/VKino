@@ -18,7 +18,7 @@ import os
 import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import aiohttp
 import feedparser
@@ -39,6 +39,7 @@ DEFAULT_FEEDS = [
     "x:DiscussingFilm",
     "x:DanielRPK",
     "x:MyTimeToShineH",
+    "https://www.empireonline.com/",
 ]
 HOURS = 12
 PER_FEED = 6
@@ -177,6 +178,64 @@ async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
         return await netsafe.fetch(safe, url, 5 * 1024 * 1024)
 
 
+_found_feed: dict[str, str] = {}  # адрес сайта → его RSS, найденный на главной (чтобы не искать каждый раз)
+ALT = re.compile(r'<link[^>]+type=["\']application/(?:rss|atom)\+xml["\'][^>]*>', re.I)
+OG_IMAGE = re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)'
+                      r'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)',
+                      re.I)
+OG_EVERY = 4  # у скольких новостей сайта без картинки в ленте искать её на странице статьи
+
+
+def google_news(host: str) -> str:
+    """Запасная лента любого сайта: свежие статьи сайта в Google Новостях (если своей RSS у сайта нет)."""
+    return (f"https://news.google.com/rss/search?q={quote_plus('site:' + host + ' when:1d')}"
+            "&hl=en-US&gl=US&ceid=US:en")
+
+
+def is_feed(raw: bytes) -> bool:
+    head = raw[:600].lstrip().lower()
+    return head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head
+
+
+async def _site_feed(session: aiohttp.ClientSession, url: str, raw: bytes) -> tuple[str, bytes]:
+    """Добавили адрес сайта, а не ленты: ищем его RSS на странице (<link rel="alternate">), нет — Google Новости
+    по этому сайту."""
+    page = raw.decode("utf-8", "ignore")
+    for tag in ALT.findall(page):
+        href = re.search(r'href=["\']([^"\']+)', tag)
+        if not href:
+            continue
+        feed = urljoin(url, html.unescape(href.group(1)))
+        try:
+            data = await _download(session, feed)
+        except Exception as exc:  # noqa: BLE001
+            log.info("shorts: site feed %s failed: %s", feed, exc)
+            continue
+        if is_feed(data):
+            return feed, data
+    feed = google_news(urlparse(url).netloc.removeprefix("www."))
+    return feed, await _download(session, feed)
+
+
+async def _add_images(posts: list[dict[str, Any]]) -> None:
+    """Картинка новости со страницы статьи (og:image), если в ленте её нет: у сайтов вроде Empire там постер
+    или эксклюзивный кадр."""
+    todo = [p for p in posts if not p.get("image") and "news.google.com" not in p["url"]][:OG_EVERY]
+    if not todo:
+        return
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=15), headers=HEADERS) as safe:
+        async def one(post: dict[str, Any]) -> None:
+            try:
+                page, _ = await netsafe.fetch_page(safe, post["url"], 1024 * 1024)
+            except Exception:  # noqa: BLE001
+                return
+            m = OG_IMAGE.search(page)
+            if m:
+                image = urljoin(post["url"], html.unescape(m.group(1) or m.group(2)))
+                post["image"], post["media"] = image, [{"image": image}]
+        await asyncio.gather(*(one(p) for p in todo))
+
+
 async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_feed: int) -> list[dict[str, Any]]:
     global _reddit
     url = feed_url(entry)
@@ -199,8 +258,15 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
                     log.info("shorts: reddit 429, using cached %s", url)
                     raw = cached[1]
     else:
-        raw = await _download(session, url)
-    return await asyncio.to_thread(parse, raw, label(entry), since, per_feed)
+        known = _found_feed.get(url)
+        raw = await _download(session, known or url)
+        if not known and not is_feed(raw):  # страница сайта — ищем его ленту
+            feed, raw = await _site_feed(session, url, raw)
+            _found_feed[url] = feed
+    posts = await asyncio.to_thread(parse, raw, label(entry), since, per_feed)
+    if per_feed <= PER_FEED and not entry.startswith("x:") and "reddit.com" not in url:
+        await _add_images(posts)
+    return posts
 
 
 async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEED,
