@@ -94,5 +94,9 @@ def test_task_mode_docx_and_parse(monkeypatch) -> None:
                                         {"text": "«Тор».", "url": "https://www.google.com/search?q=thor"}]}
     monkeypatch.setattr(ai, "_with_reserve", fake)
     plan = asyncio.run(ai.parse_task("k", "задание " * 20))
-    assert [x["url"] for x in plan["lines"]] == ["", "https://x.com/loki.jpg", ""]  # поиск Google — не картинка
+    assert [x["url"] for x in plan["lines"]] == ["", "https://x.com/loki.jpg", "https://www.google.com/search?q=thor"]
+    assert bot.search_query("https://www.google.com/search?tbm=isch&q=Doctor+Doom+Latveria") == "Doctor Doom Latveria"
+    assert bot.search_query("https://x.com/a.jpg") == ""
+    assert bot.IMG_URL.findall("[арт](https://a.com/x.jpg) и https://b.com/y.png») ") == \
+        [("", "https://a.com/x.jpg"), ("", "https://b.com/y.png")]
     assert plan["lines"][0]["label"] == "11 ПРОЕКТОВ"

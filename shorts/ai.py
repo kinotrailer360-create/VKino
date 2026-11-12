@@ -2526,7 +2526,8 @@ async def parse_task(key: str, text: str) -> dict[str, Any] | None:
               "— сделай каждый пункт перечисления отдельной фразой («В список попали…» — отдельно, затем каждое "
               "название в «ёлочках» отдельной фразой с точкой), чтобы под каждый был свой кадр.\n"
               "2. Для каждой фразы: url — прямая ссылка на кадр из задания, относящаяся именно к этой фразе (к "
-              "этому фильму/персонажу), иначе пусто; ссылки на поиск (google.com/search) не бери. show — что "
+              "этому фильму/персонажу), иначе пусто; ссылку на поиск картинок (google.com/search…) тоже бери — бот найдёт по "
+              "её запросу. show — что "
               "показать по заданию, коротко. label — надпись на экране из плана монтажа для этого момента "
               "(«11 проектов перед Doomsday»), иначе пусто; до 40 знаков.\n"
               "3. title, description, hashtags, cover — из раздела оформления, как есть.\n"
@@ -2543,7 +2544,7 @@ async def parse_task(key: str, text: str) -> dict[str, Any] | None:
         if not isinstance(row, dict) or len(str(row.get("text") or "").strip()) < 2:
             continue
         url = str(row.get("url") or "").strip()
-        if not url.startswith("http") or "google." in url and "/search" in url:
+        if not url.startswith("http"):
             url = ""
         lines.append({"text": _unnumber(str(row["text"]).strip()), "url": url,
                       "show": str(row.get("show") or "").strip()[:200], "label": str(row.get("label") or "").strip()[:60]})
