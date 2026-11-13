@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import subprocess
@@ -254,6 +255,10 @@ class OneWordCaptions(WordCaptions):
 
     def __init__(self, cfg: dict, words: list[dict], y: int):
         self.big = font(cfg, "head", self.SIZE)
+        # ключевые слова («Ванда», «красный», «Камень») — своим цветом (настраивается: highlight_color)
+        self.keys = {w.lower().replace("ё", "е")[:5] for h in cfg.get("highlights") or []
+                     for w in re.findall(r"\w{3,}", str(h))}
+        self.key_color = tuple(cfg.get("highlight_color") or (64, 220, 255))
         super().__init__(cfg, words, y)
 
     def _group(self) -> list[list[int]]:
@@ -274,12 +279,33 @@ class OneWordCaptions(WordCaptions):
         shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         ImageDraw.Draw(shadow).text((34, 14), text, font=fnt, fill=(0, 0, 0, 190), stroke_width=7,
                                     stroke_fill=(0, 0, 0, 190))
-        ImageDraw.Draw(layer).text((30, 8), text, font=fnt, fill=self.HOT if name else (255, 255, 255),
+        key = len(word) >= 3 and word.lower().replace("ё", "е")[:5] in self.keys
+        ImageDraw.Draw(layer).text((30, 8), text, font=fnt,
+                                   fill=self.key_color if key else self.HOT if name else (255, 255, 255),
                                    stroke_width=6, stroke_fill=(0, 0, 0))
         out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         out.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(6)))
         out.alpha_composite(layer)
         return out
+
+
+def draw_mark(img: Image.Image, mark: dict, t: float) -> None:
+    """Аннотация к доказательству: красный круг вокруг детали и стрелка к нему (свой слой и время, отключается
+    автором). Круг «прорисовывается» за 0,25 с."""
+    x, y = mark["x"] * W, mark["y"] * H
+    r = max(60, mark.get("r", 0.1) * W)
+    p = min(1.0, max(0.0, (t - mark["start"]) / 0.25))
+    d = ImageDraw.Draw(img)
+    d.arc((x - r, y - r, x + r, y + r), -90, -90 + 360 * p, fill=(255, 40, 40), width=12)
+    if p >= 1:  # стрелка — с той стороны, где больше места
+        sx = x + (r + 170) * (1 if x < W / 2 else -1)
+        sy = y + (r + 140) * (1 if y < H / 2 else -1)
+        ex = x + (r + 12) * (1 if sx > x else -1) * 0.7
+        ey = y + (r + 12) * (1 if sy > y else -1) * 0.7
+        d.line((sx, sy, ex, ey), fill=(255, 40, 40), width=14)
+        ang = math.atan2(ey - sy, ex - sx)
+        for da in (2.6, -2.6):
+            d.line((ex, ey, ex + 46 * math.cos(ang + da), ey + 46 * math.sin(ang + da)), fill=(255, 40, 40), width=14)
 
 
 def _label_image(text: str, font_path: Path) -> Image.Image:
@@ -358,6 +384,7 @@ def render(cfg: dict, base: Path) -> Path:
               for lb in cfg.get("labels") or [] if str(lb.get("text") or "").strip()]
     captions = (OneWordCaptions(cfg, cfg.get("words") or [], cfg.get("word_y", H // 2 + 160)) if dynamic
                 else WordCaptions(cfg, cfg.get("words") or [], cfg.get("word_y", H // 2 + 120)))
+    marks = [m for m in cfg.get("marks") or [] if {"x", "y", "start", "end"} <= set(m)]
     wm_w = 150
     wm = logo.resize((wm_w, round(logo.height * wm_w / logo.width)), Image.LANCZOS)
     wm.putalpha(wm.getchannel("A").point(lambda a: int(a * 0.85)))
@@ -411,6 +438,9 @@ def render(cfg: dict, base: Path) -> Path:
                     y = 230 - round(40 * (1 - ease_out(pop)))
                     img.paste(lab, ((W - lab.width) // 2, y), lab)
                     break
+            for mk in marks:
+                if mk["start"] <= t < mk["end"]:
+                    draw_mark(img, mk, t)
             captions.draw(img, t)
         try:
             enc.stdin.write(img.tobytes())

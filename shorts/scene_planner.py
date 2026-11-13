@@ -15,15 +15,17 @@ from typing import Any
 # но лицензия не подтверждена (публиковать можно, при жалобе по источнику ясно, что заменить)
 RIGHTS = {"user_media": "author", "user_replacement": "author", "ai_generated_illustration": "ai"}
 RIGHTS_LABEL = {"author": "✅ материал автора", "ai": "🎨 ИИ-иллюстрация, не кадр из фильма",
+                "licensed": "✅ лицензия (из библиотеки)",
                 "unconfirmed": "⚠️ права не подтверждены"}
 SOURCE_LABEL = {"trailer_clip": "трейлер", "film_frame_pool": "кадр TMDB/Кинопоиска", "film_poster_fallback": "постер",
                 "web_image_search": "поиск картинок", "person_portrait": "фото человека", "user_media": "ваш материал",
                 "user_replacement": "ваша замена", "channel_media": "Telegram-канал",
-                "ai_generated_illustration": "ИИ-иллюстрация"}
+                "ai_generated_illustration": "ИИ-иллюстрация", "library": "библиотека сцен"}
 
 
 FACT_LABEL = {"confirmed": "✅ подтверждён", "single": "🟡 один источник", "conflict": "❌ источники расходятся",
-              "unverified": "⚠️ не подтверждён источниками", "author": "✍️ текст автора"}
+              "unverified": "⚠️ не подтверждён источниками", "author": "✍️ текст автора",
+              "theory": "🔮 теория (не подтверждено авторами фильма)"}
 
 
 def fact_line(fact: dict[str, Any]) -> str:

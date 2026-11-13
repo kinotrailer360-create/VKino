@@ -1073,3 +1073,68 @@ def test_search_topics_replace_online_in_schedule_and_plan():
     assert plan.publish_time(date(2026, 11, 16)) == "14:00" and plan.publish_time(date(2026, 11, 15)) == "12:00"
     assert daily._one_season({"releaseYears": [{"start": 2024, "end": 2024}]})
     assert not daily._one_season({"seasonsInfo": [{"number": 1}, {"number": 2}]})
+
+
+def test_library_caption_segments_and_preselect():
+    from shorts import library
+    work, rights, s, e = library.parse_caption("Мстители: Финал | права: трейлер | сезон 1 серия 3")
+    assert work == "Мстители: Финал" and rights["publish"] == "unconfirmed" and (s, e) == (1, 3)
+    assert library.parse_caption("Моё видео | права: свои")[1]["publish"] == "yes"
+    assert library.parse_caption("Фильм | права: нельзя")[1]["publish"] == "no"
+    segs = library.segments([0.3, 2.0, 2.4, 14.0], 20.0)
+    assert all(library.SCENE_MIN - 0.01 <= b - a <= library.SCENE_MAX + 0.01 for a, b in segs[:-1])
+    assert segs[0][0] == 0.0 and segs[-1][1] == 20.0
+    scenes = [{"words": library.scene_text({"who": ["Ванда"], "action": "колдует", "colors": "красный"}), "id": 1},
+              {"words": library.scene_text({"who": ["Стрэндж"], "action": "открывает портал"}), "id": 2}]
+    assert [s["id"] for s in library.preselect("Ванда и её красная магия", scenes)] == [1]
+    assert library.preselect("Халк крушит", scenes) == []  # нет кандидатов — не подставляем случайную сцену
+
+
+def test_library_find_threshold_rights_and_eval(monkeypatch):
+    import asyncio
+    from PIL import Image
+    from shorts import ai, library
+    rows = [{"lib_id": 1, "n": 0, "t_start": 10.0, "t_end": 13.0, "keyframe": "/nope.jpg", "work": "Ванда/Вижн",
+             "file": "/v.mp4", "source": "официальный трейлер", "license": "права не подтверждены",
+             "publish": "unconfirmed", "words": library.scene_text({"who": ["Ванда"], "colors": "красный"})}]
+
+    class Pool:
+        async def fetch(self, sql, *a):
+            return rows
+
+    async def rank(key, texts, imgs):
+        return [{"index": 0, "score": 90 if "Ванда" in texts[0] else 50, "reason": "Ванда в красном"}]
+
+    monkeypatch.setattr(library, "pool", Pool())
+    monkeypatch.setattr(ai, "rank_image_candidates", rank)
+    res = asyncio.run(library.find(["Ванда — красный цвет", "Ванда и Вижн смеются"], ["Ванда/Вижн"], "k"))
+    assert res[0]["start"] == 10.0 and res[0]["rights"] == "unconfirmed" and "библиотека" in res[0]["ref"]
+    assert "none" in res[1]  # та же сцена второй раз не берётся, а другой нет — честный отказ
+    score = library.evaluate([{"want": (1, 0)}, {"want": None}], res)
+    assert score == {"top1": 1.0, "wrong": 0.0, "refusal": 1.0}
+
+
+def test_theory_marks_and_highlights_render(tmp_path):
+    from PIL import Image
+    from shorts import make_lore, ai
+    img = Image.new("RGB", (1080, 1920), (20, 20, 20))
+    make_lore.draw_mark(img, {"x": 0.5, "y": 0.4, "r": 0.1, "start": 0.0, "end": 2.0}, 1.0)
+    assert img.getpixel((540 + 108, 768))[0] > 200  # красный круг вокруг детали
+    cfg = {"fonts": {"head": "shorts/assets/Oswald.ttf", "sans": "shorts/assets/Montserrat.ttf"},
+           "highlights": ["Камни"]}
+    cap = make_lore.OneWordCaptions(cfg, [{"w": "камни", "s": 0.0, "e": 0.5}], 1000)
+    assert "камни" in cap.keys
+    assert ai.theory_title_ok("Дум собирает Мстителей по цветам Камней?") and not ai.theory_title_ok("x" * 61)
+
+
+def test_lore_scene_plan_marks_theory_and_sources():
+    from shorts import lore
+    plan = lore.scene_plan_for(["Заметили?", "Ванда — красный", "Подписывайся"], [0.0, 2.0, 5.0], [2.0, 3.0, 2.0],
+                               [{"start": 0.0, "image": "luser0.jpg"}, {"start": 2.0, "clip": "lib1.mp4"},
+                                {"start": 5.0, "clip": "tclip2.mp4"}],
+                               {1: {"rights": "unconfirmed", "ref": "библиотека: Ванда/Вижн, 0:10–0:13", "score": 90,
+                                    "reason": "красная магия"}}, {},
+                               {"claims": [{"line": 1, "status": "theory", "source": "трейлер"}]})
+    s = plan["scenes"]
+    assert s[0]["asset"]["rights"] == "author" and s[1]["asset"]["source"] == "library"
+    assert s[1]["fact"]["status"] == "theory" and s[2]["asset"]["source"] == "trailer_clip"

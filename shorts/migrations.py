@@ -191,6 +191,52 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             PRIMARY KEY (chat_id, scene_hash)
         );
     """, None),
+    # 009 — библиотека сцен (ТЗ, приложение B): видео с правами, их сцены с ключевыми кадрами и описаниями;
+    # выпуски рубрик (заголовок, крючок, ролик на YouTube) и их показатели через 48 часов
+    (9, "media_library + media_scenes + episodes", """
+        CREATE TABLE IF NOT EXISTS media_library (
+            id SERIAL PRIMARY KEY,
+            work TEXT NOT NULL,
+            season INT,
+            episode INT,
+            file TEXT NOT NULL DEFAULT '',
+            sha TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT '',
+            owner TEXT NOT NULL DEFAULT '',
+            license TEXT NOT NULL DEFAULT '',
+            publish TEXT NOT NULL DEFAULT 'unconfirmed',
+            added_by BIGINT,
+            added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            indexed_at TIMESTAMPTZ,
+            scenes INT NOT NULL DEFAULT 0,
+            model TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS media_scenes (
+            lib_id INT NOT NULL REFERENCES media_library(id) ON DELETE CASCADE,
+            n INT NOT NULL,
+            t_start REAL NOT NULL,
+            t_end REAL NOT NULL,
+            keyframe TEXT NOT NULL,
+            info JSONB NOT NULL DEFAULT '{}',
+            words TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (lib_id, n)
+        );
+        CREATE TABLE IF NOT EXISTS episodes (
+            id SERIAL PRIMARY KEY,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            hook TEXT NOT NULL DEFAULT '',
+            script JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            video_id TEXT,
+            published_at TIMESTAMPTZ,
+            views_48h BIGINT,
+            likes_48h BIGINT,
+            comments_48h BIGINT,
+            collected_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_episodes_pub ON episodes(published_at);
+    """, None),
 ]
 
 

@@ -22,7 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageEnhance, ImageOps
 
-from . import ai, clips, daily, project, pronounce, tmdb
+from . import ai, clips, daily, library, project, pronounce, tmdb
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -587,7 +587,78 @@ def spoken_lines(script: dict[str, Any]) -> list[str]:
     mourning = news and is_mourning(script)
     dynamic = script.get("style") == "dynamic" and not mourning
     has_cta = dynamic and any("телеграм" in ln.lower() for ln in lines)
-    return lines if mourning or has_cta else lines[:-1] + [daily.with_outro(lines[-1])]
+    # «Теория Marvel» кончается сильной фразой, без «подпишись» (ТЗ, приложение A)
+    return lines if mourning or has_cta or script.get("theory") else lines[:-1] + [daily.with_outro(lines[-1])]
+
+
+async def _screen_frame(work: Path, sl: dict[str, Any], fill: bool) -> Image.Image | None:
+    """Кадр сцены таким, каким он будет на экране 1080×1920 (координаты стрелки — сразу экранные)."""
+    from . import make_lore as ml
+    try:
+        if sl.get("clip"):
+            out = work / f"{Path(sl['clip']).stem}_mark.jpg"
+            await daily._run("ffmpeg", "-v", "error", "-y", "-ss", "0.8", "-i", str(work / sl["clip"]),
+                             "-frames:v", "1", str(out))
+            return Image.open(out).convert("RGB")
+        path = work / sl["image"]
+
+        def render() -> Image.Image:
+            with Image.open(path) as probe:
+                wide = probe.width > probe.height * 1.05
+            kind = ml.FillSlide if fill and wide else ml.FitSlide if wide else ml.PanSlide
+            return kind(path, reverse=False).frame(0.6, 3.0)
+        return await asyncio.to_thread(render)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: mark frame failed: %s", exc)
+        return None
+
+
+def _source_of(name: str) -> tuple[str, str]:
+    """(источник для scene_planner, пояснение) по имени файла кадра в папке сборки."""
+    for prefix, src, ref in (("lib", "library", "библиотека сцен"), ("luser", "user_media", "материал автора"),
+                             ("lvid", "user_media", "кадр из видео автора"), ("lfix", "web_image_search",
+                                                                              "картинка по ссылке из задания"),
+                             ("lsearch", "web_image_search", "поиск картинок"),
+                             ("lwiki", "film_frame_pool", "иллюстрация статьи"),
+                             ("hclip", "trailer_clip", "трейлер фильма с героем"), ("tclip", "trailer_clip", "трейлер"),
+                             ("score", "user_media", "карточка оценки")):
+        if name.startswith(prefix):
+            return src, ref
+    return "film_frame_pool", "кадр фильма"
+
+
+def scene_plan_for(lines: list[str], starts: list[float], durs: list[float], slides: list[dict[str, Any]],
+                   lib_refs: dict[int, dict[str, Any]], lib_misses: dict[int, str],
+                   script: dict[str, Any]) -> dict[str, Any]:
+    """План сцен ролика по своему сценарию: фраза → её первый кадр/отрезок, источник, права, тезис (теория или
+    факт). Подтверждение сцен — как у «Фактов о фильме»: каждая отдельно, по версии."""
+    from . import scene_planner
+    claims = {int(c.get("line", -1)): c for c in script.get("claims") or [] if isinstance(c, dict)}
+    scenes = []
+    for i, text in enumerate(lines):
+        sl = next((s for s in slides if abs(float(s["start"]) - starts[i]) < 0.05), None) or \
+            max((s for s in slides if s["start"] <= starts[i] + 0.05), key=lambda s: s["start"], default={})
+        name = str(sl.get("clip") or sl.get("image") or "")
+        src, ref = _source_of(name)
+        if i in lib_refs:
+            src, ref = ("user_media" if lib_refs[i]["rights"] == "author" else "library"), lib_refs[i]["ref"]
+        rights = lib_refs[i]["rights"] if i in lib_refs else "author" if src == "user_media" else scene_planner.rights(src)
+        claim = claims.get(i)
+        fact = ({"status": {"fact": "confirmed", "observation": "single", "theory": "theory",
+                            "unknown": "unverified"}.get(str(claim.get("status")), "unverified"),
+                 "source": str(claim.get("source") or ""), "note": str(claim.get("note") or "")} if claim else {})
+        scenes.append({
+            "id": f"scene-{i + 1:02d}", "line_index": i, "text": text, "start": round(starts[i], 3),
+            "end": round(starts[i] + durs[i], 3), "duration": round(durs[i], 3),
+            "asset": {"type": "clip" if sl.get("clip") else "still", "path": name, "source": src, "ref": ref,
+                      "rights": rights},
+            "fact": fact,
+            "match": {"status": "library_match" if i in lib_refs else "auto", "score": (lib_refs.get(i) or {}).get("score"),
+                      "reason": (lib_refs.get(i) or {}).get("reason") or lib_misses.get(i, "")},
+            "review": {"required": True, "approved": False, "replacement": None},
+        })
+    return {"schema_version": 1, "planner": "vkino-lore", "timing_source": "tts_phrase_timestamps",
+            "review_mode": "required", "scenes": scenes}
 
 
 async def make_lore(work: Path, script: dict[str, Any], music: Path | None = None,
@@ -737,6 +808,29 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     durs = [((starts[i + 1] if i + 1 < len(starts) else starts[i] + float(spans[i]["speech"]) + 0.3) - starts[i])
             for i in range(len(lines))]
     clip_notes: list[str] = []
+    # библиотека сцен: сцена из проиндексированного видео автора/лицензии/официального трейлера — раньше трейлера
+    lib_refs: dict[int, dict[str, Any]] = {}
+    lib_misses: dict[int, str] = {}
+    pinned_lines = {line - 1 for line in (user_pins or {}).values()}
+    if gemini_key and library.pool is not None and not only_own:
+        try:
+            await _progress(42, "Ищу сцены в библиотеке")
+            free = [i for i in range(len(lines)) if i not in pinned_lines]
+            works = [str(f.get("title") or "") for f in (script.get("trailer_films") or [script.get("trailer_film")])
+                     if f] + [str(script.get("name") or "")]
+            found_lib = await library.find([lines[i] for i in free], works, gemini_key)
+            for i, res in zip(free, found_lib):
+                if "none" in res:
+                    lib_misses[i] = res["none"]
+                    continue
+                length = max(1.2, min(durs[i], 6.0))
+                cut = await _cut_trailer(work, float(res["start"]), Path(res["file"]), f"lib{i}", length,
+                                         dynamic or bool(script.get("kind_own")))
+                if cut:
+                    slides[i] = {"start": starts[i], "clip": cut[0]}
+                    lib_refs[i] = res
+        except Exception as exc:  # noqa: BLE001 — без библиотеки ролик соберётся как раньше
+            log.warning("shorts: library search failed: %s", exc)
     score = script.get("score") if news else None
     tfilm = script.get("trailer_film") if news else None
     if only_own:
@@ -749,7 +843,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             log.info("shorts: score card failed: %s", exc)
     if (tfilm or videos) and gemini_key:
         # отрезки трейлера под фразы: кроме фраз со своими картинками автора и с карточкой оценки
-        skip = {line - 1 for line in (user_pins or {}).values()} | ({int(score["line"])} if score else set())
+        skip = pinned_lines | set(lib_refs) | ({int(score["line"])} if score else set())
         await _progress(44, "Трейлер: подбираю отрезки")
         seen: set[str] = set()
         repeats: set[int] = set()
@@ -800,6 +894,21 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         slides = [sl for sl in slides if sl["start"] < last - 0.05]
         first = next((sl for sl in slides if sl["start"] <= starts[0] + 0.05), slides[0])
         slides.append({k: v for k, v in first.items() if k in ("clip", "image")} | {"start": last})
+    # круги и стрелки к доказательствам (теория): где деталь — ИИ смотрит на кадр так, как он будет на экране
+    marks: list[dict[str, Any]] = []
+    if gemini_key and script.get("marks") and script.get("marks_on", True):
+        await _progress(46, "Ищу детали для стрелок")
+        fill = dynamic or bool(script.get("kind_own"))
+        for m in script["marks"]:
+            i = int(m.get("line", -1))
+            if not 0 <= i < len(lines) or not m.get("target"):
+                continue
+            sl = next((s for s in slides if abs(float(s["start"]) - starts[i]) < 0.05), None)
+            frame = await _screen_frame(work, sl, fill) if sl else None
+            spot = await ai.locate(gemini_key, frame, str(m["target"])) if frame else None
+            if spot:
+                marks.append({**spot, "start": round(starts[i] + 0.4, 2),
+                              "end": round(starts[i] + min(durs[i], 2.6), 2), "target": m["target"]})
     labels: list[dict[str, Any]] = []
     fixed_labels = script.get("screen_labels") or []  # надписи из задания автора — как есть, по фразам
     if any(fixed_labels):
@@ -827,6 +936,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "style": "dynamic" if dynamic else "calm",
         "fill": dynamic or bool(script.get("kind_own")),  # кадры на весь экран, без размытых полос
         "words": words,
+        "highlights": script.get("highlights") or [],
+        "marks": marks,
         "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
         "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
                   else "ПРО КОГО\nРАССКАЗАТЬ\nДАЛЬШЕ?", "channel": "KinoMir360", "youtube": "@kinomir360",
@@ -834,6 +945,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     }
     cfg_path = work / "lore.json"
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    # план сцен для проверки автором (как у «Фактов»): кадр каждой фразы, откуда он и права
+    plan = scene_plan_for(lines, starts, durs, slides, lib_refs, lib_misses, script)
+    (work / "scene_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     await _progress(50, "Монтаж видео")
     proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "shorts.make_lore", str(cfg_path),
                                                 stdout=asyncio.subprocess.PIPE,
