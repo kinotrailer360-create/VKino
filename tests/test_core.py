@@ -891,7 +891,9 @@ def test_list_hook_promises_number_one():
     from shorts import daily
     theme = daily.theme_for("online", date(2026, 11, 12))
     films = [{"name": "Фильм В", "rating": {"imdb": 7.0}}, {"name": "Фильм Б"}, {"name": "Фильм А", "rating": {"imdb": 8.4}}]
-    assert "досмотри до конца" in daily.voice_lines(theme, films)[0]
+    # обещание номера один осталось, но короткое: длинную фразу смахивали на 4,5–6-й секунде (Studio, ноябрь 2026)
+    hook = daily.voice_lines(theme, films)[0]
+    assert hook.startswith("Номер один") and "8.4" in hook and len(hook.split()) <= 6
 
 
 def test_yt_commands_parse_links_and_batches() -> None:
@@ -981,3 +983,16 @@ def test_fast_site_page_finds_its_feed_and_article_images(monkeypatch):
     assert posts[0]["image"] == "https://img.example/poster.jpg"
     assert fastnews._found_feed["https://www.empireonline.com/"] == "https://www.empireonline.com/feed/rss"
     assert "site%3Aempireonline.com" in fastnews.google_news("empireonline.com")
+
+
+
+def test_list_hook_is_short() -> None:
+    # подборки теряли зрителей на 4,5–6-й секунде: первая фраза кончалась, а фильм ещё не начался
+    from datetime import date
+    from shorts.daily import _hook, theme_for
+    online = theme_for("online", date(2026, 11, 13))
+    best = {"name": "Плач осени", "rating": {"imdb": 9.1}}
+    for films in ([best], [{"name": "X"}]):
+        hook = _hook(online, films)
+        assert len(hook.split()) <= 6, hook
+    assert _hook(online, [{"name": "X"}]) == "Онлайн-премьеры!"

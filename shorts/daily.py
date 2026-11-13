@@ -937,13 +937,14 @@ def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
 
 
 def _hook(theme: Theme, films: list[dict[str, Any]]) -> str:
-    """Первая фраза: тема и интрига — у номера один высокий рейтинг, досмотри до конца (половина зрителей уходит в
-    первые секунды; «5 свежих премьер» без крючка досматривали на 40–50 %)."""
+    """Первая фраза — не дольше ~2 секунд: пока она звучит, на экране обложка, а первый фильм ещё не начался.
+    По Studio (ноябрь 2026) подборки теряли зрителей ровно на 4,5–6-й секунде, когда кончалась длинная фраза
+    «5 свежих онлайн-премьер, которые стоит посмотреть! Номер один — …, досмотри до конца». Тема и так на обложке."""
     best = films[-1] if films else {}
     rating, src = _rating(best) if best and not theme.upcoming else (0, "")
     if rating and rating >= 7.5:
-        return f"{theme.hook}! Номер один — {src} {rating:.1f}, досмотри до конца."
-    return f"{theme.hook}!"
+        return f"Номер один тут — {src} {rating:.1f}!"
+    return f"{theme.header.capitalize()}!"
 
 
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
@@ -2236,7 +2237,9 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
-    lines = [intro] + facts + [f"{outro_line} {SAVE_AND_SUBSCRIBE}"]
+    # без «Сохрани и подпишись…»: по Studio факты теряли 8–20 п. п. зрителей за 6–7 секунд до конца, на прощании.
+    # Короткий вопрос — и ролик сразу уходит на повтор (повторы YouTube тоже считает)
+    lines = [intro] + facts + [outro_line]
     voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music, scene_plan=not review and not rumors)
     seo = build_review_seo(film, facts) if review else build_rumors_seo(film, facts) if rumors \
         else build_facts_seo(film, facts)
