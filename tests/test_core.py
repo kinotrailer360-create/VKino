@@ -1144,3 +1144,12 @@ def test_own_script_voiced_verbatim_without_subscribe():
     lines = ["Заметили?", "Сейчас объясню.", "И это — Часовой!"]
     assert lore.spoken_lines({"lines": lines, "kind": "news", "kind_own": True}) == lines
     assert "подпиш" in lore.spoken_lines({"lines": lines, "kind": "lore"})[-1].lower()
+
+
+def test_theory_stone_colors_and_doubt_lines():
+    from shorts import ai
+    bad = "Халк зелёный — как Камень Реальности."
+    good = "А Халк зелёный целиком — как Камень времени."
+    assert ai.stone_mistakes([bad, good, "Клеа носит фиолетовое. Это цвет Камня силы."]) == [bad]
+    assert ai.DOUBT.search("Но цвет сам по себе ничего не доказывает")
+    assert not ai.DOUBT.search("По теории, Дум собирает команду")
