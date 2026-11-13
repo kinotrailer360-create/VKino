@@ -1153,3 +1153,29 @@ def test_theory_stone_colors_and_doubt_lines():
     assert ai.stone_mistakes([bad, good, "Клеа носит фиолетовое. Это цвет Камня силы."]) == [bad]
     assert ai.DOUBT.search("Но цвет сам по себе ничего не доказывает")
     assert not ai.DOUBT.search("По теории, Дум собирает команду")
+
+
+def test_source_health_alerts_once_and_recovers():
+    from shorts import health
+    st, msgs = {}, []
+    for k in range(4):
+        st, out = health.update(st, [("fast:x", "Empire", "HTTP 403"), ("tg:a", "t.me/a", 5)], now=1000.0 + k * 3600)
+        msgs += out
+    assert len(msgs) == 1 and "Empire" in msgs[0] and "403" in msgs[0]  # одна тревога после 3 ошибок подряд
+    st, out = health.update(st, [("fast:x", "Empire", 0)], now=20000.0)  # читается, но новостей нет — не ошибка
+    assert out == ["✅ Снова читается: Empire"] and st["fast:x"]["streak"] == 0
+    assert health.status_line(st["tg:a"], now=1000.0 + 3 * 3600 + 10).startswith("✅")
+    assert health.status_line(st["tg:a"], now=1000.0 + 80 * 3600).startswith("⚪")  # молчит дольше 72 ч
+
+
+def test_mood_buttons_in_picker():
+    import os
+    for name, value in {"BOT_TOKEN": "123456:TEST", "ADMIN_IDS": "1", "KINOPOISK_TOKEN": "test",
+                        "DATABASE_URL": "postgresql://test@localhost/test"}.items():
+        os.environ.setdefault(name, value)
+    import bot
+    text, kb = bot.rq_screen("m", "-", "-", "-")
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "😂 Посмеяться" in labels and "настроение" in text
+    first = kb.inline_keyboard[0][0].callback_data
+    assert first == f"rq:m:{bot.RQ_GENRES.index('комедия')}:-:-"
