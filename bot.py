@@ -80,6 +80,7 @@ from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
 from shorts import scene_planner as shorts_scene_planner
+from shorts import qc as shorts_qc
 from shorts import direct_stats
 from shorts import copycat as shorts_copycat
 from shorts import dub as shorts_dub
@@ -7284,6 +7285,11 @@ async def fast_feeds() -> list[str]:
     return feeds if isinstance(feeds, list) else list(shorts_fast.DEFAULT_FEEDS)  # [] — автор удалил все
 
 
+async def send_qc(bot: Bot, chat_id: int, video: Path, vertical: bool | None = None) -> None:
+    """Автопроверка готового ролика (формат, звук, чёрные/застывшие кадры) — отчёт автору под роликом."""
+    await bot.send_message(chat_id, shorts_qc.report(await shorts_qc.check(video, vertical)))
+
+
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     seo = result.seo
     video = await bot.send_video(
@@ -7295,6 +7301,7 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         supports_streaming=True,
     )
     keep_for_upload(chat_id, video.message_id, result)
+    await send_qc(bot, chat_id, result.video, True)
     has_project = await keep_project(chat_id, video.message_id, result.video.parent,
                                      {"mode": "short", "caption": post_caption(short_caption(result)), "seo": seo})
     source_plan = result.video.parent / "scene_plan.json"
@@ -9192,6 +9199,7 @@ async def send_review(bot: Bot, chat_id: int, result: Any) -> None:
         supports_streaming=True,
         request_timeout=600,  # файл до 50 МБ — загрузка дольше обычного
     )
+    await send_qc(bot, chat_id, result.video, False)
     has_project = await keep_project(chat_id, sent.message_id, result.video.parent,
                                      {"mode": "review", "caption": f"🎞 <b>{escape(seo['title'])}</b>", "seo": seo})
     for label, key in (("Название", "title"), ("Описание (с таймкодами)", "description"),
@@ -14348,7 +14356,8 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
     body = "" if brief else "\n\n" + escape(shorts_lore.script_text(script))
     dynamic = await lore_style() == "dynamic"
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("✅ Собрать шортс", "lo:go")], [_btn("✏️ Поправить текст", "lo:edit")],
+        [_btn("✅ Собрать шортс", "lo:go")], [_btn("🎙 Сначала послушать озвучку", "lo:voice")],
+        [_btn("✏️ Поправить текст", "lo:edit")],
         [_btn("⚡ Монтаж: динамичный (сменить)" if dynamic else "🎞 Монтаж: спокойный (сменить)", "lo:style")],
         [_btn(f"📎 Свои картинки и видео ({len(media)})" if media else "📎 Добавить свои картинки и видео", "lo:media")],
         [_btn("🖼 Кадры: только мои (сменить)" if await lore_media_mode() == "own" else
@@ -14766,6 +14775,33 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(LoreState.edit)
         await message.answer("✏️ Скопируй текст выше, поправь и пришли одним сообщением — "
                              "каждая фраза с новой строки (номера можно оставить).\n\n<i>Передумал — /cancel</i>")
+    elif action == "voice":  # этап «озвучка → утверждение» до монтажа: фразы кэшируются, сборка их не перепишет
+        if shorts_lock.locked():
+            await message.answer("⏳ Сейчас собирается другой ролик — нажми «Послушать озвучку» через пару минут.")
+            return
+        wait = await message.answer("🎙 Озвучиваю текст сценария…")
+        work = SHORTS_DIR / f"voice_{time.time_ns()}"
+        try:
+            async with shorts_lock:
+                await load_pronunciations()
+                await load_voice()
+                voice, _, voiced, _ = await shorts_daily.synthesize(shorts_lore.spoken_lines(data["lore_script"]), work)
+            if not voiced:
+                await wait.edit_text("❌ Голос не озвучил текст: " + escape(str(shorts_daily.tts_error or "без подробностей")[:300]))
+                return
+            await wait.delete()
+            await message.answer_audio(FSInputFile(voice, filename="ozvuchka.mp3" if voice.suffix == ".mp3" else voice.name),
+                                       caption="🎙 Озвучка сценария. Неправильное ударение — исправь через /say и нажми "
+                                               "ещё раз (заново озвучатся только исправленные фразы).",
+                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                           [_btn("✅ Озвучка ок — собрать ролик", "lo:go")],
+                                           [_btn("🔁 Послушать снова (после /say)", "lo:voice")],
+                                           [_btn("✏️ Поправить текст", "lo:edit")]]))
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Lore voice preview failed")
+            await _edit_quiet(wait, f"❌ Озвучка не получилась: <code>{escape(_safe_err(exc)[:300])}</code>")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     elif action == "media":
         await state.set_state(LoreState.media)
         await message.answer(
@@ -16850,6 +16886,7 @@ def _scene_caption(index: int, scene: dict[str, Any], approved: bool) -> str:
     return (f"{'✅' if approved else '⏳'} Сцена {index + 1} · {float(scene.get('start') or 0):.1f}–"
             f"{float(scene.get('end') or 0):.1f} сек.\n{str(scene.get('text') or '')[:550]}\n"
             f"📎 Источник: {source}{' — ' + ref[:200] if ref else ''}\n{rights}\n"
+            + (shorts_scene_planner.fact_line(scene.get("fact") or {}) + "\n" if scene.get("fact") else "") +
             f"Соответствие: {(scene.get('match') or {}).get('status') or 'не проверено'}")[:1000]
 
 
@@ -16940,6 +16977,7 @@ async def send_fixed(bot: Bot, chat_id: int, folder: Path, video: Path, note: st
         supports_streaming=True, request_timeout=600)
     if send.get("seo"):
         keep_for_upload(chat_id, msg.message_id, SimpleNamespace(video=video, seo=send["seo"]))
+    await send_qc(bot, chat_id, video, not review)
     await keep_project(chat_id, msg.message_id, folder, send)
     plan_path = folder / "scene_plan.json"
     review_pending = False

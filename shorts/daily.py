@@ -545,6 +545,24 @@ async def pick_fact_film(fetch: Fetch, query: str, exclude: set[int],
 fact_channels: list[str] = list(tgsearch.DEFAULT_CHANNELS)  # бот подставляет список из настроек
 
 
+fact_checks: dict[str, dict[str, str]] = {}  # факт → сверка с источниками (последний сбор фактов)
+
+
+def fact_check_for(fact: str, kp_facts: list[str], award: str | None, custom: bool) -> dict[str, str]:
+    """Сверка факта для сцены: найденные в интернете — по ai.check_facts; свои — «текст автора»;
+    с Кинопоиска и Викиданных — один источник."""
+    today = date.today().isoformat()
+    if custom:
+        return {"status": "author", "source": "текст автора", "note": "", "checked": today}
+    if award and fact == award:
+        return {"status": "single", "source": "Викиданные", "note": "", "checked": today}
+    if fact in fact_checks:
+        return {**fact_checks[fact], "checked": today}
+    if fact in kp_facts:
+        return {"status": "single", "source": "Кинопоиск", "note": "", "checked": today}
+    return {"status": "unverified", "source": "", "note": "", "checked": today}
+
+
 async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
                     n: int = FACTS, rumors: bool = False,
                     media_out: list[dict[str, Any]] | None = None,
@@ -568,6 +586,13 @@ async def web_facts(film: dict[str, Any], kp_facts: list[str], gemini_key: str,
     if progress:
         await progress(85, "Корректор проверяет падежи и имена")
     facts = await ai.proofread(gemini_key, facts)
+    if progress is None:  # в ролике — сверка каждого факта с материалами (для экрана проверки сцен)
+        await _progress(9, "Сверяю факты с источниками")
+    material = {"Википедия": article, "Кинопоиск": "\n".join(kp_facts),
+                "Telegram-каналы": tgsearch.as_text(posts, 7000)}
+    checks = await ai.check_facts(gemini_key, facts, material)
+    fact_checks.clear()
+    fact_checks.update({f: c for f, c in zip(facts, checks)})
     channels = list(dict.fromkeys(f"t.me/{p['channel']}" for p in posts))
     return facts, [s for s in sources if s != "Telegram-каналы"] + channels
 
@@ -1951,19 +1976,29 @@ async def _run_render(cfg_path: Path, stage: str = "Монтаж видео") ->
 
 
 def _mentioned_person(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
-    """Актёр или режиссёр, чья фамилия есть в тексте (с учётом падежей: Хиддлстона, Нолану)."""
+    """Актёр или режиссёр ЭТОГО фильма, о котором факт: по фамилии (с учётом падежей: Хиддлстона, Нолану) или
+    по роли (факт о Локи — фото актёра, который его играет). Фамилия — только с заглавной буквы (не обычное
+    слово); если подходят двое (однофамильцы, «Скарсгард» в касте дважды) — никого: лучше без портрета,
+    чем фото не того человека."""
+    found: list[dict[str, Any]] = []
     for p in (item.get("persons") or [])[:25]:
         if not isinstance(p, dict) or not p.get("name"):
             continue
         if str(p.get("enProfession") or "") not in ("actor", "director"):
             continue
-        surname = str(p["name"]).split()[-1]
-        if len(surname) < 4:
-            continue
-        stem = surname[:-1] if len(surname) >= 5 and surname[-1].lower() in "аеёиоуыэюяйь" else surname
-        if re.search(rf"(?<!\w){re.escape(stem)}\w{{0,3}}(?!\w)", text, re.IGNORECASE):
-            return p
-    return None
+        names = [str(p["name"]).split()[-1]]
+        role = str(p.get("description") or "").split("/")[0].strip()
+        if role and len(role) >= 4 and not re.search(r"\(.*голос|камео|в титрах не", role, re.I):
+            names.append(role.split()[-1])  # «Тор Одинсон» → «Одинсон», «Локи» → «Локи»
+        for name in names:
+            if len(name) < 4 or not name[0].isupper():
+                continue
+            stem = name[:-1] if len(name) >= 5 and name[-1].lower() in "аеёиоуыэюяйь" else name
+            if re.search(rf"(?<!\w){re.escape(stem)}\w{{0,3}}(?!\w)", text):
+                if p not in found:
+                    found.append(p)
+                break
+    return found[0] if len(found) == 1 else None
 
 
 FACT_CARD_H = 780  # высота картинки на слайдах фактов и новостей (как CARD_H)
@@ -2055,6 +2090,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     display_title — название в ролике (голос, обложка, SEO), если на Кинопоиске фильм называется иначе.
     tg_media — посты Telegram-каналов с фото и видео о фильме: ИИ ставит их к фактам, к которым они подходят."""
     await _progress(5, "Ищу фильм и факты")
+    kp_facts: list[str] = []
+    fact_checks.clear()
     if custom_facts:
         film, note = await find_film_smart(fetch, query, gemini_key, upcoming=rumors)
         if not film:
@@ -2174,8 +2211,12 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     poster_ref = str(_poster_url(film) or "постер фильма")
     refs: dict[int, str] = {i: "Telegram-канал (пост из подборки)" for i in own if i in tg_facts}
     refs.update({i: "материал автора" for i in own if i not in tg_facts})
-    refs.update({i: f"фото человека из TMDB/Кинопоиска ({(_mentioned_person(facts[i], film) or {}).get('name') or ''})"
-                 for i in portraits})
+    def _who(i: int) -> str:
+        p = _mentioned_person(facts[i], film) or {}
+        role = str(p.get("description") or "").strip()
+        return f"{p.get('name') or ''}" + (f" — роль: {role}" if role else "") + " (актёрский состав фильма)"
+
+    refs.update({i: f"фото TMDB/Кинопоиска: {_who(i)}" for i in portraits})
     for k, i in enumerate(stills):
         match = ranked[k] if ranked and k < len(ranked) else {"index": -1, "score": 0, "reason": ""}
         c = int(match.get("index", -1))
@@ -2276,7 +2317,8 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
         })
         cards.append({"image": path.name, "caption": fact, "karaoke": True,
                       "visual_match": match_meta, "asset_source": visual_sources.get(i - 1, "unknown"),
-                      "asset_ref": refs.get(i - 1, ""), **video})
+                      "asset_ref": refs.get(i - 1, ""),
+                      "fact_check": fact_check_for(fact, kp_facts, award_fact, bool(custom_facts)), **video})
 
     cover = await asyncio.to_thread(make_cover, cover_src, label, cover_text)
     cover_path = work / "cover.jpg"

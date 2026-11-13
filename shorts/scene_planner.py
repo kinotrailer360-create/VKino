@@ -22,6 +22,21 @@ SOURCE_LABEL = {"trailer_clip": "трейлер", "film_frame_pool": "кадр T
                 "ai_generated_illustration": "ИИ-иллюстрация"}
 
 
+FACT_LABEL = {"confirmed": "✅ подтверждён", "single": "🟡 один источник", "conflict": "❌ источники расходятся",
+              "unverified": "⚠️ не подтверждён источниками", "author": "✍️ текст автора"}
+
+
+def fact_line(fact: dict[str, Any]) -> str:
+    """Строка о проверке факта сцены для автора."""
+    if not fact:
+        return ""
+    src = str(fact.get("source") or "")
+    note = str(fact.get("note") or "")
+    return (f"🔎 Факт: {FACT_LABEL.get(str(fact.get('status')), str(fact.get('status')))}"
+            + (f" ({src})" if src and fact.get("status") != "author" else "")
+            + (f" — {note}" if note else "") + (f" · проверено {fact['checked']}" if fact.get("checked") else ""))
+
+
 def rights(source: str) -> str:
     return RIGHTS.get(source, "unconfirmed")
 
@@ -58,7 +73,11 @@ def sources_summary(plan: dict[str, Any]) -> str:
         counts[name] = counts.get(name, 0) + 1
     unconfirmed = sum(1 for s in scenes if (s.get("asset") or {}).get("rights", "unconfirmed") == "unconfirmed")
     parts = ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
-    return f"📎 Кадров: {len(scenes)} — {parts}." + (f" Права не подтверждены у {unconfirmed}." if unconfirmed else "")
+    out = f"📎 Кадров: {len(scenes)} — {parts}." + (f" Права не подтверждены у {unconfirmed}." if unconfirmed else "")
+    bad = [str(i + 1) for i, s in enumerate(scenes) if (s.get("fact") or {}).get("status") in ("conflict", "unverified")]
+    if bad:
+        out += f"\n⚠️ Факты без подтверждения или с расхождением: сцены {', '.join(bad)} — проверь до утверждения."
+    return out
 
 
 def build_scene_plan(
@@ -102,6 +121,7 @@ def build_scene_plan(
             "duration": round(max(0.0, end - start), 3),
             "asset": {"type": asset_type, "path": asset_path, "source": source,
                       "ref": str(card.get("asset_ref") or "")[:300], "rights": rights(str(source))},
+            "fact": card.get("fact_check") or {},
             "match": {"status": match_status, "score": match_score,
                       "reason": str(visual_match.get("reason") or "")[:160]},
             "review": {"required": bool(require_review), "approved": False, "replacement": None},

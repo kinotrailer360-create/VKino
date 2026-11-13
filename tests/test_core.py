@@ -1013,3 +1013,46 @@ def test_live_intro_uses_number_two_clip_not_number_one() -> None:
     cards[4].pop("clip")
     assert live_intro(theme, films, cards)["card"] == 3  # нет отрывка у №2 — берём №3
     assert live_intro(theme, films, [{}] * 5 + [{"clip": "c.mp4"}]) is None  # отрывок только у №1 — не раскрываем
+
+
+def test_qc_parse_finds_black_freeze_silence_and_format():
+    from shorts import qc
+    probe = {"streams": [{"codec_type": "video", "width": 1080, "height": 1350}, {"codec_type": "audio"}],
+             "format": {"duration": "40.0"}}
+    log = ("black_start:39.0 black_end:40.0 black_duration:1.0\n"
+           "lavfi.freezedetect.freeze_start: 10.0\nlavfi.freezedetect.freeze_duration: 7.5\n"
+           "silence_start: 20.0\nsilence_end: 23.0 | silence_duration: 3.0\nPeak level dB: 0.0\n")
+    issues = qc.parse(probe, log, vertical=True)
+    text = " ".join(issues)
+    assert "1080×1920" in text and "чёрный экран" in text and "застыла" in text and "тишина" in text
+    assert "пределе" in text
+    ok = {"streams": [{"codec_type": "video", "width": 1080, "height": 1920}, {"codec_type": "audio"}],
+          "format": {"duration": "40.0"}}
+    assert qc.parse(ok, "Peak level dB: -3.0\nsilence_start: 39.0\nsilence_end: 40 | silence_duration: 1.0") == []
+
+
+def test_person_by_surname_or_role_and_not_ambiguous():
+    from shorts import daily
+    film = {"persons": [
+        {"name": "Том Хиддлстон", "enProfession": "actor", "description": "Локи"},
+        {"name": "Крис Хемсворт", "enProfession": "actor", "description": "Тор"},
+        {"name": "Стеллан Скарсгард", "enProfession": "actor", "description": "Эрик Селвиг"},
+        {"name": "Александр Скарсгард", "enProfession": "actor", "description": "Эрик"}]}
+    assert daily._mentioned_person("Хиддлстона утвердили сразу", film)["name"] == "Том Хиддлстон"
+    assert daily._mentioned_person("Локи должен был погибнуть", film)["name"] == "Том Хиддлстон"
+    assert daily._mentioned_person("Скарсгард снялся в роли", film) is None  # двое — не угадываем
+    assert daily._mentioned_person("локи и хиддлстон", film) is None  # не имя (строчные)
+
+
+def test_fact_checks_parse_and_label(monkeypatch):
+    import asyncio
+    from shorts import ai, scene_planner
+    async def fake(key, parts, prompt, *a, **k):
+        return {"checks": [{"n": 1, "status": "confirmed", "source": "Википедия"},
+                           {"n": 2, "status": "conflict", "source": "Кинопоиск", "note": "бюджет 200, а не 300"}]}
+    monkeypatch.setattr(ai, "_with_reserve", fake)
+    monkeypatch.setattr(ai, "available", lambda key: True)
+    res = asyncio.run(ai.check_facts("k", ["факт 1", "факт 2", "факт 3"], {"Википедия": "текст"}))
+    assert [r["status"] for r in res] == ["confirmed", "conflict", "unverified"]
+    line = scene_planner.fact_line({**res[1], "checked": "2026-11-13"})
+    assert "расходятся" in line and "бюджет" in line and "2026-11-13" in line
