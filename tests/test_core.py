@@ -1092,7 +1092,6 @@ def test_library_caption_segments_and_preselect():
 
 def test_library_find_threshold_rights_and_eval(monkeypatch):
     import asyncio
-    from PIL import Image
     from shorts import ai, library
     rows = [{"lib_id": 1, "n": 0, "t_start": 10.0, "t_end": 13.0, "keyframe": "/nope.jpg", "work": "Ванда/Вижн",
              "file": "/v.mp4", "source": "официальный трейлер", "license": "права не подтверждены",
