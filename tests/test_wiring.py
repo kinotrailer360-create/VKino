@@ -206,3 +206,23 @@ def test_scene_approval_flow_end_to_end(tmp_path, monkeypatch) -> None:
     (folder / "card2.jpg").write_bytes(b"replacement")  # автор заменил кадр сцены 2
     _, ok = asyncio.run(bot.scene_approvals(7, folder, plan))
     assert ok == [True, False]
+
+
+def test_scene_replacements_wait_for_one_remake(tmp_path, monkeypatch) -> None:
+    """Замена сцены не запускает сборку сразу: замены копятся, перемонтаж — одной кнопкой."""
+    import asyncio
+    import json
+    import bot
+    (tmp_path / "project.json").write_text(json.dumps({"rerun": {}}), encoding="utf-8")
+    sent, jobs = [], []
+
+    class Msg:
+        async def answer(self, text, **kw):
+            sent.append((text, kw.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "_run_job", lambda fn: jobs.append(fn))
+    asyncio.run(bot.replacement_saved(Msg(), tmp_path, 100, 0))
+    asyncio.run(bot.replacement_saved(Msg(), tmp_path, 100, 3))
+    assert not jobs  # сборка не началась
+    text, kb = sent[-1]
+    assert "1, 4" in text and kb.inline_keyboard[0][0].callback_data == "pt:vrr:100"

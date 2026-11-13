@@ -9872,6 +9872,20 @@ async def run_text_facts(bot: Bot, chat_id: int, title: str, facts: list[str], s
             shutil.rmtree(work, ignore_errors=True)
 
 
+async def replacement_saved(message: Message, folder: Path, first: int, index: int) -> None:
+    """Замена сохранена в проекте, но ролик сразу не пересобираем: автор может заменить ещё несколько сцен
+    (раньше вторая замена, присланная во время сборки, терялась). Сборка — одной кнопкой со всеми заменами."""
+    proj = shorts_project.load(folder) or {}
+    done = sorted(set(proj.get("pending_replacements") or []) | {index + 1})
+    proj["pending_replacements"] = done  # после перемонтажа проект пишется заново — список обнуляется сам
+    (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
+    await message.answer(
+        f"✅ Сцена {index + 1} заменена (ждут перемонтажа: {', '.join(map(str, done))}). "
+        "Замени ещё — кнопка «🔄 Заменить» под нужной сценой, или собери ролик:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn(f"🎬 Перемонтировать с заменами ({len(done)})", f"pt:vrr:{first}")]]))
+
+
 @router.message(SceneReviewState.replacement, F.photo | F.video)
 async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
@@ -9901,8 +9915,7 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
         rr["pins"] = {**(rr.get("pins") or {}), str(media.index(path.name)): index + 1}
         (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
         await state.clear()
-        await message.answer("✅ Принято. Перемонтирую ролик с заменённой сценой…")
-        _run_job(lambda: project_remake_job(message.bot, message.chat.id, first))
+        await replacement_saved(message, folder, first, index)
         return
     if rr.get("fn") == "lore":
         await message.answer("Для этой сцены пришли фото.")
@@ -9942,8 +9955,7 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
     proj["rerun"]["scene_plan_enabled"] = True
     (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
     await state.clear()
-    await message.answer("✅ Принято. Перемонтирую ролик с заменённой сценой…")
-    _run_job(lambda: project_remake_job(message.bot, message.chat.id, first))
+    await replacement_saved(message, folder, first, index)
 
 
 @router.message(FactsState.title, F.text, ~F.text.startswith("/"))
@@ -13522,6 +13534,12 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if kind == "vis" and arg.isdigit():
         await callback.answer()
         await show_scene_review(message.bot, chat_id, int(arg))
+        return
+    if kind == "vrr" and arg.isdigit():  # все замены сцен сделаны — один перемонтаж
+        await callback.answer("🎬 Перемонтирую")
+        with contextlib.suppress(TelegramBadRequest):
+            await message.edit_reply_markup(reply_markup=None)
+        _run_job(lambda: project_remake_job(message.bot, chat_id, int(arg)))
         return
     if kind == "va" and arg.isdigit():  # старая кнопка «подтвердить все»: теперь каждая сцена — отдельно
         await callback.answer("Теперь каждая сцена утверждается отдельно")
