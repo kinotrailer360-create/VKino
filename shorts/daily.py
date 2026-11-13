@@ -42,7 +42,10 @@ YOUTUBE_URL = "https://youtube.com/@kinomir360"
 TELEGRAM_URL = "t.me/KinoMir360"
 
 # По дням недели (пн..вс)
-SCHEDULE = ["online", "cinema", "facts_new", "genre", "news", "upcoming", "facts"]
+# YouTube Studio (ноябрь 2026): «Что посмотреть / онлайн-премьеры» смахивали 60–80 % — рубрику убрали; вместо неё
+# три подборки по запросам, с которыми канал находят в поиске (мини-сериалы, реальные события, детективы)
+SCHEDULE = ["genre:мини-сериалы", "cinema", "facts_new", "genre:реальные события", "news", "upcoming",
+            "genre:зарубежные детективы"]
 
 GENRES = {
     "фантастика": ("ТОП ФАНТАСТИКИ", "фантастических фильмов, которые взрывают мозг", "фантастика"),
@@ -51,6 +54,20 @@ GENRES = {
     "комедия": ("ТОП КОМЕДИЙ", "комедий для отличного вечера", "комедии"),
     "боевик": ("ТОП БОЕВИКОВ", "боевиков, от которых захватывает дух", "боевики"),
     "детектив": ("ТОП ДЕТЕКТИВОВ", "детективов с неожиданной развязкой", "детективы"),
+    # поисковые темы канала (запросы «мини сериалы», «фильмы на реальных событиях», «детективы зарубежные»)
+    "мини-сериалы": ("МИНИ-СЕРИАЛЫ НА ВЕЧЕР", "мини-сериалов, которые смотрятся за вечер", "мини-сериалы"),
+    "реальные события": ("НА РЕАЛЬНЫХ СОБЫТИЯХ", "фильмов на реальных событиях, о которых мало кто знает",
+                         "фильмы на реальных событиях"),
+    "зарубежные детективы": ("ЗАРУБЕЖНЫЕ ДЕТЕКТИВЫ", "зарубежных детективов, где убийцу не угадать",
+                             "зарубежные детективы"),
+}
+# фильтры Кинопоиска для тем, которые не совпадают с жанром один в один
+GENRE_QUERY: dict[str, dict[str, str]] = {
+    "мини-сериалы": {"isSeries": "true", "rating.kp": "7.4-10", "votes.kp": "15000-100000000"},
+    "реальные события": {"isSeries": "false", "genres.name": "биография", "rating.kp": "7.2-10",
+                         "votes.kp": "20000-100000000"},
+    "зарубежные детективы": {"isSeries": "false", "genres.name": "детектив", "countries.name": "!Россия",
+                             "rating.kp": "7.0-10", "votes.kp": "30000-100000000"},
 }
 
 Fetch = Callable[..., Awaitable[dict[str, Any]]]
@@ -358,6 +375,15 @@ def _mix(foreign: list[dict[str, Any]], local: list[dict[str, Any]]) -> list[dic
     return out
 
 
+def _one_season(doc: dict[str, Any]) -> bool:
+    """Мини-сериал: один сезон (по seasonsInfo) или годы выхода начинаются и кончаются в одном году."""
+    seasons = [s for s in doc.get("seasonsInfo") or [] if isinstance(s, dict) and s.get("number")]
+    if seasons:
+        return len(seasons) == 1
+    years = (doc.get("releaseYears") or [{}])[0] if doc.get("releaseYears") else {}
+    return bool(years.get("start")) and years.get("start") == years.get("end")
+
+
 async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int]) -> list[dict[str, Any]]:
     common = {"sortField": "votes.kp", "sortType": "-1", "notNullFields": "name"}
     if theme.key == "online":
@@ -410,9 +436,11 @@ async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int])
         random.shuffle(docs)
     else:
         genre = theme.key.split(":", 1)[1]
-        docs = await _query(fetch, page=random.randint(1, 3), isSeries="false",
-                            **{"genres.name": genre, "rating.kp": "7.2-10", "votes.kp": "30000-100000000"},
-                            **common)
+        query = GENRE_QUERY.get(genre) or {"isSeries": "false", "genres.name": genre, "rating.kp": "7.2-10",
+                                           "votes.kp": "30000-100000000"}
+        docs = await _query(fetch, page=random.randint(1, 3), **query, **common)
+        if genre == "мини-сериалы":  # один сезон: вышел и закончился в один год
+            docs = [d for d in docs if _one_season(d)]
         random.shuffle(docs)
 
     picked, seen = [], set()
@@ -985,12 +1013,13 @@ def live_intro(theme: Theme, films: list[dict[str, Any]], cards: list[dict[str, 
     # cards[i] — фильм с местом n - i; номер один — последняя карточка
     order = sorted(range(n - 1), key=lambda i: n - i)
     pick = next((i for i in order if cards[i].get("clip")), None)
-    if pick is None:
-        return None
     best = films[-1] if films else {}
     rating, src = _rating(best) if best and not theme.upcoming else (0, "")
     sub = f"№1 — {src} {rating:.1f}" if rating and rating >= 7.5 else ""
-    return {"card": pick, "title": theme.header, "sub": sub}
+    if pick is None:  # отрывков нет — кадр фильма без надписей (raw*.jpg) на весь экран с тем же заголовком
+        still = next((i for i in order + [n - 1] if cards[i].get("raw")), None) if n else None
+        return {"image": cards[still]["raw"], "title": theme.header, "sub": sub} if still is not None else None
+    return {"card": pick, "title": theme.header, "sub": sub, **({"image": cards[pick]["raw"]} if cards[pick].get("raw") else {})}
 
 
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
@@ -1613,6 +1642,10 @@ GENRE_TITLES: dict[str, tuple[str, tuple[str, str, str]]] = {
     "комедия": ("Лучшие комедии", ("комедия", "комедии", "комедий")),
     "боевик": ("Лучшие боевики", ("боевик", "боевика", "боевиков")),
     "детектив": ("Лучшие детективы", ("детектив", "детектива", "детективов")),
+    # заголовки — как запросы в поиске YouTube, по которым канал уже находят
+    "мини-сериалы": ("Мини сериалы на вечер", ("мини-сериал", "мини-сериала", "мини-сериалов")),
+    "реальные события": ("Фильмы на реальных событиях", _FILM),
+    "зарубежные детективы": ("Детективы зарубежные фильмы", ("детектив", "детектива", "детективов")),
 }
 
 
@@ -2327,7 +2360,16 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     # без «Сохрани и подпишись…»: по Studio факты теряли 8–20 п. п. зрителей за 6–7 секунд до конца, на прощании.
     # Короткий вопрос — и ролик сразу уходит на повтор (повторы YouTube тоже считает)
     lines = [intro] + facts + [outro_line]
-    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music, scene_plan=not review and not rumors)
+    # первый кадр — кадр из фильма на весь экран и крупное название, а не постер с плашкой (YouTube Studio:
+    # на заставке смахивают); отрывок трейлера к первому факту — живой заставкой
+    intro_bg = work / "intro_bg.jpg"
+    await asyncio.to_thread((images[0] if images else cover_src).convert("RGB").save, intro_bg, quality=90)
+    first_clip = 0 if cards and cards[0].get("clip") else None
+    sub = "стоит ли смотреть?" if review else "новости и слухи" if rumors else f"{n} {_facts_word(n)}, которые ты не знал"
+    intro_live = {"title": t, "sub": sub, "image": intro_bg.name,
+                  **({"card": first_clip} if first_clip is not None else {})}
+    voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music,
+                           scene_plan=not review and not rumors, intro_live=intro_live)
     seo = build_review_seo(film, facts) if review else build_rumors_seo(film, facts) if rumors \
         else build_facts_seo(film, facts)
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
@@ -2759,6 +2801,7 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
                                            _actors(f), badge, place=n - i + 1)
             path = work / f"card{i}.jpg"
             card.save(path, quality=93)
+            await asyncio.to_thread(img.convert("RGB").save, work / f"raw{i}.jpg", quality=90)  # для заставки
             video: dict[str, str] = {}
             clip = own_videos.get(i - 1)  # своё видео автора — вместо трейлера
             if not clip and (i - 1) not in own and trailer_clips and await _trailer_clip(f, work / f"clip{i}.mp4"):
@@ -2775,7 +2818,7 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
             f["_awards"] = wiki.awards_line(await wiki.awards(f))
             if f["_awards"]:
                 rows.append([("Награды", f["_awards"])])
-            cards.append({"image": path.name, "caption": caption, "info": rows, **video})
+            cards.append({"image": path.name, "caption": caption, "info": rows, "raw": f"raw{i}.jpg", **video})
         # обложка — фильм №1: русский постер Кинопоиска, запасной — постер TMDB
         cover_src = await _download_first(session, [_poster_url(films[-1])] + posters_tmdb)
 

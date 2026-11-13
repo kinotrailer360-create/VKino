@@ -1234,7 +1234,11 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         log.warning("shorts: write_post names not in sources: %s", wrong)
         post = await fix_names(key, post, sources, wrong)
         wrong = ungrounded_names(post, sources)
-    return {"post": post[:1020], "unverified_names": wrong, "topic": str(data.get("topic") or "").strip()[:80], "media": media,
+    # каждое утверждение поста — со сверкой с источниками новости: автор видит, что не подтвердилось
+    claims = post_claims(post)
+    checks = await check_facts(key, claims, {"Источники новости": sources}) if claims else []
+    flags = [{"text": c, **chk} for c, chk in zip(claims, checks) if chk["status"] in ("conflict", "unverified")]
+    return {"post": post[:1020], "unverified_names": wrong, "fact_flags": flags, "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
             "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
             "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true",
@@ -1275,6 +1279,21 @@ def ungrounded_names(post: str, sources: str) -> list[str]:
         if not found and m.group(0) not in out:
             out.append(m.group(0))
     return out
+
+
+def post_claims(post: str) -> list[str]:
+    """Утверждения поста для сверки: абзацы без заголовка, строки реакций («❤️ — …»), призывов и хэштегов."""
+    out = []
+    for para in re.split(r"\n\s*\n", post):
+        lines = [ln for ln in para.splitlines()
+                 if ln.strip() and not re.match(r"\s*(?:#|[❤🔥📤👍💬👇]|.{0,3}—\s)", ln)
+                 and not re.search(r"(?i)перешли|подпис|пиши в комментар|ставь", ln)]
+        text = " ".join(ln.strip() for ln in lines).strip()
+        letters = [ch for ch in text if ch.isalpha()]
+        if len(text) < 40 or (letters and sum(ch.isupper() for ch in letters) / len(letters) > 0.7):  # заголовок
+            continue
+        out.append(text[:400])
+    return out[:6]
 
 
 async def fix_names(key: str, post: str, sources: str, names: list[str]) -> str:

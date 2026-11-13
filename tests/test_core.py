@@ -1056,3 +1056,20 @@ def test_fact_checks_parse_and_label(monkeypatch):
     assert [r["status"] for r in res] == ["confirmed", "conflict", "unverified"]
     line = scene_planner.fact_line({**res[1], "checked": "2026-11-13"})
     assert "расходятся" in line and "бюджет" in line and "2026-11-13" in line
+
+
+def test_post_claims_skip_headline_reactions_and_tags():
+    from shorts import ai
+    post = ("📉 «СУПЕРГЁРЛ» СТАЛА КИНОПРОВАЛОМ ГОДА!\n\nФильм с Милли Олкок в главной роли потерял $135 млн в прокате.\n\n"
+            "❤️ — жаль\n🔥 — не смотрел\n📤 Перешли другу\n\n#Супергёрл #КиноПровал")
+    assert ai.post_claims(post) == ["Фильм с Милли Олкок в главной роли потерял $135 млн в прокате."]
+
+
+def test_search_topics_replace_online_in_schedule_and_plan():
+    from datetime import date
+    from shorts import daily, plan
+    assert "online" not in daily.SCHEDULE and "genre:мини-сериалы" in daily.SCHEDULE
+    assert all(kind != "online" for kind, _ in plan.PLAN.values())
+    assert plan.publish_time(date(2026, 11, 16)) == "14:00" and plan.publish_time(date(2026, 11, 15)) == "12:00"
+    assert daily._one_season({"releaseYears": [{"start": 2024, "end": 2024}]})
+    assert not daily._one_season({"seasonsInfo": [{"number": 1}, {"number": 2}]})

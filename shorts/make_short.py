@@ -150,6 +150,44 @@ class IntroSlide(Slide):
         return zoom(self.base, 1.0 + 0.07 * t / max(dur, 1), W, H)
 
 
+def intro_overlay(cfg, title: str, sub: str = "") -> Image.Image:
+    """Крупный заголовок заставки поверх кадра: затемнение снизу, 2–3 строки, подзаголовок жёлтым."""
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shade = Image.new("L", (1, H))
+    for y in range(H):  # затемняем середину и низ — там текст, сверху кадр остаётся ярким
+        shade.putpixel((0, y), int(200 * min(max((y - 600) / 700, 0), 1)))
+    overlay.paste((0, 0, 0, 255), (0, 0, W, H), shade.resize((W, H)))
+    d = ImageDraw.Draw(overlay)
+    size = 132
+    while size > 80:
+        fnt = font(cfg, "head", size)
+        lines = wrap(d, title.upper(), fnt, 900)
+        if len(lines) <= 2:
+            break
+        size -= 12
+    y = 1040 - (len(lines) - 1) * round(size * 0.55)
+    for line in lines[:3]:  # заголовок выше подписей YouTube внизу экрана
+        y += text_center(d, W / 2, y, line, fnt, stroke=4) + round(size * 0.18)
+    if sub:
+        sf = font(cfg, "sans", 60)
+        text_center(d, W / 2, y + 24, sub, sf, fill=(255, 205, 90), stroke=3)
+    return overlay
+
+
+class StillIntroSlide(Slide):
+    """Заставка, когда отрывка нет: кадр из фильма на весь экран с наездом + крупный заголовок (а не постер
+    с плашкой и мелким текстом — такие ролики смахивали, см. LiveIntroSlide)."""
+
+    def __init__(self, cfg, path: Path, title: str, sub: str = ""):
+        self.base = cover(Image.open(path).convert("RGB"), int(W * 1.08), int(H * 1.08))
+        self.overlay = intro_overlay(cfg, title, sub)
+
+    def frame(self, t, dur):
+        img = zoom(self.base, 1.0 + 0.07 * t / max(dur, 1), W, H).convert("RGBA")
+        img.alpha_composite(self.overlay)
+        return img.convert("RGB")
+
+
 class LiveIntroSlide(Slide):
     """Заставка из кадров трейлера на весь экран + крупный заголовок с первого кадра.
 
@@ -159,25 +197,7 @@ class LiveIntroSlide(Slide):
     def __init__(self, cfg, frames_dir: Path, title: str, sub: str = ""):
         self.reader = ClipReader(frames_dir)
         self.fallback: Image.Image | None = None
-        self.overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        shade = Image.new("L", (1, H))
-        for y in range(H):  # затемняем середину и низ — там текст, сверху кадр остаётся ярким
-            shade.putpixel((0, y), int(200 * min(max((y - 600) / 700, 0), 1)))
-        self.overlay.paste((0, 0, 0, 255), (0, 0, W, H), shade.resize((W, H)))
-        d = ImageDraw.Draw(self.overlay)
-        size = 132
-        while size > 80:
-            fnt = font(cfg, "head", size)
-            lines = wrap(d, title.upper(), fnt, 900)
-            if len(lines) <= 2:
-                break
-            size -= 12
-        y = 1040 - (len(lines) - 1) * round(size * 0.55)
-        for line in lines[:3]:  # заголовок выше подписей YouTube внизу экрана
-            y += text_center(d, W / 2, y, line, fnt, stroke=4) + round(size * 0.18)
-        if sub:
-            sf = font(cfg, "sans", 60)
-            text_center(d, W / 2, y + 24, sub, sf, fill=(255, 205, 90), stroke=3)
+        self.overlay = intro_overlay(cfg, title, sub)
 
     @staticmethod
     def frames(clip: Path, seconds: float = 4.0) -> Path | None:
@@ -621,6 +641,8 @@ def render(cfg: dict, base: Path) -> Path:
     live_frames = LiveIntroSlide.frames(p(live_clip)) if live_clip and p(live_clip).exists() else None
     if live_frames:
         makers[0] = lambda: LiveIntroSlide(cfg, live_frames, live.get("title", ""), live.get("sub", ""))
+    elif live.get("image") and p(live["image"]).exists():  # отрывка нет — кадр из фильма, не постер с плашкой
+        makers[0] = lambda: StillIntroSlide(cfg, p(live["image"]), live.get("title", ""), live.get("sub", ""))
     makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"),
                                           c.get("karaoke"),
                                           clip_dirs.get(i),

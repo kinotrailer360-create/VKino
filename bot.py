@@ -7462,7 +7462,7 @@ def plan_text(day: date) -> tuple[str, InlineKeyboardMarkup | None]:
     item, long_video = shorts_plan.today(day), shorts_plan.long_today(day)
     if not item and not long_video:
         return "📅 На сегодня в контент-плане ничего нет.", None
-    rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать 12:00–15:00 МСК):"]
+    rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать в {shorts_plan.publish_time(day)} МСК):"]
     ready = shorts_plan.script(day)
     if item:
         kind, topic = item
@@ -8421,7 +8421,9 @@ def shorts_section(name: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if name == "shorts":
         rows = [[_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
-                [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+                [_btn("🔎 Мини-сериалы на вечер", "sh:go:genre:мини-сериалы"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+                [_btn("🔎 На реальных событиях", "sh:go:genre:реальные события"),
+                 _btn("🔎 Зарубежные детективы", "sh:go:genre:зарубежные детективы")],
                 [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
                 [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
                 [_btn("🎉 Шортс к празднику ▸", "sh:hol")]]
@@ -11068,6 +11070,11 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 res.get("status") or "")
             if status:
                 seen += f"\n\n🏷 Достоверность: {status}"
+            if res.get("fact_flags"):
+                seen += "\n\n🔎 <b>Не подтвердилось источниками новости — проверь:</b>\n" + "\n".join(
+                    f"• {'❌ расходится' if f['status'] == 'conflict' else '⚠️ нет в источниках'}: "
+                    f"«{escape(f['text'][:120])}»" + (f" — {escape(f['note'])}" if f.get("note") else "")
+                    for f in res["fact_flags"][:4])
             if res.get("unverified_names"):
                 seen += ("\n\n⚠️ Этих имён нет в источниках новости — проверь, не перепутал ли ИИ человека: "
                          + escape(", ".join(res["unverified_names"])))
