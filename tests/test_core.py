@@ -1137,3 +1137,10 @@ def test_lore_scene_plan_marks_theory_and_sources():
     s = plan["scenes"]
     assert s[0]["asset"]["rights"] == "author" and s[1]["asset"]["source"] == "library"
     assert s[1]["fact"]["status"] == "theory" and s[2]["asset"]["source"] == "trailer_clip"
+
+
+def test_own_script_voiced_verbatim_without_subscribe():
+    from shorts import lore
+    lines = ["Заметили?", "Сейчас объясню.", "И это — Часовой!"]
+    assert lore.spoken_lines({"lines": lines, "kind": "news", "kind_own": True}) == lines
+    assert "подпиш" in lore.spoken_lines({"lines": lines, "kind": "lore"})[-1].lower()

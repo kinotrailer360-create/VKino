@@ -588,7 +588,9 @@ def spoken_lines(script: dict[str, Any]) -> list[str]:
     dynamic = script.get("style") == "dynamic" and not mourning
     has_cta = dynamic and any("телеграм" in ln.lower() for ln in lines)
     # «Теория Marvel» кончается сильной фразой, без «подпишись» (ТЗ, приложение A)
-    return lines if mourning or has_cta or script.get("theory") else lines[:-1] + [daily.with_outro(lines[-1])]
+    # свой сценарий и задание читаем как есть: дописанное «подпишись» ломает задуманный обрыв на последнем слове
+    verbatim = script.get("theory") or script.get("kind_own")
+    return lines if mourning or has_cta or verbatim else lines[:-1] + [daily.with_outro(lines[-1])]
 
 
 async def _screen_frame(work: Path, sl: dict[str, Any], fill: bool) -> Image.Image | None:
