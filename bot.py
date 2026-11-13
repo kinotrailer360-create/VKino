@@ -14885,7 +14885,8 @@ async def theory_topic(message: Message, state: FSMContext) -> None:
            if prem.get("date") else "")
         + f"\n\n<b>Тезисы:</b>\n{claims or '—'}"
         + ("\n\n<b>Возражения:</b>\n" + "\n".join(f"• {escape(o)}" for o in th["objections"]) if th["objections"] else "")
-        + "\n\n<i>Теория в ролике звучит как теория, не как официальный факт.</i>")
+        + ("\n\n⚠️ <b>Проверь:</b>\n" + "\n".join(f"• {escape(w)}" for w in th["warnings"]) if th.get("warnings") else "")
+        + "\n\n<i>Сомнения и возражения — здесь, для тебя; в ролике теория звучит уверенно, с пометкой «по теории».</i>")
     body = f"**Заголовок:** {title}\n" + "\n".join(th["lines"])
     await state.update_data(own_scripts=[(title, body)], own_pick=0, lore_kind="own", lore_name=title, lore_hook="",
                             lore_script=None, lore_media=[], task_labels=[])
