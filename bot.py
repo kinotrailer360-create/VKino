@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import hmac
@@ -78,6 +79,7 @@ from shorts import music as shorts_music
 from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
+from shorts import scene_planner as shorts_scene_planner
 from shorts import direct_stats
 from shorts import copycat as shorts_copycat
 from shorts import dub as shorts_dub
@@ -13208,9 +13210,14 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         await show_scene_review(message.bot, chat_id, int(arg))
         return
-    if kind == "va" and arg.isdigit():
-        await callback.answer()
-        await approve_scene_review(message.bot, chat_id, int(arg))
+    if kind == "va" and arg.isdigit():  # старая кнопка «подтвердить все»: теперь каждая сцена — отдельно
+        await callback.answer("Теперь каждая сцена утверждается отдельно")
+        await show_scene_review(message.bot, chat_id, int(arg))
+        return
+    if kind == "vok" and re.fullmatch(r"\d+:\d+", arg):
+        await callback.answer("✅")
+        first, index = map(int, arg.split(":"))
+        await approve_scene(message.bot, chat_id, first, index, callback.from_user.id, message)
         return
     if kind == "vr" and re.fullmatch(r"\d+:\d+", arg):
         await callback.answer()
@@ -16811,21 +16818,56 @@ async def keep_project(chat_id: int, message_id: int, work: Path, send: dict[str
         return False
 
 
+def _load_plan(folder: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads((folder / "scene_plan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+async def scene_approvals(chat_id: int, folder: Path, plan: dict[str, Any]) -> tuple[list[str], list[bool]]:
+    """Отпечатки текущих версий сцен и какие из них утверждены (в базе). Утверждение — версии, а не сообщения:
+    изменённая сцена (текст, время, файл) не утверждена, неизменённая после перемонтажа — утверждена."""
+    scenes = plan.get("scenes") or []
+    hashes = await asyncio.to_thread(lambda: [shorts_scene_planner.scene_hash(sc, folder) for sc in scenes])
+    rows = await db().fetch("SELECT scene_hash FROM scene_approvals WHERE chat_id = $1 AND scene_hash = ANY($2)",
+                            chat_id, hashes) if hashes else []
+    ok = {r["scene_hash"] for r in rows}
+    return hashes, [h in ok for h in hashes]
+
+
+def _scene_kb(first: int, index: int, approved: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        _btn("✅ Утверждена" if approved else "✅ Утвердить сцену", f"pt:vok:{first}:{index}"),
+        _btn("🔄 Заменить", f"pt:vr:{first}:{index}")]])
+
+
+def _scene_caption(index: int, scene: dict[str, Any], approved: bool) -> str:
+    asset = scene.get("asset") or {}
+    source = shorts_scene_planner.SOURCE_LABEL.get(str(asset.get("source") or ""), "неизвестен")
+    ref = str(asset.get("ref") or "")
+    rights = shorts_scene_planner.RIGHTS_LABEL.get(str(asset.get("rights") or "unconfirmed"), "")
+    return (f"{'✅' if approved else '⏳'} Сцена {index + 1} · {float(scene.get('start') or 0):.1f}–"
+            f"{float(scene.get('end') or 0):.1f} сек.\n{str(scene.get('text') or '')[:550]}\n"
+            f"📎 Источник: {source}{' — ' + ref[:200] if ref else ''}\n{rights}\n"
+            f"Соответствие: {(scene.get('match') or {}).get('status') or 'не проверено'}")[:1000]
+
+
 async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
     folder = proj_dir(chat_id, first)
     proj = shorts_project.load(folder) or {}
-    plan_path = folder / "scene_plan.json"
-    try:
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    plan = _load_plan(folder)
+    if plan is None:
         await bot.send_message(chat_id, "План сцен не найден. Открой проверку ещё раз.")
         return
     scenes = plan.get("scenes") or []
     if not scenes:
         await bot.send_message(chat_id, "В плане пока нет сцен для проверки.")
         return
-    await bot.send_message(chat_id, f"🖼 <b>Проверка визуального ряда</b> — {len(scenes)} сцен. "
-                         "Посмотри изображения. Любой кадр можно заменить своим фото.")
+    _, approved = await scene_approvals(chat_id, folder, plan)
+    await bot.send_message(chat_id, f"🖼 <b>Проверка визуального ряда</b> — {len(scenes)} сцен, утверждено "
+                         f"{sum(approved)}. Каждую сцену утверди отдельно или замени своим фото/видео. Публикация "
+                         "откроется, когда утверждены все.\n" + escape(shorts_scene_planner.sources_summary(plan)))
     cards = (proj.get("rerun") or {}).get("cards") or []
     for index, scene in enumerate(scenes):
         asset = scene.get("asset") or {}
@@ -16833,46 +16875,48 @@ async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
         path = Path(card_path or str(asset.get("path") or ""))
         if not path.is_absolute():
             path = folder / path
-        caption = (f"Сцена {index + 1} · {float(scene.get('start') or 0):.1f}–"
-                   f"{float(scene.get('end') or 0):.1f} сек.\n{str(scene.get('text') or '')[:650]}\n"
-                   f"Источник: {asset.get('source') or 'неизвестен'} · "
-                   f"статус: {(scene.get('match') or {}).get('status') or 'не проверено'}")
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [_btn("🔄 Заменить (фото или видео)", f"pt:vr:{first}:{index}")]])
+        caption = escape(_scene_caption(index, scene, approved[index]))
+        markup = _scene_kb(first, index, approved[index])
         clip = Path(str(cards[index].get("clip") or "")) if index < len(cards) else Path()
         if str(clip) not in ("", ".") and not clip.is_absolute():
             clip = folder / clip
         if clip.is_file() and clip.stat().st_size <= TG_UPLOAD_SCENE:  # сцена — отрывок: показываем сам отрывок
-            await bot.send_video(chat_id, FSInputFile(clip), caption=("🎞 " + caption)[:1000], reply_markup=markup,
+            await bot.send_video(chat_id, FSInputFile(clip), caption=caption, reply_markup=markup,
                                  supports_streaming=True, request_timeout=300)
         elif path.is_file():
-            await bot.send_photo(chat_id, FSInputFile(path), caption=caption[:1000], reply_markup=markup)
+            await bot.send_photo(chat_id, FSInputFile(path), caption=caption, reply_markup=markup)
         else:
-            await bot.send_message(chat_id, caption[:1000] + "\n⚠️ Файл изображения не найден.", reply_markup=markup)
-    await bot.send_message(chat_id, "Когда все сцены устраивают, подтверди визуальный ряд:",
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                               [_btn("✅ Подтвердить все сцены", f"pt:va:{first}")]]))
+            await bot.send_message(chat_id, caption + "\n⚠️ Файл изображения не найден.", reply_markup=markup)
 
 
-async def approve_scene_review(bot: Bot, chat_id: int, first: int) -> None:
+async def approve_scene(bot: Bot, chat_id: int, first: int, index: int, actor: int,
+                        message: Message | None = None) -> None:
+    """Утвердить одну сцену (её текущую версию). Утверждены все — предлагаем публикацию (один раз)."""
     folder = proj_dir(chat_id, first)
-    plan_path = folder / "scene_plan.json"
-    try:
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        await bot.send_message(chat_id, "План сцен не найден. Открой проверку ещё раз.")
+    plan = _load_plan(folder)
+    scenes = (plan or {}).get("scenes") or []
+    if not plan or not 0 <= index < len(scenes):
+        await bot.send_message(chat_id, "Эта сцена уже недоступна. Открой проверку ещё раз.")
         return
-    if plan.get("review_mode") == "approved":
-        await bot.send_message(chat_id, "Этот визуальный ряд уже подтверждён.")
-        return
-    for scene in plan.get("scenes") or []:
-        scene.setdefault("review", {})["approved"] = True
-        scene["review"]["approved_at"] = datetime.now(MSK).isoformat()
-    plan["review_mode"] = "approved"
-    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-    await bot.send_message(chat_id, "✅ Визуальный ряд подтверждён. Теперь можно публиковать ролик.")
-    await offer_post(bot, chat_id, [first], "caption", what="Проверенный шортс готов для Telegram-канала",
-                     extra={"yt": True})
+    hashes, approved = await scene_approvals(chat_id, folder, plan)
+    if not approved[index]:
+        await db().execute("INSERT INTO scene_approvals (chat_id, scene_hash, first_id, scene_index, actor) "
+                           "VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                           chat_id, hashes[index], first, index, actor)
+        await audit(chat_id, first, actor, "scene_approved", {"scene": index + 1, "hash": hashes[index]})
+        approved[index] = True
+    if message:
+        with contextlib.suppress(TelegramBadRequest):
+            await message.edit_reply_markup(reply_markup=_scene_kb(first, index, True))
+    if all(approved) and plan.get("review_mode") != "approved":
+        plan["review_mode"] = "approved"
+        (folder / "scene_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        await bot.send_message(chat_id, "✅ Все сцены утверждены. Теперь можно публиковать ролик.")
+        await offer_post(bot, chat_id, [first], "caption", what="Проверенный шортс готов для Telegram-канала",
+                         extra={"yt": True})
+    elif not all(approved):
+        left = [str(i + 1) for i, ok in enumerate(approved) if not ok]
+        await bot.send_message(chat_id, f"✅ Сцена {index + 1} утверждена. Осталось: {', '.join(left)}.")
 
 
 async def fix_buttons(bot: Bot, chat_id: int, first: int, weekly: bool = False, note: str = "") -> None:
@@ -16900,12 +16944,18 @@ async def send_fixed(bot: Bot, chat_id: int, folder: Path, video: Path, note: st
     plan_path = folder / "scene_plan.json"
     review_pending = False
     if plan_path.exists():
-        try:
-            plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            review_pending = any(not (scene.get("review") or {}).get("approved")
-                                 for scene in plan.get("scenes") or [])
-        except (OSError, ValueError):
+        plan = _load_plan(folder)
+        if plan is None:
             review_pending = True
+        else:
+            _, approved = await scene_approvals(chat_id, folder, plan)
+            review_pending = not all(approved)
+            if review_pending and plan.get("review_mode") == "approved":  # сцену поменяли — утверждение снова нужно
+                plan["review_mode"] = "required"
+                plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            elif not review_pending:
+                plan["review_mode"] = "approved"
+                plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     if not review and not review_pending:
         await offer_post(bot, chat_id, [msg.message_id], "caption", what="Исправленный шортс", extra={"yt": True})
     elif review_pending:

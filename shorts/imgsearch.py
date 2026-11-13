@@ -24,6 +24,7 @@ STOCK = ("shutterstock", "alamy", "gettyimages", "istockphoto", "dreamstime", "d
 BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/130.0 Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
 last_error = ""  # почему поиск не дал картинок (для сообщения автору)
+last_pick = ""  # адрес выбранной картинки (источник — для автора)
 
 
 def _ok(url: str, width: int = 0) -> bool:
@@ -111,6 +112,8 @@ async def pick(query: str, phrase: str, gemini_key: str) -> bytes | None:
             try:
                 raw, ctype = await netsafe._get(session, cands[k]["image"], 15 * 1024 * 1024, "")
                 if ctype.startswith("image/"):
+                    global last_pick
+                    last_pick = cands[k]["image"]
                     return raw
             except Exception:  # noqa: BLE001
                 continue
@@ -118,6 +121,7 @@ async def pick(query: str, phrase: str, gemini_key: str) -> bytes | None:
                 if thumbs[k].width >= 400:
                     buf = io.BytesIO()
                     thumbs[k].save(buf, "JPEG", quality=92)
+                    last_pick = cands[k]["image"]
                     return buf.getvalue()
             except Exception:  # noqa: BLE001
                 continue

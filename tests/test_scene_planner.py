@@ -72,3 +72,23 @@ def test_clip_reader_holds_last_frame_instead_of_looping(tmp_path) -> None:
     assert colors[1][2] > 180 and colors[1][0] < 80
     assert colors[2] == colors[1]
     assert colors[3] == colors[1]
+
+
+def test_scene_version_hash_and_sources(tmp_path):
+    from shorts import scene_planner as sp
+    (tmp_path / "card1.jpg").write_bytes(b"a")
+    (tmp_path / "fclip1.mp4").write_bytes(b"v")
+    cards = [{"image": "card1.jpg", "asset_source": "trailer_clip", "clip": "fclip1.mp4",
+              "asset_ref": "трейлер «X», 0:42 · https://rutube.ru/x"},
+             {"image": "card1.jpg", "asset_source": "user_media", "asset_ref": "материал автора"}]
+    plan = sp.build_scene_plan(["обложка", "факт 1", "факт 2"], [0, 1, 4], [{"speech": 1}, {"speech": 3}, {"speech": 3}],
+                               cards)
+    s1, s2 = plan["scenes"]
+    assert s1["asset"]["rights"] == "unconfirmed" and s2["asset"]["rights"] == "author"
+    assert "rutube" in s1["asset"]["ref"]
+    assert "Права не подтверждены у 1" in sp.sources_summary(plan)
+    h = sp.scene_hash(s1, tmp_path)
+    assert h == sp.scene_hash(dict(s1), tmp_path)
+    (tmp_path / "fclip1.mp4").write_bytes(b"other video")  # заменили материал — версия другая
+    assert sp.scene_hash(s1, tmp_path) != h
+    assert sp.scene_hash({**s1, "text": "правка"}, tmp_path) != sp.scene_hash(s1, tmp_path)

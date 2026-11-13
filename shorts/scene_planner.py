@@ -7,7 +7,58 @@ treated as an approved semantic match.
 """
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import Any
+
+# права на материал сцены: материал автора — его; ИИ — не кадр из фильма; остальное — источник записан,
+# но лицензия не подтверждена (публиковать можно, при жалобе по источнику ясно, что заменить)
+RIGHTS = {"user_media": "author", "user_replacement": "author", "ai_generated_illustration": "ai"}
+RIGHTS_LABEL = {"author": "✅ материал автора", "ai": "🎨 ИИ-иллюстрация, не кадр из фильма",
+                "unconfirmed": "⚠️ права не подтверждены"}
+SOURCE_LABEL = {"trailer_clip": "трейлер", "film_frame_pool": "кадр TMDB/Кинопоиска", "film_poster_fallback": "постер",
+                "web_image_search": "поиск картинок", "person_portrait": "фото человека", "user_media": "ваш материал",
+                "user_replacement": "ваша замена", "channel_media": "Telegram-канал",
+                "ai_generated_illustration": "ИИ-иллюстрация"}
+
+
+def rights(source: str) -> str:
+    return RIGHTS.get(source, "unconfirmed")
+
+
+def _digest(path: Path) -> str:
+    """Отпечаток файла: размер + начало и конец (видео бывают большими — целиком не читаем)."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            head = f.read(1 << 20)
+            f.seek(max(0, size - (1 << 20)))
+            tail = f.read(1 << 20)
+    except OSError:
+        return "missing"
+    return hashlib.sha256(str(size).encode() + head + tail).hexdigest()[:24]
+
+
+def scene_hash(scene: dict[str, Any], folder: Path) -> str:
+    """Версия сцены: текст, время, материал (содержимое файла). Изменилось что-то — утверждение не действует."""
+    asset = scene.get("asset") or {}
+    path = Path(str(asset.get("path") or ""))
+    path = path if path.is_absolute() else folder / path
+    raw = "|".join([str(scene.get("text") or ""), f"{float(scene.get('start') or 0):.2f}",
+                    f"{float(scene.get('end') or 0):.2f}", str(asset.get("type") or ""), _digest(path)])
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def sources_summary(plan: dict[str, Any]) -> str:
+    """Под роликом: откуда кадры и у скольких права не подтверждены."""
+    scenes = plan.get("scenes") or []
+    counts: dict[str, int] = {}
+    for s in scenes:
+        name = SOURCE_LABEL.get(str((s.get("asset") or {}).get("source") or ""), "другое")
+        counts[name] = counts.get(name, 0) + 1
+    unconfirmed = sum(1 for s in scenes if (s.get("asset") or {}).get("rights", "unconfirmed") == "unconfirmed")
+    parts = ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+    return f"📎 Кадров: {len(scenes)} — {parts}." + (f" Права не подтверждены у {unconfirmed}." if unconfirmed else "")
 
 
 def build_scene_plan(
@@ -49,7 +100,8 @@ def build_scene_plan(
             "start": round(start, 3),
             "end": round(end, 3),
             "duration": round(max(0.0, end - start), 3),
-            "asset": {"type": asset_type, "path": asset_path, "source": source},
+            "asset": {"type": asset_type, "path": asset_path, "source": source,
+                      "ref": str(card.get("asset_ref") or "")[:300], "rights": rights(str(source))},
             "match": {"status": match_status, "score": match_score,
                       "reason": str(visual_match.get("reason") or "")[:160]},
             "review": {"required": bool(require_review), "approved": False, "replacement": None},
