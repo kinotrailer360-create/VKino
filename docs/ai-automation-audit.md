@@ -18,7 +18,7 @@
 | Слой | Что есть | Где |
 |---|---|---|
 | Язык / Telegram | Python 3, aiogram 3.31, FSM в PostgreSQL | `requirements.txt`, `shorts/fsm_pg.py` |
-| БД | PostgreSQL через asyncpg 0.30; нумерованные миграции 1–6+ | `bot.py:init_db` (≈35 таблиц), `shorts/migrations.py` |
+| БД | PostgreSQL через asyncpg 0.30; нумерованные миграции 1–6+ | `bot.py:init_db` (31 таблица), `shorts/migrations.py` |
 | Файлы проектов | том `/data`: готовые ролики и проекты `/data/ready`, черновик выпуска `/data/weekly_draft` | `shorts/daily.py:DATA_DIR`, `bot.py:READY_DIR` |
 | ИИ (текст, зрение) | Gemini (с поиском Google), Lumean (сильная модель), Groq, резервный ключ; кулдауны провайдеров, `_with_reserve` | `shorts/ai.py` |
 | Поиск | Groq Compound / DuckDuckGo / Tavily / Яндекс; картинки — DuckDuckGo → Bing → Gemini | `shorts/websearch.py`, `shorts/imgsearch.py` |
