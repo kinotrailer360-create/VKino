@@ -81,6 +81,7 @@ from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
 from shorts import scene_planner as shorts_scene_planner
 from shorts import qc as shorts_qc
+from shorts import health as shorts_health
 from shorts import library as shorts_library
 from shorts import direct_stats
 from shorts import copycat as shorts_copycat
@@ -1074,6 +1075,26 @@ async def remember(message: Message) -> None:
         message.from_user.username,
         message.from_user.first_name,
     )
+    await mark_referral_active(message.from_user.id)
+
+
+ref_active_seen: set[int] = set()  # кого уже проверили в этом запуске — без лишних запросов к базе
+
+
+async def mark_referral_active(user_id: int) -> None:
+    """Приглашённый вернулся в бота на следующий день и позже — это реальная активность, а не просто запуск."""
+    if user_id in ref_active_seen:
+        return
+    try:
+        if await db().fetchval("UPDATE referrals SET active = TRUE WHERE user_id = $1 AND NOT active AND "
+                               "created_at < NOW() - INTERVAL '1 day' RETURNING user_id", user_id):
+            ref_active_seen.add(user_id)
+            return
+        row = await db().fetchrow("SELECT active FROM referrals WHERE user_id = $1", user_id)
+        if row is None or row["active"]:  # не приглашён или уже активен — больше не проверяем
+            ref_active_seen.add(user_id)
+    except Exception:  # noqa: BLE001 — учёт приглашений не должен мешать боту
+        logging.exception("Referral activity failed")
 
 
 async def is_favorite(
@@ -5507,6 +5528,9 @@ RQ_TYPES = {"f": "🎬 Фильм", "s": "📺 Сериал", "c": "🧸 Мул�
 RQ_KP_TYPE = {"f": "movie", "s": "tv-series", "c": "cartoon", "m": "animated-series", "j": "anime"}
 RQ_GENRES = ["комедия", "ужасы", "триллер", "фантастика", "боевик", "драма", "детектив", "мелодрама",
              "приключения", "фэнтези", "семейный", "криминал"]
+# настроение → жанр (короткий путь в подборе: не всем удобно думать жанрами)
+RQ_MOODS = [("😂 Посмеяться", "комедия"), ("😱 Испугаться", "ужасы"), ("🤔 Подумать", "драма"),
+            ("😌 Расслабиться", "семейный"), ("💥 Адреналин", "боевик"), ("❤️ Романтика", "мелодрама")]
 RQ_COUNTRIES = {"ru": "🇷🇺 Россия", "us": "🇺🇸 США", "gb": "🇬🇧 Англия", "kr": "🇰🇷 Корея", "fr": "🇫🇷 Франция",
                 "jp": "🇯🇵 Япония", "es": "🇪🇸 Испания", "tr": "🇹🇷 Турция", "de": "🇩🇪 Германия", "a": "🌍 Неважно"}
 RQ_KP_COUNTRY = {"ru": "Россия", "us": "США", "gb": "Великобритания", "kr": "Корея Южная", "fr": "Франция",
@@ -5528,8 +5552,10 @@ def rq_screen(t: str, g: str, c: str, e: str) -> tuple[str, InlineKeyboardMarkup
     if g == "-":
         rows = [[btn(RQ_GENRES[i + j].capitalize(), f"rq:{t}:{i + j}:-:-") for j in range(3) if i + j < len(RQ_GENRES)]
                 for i in range(0, len(RQ_GENRES), 3)]
+        moods = [(m, RQ_GENRES.index(g)) for m, g in RQ_MOODS]
+        rows = [[btn(m, f"rq:{t}:{i}:-:-") for m, i in moods[:3]], [btn(m, f"rq:{t}:{i}:-:-") for m, i in moods[3:]]] + rows
         rows.append([btn("🎲 Любой жанр", f"rq:{t}:a:-:-")])
-        return "2/4. Какой жанр любишь?", InlineKeyboardMarkup(inline_keyboard=rows)
+        return "2/4. Какое настроение — или какой жанр?", InlineKeyboardMarkup(inline_keyboard=rows)
     if c == "-":
         countries = list(RQ_COUNTRIES.items())
         return ("3/4. Какая страна?",
@@ -7627,6 +7653,52 @@ async def episodes_command(message: Message) -> None:
                            "<code>/episodes stats N просмотры лайки комментарии</code> — вручную")
 
 
+HEALTH_EVERY = 3600  # проверка источников новостей — раз в час
+
+
+async def health_check(bot: Bot | None = None, force: bool = False) -> dict[str, dict[str, Any]]:
+    """Все источники новостей: каналы, ленты, быстрые источники. Тревога админу — только если источник
+    сломался несколько проверок подряд (и одно сообщение, когда снова заработал)."""
+    try:
+        state = json.loads(await shorts_setting("source_health") or "{}")
+    except ValueError:
+        state = {}
+    if not force and time.time() - float(state.get("_at", {}).get("t", 0)) < HEALTH_EVERY:
+        return state
+    results: list[tuple[str, str, int | str]] = []
+    for ch, res in await shorts_tgsearch.check(await fact_channels()):
+        results.append((f"tg:{ch}", f"t.me/{ch}", res if isinstance(res, int) and res else
+                        res if isinstance(res, str) else "постов не видно"))
+    for url, res in await shorts_news.check_feeds(await news_feeds()):
+        results.append((f"feed:{url}", url.split("/")[2] if "//" in url else url,
+                        res if isinstance(res, int) else str(res)))
+    for entry, res, name in await shorts_fast.check(await fast_feeds()):
+        results.append((f"fast:{entry}", name or entry[:40], res if isinstance(res, int) else str(res)))
+    state, alerts = shorts_health.update(state, results)
+    state["_at"] = {"t": time.time()}
+    await set_shorts_setting("source_health", json.dumps(state, ensure_ascii=False))
+    if bot and alerts:
+        for admin in ADMIN_IDS:
+            with contextlib.suppress(Exception):
+                await bot.send_message(admin, "📡 <b>Источники новостей</b>\n" + "\n".join(escape(a) for a in alerts)
+                                       + "\n\nВсе источники — /sources")
+    return state
+
+
+@router.message(Command("sources"))
+async def sources_command(message: Message) -> None:
+    """Состояние всех источников новостей: когда читался, когда была новость, ошибки подряд."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    wait = await message.answer("⏳ Проверяю все источники…")
+    state = await health_check(force=True)
+    rows = sorted((v for k, v in state.items() if not k.startswith("_")),
+                  key=lambda st: (-int(st.get("streak") or 0), st.get("name", "")))
+    text = ("📡 <b>Источники новостей</b>\n✅ работает · ⚪ читается, но новостей давно нет · ❌ ошибка\n\n"
+            + "\n".join(escape(shorts_health.status_line(st)) for st in rows))
+    await wait.edit_text(text[:4000], disable_web_page_preview=True)
+
+
 async def shorts_daily_loop(
     bot: Bot,
 ) -> None:
@@ -7640,6 +7712,10 @@ async def shorts_daily_loop(
             await episodes_job(bot)
         except Exception:  # noqa: BLE001
             logging.exception("Episodes job failed")
+        try:
+            await health_check(bot)
+        except Exception:  # noqa: BLE001
+            logging.exception("Source health check failed")
         try:
             now = datetime.now(MSK)
             today = now.date().isoformat()
@@ -15577,7 +15653,8 @@ async def bot_stats_text() -> str:
         f" · за месяц <b>{await q(QUIZ_MONTH_PLAYERS)}</b>",
         f"👍 Оценок фильмов: <b>{await q('SELECT COUNT(*) FROM ratings')}</b>",
         f"🎁 Пришли по приглашениям: <b>{await q('SELECT COUNT(*) FROM referrals')}</b>"
-        f" (подписались {await q('SELECT COUNT(*) FROM referrals WHERE subscribed')})",
+        f" (подписались {await q('SELECT COUNT(*) FROM referrals WHERE subscribed')},"
+        f" вернулись на другой день {await q('SELECT COUNT(*) FROM referrals WHERE active')})",
         f"🔒 Подписка: замок показан за 7 дн <b>{await q(ev, 'sub_lock', week)}</b>"
         f" · подписались после замка <b>{await q(ev, 'sub_ok', week)}</b>",
         f"✉️ Написали админу за 7 дн: <b>{await q(ev, 'contact', week)}</b>",
@@ -18323,9 +18400,11 @@ async def referral_text(bot: Bot, user_id: int) -> str:
     link = f"{await _bot_link(bot)}?start=ref_{user_id}"
     n = await _count("SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", user_id)
     s = await _count("SELECT COUNT(*) FROM referrals WHERE referrer_id=$1 AND subscribed", user_id)
+    a = await _count("SELECT COUNT(*) FROM referrals WHERE referrer_id=$1 AND active", user_id)
     return ("🎁 <b>Пригласи друзей</b>\n\nОтправь другу свою ссылку — пусть тоже подбирает фильмы в боте:\n"
             f"<code>{escape(link)}</code>\n\n"
-            f"Пришло по твоей ссылке: <b>{n}</b>, подписались на {escape(POST_CHANNEL)}: <b>{s}</b>.\n"
+            f"Пришло по твоей ссылке: <b>{n}</b>, подписались на {escape(POST_CHANNEL)}: <b>{s}</b>, "
+            f"пользуются ботом: <b>{a}</b>.\n"
             "Кто приведёт больше всех подписавшихся друзей — получит дополнительные шансы в наших розыгрышах 🎉")
 
 

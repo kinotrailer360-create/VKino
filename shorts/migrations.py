@@ -237,6 +237,10 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_episodes_pub ON episodes(published_at);
     """, None),
+    # 010 — приглашённый «активен», если вернулся в бота на следующий день и позже (а не только запустил его)
+    (10, "referrals.active", """
+        ALTER TABLE referrals ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT FALSE;
+    """, None),
 ]
 
 
