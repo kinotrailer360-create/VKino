@@ -937,13 +937,29 @@ def _say_film(item: dict[str, Any], theme: Theme, place: int) -> str:
 
 
 def _hook(theme: Theme, films: list[dict[str, Any]]) -> str:
-    """Первая фраза: тема и интрига — у номера один высокий рейтинг, досмотри до конца (половина зрителей уходит в
-    первые секунды; «5 свежих премьер» без крючка досматривали на 40–50 %)."""
+    """Первая фраза — не дольше ~2 секунд: пока она звучит, на экране обложка, а первый фильм ещё не начался.
+    По Studio (ноябрь 2026) подборки теряли зрителей ровно на 4,5–6-й секунде, когда кончалась длинная фраза
+    «5 свежих онлайн-премьер, которые стоит посмотреть! Номер один — …, досмотри до конца». Тема и так на обложке."""
     best = films[-1] if films else {}
     rating, src = _rating(best) if best and not theme.upcoming else (0, "")
     if rating and rating >= 7.5:
-        return f"{theme.hook}! Номер один — {src} {rating:.1f}, досмотри до конца."
-    return f"{theme.hook}!"
+        return f"Номер один тут — {src} {rating:.1f}!"
+    return f"{theme.header.capitalize()}!"
+
+
+def live_intro(theme: Theme, films: list[dict[str, Any]], cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Живая заставка подборки: отрывок трейлера и крупный заголовок вместо постера с плашкой.
+    Отрывок — номер два (или ближайший к нему), не номер один: его держим в секрете до конца отсчёта."""
+    n = len(cards)
+    # cards[i] — фильм с местом n - i; номер один — последняя карточка
+    order = sorted(range(n - 1), key=lambda i: n - i)
+    pick = next((i for i in order if cards[i].get("clip")), None)
+    if pick is None:
+        return None
+    best = films[-1] if films else {}
+    rating, src = _rating(best) if best and not theme.upcoming else (0, "")
+    sub = f"№1 — {src} {rating:.1f}" if rating and rating >= 7.5 else ""
+    return {"card": pick, "title": theme.header, "sub": sub}
 
 
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
@@ -1581,11 +1597,15 @@ def list_title(theme: Theme, films: list[dict[str, Any]]) -> str:
     if not spec or not names:
         return f"{theme.seo_title} #shorts"
     lead, forms, emoji = spec
+    if len(names) == 1:
+        title = f"{lead}: «{names[0]}» {emoji} #shorts"
+        return title if len(title) <= 100 else f"{theme.seo_title} #shorts"
+    # ролик — обратный отсчёт до номера один: его в названии не раскрываем, иначе незачем досматривать
     for shown in (2, 1):
-        top = ", ".join(f"«{n}»" for n in names[:shown])
-        rest = len(names) - min(shown, len(names))
-        tail = f" и ещё {rest}" + (f" {_plural(rest, forms)}" if forms else "") if rest else ""
-        title = f"{lead}: {top}{tail} {emoji} #shorts"
+        top = ", ".join(f"«{n}»" for n in names[1:1 + shown])
+        rest = len(names) - 1 - min(shown, len(names) - 1) + 1  # + сам номер один
+        tail = f" и ещё {rest}" + (f" {_plural(rest, forms)}" if forms else "")
+        title = f"{lead}: {top}{tail}. Кто №1? {emoji} #shorts"
         if len(title) <= 100:
             return title
     return f"{theme.seo_title} #shorts"
@@ -1806,7 +1826,8 @@ def add_english_seo(result: ShortResult) -> None:
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
                   tag: str, header: str, question: str, music: Path | None,
-                  boom_slide: int | None = None, scene_plan: bool = False) -> bool:
+                  boom_slide: int | None = None, scene_plan: bool = False,
+                  intro_live: dict[str, Any] | None = None) -> bool:
     """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить.
 
     Карточки с "karaoke": True получают время слов для подсветки текста.
@@ -1816,7 +1837,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     # для «🔁 Полностью»: те же карточки и текст — до того, как ниже их поменяем
     rerun = {"fn": "render", "cover": cover_path.name, "cards": json.loads(json.dumps(cards)), "lines": list(lines),
              "tag": tag, "header": header, "question": question, "music": project._rel(music, work) if music else None,
-             "boom_slide": boom_slide}
+             "boom_slide": boom_slide, "intro_live": intro_live}
     voice, starts, voiced, spans = await synthesize(lines, work)
     voice_meta = dict(last_voice)
     plan_path: str | None = None
@@ -1840,6 +1861,8 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     cfg = {
         "output": "short.mp4",
         "intro": cover_path.name,
+        # живая заставка: кадры трейлера карточки intro_live["card"] + крупный заголовок (см. LiveIntroSlide)
+        **({"intro_live": intro_live} if intro_live else {}),
         "logo": str(ASSETS / "logo.png"),
         "voice": voice.name,
         "music": str(music or musiclib.pick(header, tag, " ".join(lines)) or ASSETS / "music.mp3"),
@@ -1869,6 +1892,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         # монтаж встал (не хватает памяти/процессора на отрывки трейлеров) — собираем ещё раз без видео,
         # из карточек: так ролик всё равно получится
         log.warning("shorts: render stalled — retrying without trailer clips")
+        cfg.pop("intro_live", None)
         for c in cfg["cards"]:
             c.pop("clip", None)
             c.pop("overlay", None)
@@ -2236,7 +2260,9 @@ async def make_facts_short(fetch: Fetch, work: Path, query: str = "", exclude: s
     cover_path = work / "cover.jpg"
     cover.save(cover_path, quality=93)
 
-    lines = [intro] + facts + [f"{outro_line} {SAVE_AND_SUBSCRIBE}"]
+    # без «Сохрани и подпишись…»: по Studio факты теряли 8–20 п. п. зрителей за 6–7 секунд до конца, на прощании.
+    # Короткий вопрос — и ролик сразу уходит на повтор (повторы YouTube тоже считает)
+    lines = [intro] + facts + [outro_line]
     voiced = await _render(work, cover_path, cards, lines, label, t.upper(), outro, music, scene_plan=not review and not rumors)
     seo = build_review_seo(film, facts) if review else build_rumors_seo(film, facts) if rumors \
         else build_facts_seo(film, facts)
@@ -2702,7 +2728,8 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
                 head = "И номер один" if place == 1 else f"Номер {NUMBERS.get(place, place)}"
                 lines[i] = f"{head} — «{_title(f)}». {note}"
     voiced = await _render(work, cover_path, cards, lines, theme.tag, theme.header,
-                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
+                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n,
+                           intro_live=live_intro(theme, films, cards))
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
     if not voiced or tts_note:

@@ -150,6 +150,51 @@ class IntroSlide(Slide):
         return zoom(self.base, 1.0 + 0.07 * t / max(dur, 1), W, H)
 
 
+class LiveIntroSlide(Slide):
+    """Заставка из кадров трейлера на весь экран + крупный заголовок с первого кадра.
+
+    По YouTube Studio (ноябрь 2026) подборки со статичной обложкой (постер, красная плашка, мелкий текст)
+    смахивали 57–81 % зрителей, а ролики, которые начинаются с героя в движении, — 28–34 %."""
+
+    def __init__(self, cfg, frames_dir: Path, title: str, sub: str = ""):
+        self.reader = ClipReader(frames_dir)
+        self.fallback: Image.Image | None = None
+        self.overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        shade = Image.new("L", (1, H))
+        for y in range(H):  # затемняем середину и низ — там текст, сверху кадр остаётся ярким
+            shade.putpixel((0, y), int(200 * min(max((y - 600) / 700, 0), 1)))
+        self.overlay.paste((0, 0, 0, 255), (0, 0, W, H), shade.resize((W, H)))
+        d = ImageDraw.Draw(self.overlay)
+        size = 132
+        while size > 80:
+            fnt = font(cfg, "head", size)
+            lines = wrap(d, title.upper(), fnt, 900)
+            if len(lines) <= 2:
+                break
+            size -= 12
+        y = 1040 - (len(lines) - 1) * round(size * 0.55)
+        for line in lines[:3]:  # заголовок выше подписей YouTube внизу экрана
+            y += text_center(d, W / 2, y, line, fnt, stroke=4) + round(size * 0.18)
+        if sub:
+            sf = font(cfg, "sans", 60)
+            text_center(d, W / 2, y + 24, sub, sf, fill=(255, 205, 90), stroke=3)
+
+    @staticmethod
+    def frames(clip: Path, seconds: float = 4.0) -> Path | None:
+        """Кадры для заставки (весь экран, первые секунды отрывка); None — годных кадров нет."""
+        out = extract_clip(clip, W, H, clip.with_suffix(".intro"), seconds)
+        return out if any(out.glob("f*.jpg")) else None
+
+    def frame(self, t, dur):
+        img = self.reader.next() or self.fallback
+        if img is None:
+            img = Image.new("RGB", (W, H), (20, 20, 20))
+        self.fallback = img
+        img = img.convert("RGBA")
+        img.alpha_composite(self.overlay)
+        return img.convert("RGB")
+
+
 DARK = 22  # средняя яркость кадра (0–255), ниже — считаем чёрным/затемнением
 
 
@@ -163,7 +208,7 @@ def _dark_or_titles(gray: Image.Image) -> bool:
     return black > 0.6 and bright > 0.02
 
 
-def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
+def extract_clip(path: Path, w: int, h: int, out_dir: Path, seconds: float | None = None) -> Path:
     """Кадры трейлера в JPEG на диск заранее, до запуска кодировщика.
 
     Раньше кадры шли из ffmpeg прямо во время монтажа: два живых декодера (текущий и прошлый слайд)
@@ -172,6 +217,7 @@ def extract_clip(path: Path, w: int, h: int, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-threads", "1", "-filter_threads", "1", "-i", str(path), "-an",
+         *(["-t", f"{seconds:.2f}"] if seconds else []),
          "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS}",
          "-q:v", "3", str(out_dir / "f%04d.jpg")],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -570,6 +616,11 @@ def render(cfg: dict, base: Path) -> Path:
             clip_dirs[i] = extract_clip(p(c["clip"]), W, ch, p(c["clip"]).with_suffix(".frames"))
     # слайды создаются по мере надобности и выгружаются после показа — экономим память
     makers = [lambda: IntroSlide(cfg, p(cfg["intro"]))]
+    live = cfg.get("intro_live") or {}
+    live_clip = cards[live["card"]].get("clip") if isinstance(live.get("card"), int) and live["card"] < len(cards) else None
+    live_frames = LiveIntroSlide.frames(p(live_clip)) if live_clip and p(live_clip).exists() else None
+    if live_frames:
+        makers[0] = lambda: LiveIntroSlide(cfg, live_frames, live.get("title", ""), live.get("sub", ""))
     makers += [lambda i=i, c=c: CardSlide(cfg, p(c["image"]), i, len(cards), c.get("caption", ""), c.get("info"),
                                           c.get("karaoke"),
                                           clip_dirs.get(i),

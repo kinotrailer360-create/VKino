@@ -891,7 +891,9 @@ def test_list_hook_promises_number_one():
     from shorts import daily
     theme = daily.theme_for("online", date(2026, 11, 12))
     films = [{"name": "Фильм В", "rating": {"imdb": 7.0}}, {"name": "Фильм Б"}, {"name": "Фильм А", "rating": {"imdb": 8.4}}]
-    assert "досмотри до конца" in daily.voice_lines(theme, films)[0]
+    # обещание номера один осталось, но короткое: длинную фразу смахивали на 4,5–6-й секунде (Studio, ноябрь 2026)
+    hook = daily.voice_lines(theme, films)[0]
+    assert hook.startswith("Номер один") and "8.4" in hook and len(hook.split()) <= 6
 
 
 def test_yt_commands_parse_links_and_batches() -> None:
@@ -917,14 +919,17 @@ def test_list_titles_name_the_films() -> None:
                                     "Доктор Икс", "Любовь под прикрытием")]
     online = theme_for("online", date(2026, 11, 9))
     assert list_title(online, films) == \
-        "Что посмотреть: «Любовь под прикрытием», «Доктор Икс» и ещё 3 онлайн-премьеры 🔥 #shorts"
+        "Что посмотреть: «Доктор Икс», «Аватар: Семь убежищ» и ещё 3 онлайн-премьеры. Кто №1? 🔥 #shorts"
     assert list_title(online, films[:1]) == "Что посмотреть: «Цикл зверя» 🔥 #shorts"
-    assert list_title(theme_for("genre:триллер", date(2026, 11, 9)), films).startswith("Лучшие триллеры: «Любовь")
+    assert list_title(theme_for("genre:триллер", date(2026, 11, 9)), films).startswith("Лучшие триллеры: «Доктор Икс»")
     # было «Лучшие фантастика: … и ещё 3 🎬»
     assert list_title(theme_for("genre:фантастика", date(2026, 11, 9)), films) == \
-        "Лучшая фантастика: «Любовь под прикрытием», «Доктор Икс» и ещё 3 фильма 🎬 #shorts"
+        "Лучшая фантастика: «Доктор Икс», «Аватар: Семь убежищ» и ещё 3 фильма. Кто №1? 🎬 #shorts"
     from shorts.daily import GENRES, GENRE_TITLES
     assert set(GENRES) == set(GENRE_TITLES)  # новый жанр без заголовка не останется
+    # номер один (последний в списке) в названии не раскрываем — ролик идёт обратным отсчётом
+    assert "Любовь под прикрытием" not in list_title(online, films)
+    assert list_title(online, films[:2]) == "Что посмотреть: «Цикл зверя» и ещё 1 онлайн-премьера. Кто №1? 🔥 #shorts"
     long = [{"name": "Очень длинное название фильма " * 2} for _ in range(5)]
     assert len(list_title(online, long)) <= 100
     assert list_title(online, []) == f"{online.seo_title} #shorts"
@@ -981,3 +986,30 @@ def test_fast_site_page_finds_its_feed_and_article_images(monkeypatch):
     assert posts[0]["image"] == "https://img.example/poster.jpg"
     assert fastnews._found_feed["https://www.empireonline.com/"] == "https://www.empireonline.com/feed/rss"
     assert "site%3Aempireonline.com" in fastnews.google_news("empireonline.com")
+
+
+
+def test_list_hook_is_short() -> None:
+    # подборки теряли зрителей на 4,5–6-й секунде: первая фраза кончалась, а фильм ещё не начался
+    from datetime import date
+    from shorts.daily import _hook, theme_for
+    online = theme_for("online", date(2026, 11, 13))
+    best = {"name": "Плач осени", "rating": {"imdb": 9.1}}
+    for films in ([best], [{"name": "X"}]):
+        hook = _hook(online, films)
+        assert len(hook.split()) <= 6, hook
+    assert _hook(online, [{"name": "X"}]) == "Онлайн-премьеры!"
+
+
+def test_live_intro_uses_number_two_clip_not_number_one() -> None:
+    # статичную обложку (постер, плашка, мелкий текст) смахивали 57–81 % — заставка теперь из трейлера
+    from datetime import date
+    from shorts.daily import live_intro, theme_for
+    theme = theme_for("genre:фантастика", date(2026, 11, 13))
+    films = [{"name": f"Ф{i}"} for i in range(5)] + [{"name": "Лучший", "rating": {"imdb": 8.4}}]
+    cards = [{"clip": f"clip{i + 1}.mp4"} for i in range(6)]  # последняя карточка — номер один
+    intro = live_intro(theme, films, cards)
+    assert intro["card"] == 4 and intro["title"] == theme.header and "8.4" in intro["sub"]
+    cards[4].pop("clip")
+    assert live_intro(theme, films, cards)["card"] == 3  # нет отрывка у №2 — берём №3
+    assert live_intro(theme, films, [{}] * 5 + [{"clip": "c.mp4"}]) is None  # отрывок только у №1 — не раскрываем

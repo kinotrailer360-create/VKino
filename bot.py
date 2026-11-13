@@ -16990,7 +16990,8 @@ async def project_remake_job(bot: Bot, chat_id: int, first: int) -> None:
             if rr["fn"] == "render":
                 job = shorts_daily._render(work, work / rr["cover"], rr["cards"], rr["lines"], rr["tag"], rr["header"],
                                            rr["question"], local(rr.get("music")), rr.get("boom_slide"),
-                                           scene_plan=bool(rr.get("scene_plan_enabled")))
+                                           scene_plan=bool(rr.get("scene_plan_enabled")),
+                                           intro_live=rr.get("intro_live"))
             elif rr["fn"] == "lore":
                 job = shorts_lore.make_lore(work, rr["script"], local(rr.get("music")),
                                             [work / m for m in rr.get("media") or []], GEMINI_API_KEY,
