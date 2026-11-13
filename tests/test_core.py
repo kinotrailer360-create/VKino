@@ -999,3 +999,17 @@ def test_list_hook_is_short() -> None:
         hook = _hook(online, films)
         assert len(hook.split()) <= 6, hook
     assert _hook(online, [{"name": "X"}]) == "Онлайн-премьеры!"
+
+
+def test_live_intro_uses_number_two_clip_not_number_one() -> None:
+    # статичную обложку (постер, плашка, мелкий текст) смахивали 57–81 % — заставка теперь из трейлера
+    from datetime import date
+    from shorts.daily import live_intro, theme_for
+    theme = theme_for("genre:фантастика", date(2026, 11, 13))
+    films = [{"name": f"Ф{i}"} for i in range(5)] + [{"name": "Лучший", "rating": {"imdb": 8.4}}]
+    cards = [{"clip": f"clip{i + 1}.mp4"} for i in range(6)]  # последняя карточка — номер один
+    intro = live_intro(theme, films, cards)
+    assert intro["card"] == 4 and intro["title"] == theme.header and "8.4" in intro["sub"]
+    cards[4].pop("clip")
+    assert live_intro(theme, films, cards)["card"] == 3  # нет отрывка у №2 — берём №3
+    assert live_intro(theme, films, [{}] * 5 + [{"clip": "c.mp4"}]) is None  # отрывок только у №1 — не раскрываем

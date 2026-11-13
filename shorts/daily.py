@@ -947,6 +947,21 @@ def _hook(theme: Theme, films: list[dict[str, Any]]) -> str:
     return f"{theme.header.capitalize()}!"
 
 
+def live_intro(theme: Theme, films: list[dict[str, Any]], cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Живая заставка подборки: отрывок трейлера и крупный заголовок вместо постера с плашкой.
+    Отрывок — номер два (или ближайший к нему), не номер один: его держим в секрете до конца отсчёта."""
+    n = len(cards)
+    # cards[i] — фильм с местом n - i; номер один — последняя карточка
+    order = sorted(range(n - 1), key=lambda i: n - i)
+    pick = next((i for i in order if cards[i].get("clip")), None)
+    if pick is None:
+        return None
+    best = films[-1] if films else {}
+    rating, src = _rating(best) if best and not theme.upcoming else (0, "")
+    sub = f"№1 — {src} {rating:.1f}" if rating and rating >= 7.5 else ""
+    return {"card": pick, "title": theme.header, "sub": sub}
+
+
 def voice_lines(theme: Theme, films: list[dict[str, Any]]) -> list[str]:
     # короткое начало — первые секунды решают, досмотрят ли ролик; «сохрани» — в конце
     n = len(films)
@@ -1811,7 +1826,8 @@ def add_english_seo(result: ShortResult) -> None:
 
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
                   tag: str, header: str, question: str, music: Path | None,
-                  boom_slide: int | None = None, scene_plan: bool = False) -> bool:
+                  boom_slide: int | None = None, scene_plan: bool = False,
+                  intro_live: dict[str, Any] | None = None) -> bool:
     """Голос + рендер видео work/short.mp4; возвращает, удалось ли озвучить.
 
     Карточки с "karaoke": True получают время слов для подсветки текста.
@@ -1821,7 +1837,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     # для «🔁 Полностью»: те же карточки и текст — до того, как ниже их поменяем
     rerun = {"fn": "render", "cover": cover_path.name, "cards": json.loads(json.dumps(cards)), "lines": list(lines),
              "tag": tag, "header": header, "question": question, "music": project._rel(music, work) if music else None,
-             "boom_slide": boom_slide}
+             "boom_slide": boom_slide, "intro_live": intro_live}
     voice, starts, voiced, spans = await synthesize(lines, work)
     voice_meta = dict(last_voice)
     plan_path: str | None = None
@@ -1845,6 +1861,8 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     cfg = {
         "output": "short.mp4",
         "intro": cover_path.name,
+        # живая заставка: кадры трейлера карточки intro_live["card"] + крупный заголовок (см. LiveIntroSlide)
+        **({"intro_live": intro_live} if intro_live else {}),
         "logo": str(ASSETS / "logo.png"),
         "voice": voice.name,
         "music": str(music or musiclib.pick(header, tag, " ".join(lines)) or ASSETS / "music.mp3"),
@@ -1874,6 +1892,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         # монтаж встал (не хватает памяти/процессора на отрывки трейлеров) — собираем ещё раз без видео,
         # из карточек: так ролик всё равно получится
         log.warning("shorts: render stalled — retrying without trailer clips")
+        cfg.pop("intro_live", None)
         for c in cfg["cards"]:
             c.pop("clip", None)
             c.pop("overlay", None)
@@ -2709,7 +2728,8 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
                 head = "И номер один" if place == 1 else f"Номер {NUMBERS.get(place, place)}"
                 lines[i] = f"{head} — «{_title(f)}». {note}"
     voiced = await _render(work, cover_path, cards, lines, theme.tag, theme.header,
-                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n)
+                           "КАКОЙ ПОСМОТРИШЬ\nПЕРВЫМ?\nПИШИ В КОММЕНТАРИЯХ", music, boom_slide=n,
+                           intro_live=live_intro(theme, films, cards))
 
     result = ShortResult(work / "short.mp4", cover_path, theme, films, build_seo(theme, films))
     if not voiced or tts_note:
