@@ -140,3 +140,69 @@ def test_search_link_picks_image_from_ddg(tmp_path, monkeypatch) -> None:
     asyncio.run(bot.fetch_image_url("https://www.google.com/search?tbm=isch&q=Doctor+Doom", tmp_path / "d.jpg",
                                     "Дум на троне"))
     assert Image.open(tmp_path / "d.jpg").getpixel((5, 5))[0] > 150  # взята картинка, которую выбрал ИИ
+
+
+class _FakeDB:
+    """База в памяти: только запросы утверждения сцен."""
+
+    def __init__(self) -> None:
+        self.approved: set[tuple[int, str]] = set()
+
+    async def fetch(self, sql, chat_id, hashes):
+        return [{"scene_hash": h} for h in hashes if (chat_id, h) in self.approved]
+
+    async def execute(self, sql, *args):
+        if "scene_approvals" in sql:
+            self.approved.add((args[0], args[1]))
+
+
+class _FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send_message(self, chat_id, text, **kw):
+        self.sent.append(text)
+
+
+def test_scene_approval_flow_end_to_end(tmp_path, monkeypatch) -> None:
+    """Сквозной сценарий ТЗ §14 без Telegram и базы: публикация — только когда утверждены все сцены текущей
+    версии; замена материала снимает утверждение только с этой сцены; публикация в канал не вызывается."""
+    import asyncio
+    import json
+    import bot
+    from shorts import scene_planner
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    for k in (1, 2):
+        (folder / f"card{k}.jpg").write_bytes(f"img{k}".encode())
+    cards = [{"image": "card1.jpg", "asset_source": "film_frame_pool"}, {"image": "card2.jpg", "asset_source": "user_media"}]
+    plan = scene_planner.build_scene_plan(["обложка", "факт 1", "факт 2"], [0, 1, 4],
+                                          [{"speech": 1}, {"speech": 3}, {"speech": 3}], cards)
+    (folder / "scene_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    fake_db, fake_bot, offers, audit = _FakeDB(), _FakeBot(), [], []
+    monkeypatch.setattr(bot, "db", lambda: fake_db)
+    monkeypatch.setattr(bot, "proj_dir", lambda chat, first: folder)
+
+    async def fake_offer(*a, **k):
+        offers.append(a)
+
+    async def fake_audit(*a, **k):
+        audit.append(a)
+
+    async def no_publish(*a, **k):
+        raise AssertionError("публикация без отдельного решения автора")
+
+    monkeypatch.setattr(bot, "offer_post", fake_offer)
+    monkeypatch.setattr(bot, "audit", fake_audit)
+    monkeypatch.setattr(bot, "publish_post", no_publish)
+
+    asyncio.run(bot.approve_scene(fake_bot, 7, 100, 0, actor=1))
+    assert not offers and "Осталось: 2" in fake_bot.sent[-1]  # одна сцена — публикации ещё нет
+    asyncio.run(bot.approve_scene(fake_bot, 7, 100, 1, actor=1))
+    assert len(offers) == 1 and audit  # все утверждены — предложение публикации (одно), действия в журнале
+    asyncio.run(bot.approve_scene(fake_bot, 7, 100, 1, actor=1))
+    assert len(offers) == 1  # повторное нажатие не дублирует
+
+    (folder / "card2.jpg").write_bytes(b"replacement")  # автор заменил кадр сцены 2
+    _, ok = asyncio.run(bot.scene_approvals(7, folder, plan))
+    assert ok == [True, False]

@@ -1004,6 +1004,44 @@ async def match_images(key: str, texts: list[str], images: list[Image.Image]) ->
     return [c if 0 <= c < len(images) else -1 for c in choices]
 
 
+last_model = ""  # какая модель описывала сцены библиотеки (для учёта версии индекса)
+
+
+async def describe_scenes(key: str, work: str, images: list[Image.Image]) -> list[dict[str, Any]]:
+    """Описание ключевых кадров сцен для библиотеки: кто в кадре, действие, место, предметы, цвета, надписи,
+    крупность, годится ли для вертикали. Героя называем, только если он узнаваем наверняка (костюм, контекст
+    произведения), иначе — описанием внешности: лучше «человек в зелёной мантии», чем не тот герой.
+    ИИ не ответил — пустые описания (сцены останутся, но по словам их не найти)."""
+    global last_model
+    blank: list[dict[str, Any]] = [{} for _ in images]
+    if not available(key) or not images:
+        return blank
+    task = (f"Это кадры из «{work}». Для каждого кадра по номеру: who — список героев (имя персонажа, только если "
+            "узнаёшь наверняка; иначе описание внешности), action — что происходит, place — где, objects — "
+            "важные предметы, colors — главные цвета, text — надписи в кадре, shot — крупный/средний/общий, "
+            "vertical — true, если главное помещается в узкую вертикальную полосу по центру. Только видимое, "
+            'без догадок о сюжете. Ответ строго JSON: {"scenes": [{"n": 0, "who": [], "action": "", "place": "", '
+            '"objects": "", "colors": "", "text": "", "shot": "", "vertical": true}]}')
+    parts: list[dict[str, Any]] = [{"text": task}]
+    for i, img in enumerate(images):
+        parts += [{"text": f"Кадр {i}:"}, _thumb(img)]
+    try:
+        data = await _with_reserve(key, parts, task, _sheet(images) if RESERVE_KEY else None)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: describe_scenes failed: %s", exc)
+        return blank
+    last_model = "gemini/reserve"
+    for item in (data.get("scenes") if isinstance(data, dict) else None) or []:
+        try:
+            n = int(item.get("n"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 0 <= n < len(images):
+            blank[n] = {k: item.get(k) for k in ("who", "action", "place", "objects", "colors", "text", "shot",
+                                                  "vertical")}
+    return blank
+
+
 async def rank_image_candidates(key: str, texts: list[str], images: list[Image.Image]) -> list[dict[str, Any]] | None:
     """Semantic image ranking with explicit confidence; -1 means no suitable image."""
     if not available(key) or not texts or not images:
@@ -1234,7 +1272,11 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         log.warning("shorts: write_post names not in sources: %s", wrong)
         post = await fix_names(key, post, sources, wrong)
         wrong = ungrounded_names(post, sources)
-    return {"post": post[:1020], "unverified_names": wrong, "topic": str(data.get("topic") or "").strip()[:80], "media": media,
+    # каждое утверждение поста — со сверкой с источниками новости: автор видит, что не подтвердилось
+    claims = post_claims(post)
+    checks = await check_facts(key, claims, {"Источники новости": sources}) if claims else []
+    flags = [{"text": c, **chk} for c, chk in zip(claims, checks) if chk["status"] in ("conflict", "unverified")]
+    return {"post": post[:1020], "unverified_names": wrong, "fact_flags": flags, "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
             "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
             "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true",
@@ -1275,6 +1317,21 @@ def ungrounded_names(post: str, sources: str) -> list[str]:
         if not found and m.group(0) not in out:
             out.append(m.group(0))
     return out
+
+
+def post_claims(post: str) -> list[str]:
+    """Утверждения поста для сверки: абзацы без заголовка, строки реакций («❤️ — …»), призывов и хэштегов."""
+    out = []
+    for para in re.split(r"\n\s*\n", post):
+        lines = [ln for ln in para.splitlines()
+                 if ln.strip() and not re.match(r"\s*(?:#|[❤🔥📤👍💬👇]|.{0,3}—\s)", ln)
+                 and not re.search(r"(?i)перешли|подпис|пиши в комментар|ставь", ln)]
+        text = " ".join(ln.strip() for ln in lines).strip()
+        letters = [ch for ch in text if ch.isalpha()]
+        if len(text) < 40 or (letters and sum(ch.isupper() for ch in letters) / len(letters) > 0.7):  # заголовок
+            continue
+        out.append(text[:400])
+    return out[:6]
 
 
 async def fix_names(key: str, post: str, sources: str, names: list[str]) -> str:
@@ -1494,6 +1551,103 @@ async def generate_illustration(key: str, topic: str, film: str = "") -> bytes |
                 import base64
                 return base64.b64decode(inline["data"])
     return None
+
+
+THEORY_STATUS = ("fact", "observation", "theory", "unknown")
+
+
+def theory_title_ok(title: str) -> bool:
+    return 0 < len(title) <= 60
+
+
+async def write_theory(key: str, topic: str, today: str = "") -> dict[str, Any] | None:
+    """«Теория Marvel» (ТЗ, приложение A): карточка темы и сценарий Shorts. Вопрос-крючок (до 3 с), обещание
+    разобрать, 4–6 наблюдений-доказательств, самое сильное — ближе к концу, без «подпишись»; 150–190 слов.
+    У каждого тезиса — статус: fact (официально подтверждено), observation (видно в конкретном кадре), theory
+    (интерпретация), unknown — и источник. Теория в тексте звучит как теория («возможно», «по теории»).
+    Названия фильмов — в «ёлочках» (по ним бот найдёт трейлеры). Дата премьеры — только из поиска, с источником."""
+    if not available(key) or not topic.strip():
+        return None
+    prompt = (
+        UNTRUSTED + f"Сегодня {today or date.today().isoformat()}. Ты автор Shorts-рубрики «Теория Marvel» канала "
+        "о кино. Тема от автора: «" + topic.strip()[:400] + "».\n"
+        "Поищи в интернете официальные материалы (трейлеры, сайт Marvel, интервью создателей) и надёжные издания. "
+        "Сделай:\n"
+        "1) title — название-вопрос до 60 знаков (считай знаки!);\n"
+        "2) hook — первая фраза-вопрос, читается до 3 секунд (до 8 слов);\n"
+        "3) lines — сценарий по фразам для озвучки, 150–190 слов всего: крючок, короткое обещание объяснить "
+        "(«Сейчас объясню»), 4–6 доказательств-наблюдений, каждое можно показать кадром, самый сильный аргумент "
+        "или поворот — ближе к концу; в конце НЕ проси подписаться, закончи сильной фразой или вопросом к "
+        "зрителю. Теорию подавай как теорию («возможно», «есть теория», «похоже»), а не как факт. Названия фильмов "
+        "и сериалов — в «ёлочках», как в российском прокате;\n"
+        "4) claims — тезисы сценария: line (номер фразы с 0), text, status (fact/observation/theory/unknown), "
+        "source (откуда: название источника или «кадр из трейлера …»), note (возражение или что не подтверждено);\n"
+        "5) visuals — для каждой фразы: line, shot (какой кадр нужен: кто, что делает, деталь), mark (деталь, на "
+        "которую указать кругом/стрелкой, или пусто);\n"
+        "6) highlights — 5–10 ключевых слов для цветного выделения в субтитрах (имена, цвета, предметы);\n"
+        "7) premiere — дата премьеры главного фильма темы, если важна, и источник (или пусто);\n"
+        "8) objections — 1–3 главных возражения к теории;\n"
+        "9) hashtags (5–8) и description (2–3 предложения)." + GRAMMAR
+        + '\n\nОтветь только JSON: {"title": "", "hook": "", "lines": [""], "claims": [{"line": 0, "text": "", '
+        '"status": "", "source": "", "note": ""}], "visuals": [{"line": 0, "shot": "", "mark": ""}], '
+        '"highlights": [""], "premiere": {"date": "", "source": ""}, "objections": [""], "hashtags": "", '
+        '"description": ""}')
+    data = None
+    try:
+        data = await _ask(key, [{"text": "Поищи в Google. " + prompt}], search=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: theory with search failed: %s", exc)
+    if not isinstance(data, dict):
+        try:
+            data = await _with_reserve(key, [{"text": prompt}], prompt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: theory failed: %s", exc)
+            return None
+    lines = [str(x).strip() for x in data.get("lines") or [] if str(x).strip()][:14] if isinstance(data, dict) else []
+    if len(lines) < 4:
+        return None
+    claims = []
+    for c in data.get("claims") or []:
+        if isinstance(c, dict) and str(c.get("text") or "").strip():
+            st = str(c.get("status") or "").lower()
+            claims.append({"line": int(c.get("line", -1)) if str(c.get("line", "")).lstrip("-").isdigit() else -1,
+                           "text": str(c["text"])[:200], "status": st if st in THEORY_STATUS else "unknown",
+                           "source": str(c.get("source") or "")[:120], "note": str(c.get("note") or "")[:160]})
+    visuals = {int(v.get("line")): v for v in data.get("visuals") or []
+               if isinstance(v, dict) and str(v.get("line", "")).isdigit()}
+    title = str(data.get("title") or "").strip()
+    return {"title": title, "title_ok": theory_title_ok(title), "hook": str(data.get("hook") or lines[0]).strip(),
+            "lines": lines, "claims": claims,
+            "marks": [{"line": i, "target": str(v.get("mark") or "").strip()[:80]} for i, v in sorted(visuals.items())
+                      if str(v.get("mark") or "").strip() and i < len(lines)],
+            "shots": {i: str(v.get("shot") or "")[:120] for i, v in visuals.items() if i < len(lines)},
+            "highlights": [str(h).strip() for h in data.get("highlights") or [] if str(h).strip()][:12],
+            "premiere": data.get("premiere") if isinstance(data.get("premiere"), dict) else {},
+            "objections": [str(o)[:160] for o in data.get("objections") or []][:3],
+            "hashtags": str(data.get("hashtags") or ""), "description": str(data.get("description") or ""),
+            "words": sum(len(x.split()) for x in lines)}
+
+
+async def locate(key: str, image: Image.Image, target: str) -> dict[str, float] | None:
+    """Где на кадре деталь (для круга/стрелки): {"x", "y", "r"} в долях кадра или None — не найдена/не уверен."""
+    if not available(key) or not target:
+        return None
+    task = (f"Найди на кадре: «{target}». Если деталь видна, верни её центр и радиус в долях ширины/высоты кадра "
+            '(0..1). Не уверен — found=false. Ответ JSON: {"found": true, "x": 0.5, "y": 0.5, "r": 0.1}')
+    try:
+        data = await _with_reserve(key, [{"text": task}, _thumb(image, 768)], task, image)
+    except Exception as exc:  # noqa: BLE001
+        log.info("shorts: locate failed: %s", exc)
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+    try:
+        x, y, r = (float(data.get(k)) for k in ("x", "y", "r"))
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        return None
+    return {"x": x, "y": y, "r": min(max(r, 0.05), 0.3)}
 
 
 async def screen_labels(key: str, lines: list[str], title: str = "") -> list[str]:

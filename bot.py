@@ -81,6 +81,7 @@ from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
 from shorts import scene_planner as shorts_scene_planner
 from shorts import qc as shorts_qc
+from shorts import library as shorts_library
 from shorts import direct_stats
 from shorts import copycat as shorts_copycat
 from shorts import dub as shorts_dub
@@ -312,6 +313,7 @@ class CustomState(StatesGroup):
 
 
 class LoreState(StatesGroup):
+    theory = State()
     own = State()
     wwk = State()
     news = State()
@@ -319,6 +321,10 @@ class LoreState(StatesGroup):
     hook = State()
     edit = State()
     media = State()
+
+
+class LibraryState(StatesGroup):
+    add = State()
 
 
 class DubState(StatesGroup):
@@ -1048,6 +1054,7 @@ async def init_db() -> None:
     if applied:
         logging.info("Migrations applied: %s", ", ".join(f"{v:03d}" for v in applied))
     shorts_budget.attach(db)  # учёт и лимиты платных вызовов — в таблице ai_usage (миграция 006)
+    shorts_library.attach(pool)  # библиотека сцен (миграция 009)
     logging.info("PostgreSQL connected")
 
 
@@ -7462,7 +7469,7 @@ def plan_text(day: date) -> tuple[str, InlineKeyboardMarkup | None]:
     item, long_video = shorts_plan.today(day), shorts_plan.long_today(day)
     if not item and not long_video:
         return "📅 На сегодня в контент-плане ничего нет.", None
-    rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать 12:00–15:00 МСК):"]
+    rows, lines = [], [f"📅 <b>По плану на {day:%d.%m}</b> (публиковать в {shorts_plan.publish_time(day)} МСК):"]
     ready = shorts_plan.script(day)
     if item:
         kind, topic = item
@@ -7537,6 +7544,89 @@ async def plan_command(message: Message) -> None:
     await message.answer(text + "\n\n<b>Дальше:</b>\n" + "\n".join(rows), reply_markup=kb)
 
 
+# ---------------------------------------------------------------- реестр выпусков рубрик и показатели через 48 ч
+
+async def register_episode(kind: str, title: str, script: dict[str, Any]) -> None:
+    """Выпуск рубрики (сейчас «Теория Marvel») — в реестр: заголовок, крючок, утверждённый сценарий. Ролик на YouTube
+    привязывается при загрузке ботом (по названию) или командой /episodes link N ссылка."""
+    try:
+        await db().execute("INSERT INTO episodes (kind, title, hook, script) VALUES ($1, $2, $3, $4::jsonb)",
+                           kind, title[:200], str(script.get("hook") or (script.get("lines") or [""])[0])[:300],
+                           json.dumps({k: script.get(k) for k in ("lines", "claims", "title")}, ensure_ascii=False))
+    except Exception:  # noqa: BLE001 — реестр не должен мешать отправке ролика
+        logging.exception("Episode register failed")
+
+
+async def link_episode(title: str, video_id: str) -> None:
+    with contextlib.suppress(Exception):
+        await db().execute(
+            "UPDATE episodes SET video_id = $1, published_at = NOW() WHERE id = (SELECT id FROM episodes "
+            "WHERE video_id IS NULL AND title = $2 ORDER BY id DESC LIMIT 1)", video_id, title[:200])
+
+
+async def episodes_job(bot: Bot) -> None:
+    """Через 48 ч после выхода — просмотры, лайки, комментарии с YouTube (если бот входил в YouTube); по
+    понедельникам — три лучших крючка за 4 недели по просмотрам за 48 ч. Ничего не меняет и не публикует."""
+    rows = await db().fetch("SELECT id, title, video_id FROM episodes WHERE video_id IS NOT NULL AND collected_at IS "
+                            "NULL AND published_at < NOW() - INTERVAL '48 hours' LIMIT 10")
+    refresh = await shorts_setting("yt_refresh") if rows else None
+    if rows and refresh and YT_CLIENT_ID:
+        token = await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, refresh)
+        for r in rows:
+            data = await shorts_yt._api(token, "GET", "videos", {"part": "statistics", "id": r["video_id"]})
+            st = ((data.get("items") or [{}])[0]).get("statistics") or {}
+            views, likes, comments = (int(st.get(k) or 0) for k in ("viewCount", "likeCount", "commentCount"))
+            await db().execute("UPDATE episodes SET views_48h = $2, likes_48h = $3, comments_48h = $4, "
+                               "collected_at = NOW() WHERE id = $1", r["id"], views, likes, comments)
+            for admin in ADMIN_IDS:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(admin, f"📊 48 часов: «{escape(r['title'])}» — 👁 {views} · 👍 {likes} · "
+                                                  f"💬 {comments}")
+    now = datetime.now(MSK)
+    week = now.strftime("%G-%V")
+    if now.weekday() == 0 and now.hour >= 12 and await shorts_setting("episodes_week") != week:
+        await set_shorts_setting("episodes_week", week)
+        top = await db().fetch("SELECT title, hook, views_48h FROM episodes WHERE views_48h IS NOT NULL AND "
+                               "published_at > NOW() - INTERVAL '28 days' ORDER BY views_48h DESC LIMIT 3")
+        if top:
+            text = ("🏆 <b>Лучшие крючки за 4 недели</b> (просмотры за первые 48 ч; это не причина успеха — "
+                    "учитывай тему и день выхода):\n" + "\n".join(
+                        f"{k}. «{escape(t['hook'][:90])}» — 👁 {t['views_48h']} ({escape(t['title'][:50])})"
+                        for k, t in enumerate(top, 1)))
+            for admin in ADMIN_IDS:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(admin, text)
+
+
+@router.message(Command("episodes"))
+async def episodes_command(message: Message) -> None:
+    """Реестр выпусков: /episodes — список; /episodes link N ссылка — привязать ролик; /episodes stats N
+    просмотры лайки комментарии — показатели вручную (если бот не входил в YouTube)."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split()[1:]
+    if len(parts) >= 3 and parts[0] == "link" and parts[1].isdigit():
+        vid = shorts_yt.video_id(parts[2]) or parts[2]
+        await db().execute("UPDATE episodes SET video_id = $2, published_at = COALESCE(published_at, NOW()) "
+                           "WHERE id = $1", int(parts[1]), vid)
+        await message.answer(f"✅ Выпуск №{parts[1]} привязан к ролику {escape(vid)}.")
+        return
+    if len(parts) >= 3 and parts[0] == "stats" and all(p.isdigit() for p in parts[1:]):
+        nums = [int(p) for p in parts[2:5]] + [0, 0]
+        await db().execute("UPDATE episodes SET views_48h = $2, likes_48h = $3, comments_48h = $4, collected_at = "
+                           "NOW() WHERE id = $1", int(parts[1]), *nums[:3])
+        await message.answer(f"✅ Показатели выпуска №{parts[1]} записаны.")
+        return
+    rows = await db().fetch("SELECT id, kind, title, video_id, views_48h, created_at FROM episodes "
+                            "ORDER BY id DESC LIMIT 20")
+    lines = [f"№{r['id']} {r['created_at']:%d.%m} «{escape(r['title'][:60])}» — "
+             + (f"🎬 {escape(r['video_id'])}" if r["video_id"] else "не привязан")
+             + (f" · 👁 {r['views_48h']} за 48 ч" if r["views_48h"] is not None else "") for r in rows]
+    await message.answer("📒 <b>Выпуски рубрик</b>\n" + ("\n".join(lines) or "Пока пусто.")
+                         + "\n\n<code>/episodes link N ссылка</code> — привязать ролик\n"
+                           "<code>/episodes stats N просмотры лайки комментарии</code> — вручную")
+
+
 async def shorts_daily_loop(
     bot: Bot,
 ) -> None:
@@ -7546,6 +7636,10 @@ async def shorts_daily_loop(
             await plan_reminder(bot)
         except Exception:  # noqa: BLE001 — напоминание не должно мешать шортсам
             logging.exception("Plan reminder failed")
+        try:
+            await episodes_job(bot)
+        except Exception:  # noqa: BLE001
+            logging.exception("Episodes job failed")
         try:
             now = datetime.now(MSK)
             today = now.date().isoformat()
@@ -7763,6 +7857,110 @@ async def title_command(message: Message) -> None:
     await message.answer("🎬 <b>Свои названия фильмов</b> (важнее базы фильмов):\n" + "\n".join(rows)
                          + "\n\n<code>/title Clayface = Глиноликий</code> — добавить\n"
                            "<code>/title del Clayface</code> — убрать")
+
+
+LIBRARY_HELP = (
+    "📚 <b>Библиотека сцен</b> — видео, из которых бот берёт точные сцены под фразы своего сценария (раньше "
+    "трейлера). Каждое видео один раз режется на сцены, ИИ описывает каждую (кто в кадре, что происходит, цвета).\n\n"
+    "<code>/library add</code> — добавить: пришли видео (до 20 МБ) или ссылку на официальный трейлер, в подписи — "
+    "<i>название | права: свои / трейлер / лицензия текст / нельзя | сезон 1 серия 2</i>\n"
+    "<code>/library scan</code> — большие файлы: положи на сервере в папку библиотеки "
+    "(<code>docker compose cp фильм.mp4 bot:/data/library/inbox/</code>), имя файла — название\n"
+    "<code>/library del N</code> — удалить\n\n"
+    "Права: «свои» и «лицензия» — можно публиковать; «трейлер» — с пометкой «права не подтверждены»; "
+    "«нельзя» — в ролики не попадает. Полные фильмы из интернета бот сам не скачивает.")
+
+
+async def library_job(bot: Bot, chat_id: int, src: Path, caption: str, actor: int) -> None:
+    work_title, rights, season, episode = shorts_library.parse_caption(caption)
+    if not work_title:
+        work_title = src.stem.replace("_", " ")
+    status = await bot.send_message(chat_id, f"📚 «{escape(work_title)}»: готовлю к поиску сцен…")
+
+    async def progress(stage: str) -> None:
+        await _edit_quiet(status, f"📚 «{escape(work_title)}»: {escape(stage)}…")
+
+    try:
+        res = await shorts_library.add(src, work_title, rights, GEMINI_API_KEY, actor, season, episode, progress)
+        await _edit_quiet(status, (f"📚 Уже в библиотеке: №{res['id']} «{escape(res['work'])}», сцен {res['scenes']}."
+                                   if res["existing"] else
+                                   f"✅ В библиотеке: №{res['id']} «{escape(res['work'])}» — сцен {res['scenes']}. "
+                                   f"Права: {escape(rights.get('license') or rights.get('source') or '')}. Теперь "
+                                   "ролики по своему сценарию берут сцены отсюда."))
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Library add failed")
+        await _edit_quiet(status, f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
+
+
+@router.message(Command("library"))
+async def library_command(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    if arg.startswith("add"):
+        await state.set_state(LibraryState.add)
+        await message.answer("📎 Пришли видео (до 20 МБ) или ссылку на трейлер. В подписи: <i>название | права: "
+                             "свои / трейлер / лицензия … / нельзя</i>. /cancel — отмена.")
+        return
+    if arg.startswith("del") and arg[3:].strip().isdigit():
+        ok = await shorts_library.remove(int(arg[3:].strip()))
+        await message.answer("🗑 Удалено." if ok else "Такого номера нет.")
+        return
+    if arg.startswith("scan"):
+        files = sorted(p for p in shorts_library.INBOX.glob("*") if p.suffix.lower() in (".mp4", ".mkv", ".mov",
+                                                                                          ".webm", ".avi"))
+        if not files:
+            await message.answer(f"Папка пуста: <code>{shorts_library.INBOX}</code>")
+            return
+        await message.answer(f"📚 Файлов: {len(files)} — индексирую по очереди.")
+
+        async def scan() -> None:
+            for f in files:
+                await library_job(message.bot, message.chat.id, f, f.stem.replace("__", " | ").replace("_", " "),
+                                  message.from_user.id)
+        _run_job(scan)
+        return
+    rows = await shorts_library.listing()
+    icon = {"yes": "✅", "unconfirmed": "⚠️", "no": "⛔"}
+    lines = [f"{icon.get(r['publish'], '❔')} №{r['id']} «{escape(r['work'])}»"
+             + (f" с{r['season']}" if r["season"] else "") + (f"е{r['episode']}" if r["episode"] else "")
+             + f" — сцен {r['scenes']}, {escape(r['license'] or r['source'])}" for r in rows]
+    await message.answer(LIBRARY_HELP + "\n\n" + ("\n".join(lines) or "Пока пусто."))
+
+
+@router.message(LibraryState.add, F.video | F.document | (F.text & ~F.text.startswith("/")))
+async def library_add(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    caption = message.caption or ""
+    shorts_library.INBOX.mkdir(parents=True, exist_ok=True)
+    if message.text:
+        url = re.search(r"https?://\S+", message.text)
+        if not url:
+            await message.answer("Нужна ссылка или видеофайл.")
+            return
+        await state.clear()
+        caption = message.text.replace(url.group(0), "").strip(" |\n")
+
+        async def from_url() -> None:
+            tmp = SHORTS_DIR / f"lib_{time.time_ns()}"
+            try:
+                src = await shorts_clips.download_full(url.group(0), tmp)
+                await library_job(message.bot, message.chat.id, src, caption, message.from_user.id)
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(f"❌ Не скачалось: <code>{escape(_safe_err(exc)[:300])}</code>")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        _run_job(from_url)
+        return
+    media = message.video or message.document
+    if (media.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        await message.answer("Больше 20 МБ Telegram боту не отдаст — положи файл на сервер и /library scan.")
+        return
+    await state.clear()
+    path = shorts_library.INBOX / f"tg_{media.file_unique_id}.mp4"
+    await message.bot.download(media.file_id, destination=path)
+    _run_job(lambda: library_job(message.bot, message.chat.id, path, caption, message.from_user.id))
 
 
 @router.message(Command("fast"))
@@ -8421,7 +8619,9 @@ def shorts_section(name: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if name == "shorts":
         rows = [[_btn("🎬 Тема дня", "sh:go:"), _btn("📰 Новости кино", "sh:go:news")],
-                [_btn("🆕 Онлайн-премьеры", "sh:go:online"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+                [_btn("🔎 Мини-сериалы на вечер", "sh:go:genre:мини-сериалы"), _btn("🍿 Кинопрокат", "sh:go:cinema")],
+                [_btn("🔎 На реальных событиях", "sh:go:genre:реальные события"),
+                 _btn("🔎 Зарубежные детективы", "sh:go:genre:зарубежные детективы")],
                 [_btn("📺 Сериалы", "sh:go:series"), _btn("⏳ Скоро в кино", "sh:go:upcoming")],
                 [_btn("🎭 Топ жанра ▸", "sh:genres"), _btn("🎂 День рождения", "sh:bdl")],
                 [_btn("🎉 Шортс к празднику ▸", "sh:hol")]]
@@ -8432,6 +8632,7 @@ def shorts_section(name: str) -> InlineKeyboardMarkup:
     elif name == "own":
         rows = [[_btn("🔮 Что мы знаем о фильме (слухи до премьеры)", "lo:wwk")],
                 [_btn("🎬 Свой сценарий: озвучу как есть", "lo:own")],
+                [_btn("🧩 Теория Marvel: тема → сценарий с доказательствами", "lo:theory")],
                 [_btn("📰 Своя новость: вставлю текст", "lo:news")],
                 [_btn("🎯 Своя подборка", "cs:text"), _btn("🔁 По образцу (видео)", "cs:video")],
                 [_btn("📖 История персонажа", "lo:start")]]
@@ -9608,7 +9809,29 @@ async def scene_replacement_photo(message: Message, state: FSMContext) -> None:
         return
     folder = proj_dir(message.chat.id, first)
     proj = shorts_project.load(folder)
-    cards = (proj or {}).get("rerun", {}).get("cards") or []
+    rr = (proj or {}).get("rerun") or {}
+    if rr.get("fn") == "lore" and message.photo:  # свой сценарий: фото автора — к этой фразе (pins), перемонтаж
+        lines = (rr.get("script") or {}).get("lines") or []
+        if not 0 <= index < len(lines):
+            await state.clear()
+            await message.answer("Проект не найден. Открой проверку сцен заново.")
+            return
+        path = folder / f"scene_replacement_{index + 1}.jpg"
+        await message.bot.download(message.photo[-1].file_id, destination=path)
+        media = list(rr.get("media") or [])
+        if path.name not in media:
+            media.append(path.name)
+        rr["media"] = media
+        rr["pins"] = {**(rr.get("pins") or {}), str(media.index(path.name)): index + 1}
+        (folder / shorts_project.FILE).write_text(json.dumps(proj, ensure_ascii=False, default=str), encoding="utf-8")
+        await state.clear()
+        await message.answer("✅ Принято. Перемонтирую ролик с заменённой сценой…")
+        _run_job(lambda: project_remake_job(message.bot, message.chat.id, first))
+        return
+    if rr.get("fn") == "lore":
+        await message.answer("Для этой сцены пришли фото.")
+        return
+    cards = rr.get("cards") or []
     if not proj or not 0 <= index < len(cards):
         await state.clear()
         await message.answer("Проект не найден. Открой проверку сцен заново.")
@@ -11068,6 +11291,11 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 res.get("status") or "")
             if status:
                 seen += f"\n\n🏷 Достоверность: {status}"
+            if res.get("fact_flags"):
+                seen += "\n\n🔎 <b>Не подтвердилось источниками новости — проверь:</b>\n" + "\n".join(
+                    f"• {'❌ расходится' if f['status'] == 'conflict' else '⚠️ нет в источниках'}: "
+                    f"«{escape(f['text'][:120])}»" + (f" — {escape(f['note'])}" if f.get("note") else "")
+                    for f in res["fact_flags"][:4])
             if res.get("unverified_names"):
                 seen += ("\n\n⚠️ Этих имён нет в источниках новости — проверь, не перепутал ли ИИ человека: "
                          + escape(", ".join(res["unverified_names"])))
@@ -12842,6 +13070,7 @@ async def youtube_button(callback: CallbackQuery) -> None:
                                             if long else "▶️ Загружаю шортс на YouTube…")
                 hidden = await shorts_setting("yt_privacy") == "unlisted"
                 res = await shorts_yt.upload(token, video, seo, "unlisted" if hidden else "public")
+                await link_episode(str(seo.get("title") or ""), res["id"])  # выпуск рубрики — к реестру
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
                 shorts_usage.record("yt_long" if long else "yt_shorts")  # для недельного отчёта
                 try:
@@ -13232,9 +13461,17 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         first, index = map(int, arg.split(":"))
         folder = proj_dir(chat_id, first)
         proj = shorts_project.load(folder) or {}
-        cards = (proj.get("rerun") or {}).get("cards") or []
-        if not 0 <= index < len(cards):
+        rr = proj.get("rerun") or {}
+        cards = rr.get("cards") or []
+        lines = (rr.get("script") or {}).get("lines") or [] if rr.get("fn") == "lore" else []
+        if not 0 <= index < max(len(cards), len(lines)):
             await message.answer("Эта сцена уже недоступна. Открой проверку ещё раз.")
+            return
+        if lines:
+            await state.set_state(SceneReviewState.replacement)
+            await state.update_data(scene_review_first=first, scene_review_index=index)
+            await message.answer(f"📷 Пришли фото (до 20 МБ) для фразы №{index + 1} — оно встанет на неё. "
+                                 "/cancel — отмена.")
             return
         await state.set_state(SceneReviewState.replacement)
         await state.update_data(scene_review_first=first, scene_review_index=index)
@@ -14357,6 +14594,8 @@ async def show_lore(message: Message, state: FSMContext, brief: bool = False) ->
     dynamic = await lore_style() == "dynamic"
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [_btn("✅ Собрать шортс", "lo:go")], [_btn("🎙 Сначала послушать озвучку", "lo:voice")],
+        *([[_btn("🎯 Стрелки: вкл (выключить)" if script.get("marks_on", True) else "🎯 Стрелки: выкл (включить)",
+                 "lo:marks")]] if script.get("marks") else []),
         [_btn("✏️ Поправить текст", "lo:edit")],
         [_btn("⚡ Монтаж: динамичный (сменить)" if dynamic else "🎞 Монтаж: спокойный (сменить)", "lo:style")],
         [_btn(f"📎 Свои картинки и видео ({len(media)})" if media else "📎 Добавить свои картинки и видео", "lo:media")],
@@ -14407,6 +14646,8 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
+            if (data.get("lore_script") or {}).get("theory"):
+                await register_episode("theory", result.seo.get("title") or "", data["lore_script"])
         except asyncio.TimeoutError:
             raise RuntimeError(f"сборка шла дольше {LORE_TIMEOUT // 60} минут — "
                                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}.") from None
@@ -14620,6 +14861,49 @@ async def own_generate(message: Message, state: FSMContext) -> None:
                              "кнопкой «📎 Добавить свои картинки», иначе картинки будут повторяться.")
 
 
+THEORY_ICONS = {"fact": "✅ факт", "observation": "👁 наблюдение", "theory": "🔮 теория", "unknown": "❓ неизвестно"}
+
+
+@router.message(LoreState.theory, F.text, ~F.text.startswith("/"))
+async def theory_topic(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    wait = await message.answer("🧩 Ищу официальные материалы и пишу сценарий…")
+    th = await shorts_ai.write_theory(GEMINI_API_KEY, _typed(message), datetime.now(MSK).date().isoformat())
+    if not th:
+        await wait.edit_text("❌ ИИ не написал сценарий. Попробуй ещё раз или сформулируй тему иначе.")
+        return
+    title = th["title"]
+    claims = "\n".join(f"{THEORY_ICONS.get(c['status'], c['status'])}: {escape(c['text'][:150])}"
+                        + (f" <i>({escape(c['source'][:60])})</i>" if c["source"] else "")
+                        + (f"\n   ↳ {escape(c['note'][:120])}" if c["note"] else "") for c in th["claims"][:8])
+    prem = th.get("premiere") or {}
+    await wait.edit_text(
+        f"🧩 <b>Карточка темы</b>\n\n<b>Название:</b> {escape(title)} — {len(title)} знаков "
+        + ("✅" if th["title_ok"] else "⚠️ больше 60, сократи кнопкой «✏️ Поправить текст»")
+        + f"\n<b>Крючок:</b> {escape(th['hook'])}\n<b>Слов в сценарии:</b> {th['words']} (нужно 150–190)"
+        + (f"\n<b>Премьера:</b> {escape(str(prem.get('date') or ''))} — {escape(str(prem.get('source') or 'источник не указан'))}"
+           if prem.get("date") else "")
+        + f"\n\n<b>Тезисы:</b>\n{claims or '—'}"
+        + ("\n\n<b>Возражения:</b>\n" + "\n".join(f"• {escape(o)}" for o in th["objections"]) if th["objections"] else "")
+        + "\n\n<i>Теория в ролике звучит как теория, не как официальный факт.</i>")
+    body = f"**Заголовок:** {title}\n" + "\n".join(th["lines"])
+    await state.update_data(own_scripts=[(title, body)], own_pick=0, lore_kind="own", lore_name=title, lore_hook="",
+                            lore_script=None, lore_media=[], task_labels=[])
+    await message.answer("📦 Для YouTube:\n" + "\n".join(x for x in [
+        f"<b>Название:</b> {escape(title)}", f"<b>Описание:</b>\n{escape(th['description'])}" if th["description"] else "",
+        f"<b>Хэштеги:</b> {escape(th['hashtags'])}" if th["hashtags"] else ""] if x))
+    await own_generate(message, state)
+    data = await state.get_data()
+    if data.get("lore_script"):
+        await state.update_data(lore_script={**data["lore_script"], "theory": True, "style": "dynamic",
+                                             "claims": th["claims"], "marks": th["marks"], "marks_on": True,
+                                             "highlights": th["highlights"], "shots": th["shots"],
+                                             "title": title, "hook": th["hook"]})
+        await message.answer("🎯 К фразам с доказательствами бот поставит круг и стрелку на нужную деталь "
+                             f"({len(th['marks'])}), ключевые слова в субтитрах — цветом. Выключить стрелки — "
+                             "«🎯 Стрелки» в меню ролика.")
+
+
 @router.message(LoreState.news, F.text, ~F.text.startswith("/"))
 async def news_text(message: Message, state: FSMContext) -> None:
     text = message.text or ""
@@ -14727,6 +15011,14 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if action == "news":
         await news_ask_text(message, state)
         return
+    if action == "theory":
+        await state.clear()
+        await state.set_state(LoreState.theory)
+        await message.answer("🧩 <b>Теория Marvel</b>\n\nНапиши тему одной фразой — например «Дум собирает героев по "
+                             "цветам Камней Бесконечности». Бот проверит факты, разделит их на подтверждённые, "
+                             "наблюдения и теорию, напишет сценарий на 150–190 слов с вопросом-крючком и подберёт к "
+                             "каждой фразе кадр и деталь для стрелки.\n\n<i>Передумал — /cancel</i>")
+        return
     if action == "own":
         await state.clear()
         await state.set_state(LoreState.own)
@@ -14775,6 +15067,10 @@ async def lore_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(LoreState.edit)
         await message.answer("✏️ Скопируй текст выше, поправь и пришли одним сообщением — "
                              "каждая фраза с новой строки (номера можно оставить).\n\n<i>Передумал — /cancel</i>")
+    elif action == "marks":
+        script = data["lore_script"]
+        await state.update_data(lore_script={**script, "marks_on": not script.get("marks_on", True)})
+        await show_lore(message, state, brief=True)
     elif action == "voice":  # этап «озвучка → утверждение» до монтажа: фразы кэшируются, сборка их не перепишет
         if shorts_lock.locked():
             await message.answer("⏳ Сейчас собирается другой ролик — нажми «Послушать озвучку» через пару минут.")
@@ -16915,6 +17211,8 @@ async def show_scene_review(bot: Bot, chat_id: int, first: int) -> None:
         caption = escape(_scene_caption(index, scene, approved[index]))
         markup = _scene_kb(first, index, approved[index])
         clip = Path(str(cards[index].get("clip") or "")) if index < len(cards) else Path()
+        if str(clip) in ("", ".") and asset.get("type") == "clip":  # свой сценарий: отрезок — в плане сцен
+            clip = Path(str(asset.get("path") or ""))
         if str(clip) not in ("", ".") and not clip.is_absolute():
             clip = folder / clip
         if clip.is_file() and clip.stat().st_size <= TG_UPLOAD_SCENE:  # сцена — отрывок: показываем сам отрывок
