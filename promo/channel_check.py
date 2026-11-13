@@ -107,8 +107,10 @@ def check(name: str, price: int) -> dict:
         bad.append(f"не публикует {days_quiet} дн.")
     if pirate >= max(3, len(msgs) // 3):
         bad.append(f"пиратский контент ({pirate}/{len(msgs)} постов)")
-    if cinema < max(3, len(msgs) // 3):
-        warn.append(f"мало про кино ({cinema}/{len(msgs)} постов)")
+    if cinema < max(2, len(msgs) // 4):
+        bad.append(f"не про кино ({cinema}/{len(msgs)} постов о кино)")
+    elif cinema < max(3, len(msgs) // 2):
+        warn.append(f"кино не основная тема ({cinema}/{len(msgs)} постов)")
     if off:
         warn.append("похоже на личный блог/не по теме")
     if per_day > 12:
