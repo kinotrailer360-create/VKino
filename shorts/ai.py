@@ -2416,6 +2416,43 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
     return facts, sources + (["Кинопоиск"] if known else [])
 
 
+FACT_STATUS = ("confirmed", "single", "conflict", "unverified")
+
+
+async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> list[dict[str, str]]:
+    """Сверка фактов ролика с материалами (Википедия, Кинопоиск, посты каналов, выдача поиска). Для каждого
+    факта: status — confirmed (есть в материале), single (только в одном источнике / только поиск), conflict
+    (материал противоречит: другие цифры, имя, год), unverified (в материалах нет); source — где нашёл;
+    note — что именно расходится. ИИ не ответил — все unverified: неизвестность видна автору, а не скрыта."""
+    blank = [{"status": "unverified", "source": "", "note": ""} for _ in facts]
+    body = "\n\n".join(f"=== {name} ===\n{text[:7000]}" for name, text in material.items() if text and text.strip())
+    if not facts or not body or not available(key):
+        return blank
+    prompt = (UNTRUSTED + "Ты фактчекер. Сверь каждый ФАКТ с МАТЕРИАЛАМИ (только с ними, не с памятью). "
+              "status: confirmed — факт прямо подтверждается материалом (имена, цифры, годы совпадают); single — "
+              "есть только в одном источнике или подтверждён лишь частично; conflict — материал говорит другое "
+              "(другая цифра, год, имя, роль); unverified — в материалах этого нет. source — название источника "
+              "из заголовка === … ===, где нашёл; note — коротко, что расходится или чего не хватает (до 120 "
+              'символов). Ответь только JSON: {"checks": [{"n": 1, "status": "...", "source": "...", '
+              '"note": "..."}, ...]}\n\nФАКТЫ:\n' + "\n".join(f"{i}. {f}" for i, f in enumerate(facts, 1))
+              + "\n\nМАТЕРИАЛЫ:\n" + body)
+    try:
+        data = await _with_reserve(key, [{"text": prompt}], prompt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shorts: fact check failed: %s", exc)
+        return blank
+    for item in (data.get("checks") if isinstance(data, dict) else None) or []:
+        try:
+            i = int(item.get("n")) - 1
+        except (TypeError, ValueError, AttributeError):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if 0 <= i < len(facts) and status in FACT_STATUS:
+            blank[i] = {"status": status, "source": str(item.get("source") or "")[:80],
+                        "note": str(item.get("note") or "")[:160]}
+    return blank
+
+
 WEEKLY_STYLE = (
     "Ты ведущий YouTube-канала KinoMir360 о кино: говоришь живо, от первого лица, как блогер, который сам "
     "любит кино, — с эмоциями, личным мнением и лёгким юмором. Мягко: без оскорблений, мата, резких "

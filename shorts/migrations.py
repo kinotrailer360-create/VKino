@@ -177,6 +177,20 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
         ALTER TABLE ai_post_history DROP CONSTRAINT IF EXISTS ai_post_history_pkey;
         ALTER TABLE ai_post_history ADD PRIMARY KEY (kind, vhash);
     """, None),
+    # 008 — утверждение сцен ролика: по версии сцены (отпечаток текста, времени и файла), а не по сообщению —
+    # правка сцены даёт новый отпечаток и снимает утверждение только с неё; неизменённые сцены после
+    # перемонтажа остаются утверждёнными
+    (8, "scene_approvals — утверждённые версии сцен", """
+        CREATE TABLE IF NOT EXISTS scene_approvals (
+            chat_id BIGINT NOT NULL,
+            scene_hash TEXT NOT NULL,
+            first_id BIGINT NOT NULL,
+            scene_index INT NOT NULL,
+            actor BIGINT,
+            at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (chat_id, scene_hash)
+        );
+    """, None),
 ]
 
 

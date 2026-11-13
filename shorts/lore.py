@@ -579,6 +579,17 @@ async def _score_card(poster_url: str, value: str, out: Path) -> Path:
     return out
 
 
+def spoken_lines(script: dict[str, Any]) -> list[str]:
+    """Что прозвучит в ролике: фразы сценария и призыв в конце (кроме прощальных роликов и роликов, где призыв
+    в телеграм уже есть). Тот же текст — у «🎙 Послушать озвучку»: фразы из кэша, второй раз не платим."""
+    lines = script["lines"]
+    news = script.get("kind") == "news"
+    mourning = news and is_mourning(script)
+    dynamic = script.get("style") == "dynamic" and not mourning
+    has_cta = dynamic and any("телеграм" in ln.lower() for ln in lines)
+    return lines if mourning or has_cta else lines[:-1] + [daily.with_outro(lines[-1])]
+
+
 async def make_lore(work: Path, script: dict[str, Any], music: Path | None = None,
                     user_media: list[Path] | None = None, gemini_key: str = "",
                     user_pins: dict[int, int] | None = None) -> ShortResult:
@@ -593,8 +604,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     # в прощальном ролике «подписывайся» в конце неуместно
     # в ролике уже есть призыв в телеграм (рубрика «Что мы знаем») — в конце не дописываем «подпишись»:
     # он обрывается на самой сильной фразе
-    has_cta = dynamic and any("телеграм" in ln.lower() for ln in lines)
-    spoken = lines if mourning or has_cta else lines[:-1] + [daily.with_outro(lines[-1])]
+    spoken = spoken_lines(script)
     voice, starts, voiced, spans = await daily.synthesize(spoken, work)
     voice_meta = dict(daily.last_voice)
     await _progress(30, "Субтитры по слову")
