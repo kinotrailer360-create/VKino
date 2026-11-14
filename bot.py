@@ -12502,9 +12502,12 @@ async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
         queries = [f'"{title}" {year} киноляпы ошибки фильма',
                    f'"{en}" {year} movie goofs mistakes'] if en else [f'"{title}" {year} киноляпы ошибки фильма']
         web_batches, tg_batches = await asyncio.gather(
-            asyncio.gather(*(shorts_websearch.search(q, n=5) for q in queries)),
-            asyncio.gather(*(shorts_tgsearch.search(channels, [n for n in (title, en) if n], per_channel=2),
-                             return_exceptions=True), return_exceptions=True))
+            asyncio.gather(*(shorts_websearch.search(q, n=5) for q in queries),
+                           return_exceptions=True),
+            asyncio.gather(shorts_tgsearch.search(
+                channels, [n for n in (title, en) if n], per_channel=2
+            ), return_exceptions=True),
+            return_exceptions=True)
         for results in web_batches:
             if isinstance(results, Exception):
                 logging.info("Bloopers: web search failed: %s", results)
