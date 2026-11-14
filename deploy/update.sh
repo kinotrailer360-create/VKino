@@ -71,6 +71,16 @@ ls -1t /opt/vkino-backups/pre-update-*.dump 2>/dev/null | tail -n +6 | xargs -r 
 if bash "$DIR/deploy/install.sh" >/tmp/vkino-update.out 2>&1 && healthy; then
   status="✅ Бот обновлён автоматически"
 else
+  # Сохраняем причину сбоя ДО отката: docker compose up удалит неудачный контейнер вместе с его логами.
+  {
+    echo "$(date '+%F %T') диагностика неудачного запуска новой версии"
+    (cd "$DIR/deploy" && docker compose ps -a) || true
+    (cd "$DIR/deploy" && docker compose logs --no-color --tail 200 bot) || true
+    cid=$(cd "$DIR/deploy" && docker compose ps -aq bot | head -1)
+    if [ -n "$cid" ]; then
+      docker inspect --format='container={{.Id}} restarts={{.RestartCount}} state={{json .State}}' "$cid" || true
+    fi
+  } >> /tmp/vkino-update.out 2>&1
   # новая версия не запустилась — возвращаем прошлую, чтобы канал не остался без бота
   git -C "$DIR" rev-parse origin/main > "$BAD"
   echo "$(date '+%F %T') новая версия не запустилась — откатываю на $old" >> /tmp/vkino-update.out
