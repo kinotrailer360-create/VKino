@@ -12470,14 +12470,29 @@ async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
     if not film:
         raise RuntimeError("не нашлось фильма с ляпами — попробуй ещё раз")
     title = shorts_daily._title(film)
-    task = (f"Напиши пост «🎭 Ляпы в «{title}» ({film.get('year') or ''}), которые вы не замечали»: заголовок "
-            "КАПСОМ с эмодзи, 3–5 ляпов из материала строками «1️⃣ …» — своими словами, коротко и с юмором; в конце "
-            "вопрос «А вы замечали?» и строка реакций.")
-    post = await shorts_ai.write_styled_post(GEMINI_API_KEY, task, _film_line(film) + "\n\nЛяпы:\n" + "\n".join(
-        f"— {b}" for b in bloopers[:8]), search=False) or "\n".join(
-        [f"🎭 ЛЯПЫ В {_label(film).upper()}", ""] + [f"{n} {b}" for n, b in zip(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"],
-                                                                               bloopers)]
-        + ["", "А вы замечали? 👇", "", "🔥 — замечал ❤️ — теперь пересмотрю"])
+    # В рубрике «Ляпы» ИИ раньше дописывал справку к фильму и мог приписать его другому актёру
+    # (например, «классика Николаса Кейджа» к «Области тьмы»). Оставляем только утверждения из
+    # найденных записей Кинопоиска; заголовок и вовлечение строим детерминированно.
+    selected: list[str] = []
+    fact_chars = 0
+    for blooper in bloopers:
+        if len(selected) == 3:
+            break
+        if fact_chars + len(blooper) <= 620:
+            selected.append(blooper)
+            fact_chars += len(blooper)
+    post = "\n".join([
+        f"🎭 ЛЯПЫ В «{title}» ({film.get('year') or ''}), КОТОРЫЕ ВЫ МОГЛИ НЕ ЗАМЕТИТЬ",
+        "",
+        *[f"{n} {b}" for n, b in zip(("1️⃣", "2️⃣", "3️⃣"), selected)],
+        "",
+        "А вы замечали? 👇",
+        "",
+        "❤️ — пересматриваю  🔥 — не замечал",
+        "📤 Перешли другу, который любит находить ошибки",
+        "",
+        "#ЛяпыВКино #КиноОшибки #КиноФакты #KinoMir360",
+    ])
     hist["bloopers"] = (hist["bloopers"] + [str(film["id"])])[-200:]
     await save_posts_history(hist)
     work = SHORTS_DIR / f"bloopers_{time.time_ns()}"
