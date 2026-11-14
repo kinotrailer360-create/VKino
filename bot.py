@@ -12455,42 +12455,97 @@ async def make_vote_result_post(bot: Bot, chat_id: int) -> None:
 
 
 async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
-    """«🎭 Ляпы в кино»: известный фильм с 3+ ляпами Кинопоиска, пересказ своими словами, кадры со знаком."""
+    """«🎭 Ляпы в кино»: только найденные записи/публикации, с проверкой фильма в TMDB."""
+    from shorts import websearch as shorts_websearch
     hist = await _posts_history()
     used = {int(x) for x in hist["bloopers"]}
-    film, bloopers = None, []
-    for pick in [f for f in await _popular_films(15) if f["id"] not in used][:8]:
-        full = await kp._get(f"/movie/{pick['id']}")
-        bloopers = [shorts_daily._clean_fact(f.get("value")) for f in full.get("facts") or []
-                    if isinstance(f, dict) and str(f.get("type") or "").upper() == "BLOOPER" and not f.get("spoiler")]
-        bloopers = [b for b in bloopers if 30 <= len(b) <= 400]
-        if len(bloopers) >= 3:
+    films = [f for f in await _popular_films(15) if f.get("id") not in used]
+    channels = await fact_channels()
+    markers = ("ляп", "ошибк", "киноляп", "continuity", "goof", "mistake", "inconsisten", "blooper")
+    sources_by_film: dict[str, list[tuple[str, str]]] = {}
+    film = None
+    for pick in films[:8]:
+        try:
+            full = await kp._get(f"/movie/{pick['id']}")
+        except Exception as exc:  # noqa: BLE001 — один фильм не мешает остальным
+            logging.info("Bloopers: Kinopoisk lookup failed for %s: %s", pick.get("id"), exc)
+            continue
+        title = shorts_daily._title(full)
+        en = str(full.get("alternativeName") or full.get("enName") or "").strip()
+        year = str(full.get("year") or "")
+
+        # TMDB подтверждает, что поиск относится к этому фильму (название + год).
+        # TMDB не ведёт каталог киноляпов, поэтому сами пункты берём только из источников ниже.
+        tmdb_match = None
+        if TMDB_API_KEY:
+            try:
+                tmdb_rows = await shorts_daily.tmdb.search_movie(TMDB_API_KEY, en or title, n=8)
+                names = {re.sub(r"[^a-zа-я0-9]", "", n.lower().replace("ё", "е"))
+                         for n in (title, en) if n}
+                tmdb_match = next((row for row in tmdb_rows
+                                   if str(row.get("year") or "") == year
+                                   and re.sub(r"[^a-zа-я0-9]", "", str(row.get("original") or "").lower().replace("ё", "е")) in names), None)
+            except Exception as exc:  # noqa: BLE001
+                logging.info("Bloopers: TMDB lookup failed for %s: %s", title, exc)
+        if not tmdb_match:
+            continue
+
+        collected: list[tuple[str, str]] = []
+        # Официальные записи Кинопоиска.
+        for fact in full.get("facts") or []:
+            if isinstance(fact, dict) and str(fact.get("type") or "").upper() == "BLOOPER" and not fact.get("spoiler"):
+                text = shorts_daily._clean_fact(fact.get("value"))
+                if 30 <= len(text) <= 400:
+                    collected.append((text, "Кинопоиск"))
+
+        # Интернет-поиск и список каналов автора дают дополнительные публикации.
+        queries = [f'"{title}" {year} киноляпы ошибки фильма',
+                   f'"{en}" {year} movie goofs mistakes'] if en else [f'"{title}" {year} киноляпы ошибки фильма']
+        web_batches, tg_batches = await asyncio.gather(
+            asyncio.gather(*(shorts_websearch.search(q, n=5) for q in queries)),
+            asyncio.gather(*(shorts_tgsearch.search(channels, [n for n in (title, en) if n], per_channel=2),
+                             return_exceptions=True), return_exceptions=True))
+        for results in web_batches:
+            if isinstance(results, Exception):
+                logging.info("Bloopers: web search failed: %s", results)
+                continue
+            for row in results:
+                text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()
+                if len(text) >= 45 and any(mark in (str(row.get("title") or "") + " " + text).lower() for mark in markers):
+                    collected.append((text[:320], str(row.get("url") or "Интернет-поиск")))
+        if tg_batches and not isinstance(tg_batches, Exception):
+            tg_posts = tg_batches[0]
+            if isinstance(tg_posts, Exception):
+                logging.info("Bloopers: Telegram search failed: %s", tg_posts)
+                tg_posts = []
+            for row in tg_posts:
+                text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()
+                if len(text) >= 45 and any(mark in text.lower() for mark in markers):
+                    collected.append((text[:320], str(row.get("url") or f"t.me/{row.get('channel', '')}")))
+
+        unique: list[tuple[str, str]] = []
+        seen_text: set[str] = set()
+        for text, source in collected:
+            key = re.sub(r"\W+", "", text.lower())
+            if key not in seen_text:
+                seen_text.add(key)
+                unique.append((text, source))
+        if len(unique) >= 3:
             film = full
+            sources_by_film[title] = unique[:3]
             break
     if not film:
-        raise RuntimeError("не нашлось фильма с ляпами — попробуй ещё раз")
+        raise RuntimeError("не нашлось фильма с тремя ляпами из Кинопоиска, интернета или ваших Telegram-каналов; попробуй позже")
+
     title = shorts_daily._title(film)
-    # В рубрике «Ляпы» ИИ раньше дописывал справку к фильму и мог приписать его другому актёру
-    # (например, «классика Николаса Кейджа» к «Области тьмы»). Оставляем только утверждения из
-    # найденных записей Кинопоиска; заголовок и вовлечение строим детерминированно.
-    selected: list[str] = []
-    fact_chars = 0
-    for blooper in bloopers:
-        if len(selected) == 3:
-            break
-        if fact_chars + len(blooper) <= 620:
-            selected.append(blooper)
-            fact_chars += len(blooper)
+    selected = sources_by_film[title]
     post = "\n".join([
         f"🎭 ЛЯПЫ В «{title}» ({film.get('year') or ''}), КОТОРЫЕ ВЫ МОГЛИ НЕ ЗАМЕТИТЬ",
         "",
-        *[f"{n} {b}" for n, b in zip(("1️⃣", "2️⃣", "3️⃣"), selected)],
+        *[f"{n} {fact}" for n, (fact, _) in zip(("1️⃣", "2️⃣", "3️⃣"), selected)],
         "",
-        "А вы замечали? 👇",
-        "",
-        "❤️ — пересматриваю  🔥 — не замечал",
-        "📤 Перешли другу, который любит находить ошибки",
-        "",
+        "А вы замечали? 👇", "", "❤️ — пересматриваю  🔥 — не замечал",
+        "📤 Перешли другу, который любит находить ошибки", "",
         "#ЛяпыВКино #КиноОшибки #КиноФакты #KinoMir360",
     ])
     hist["bloopers"] = (hist["bloopers"] + [str(film["id"])])[-200:]
@@ -12513,7 +12568,9 @@ async def make_bloopers_post(bot: Bot, chat_id: int) -> None:
         ids, kind = await _send_album(bot, chat_id, cards, post, "#ляпы")
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    await offer_post(bot, chat_id, ids, kind, "pt:bl", what="Пост с ляпами готов")
+    source_note = "\n\n🔎 Источники ляпов (проверь перед публикацией):\n" + "\n".join(
+        f"• {source}" for _, source in selected)
+    await offer_post(bot, chat_id, ids, kind, "pt:bl", note=source_note, what="Пост с ляпами готов")
 
 
 BOT_USERNAME = ""  # имя бота: для ссылок «Поделиться» (запоминаем при первом запросе)
