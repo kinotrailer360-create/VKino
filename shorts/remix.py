@@ -147,7 +147,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                     picture = im.convert("RGB").copy()
             except Exception:
                 continue
-            timestamp = min(video_length - 0.1, frame_number / fps)
+            timestamp = min(video_length - 0.1, (frame_number + 0.5) * video_length / max(1, len(frame_paths)))
             candidates.append({
                 "kind": "video", "image": picture, "path": path,
                 "timestamp": max(0.0, timestamp), "duration": video_length,
