@@ -48,6 +48,12 @@ REDDIT_SKIP = re.compile(r"\b(?:thread|discussion|megathread|predictions?|projec
 REDDIT_EVERY = 600  # Reddit без входа режет частые запросы (429): одну ленту — не чаще раза в 10 минут
 REDDIT_STALE = 6 * 3600  # при отказе берём последнюю сохранённую ленту, если ей меньше 6 часов
 _reddit_cache: dict[str, tuple[float, bytes]] = {}
+_reddit_retry: dict[str, float] = {}
+REDDIT_BACKOFF = 6 * 3600
+
+
+class RedditRateLimited(RuntimeError):
+    """Temporary upstream throttle, distinct from a broken source."""
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://t.me/KinoMir360)"}
 
 
@@ -245,16 +251,29 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
         _reddit = _reddit or asyncio.Lock()
         async with _reddit:
             cached = _reddit_cache.get(url)
-            if cached and time.time() - cached[0] < REDDIT_EVERY:
+            if time.time() < _reddit_retry.get(url, 0):
+                if not cached or time.time() - cached[0] > REDDIT_STALE:
+                    raise RedditRateLimited("Лимит Reddit: ждём следующей попытки")
+                raw = cached[1]
+            elif cached and time.time() - cached[0] < REDDIT_EVERY:
                 raw = cached[1]
             else:
                 await asyncio.sleep(2)  # пауза между запросами к Reddit (чаще — 429)
                 try:
                     raw = await _download(session, url)
                     _reddit_cache[url] = (time.time(), raw)
+                    _reddit_retry.pop(url, None)
                 except aiohttp.ClientResponseError as exc:
-                    if exc.status != 429 or not cached or time.time() - cached[0] > REDDIT_STALE:
+                    if exc.status != 429:
                         raise
+                    retry = exc.headers.get("Retry-After", "") if exc.headers else ""
+                    try:
+                        seconds = float(retry)
+                    except ValueError:
+                        seconds = REDDIT_BACKOFF
+                    _reddit_retry[url] = time.time() + max(3600, min(seconds, 24 * 3600))
+                    if not cached or time.time() - cached[0] > REDDIT_STALE:
+                        raise RedditRateLimited("Лимит Reddit: ждём следующей попытки") from None
                     log.info("shorts: reddit 429, using cached %s", url)
                     raw = cached[1]
     else:
@@ -318,12 +337,18 @@ async def check(feeds: list[str]) -> list[tuple[str, int | str, str]]:
                            "или RSS-ссылка rss.app"), name
         try:
             posts = await _fetch(session, entry, 0, 200)
+            url = feed_url(entry) or ""
+            if "reddit.com" in url and time.time() < _reddit_retry.get(url, 0):
+                return entry, "Лимит Reddit: ждём следующей попытки", name
             fresh = [p for p in posts if p["time"] >= since]
             return entry, len(fresh), name or (posts[0]["label"] if posts else "RSS")
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, RedditRateLimited):
+                return entry, str(exc), name
             hint = (" — RSSHub не запущен или нет TWITTER_AUTH_TOKEN" if rsshub() and
                     str(feed_url(entry)).startswith(rsshub()) else "")
             return entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}", name or "RSS"
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40), headers=HEADERS) as session:
         return list(await asyncio.gather(*(one(session, e) for e in feeds)))
+
