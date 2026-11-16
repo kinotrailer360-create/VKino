@@ -77,8 +77,9 @@ async def _instagram_metadata(url: str) -> dict[str, Any]:
         await proc.wait()
         raise RuntimeError("Instagram: истекло время получения публикации")
     if proc.returncode:
-        raise RuntimeError("Instagram: не удалось получить медиа: " +
-                           err.decode(errors="replace")[-180:])
+        detail = err.decode(errors="replace").strip().splitlines()
+        raise RuntimeError("Instagram: не удалось получить список публикации: " +
+                           (detail[-1][:250] if detail else "неизвестная ошибка"))
     try:
         info = json.loads(out)
     except (ValueError, UnicodeDecodeError) as exc:
