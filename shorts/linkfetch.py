@@ -66,7 +66,7 @@ class _Article(HTMLParser):
 async def _instagram_metadata(url: str) -> dict[str, Any]:
     """Try yt-dlp's Instagram extractor, including carousel entries, without downloading media."""
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "yt_dlp", "--dump-single-json", "--skip-download",
+        sys.executable, "-m", "yt_dlp", "--flat-playlist", "--dump-single-json", "--skip-download",
         "--no-warnings", "--yes-playlist", "--socket-timeout", "12", url,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
@@ -91,6 +91,10 @@ async def _instagram_metadata(url: str) -> dict[str, Any]:
         # For carousel images, yt-dlp exposes the image URL as the entry URL.
         candidate = entry.get("url") if entry.get("ext") in ("jpg", "jpeg", "png", "webp") else None
         candidate = candidate or entry.get("thumbnail")
+        if not candidate:
+            thumbs = entry.get("thumbnails") or []
+            candidate = next((t.get("url") for t in reversed(thumbs)
+                              if isinstance(t, dict) and t.get("url")), None)
         if isinstance(candidate, str) and candidate.startswith("https://"):
             images.append(candidate)
     return {
