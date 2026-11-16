@@ -14085,6 +14085,29 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
         texts.append(rest)
     material = "\n\n".join(t for t in texts if t.strip())
     images = list(photos or []) + await _web_images(list(dict.fromkeys(image_urls)), 8)
+    if len(material) < 20 and not images and any(shorts_linkfetch.INSTAGRAM.fullmatch(u) for u in urls):
+        # Reuse existing Shorts extraction for publicly accessible Instagram video.
+        for instagram_url in urls:
+            if not shorts_linkfetch.INSTAGRAM.fullmatch(instagram_url):
+                continue
+            work_video = SHORTS_DIR / f"instagram_import_{time.time_ns()}"
+            work_video.mkdir(parents=True, exist_ok=True)
+            try:
+                video = await shorts_dub.fetch_source(instagram_url, work_video)
+                extracted = await shorts_copycat.extract(video, work_video, GEMINI_API_KEY)
+                film_rows = extracted.get("films") or []
+                if len(film_rows) >= 2:
+                    material = "\n".join(
+                        [str(extracted.get("title") or "Подборка")] +
+                        [str(f.get("ru") or f.get("en") or "") +
+                         (f" ({f['year']})" if f.get("year") else "") for f in film_rows]
+                    )
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logging.info("Instagram video extraction failed: %s", exc)
+                source_errors.append("Видео: " + str(exc)[:120])
+            finally:
+                shutil.rmtree(work_video, ignore_errors=True)
     if len(material) < 20 and not images:
         reason = source_errors[0] if source_errors else "Источник не вернул текст и изображения"
         if any(shorts_linkfetch.INSTAGRAM.fullmatch(u) for u in urls):
