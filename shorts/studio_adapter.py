@@ -43,7 +43,7 @@ def clip_window(scene: dict[str, Any], actual: float, voice: float) -> float:
     return total
 
 
-async def render_scene(bridge: Any, admin: int, scene: dict[str, Any], work: Path) -> dict[str, Any]:
+async def render_scene(bridge: Any, admin: int, scene: dict[str, Any], work: Path, key: str = "") -> dict[str, Any]:
     media, meta = await bridge.resolve_file(admin, scene["asset"]["id"])
     voice, _, voiced, _ = await daily.synthesize([scene["text"]], work, careful=True)
     if not voiced:
@@ -62,6 +62,10 @@ async def render_scene(bridge: Any, admin: int, scene: dict[str, Any], work: Pat
                 raise ValueError("Слишком большое изображение: максимум 30 мегапикселей")
             im.verify()
         inputs = ["-loop", "1", "-i", str(media)]
+    from . import visual_guard
+    await visual_guard.audit(work, [{"text": scene["text"], "start": 0, "end": total,
+        "offset": scene.get("start", 0),
+        "clip" if meta["mime"].startswith("video/") else "image": str(media.resolve())}], key)
     # Text is held in a file rather than interpolated into a shell/filter expression.
     words, lines, line = scene["text"].split(), [], ""
     for word in words:
@@ -198,7 +202,7 @@ async def execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path, 
             results.append({"fits": fits, "reason": reason})
         return {"checks": results, "note": "Мнение ИИ по выборочным кадрам. Полный просмотр и утверждение — за автором."}
     if operation == "render":
-        return await render_scene(bridge, admin, p["scenes"][payload["sceneIndex"]], work)
+        return await render_scene(bridge, admin, p["scenes"][payload["sceneIndex"]], work, key)
     if operation == "assemble":
         return await assemble(bridge, admin, p["scenes"], work)
     if operation == "notify":
@@ -208,3 +212,4 @@ async def execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path, 
                                         caption=("📁 " + p["title"] + "\nЧерновик из студии. Публикация не запущена.")[:1000], parse_mode=None)
         return {"delivered": True}
     raise ValueError("Неизвестная операция")
+

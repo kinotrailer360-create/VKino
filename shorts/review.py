@@ -506,6 +506,10 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
         recent = (recent + [shot["image"]])[-3:]
         shots.append(shot)
 
+    from . import visual_guard
+    await visual_guard.audit(work, [dict(shot, text=visual_guard.narration(shot["start"], shot["end"],
+        [section["text"] for section in sections], starts, speech_end)) for shot in shots], gemini_key)
+
     headings = [{"start": starts[i] + 0.3, "end": starts[i] + 4.0, "text": s["heading"].upper()}
                 for i, s in enumerate(sections) if s.get("heading") and i > 0]
     r = film.get("rating") or {}
@@ -574,3 +578,4 @@ async def make_review(fetch: Fetch, work: Path, script: dict[str, Any], music: P
     if notes:
         result.seo["warning"] = "\n".join(notes)
     return result
+

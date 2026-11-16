@@ -670,7 +670,7 @@ async def build_story(work: Path, story: dict[str, Any], n: int, total_n: int, i
     Повторная сборка с другими картинками берёт голос из кэша — звук тот же и бесплатно."""
     daily.voice_issues.clear()
     daily.stressed.clear()
-    bg = imgs[0] if imgs else first_img
+    bg = imgs[0] if imgs else None
     card = work / f"card{n}.jpg"
     await asyncio.to_thread(_card_file, bg, f"НОВОСТЬ {n}", story["headline"], "", card, story["mourning"])
     # своя музыка у каждой новости — по её настроению (смерть — спокойная драма, хоррор — мрачная, …)
@@ -684,7 +684,15 @@ async def build_story(work: Path, story: dict[str, Any], n: int, total_n: int, i
     over = work / f"over{n}.png"
     await asyncio.to_thread(lambda: overlay(story["headline"], n, total_n, story["mourning"]).save(over))
     total = dur + 0.5
-    slides = _even_slides(paths, starts, total)
+    from . import ai, visual_guard
+    import os
+    choices = await ai.match_images(os.getenv("GEMINI_API_KEY", ""), story["lines"], imgs)
+    if choices is None or len(choices) != len(story["lines"]) or any(not isinstance(c, int) or isinstance(c, bool) or c < 0 or c >= len(paths) for c in choices):
+        raise visual_guard.VisualReviewRequired("Не найдены кадры ко всем фразам новости. Добавьте подходящие материалы; чужая новость не подставляется.")
+    ends = starts[1:] + [total]
+    slides = [(paths[c], end - start) for c, start, end in zip(choices, starts, ends)]
+    await visual_guard.audit(work, [dict(image=str(paths[c].resolve()), text=line, start=start, end=end)
+        for c, line, start, end in zip(choices, story["lines"], starts, ends)], name=f"visual_review_story{n}")
     for t0, clip, length in await _graphics(work, n, story, starts, total, bg, tmdb_key):
         slides = _insert_clip(slides, t0, clip, length, total)  # графики, оценки, таймлайн, цитата, афиши
     seg_story = await _segment(work, f"story{n}", slides, over, voice, total, music)
@@ -1054,3 +1062,4 @@ async def revoice(folder: Path, video: Path, sure: bool = False) -> tuple[Path, 
         return out, sorted(fixed), notes
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+

@@ -612,6 +612,14 @@ def test_weekly_blocks_build_fix_and_assemble(tmp_path, monkeypatch):
         def exists(self):
             return self.text != "Фраза два.!"
 
+    # Rendering integration test: external vision is deterministic here.
+    from shorts import ai
+    async def fits(*args):
+        return True, "fixture"
+    async def matches(key, lines, images):
+        return [0] * len(lines)
+    monkeypatch.setattr(ai, "media_fits", fits)
+    monkeypatch.setattr(ai, "match_images", matches)
     monkeypatch.setattr(daily, "synthesize", synth)
     monkeypatch.setattr(daily, "spoken_lines", spoken)
     monkeypatch.setattr(daily, "_voice_key", lambda t, p: Key(t))
@@ -1179,3 +1187,4 @@ def test_mood_buttons_in_picker():
     assert "😂 Посмеяться" in labels and "настроение" in text
     first = kb.inline_keyboard[0][0].callback_data
     assert first == f"rq:m:{bot.RQ_GENRES.index('комедия')}:-:-"
+

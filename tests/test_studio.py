@@ -155,6 +155,9 @@ def test_render_and_assemble_with_audio(tmp_path, monkeypatch):
                 wav.writeframes(b''.join(struct.pack('<h', int(3000 * math.sin(2 * math.pi * 440 * i / 16000))) for i in range(16000)))
             return voice, [0], True, []
 
+        async def fits(*args):
+            return True, "fixture"
+        monkeypatch.setattr(adapter.ai, 'media_fits', fits)
         monkeypatch.setattr(adapter.daily, 'synthesize', synthesize)
         bridge = SimpleNamespace(resolve_file=resolve, store_file=store)
         scene = {'text': 'Проверка русского текста и озвучки.', 'duration': 2, 'asset': {'id': 'source'}}
