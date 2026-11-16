@@ -241,6 +241,29 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
     (10, "referrals.active", """
         ALTER TABLE referrals ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT FALSE;
     """, None),
+
+    (11, "studio — приватная связь с Sites, задания и материалы", """
+        CREATE TABLE IF NOT EXISTS studio_tokens (
+            token_hash TEXT PRIMARY KEY, admin_id BIGINT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('pair','session')),
+            expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS studio_jobs (
+            id TEXT PRIMARY KEY, admin_id BIGINT NOT NULL, payload JSONB NOT NULL,
+            status TEXT NOT NULL, result JSONB, error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_studio_jobs_queue ON studio_jobs(status,created_at);
+        CREATE TABLE IF NOT EXISTS studio_files (
+            id TEXT PRIMARY KEY, admin_id BIGINT NOT NULL, metadata JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS studio_inbox (
+            id TEXT PRIMARY KEY, admin_id BIGINT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """, None),
+
 ]
 
 
@@ -288,3 +311,4 @@ async def migrate(pool: Any) -> list[int]:
             log.info("migration %03d applied: %s", version, name)
             done.append(version)
     return done
+

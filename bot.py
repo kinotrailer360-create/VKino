@@ -52,6 +52,8 @@ from aiogram.types import (
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from shorts import studio as shorts_studio
+from shorts import studio_adapter as shorts_studio_adapter
 from shorts import ai as shorts_ai
 from shorts import budget as shorts_budget
 from shorts import migrations as shorts_migrations
@@ -2982,8 +2984,57 @@ async def api_progress(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+studio_bridge: shorts_studio.Studio | None = None
+
+
+async def _studio_execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path) -> dict[str, Any]:
+    if payload["operation"] in {"render", "assemble"}:
+        await load_pronunciations()
+        await load_voice()
+    return await shorts_studio_adapter.execute(bridge, admin, payload, work, GEMINI_API_KEY)
+
+
+@router.message(Command("studio"))
+async def studio_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS or message.chat.type != "private":
+        return
+    if studio_bridge is None:
+        await message.answer("Студия ещё запускается. Попробуйте чуть позже.")
+        return
+    if (message.text or "").strip().endswith(" revoke"):
+        await studio_bridge.revoke(message.from_user.id)
+        await message.answer("Подключения студии отозваны. Задания в очереди отменены; текущая сборка может завершиться.")
+        return
+    code = await studio_bridge.issue_pair(message.from_user.id)
+    await message.answer(
+        "🌐 Подключение KinoMir360 Studio\n\nНа сайте откройте «Настройки → Подключить VKino».\n"
+        + "Адрес сервера: " + escape(WEBAPP_URL.rstrip("/")) + "\nОдноразовый код (10 минут):\n<code>"
+        + code + "</code>\n\nКод даёт доступ к заданиям студии на 30 дней. Не публикуйте его. "
+        "Отозвать доступ: /studio revoke. Токен Telegram-бота не нужен.\n"
+        "Чтобы перенести текст на сайт, ответьте на сообщение командой /studio_export."
+    )
+
+
+@router.message(Command("studio_export"))
+async def studio_export_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS or message.chat.type != "private":
+        return
+    if studio_bridge is None:
+        return
+    quoted = message.reply_to_message
+    text = (quoted.text or quoted.caption or "") if quoted else (message.text or "").partition(" ")[2]
+    if not text.strip():
+        await message.answer("Ответьте /studio_export на сообщение с текстом или сценарием.")
+        return
+    await studio_bridge.export_text(message.from_user.id, text, text.splitlines()[0][:120])
+    await message.answer("✅ Материал сохранён. На сайте: «Из бота → Обновить». Импорт начнётся с проверки исходника.")
+
+
 async def start_miniapp_server() -> web.AppRunner:
+    global studio_bridge
     app = web.Application(client_max_size=1024 * 1024)
+    studio_bridge = shorts_studio.Studio(db(), ADMIN_IDS, shorts_studio.default_root(), _studio_execute, shorts_lock)
+    studio_bridge.register(app)
     app.router.add_get("/", miniapp_page)
     app.router.add_get("/app", miniapp_page)
     app.router.add_get("/trailer", trailer_page)
@@ -18698,6 +18749,8 @@ async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
         BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
+        BotCommand(command="studio", description="🌐 Подключить KinoMir360 Studio"),
+        BotCommand(command="studio_export", description="📁 Перенести текст в студию (ответом на сообщение)"),
         BotCommand(command="report", description="📊 Отчёт за неделю и план"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="hype", description="🔥 Инфоповоды: проверить сейчас, /hype on|off"),
@@ -18771,6 +18824,9 @@ async def main() -> None:
             parse_mode=ParseMode.HTML
         ),
     )
+
+    if studio_bridge is not None:
+        await studio_bridge.start(bot)
 
     async def budget_warning(text: str) -> None:  # 80 % месячного лимита — сообщение админам
         for admin_id in ADMIN_IDS:
@@ -18858,8 +18914,11 @@ async def main() -> None:
         except asyncio.CancelledError:
             pass
 
+        if studio_bridge is not None:
+            await studio_bridge.stop()
         await web_runner.cleanup()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
