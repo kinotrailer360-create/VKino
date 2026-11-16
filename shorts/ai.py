@@ -545,6 +545,7 @@ def _json_from(text: str) -> Any:
 # у бесплатного Groq лимит ~7000 токенов в минуту (≈ 4 символа на токен по-русски): длинный материал
 # (статья Википедии, посты каналов) сокращаем — начало с заданием и конец с форматом ответа остаются
 RESERVE_MAX_CHARS = 16000
+RESERVE_MAX_OUTPUT_TOKENS = 768  # ниже частого OTPM-лимита Qwen в 1000 токенов
 LUMEAN_MAX_CHARS = 60000  # потолок задания для платной модели Lumean — только от сбоя (обычное задание меньше)
 
 
@@ -554,7 +555,8 @@ def _fit(prompt: str, limit: int = RESERVE_MAX_CHARS) -> str:
     return prompt[: limit - 2500] + "\n…\n" + prompt[-2500:]
 
 
-async def _ask_reserve(prompt: str, image: Image.Image | None = None) -> Any:
+async def _ask_reserve(prompt: str, image: Image.Image | None = None,
+                       max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS) -> Any:
     """Запрос к резервному OpenAI-совместимому ИИ (по умолчанию Groq). HTTP 429 не повторяется вслепую:
     задание больше минутного лимита токенов («Limit 6000, Requested 8123») — один раз ужимаем его под лимит;
     лимит ненадолго — ждём сколько просят (до 20 с); надолго — пауза провайдера, запрос идёт к следующему."""
@@ -571,7 +573,7 @@ async def _ask_reserve(prompt: str, image: Image.Image | None = None) -> Any:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for attempt in range(2):
             text = _fit(prompt, limit)
-            body = {"model": RESERVE_MODEL, "temperature": 0.2,
+            body = {"model": RESERVE_MODEL, "temperature": 0.2, "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": [{"type": "text", "text": text}] + ([picture] if picture else [])}]}
             started = time.monotonic()
             async with session.post(RESERVE_URL, json=body,
@@ -586,6 +588,13 @@ async def _ask_reserve(prompt: str, image: Image.Image | None = None) -> Any:
             if status == 429:
                 wait = _retry_after(headers, data, msg)
                 too_big = re.search(r"Limit (\d+), Requested (\d+)", msg)
+                if attempt == 0 and "otpm" in msg.lower() and too_big and max_tokens > 64:
+                    reduced = max(64, min(max_tokens - 1,
+                                          int(max_tokens * int(too_big[1]) / int(too_big[2]) * 0.8)))
+                    if reduced < max_tokens:
+                        max_tokens = reduced
+                        await asyncio.sleep(1)
+                        continue
                 if attempt == 0 and too_big and int(too_big[2]) > int(too_big[1]):
                     smaller = int(len(text) * int(too_big[1]) / int(too_big[2]) * 0.85)
                     if smaller >= len(text) * 0.5:  # ужать можно без потери смысла задания
@@ -615,7 +624,8 @@ RESERVE_BUDGET = 90  # с на ответ резервного ИИ
 
 
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
-                        image: Image.Image | None = None, premium: bool = False) -> Any:
+                        image: Image.Image | None = None, premium: bool = False,
+                        reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS) -> Any:
     """Порядок ИИ. Важное (premium) или режим «all» — сначала сильная модель Lumean (платно), потом Gemini и
     резервные. Остальное — бесплатные Gemini и Groq, а Lumean — только если они не ответили.
     Ошибка — с причинами всех."""
@@ -670,7 +680,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             failed("Gemini", exc, "Gemini не ответил")
     if RESERVE_KEY and not skip("reserve"):
         try:
-            result = await asyncio.wait_for(_ask_reserve(prompt, image), RESERVE_BUDGET)
+            result = await asyncio.wait_for(_ask_reserve(prompt, image, reserve_max_tokens), RESERVE_BUDGET)
             log.info("shorts: reserve AI (%s) answered", RESERVE_MODEL)
             last_engine = "reserve"
             return result
@@ -987,7 +997,10 @@ async def match_images(key: str, texts: list[str], images: list[Image.Image]) ->
     prompt = ("Ты монтажёр коротких роликов о кино. На картинке — кадры из фильма, номер каждого "
               "в жёлтом квадрате в углу кадра. " + task + "\n\n" + facts)
     try:
-        data = await _with_reserve(key, parts, prompt, _sheet(images) if RESERVE_KEY else None)
+        data = await _with_reserve(
+            key, parts, prompt, _sheet(images) if RESERVE_KEY else None,
+            reserve_max_tokens=128,
+        )
         raw = list(data["choices"])[: len(texts)]
     except Exception as exc:  # noqa: BLE001
         global last_error
