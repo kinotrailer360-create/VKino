@@ -7374,11 +7374,46 @@ async def send_qc(bot: Bot, chat_id: int, video: Path, vertical: bool | None = N
     await bot.send_message(chat_id, shorts_qc.report(await shorts_qc.check(video, vertical)))
 
 
+TG_SHORT_UPLOAD_LIMIT = 48 * 1024 * 1024  # leave headroom below Telegram Bot API's 50 MB limit
+
+
+async def _telegram_short_file(video: Path) -> Path:
+    """Return an MP4 that fits the standard Telegram Bot API upload limit."""
+    if video.stat().st_size <= TG_SHORT_UPLOAD_LIMIT:
+        return video
+    for bitrate in (1500, 1000, 650):
+        target = video.with_name(f"{video.stem}_telegram_{bitrate}k.mp4")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf",
+            "scale=trunc(min(720\\,iw)/2)*2:-2",
+            "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{bitrate}k",
+            "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
+            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(target),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            target.unlink(missing_ok=True)
+            raise RuntimeError("Сжатие шортса для Telegram превысило 10 минут")
+        if proc.returncode:
+            target.unlink(missing_ok=True)
+            raise RuntimeError("Не удалось сжать шортс: " + stderr.decode(errors="replace")[-250:])
+        if target.is_file() and target.stat().st_size <= TG_SHORT_UPLOAD_LIMIT:
+            return target
+        target.unlink(missing_ok=True)
+    raise RuntimeError("Видео слишком длинное для отправки через Telegram Bot API (50 МБ) даже после сжатия")
+
+
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     seo = result.seo
+    telegram_video = await _telegram_short_file(result.video)
     video = await bot.send_video(
         chat_id,
-        FSInputFile(result.video, filename="kinomir360_short.mp4"),
+        FSInputFile(telegram_video, filename="kinomir360_short.mp4"),
         caption=post_caption(short_caption(result)),  # готово и для Telegram-канала
         width=1080,
         height=1920,
@@ -17505,8 +17540,9 @@ async def send_fixed(bot: Bot, chat_id: int, folder: Path, video: Path, note: st
     """Исправленный шортс/обзор: тот же текст подписи и SEO, кнопки публикации и правки — как у первого."""
     send = (shorts_project.load(folder) or {}).get("send") or {}
     review = send.get("mode") == "review"
+    telegram_video = await _telegram_short_file(video)
     msg = await bot.send_video(
-        chat_id, FSInputFile(video, filename="kinomir360_review.mp4" if review else "kinomir360_short.mp4"),
+        chat_id, FSInputFile(telegram_video, filename="kinomir360_review.mp4" if review else "kinomir360_short.mp4"),
         caption=send.get("caption") or None, width=1280 if review else 1080, height=720 if review else 1920,
         supports_streaming=True, request_timeout=600)
     if send.get("seo"):
