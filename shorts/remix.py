@@ -84,7 +84,11 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     """Build a semantic, non-repeating video edit from supplied clips and photos."""
     if assets_mode not in {"user", "ai", "mix"}:
         raise ValueError("Неизвестный источник кадров.")
-    if not assets and assets_mode in {"user", "mix"}:
+    # For AI-assisted modes, the source video itself is the first footage source.
+    # Additional uploads replace this fallback and are preferred for matching.
+    if not assets and assets_mode in {"ai", "mix"}:
+        assets = [source]
+    if not assets and assets_mode == "user":
         raise ValueError("Добавь хотя бы одно фото или видео для нового видеоряда.")
 
     voice: Path | None = None
@@ -153,19 +157,6 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 "timestamp": max(0.0, timestamp), "duration": video_length,
             })
 
-    # If the user supplied videos, use their moving scenes and any supplied photos.
-    # Only generate stills when there is no user video to cut from.
-    has_video = any(item["kind"] == "video" for item in candidates)
-    if assets_mode in {"ai", "mix"} and not has_video:
-        for number, phrase in enumerate(texts, 1):
-            raw = await ai.generate_illustration(key, phrase)
-            if not raw:
-                raise RuntimeError(
-                    f"ИИ не создал кадр для сцены {number}. Попробуй ещё раз или добавь свои материалы."
-                )
-            with Image.open(io.BytesIO(raw)) as im:
-                candidates.append({"kind": "image", "image": im.convert("RGB").copy()})
-
     if not candidates:
         raise ValueError("Не удалось прочитать загруженные видео или фото.")
 
@@ -201,20 +192,44 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                     continue
             available.append((candidate_index, candidate, start_at))
 
+        async def generate_fallback() -> dict[str, Any] | None:
+            if assets_mode not in {"ai", "mix"}:
+                return None
+            raw = await ai.generate_illustration(key, text)
+            if not raw:
+                return None
+            with Image.open(io.BytesIO(raw)) as im:
+                return {"kind": "image", "image": im.convert("RGB").copy()}
+
         if not available:
-            raise ValueError(
-                f"Для сцены {scene_number} не нашлось подходящего свободного фрагмента. "
-                "Добавь еще видео или фото."
+            generated = await generate_fallback()
+            if generated is None:
+                raise ValueError(
+                    f"Для сцены {scene_number} не нашлось подходящего свободного видеофрагмента "
+                    "или фото, а запасной ИИ-кадр создать не удалось."
+                )
+            candidates.append(generated)
+            candidate_index = len(candidates) - 1
+            candidate = generated
+            start_at = 0.0
+        else:
+            matches = await ai.match_images(
+                key, [text], [candidate["image"] for _, candidate, _ in available]
             )
-        matches = await ai.match_images(
-            key, [text], [candidate["image"] for _, candidate, _ in available]
-        )
-        if not matches or int(matches[0]) < 0 or int(matches[0]) >= len(available):
-            raise ValueError(
-                f"ИИ не нашел подходящий кадр по смыслу для сцены {scene_number}. "
-                "Добавь другое видео или фото."
-            )
-        candidate_index, candidate, start_at = available[int(matches[0])]
+            selected_index = int(matches[0]) if matches and matches[0] is not None else -1
+            if selected_index < 0 or selected_index >= len(available):
+                generated = await generate_fallback()
+                if generated is None:
+                    raise ValueError(
+                        f"ИИ не нашел подходящий неповторяющийся кадр для сцены {scene_number}, "
+                        "а запасной ИИ-кадр создать не удалось."
+                    )
+                candidates.append(generated)
+                candidate_index = len(candidates) - 1
+                candidate = generated
+                start_at = 0.0
+            else:
+                candidate_index, candidate, start_at = available[selected_index]
         used_candidates.add(candidate_index)
         if candidate["kind"] == "video":
             end_at = start_at + scene_seconds
