@@ -9028,8 +9028,8 @@ async def shorts_panel(
         await state.update_data(remix_mode=mode)
         await show("🎞 <b>Откуда взять кадры?</b>", InlineKeyboardMarkup(inline_keyboard=[
             [_btn("📂 Мои фото/видео", "sh:remix:assets:user")],
-            [_btn("✨ Создать кадры ИИ", "sh:remix:assets:ai")],
-            [_btn("🔀 Мои + кадры ИИ", "sh:remix:assets:mix")],
+            [_btn("🤖 ИИ подберёт сцены из видео", "sh:remix:assets:ai")],
+            [_btn("🔀 Мои материалы + ИИ при нехватке", "sh:remix:assets:mix")],
             [_btn("⬅️ Назад", "sh:remix")]]))
     elif data.startswith("sh:remix:assets:"):
         source_type=data.rsplit(":",1)[1]
@@ -10710,12 +10710,15 @@ async def remix_source(message: Message, state: FSMContext) -> None:
     if data["remix_mode"] in {"audio","both"}:
         await state.set_state(RemixState.text)
         await message.answer("Вставь текст новой озвучки. В режиме «только видеоряд» оригинальная озвучка сохранится.")
-    elif data.get("remix_source_type") == "ai":
-        await state.clear()
-        _run_job(lambda: remix_visual_job(message,data))
     else:
         await state.set_state(RemixState.assets)
-        await message.answer("Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.",
+        source_type = data.get("remix_source_type", "user")
+        prompt = ("Можешь добавить свои фото/видео. Сначала ИИ подберёт подходящие неповторяющиеся фрагменты; "
+                  "генерацию кадров включит только если подходящего материала не найдётся. "
+                  "Если ничего не добавлять, будет использован исходный ролик."
+                  if source_type in {"ai", "mix"} else
+                  "Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.")
+        await message.answer(prompt,
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
 
@@ -10730,12 +10733,15 @@ async def remix_text(message: Message,state: FSMContext)->None:
     if data.get("remix_mode")=="audio":
         await state.clear()
         _run_job(lambda: remix_audio_job(message,data))
-    elif data.get("remix_source_type") == "ai":
-        await state.clear()
-        _run_job(lambda: remix_visual_job(message,data))
     else:
         await state.set_state(RemixState.assets)
-        await message.answer("Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.",
+        source_type = data.get("remix_source_type", "user")
+        prompt = ("Можешь добавить свои фото/видео. Сначала ИИ подберёт подходящие неповторяющиеся фрагменты; "
+                  "генерацию кадров включит только если подходящего материала не найдётся. "
+                  "Если ничего не добавлять, будет использован исходный ролик."
+                  if source_type in {"ai", "mix"} else
+                  "Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.")
+        await message.answer(prompt,
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
 
@@ -10761,7 +10767,7 @@ async def remix_asset(message: Message,state: FSMContext)->None:
 async def remix_done(message: Message,state: FSMContext)->None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:return
     data=await state.get_data()
-    if not data.get("remix_assets") and data.get("remix_source_type") != "ai":
+    if not data.get("remix_assets") and data.get("remix_source_type") not in {"ai", "mix"}:
         await message.answer("Сначала пришли хотя бы один кадр.");return
     await state.clear()
     _run_job(lambda: remix_visual_job(message,data))
