@@ -14084,45 +14084,27 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
     if rest:
         texts.append(rest)
     material = "\n\n".join(t for t in texts if t.strip())
-    images = list(photos or []) + await _web_images(list(dict.fromkeys(image_urls)), 8)
+    images = list(photos or []) + await _web_images(list(dict.fromkeys(image_urls)), 20)
+    # Instagram /p/ can be a photo carousel: never retry it as a video.
+    # Extract from the actual slides before attempting text-only parsing.
+    instagram_posts = [u for u in urls if shorts_linkfetch.INSTAGRAM.fullmatch(u)
+                       and "/p/" in u]
+    if instagram_posts and not images:
+        detail = "; ".join(source_errors[:2]) or "Instagram не отдал доступные изображения"
+        raise RuntimeError(
+            "Не удалось получить фотографии Instagram-карусели. " + detail[:300] +
+            ". Видеозагрузчик для фото не используется."
+        )
     if len(material) < 20 and not images:
-        # For Instagram, reuse the existing video recognizer when the page and
-        # carousel images are inaccessible. Do not silently swallow failures.
-        instagram_urls = [u for u in urls if shorts_linkfetch.INSTAGRAM.fullmatch(u)]
-        for instagram_url in instagram_urls:
-            work_video = SHORTS_DIR / f"instagram_list_{time.time_ns()}"
-            work_video.mkdir(parents=True, exist_ok=True)
-            try:
-                video = await shorts_dub.fetch_source(instagram_url, work_video)
-                extracted = await shorts_copycat.extract(video, work_video, GEMINI_API_KEY)
-                film_rows = extracted.get("films") or []
-                if len(film_rows) >= 2:
-                    material = "\n".join(
-                        [str(extracted.get("title") or "Подборка")] +
-                        [str(f.get("ru") or f.get("en") or "") +
-                         (f" ({f['year']})" if f.get("year") else "") for f in film_rows]
-                    )
-                    break
-                source_errors.append("В видео распознано менее двух фильмов")
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("Instagram list video extraction failed: %s", exc)
-                source_errors.append("Видео: " + _safe_err(exc)[:180])
-            finally:
-                shutil.rmtree(work_video, ignore_errors=True)
-        if len(material) < 20:
-            detail = "; ".join(source_errors[:2]) or "источник не вернул текст и изображения"
-            raise RuntimeError(
-                "Не удалось извлечь фильмы из Instagram. " + detail[:380] +
-                ". Можно прислать скриншоты карусели или видеофайл."
-            )
-    try:
-        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
-    except shorts_ai.AIError:
-        if not images:
-            raise
-        plan = None  # в тексте фильмов нет — читаем постеры
-    if images and (plan is None or len(plan.get("films") or []) < 3):
-        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, 10, images[:8])
+        detail = "; ".join(source_errors[:2]) or "источник не вернул текст и изображения"
+        raise RuntimeError("Не удалось прочитать источник: " + detail[:300])
+    if images:
+        # The author may have put all titles on the images; text-only AI can
+        # falsely produce a shorter list and silently skip the slides.
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=20,
+                                            images=images[:20])
+    else:
+        plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=20)
     films = plan.get("films") or []
     if len(films) < 2:
         raise RuntimeError("в источнике не нашлось списка фильмов")
