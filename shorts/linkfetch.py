@@ -67,7 +67,7 @@ async def _instagram_metadata(url: str) -> dict[str, Any]:
     """Try yt-dlp's Instagram extractor, including carousel entries, without downloading media."""
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "yt_dlp", "--dump-single-json", "--skip-download",
-        "--no-warnings", "--no-playlist", "--socket-timeout", "12", url,
+        "--no-warnings", "--yes-playlist", "--socket-timeout", "12", url,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
@@ -119,7 +119,12 @@ async def fetch(url: str) -> dict[str, Any]:
             return {"url": url, "title": "", "text": post["text"][:TEXT_MAX], "image": post["image"],
                     "video": post["video"], "thumb": post.get("thumb"), "media": post.get("media") or []}
         # статья по ссылке: только публичный интернет (и после перенаправлений), не больше 3 МБ
-        html, _ = await netsafe.fetch_page(session, url)
+        try:
+            html, _ = await netsafe.fetch_page(session, url)
+        except Exception:
+            if not INSTAGRAM.fullmatch(url):
+                raise
+            html = ""  # yt-dlp fallback can work even if Instagram blocks HTML access
     parser = _Article()
     parser.feed(html)
     if INSTAGRAM.fullmatch(url):
