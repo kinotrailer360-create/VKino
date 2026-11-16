@@ -7380,11 +7380,46 @@ async def send_qc(bot: Bot, chat_id: int, video: Path, vertical: bool | None = N
     await bot.send_message(chat_id, shorts_qc.report(await shorts_qc.check(video, vertical)))
 
 
+TG_SHORT_UPLOAD_LIMIT = 48 * 1024 * 1024  # leave headroom below Telegram Bot API's 50 MB limit
+
+
+async def _telegram_short_file(video: Path) -> Path:
+    """Return an MP4 that fits the standard Telegram Bot API upload limit."""
+    if video.stat().st_size <= TG_SHORT_UPLOAD_LIMIT:
+        return video
+    for bitrate in (1500, 1000, 650):
+        target = video.with_name(f"{video.stem}_telegram_{bitrate}k.mp4")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf",
+            "scale=trunc(min(720\\,iw)/2)*2:-2",
+            "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{bitrate}k",
+            "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
+            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(target),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            target.unlink(missing_ok=True)
+            raise RuntimeError("Сжатие шортса для Telegram превысило 10 минут")
+        if proc.returncode:
+            target.unlink(missing_ok=True)
+            raise RuntimeError("Не удалось сжать шортс: " + stderr.decode(errors="replace")[-250:])
+        if target.is_file() and target.stat().st_size <= TG_SHORT_UPLOAD_LIMIT:
+            return target
+        target.unlink(missing_ok=True)
+    raise RuntimeError("Видео слишком длинное для отправки через Telegram Bot API (50 МБ) даже после сжатия")
+
+
 async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
     seo = result.seo
+    telegram_video = await _telegram_short_file(result.video)
     video = await bot.send_video(
         chat_id,
-        FSInputFile(result.video, filename="kinomir360_short.mp4"),
+        FSInputFile(telegram_video, filename="kinomir360_short.mp4"),
         caption=post_caption(short_caption(result)),  # готово и для Telegram-канала
         width=1080,
         height=1920,
@@ -8981,11 +9016,24 @@ async def shorts_panel(
                        [_btn("🎞 Только видеоряд", "sh:remix:visuals")],
                        [_btn("🎙 + 🎞 Озвучку и видеоряд", "sh:remix:both")],
                        [_btn("⬅️ Назад", "sh:menu")]]))
-    elif data in {"sh:remix:audio", "sh:remix:visuals", "sh:remix:both"}:
+    elif data in {"sh:remix:visuals", "sh:remix:both"}:
         mode=data.rsplit(":",1)[1]
         await state.update_data(remix_mode=mode)
+        await show("🎞 <b>Откуда взять кадры?</b>", InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("📂 Мои фото/видео", "sh:remix:assets:user")],
+            [_btn("✨ Создать кадры ИИ", "sh:remix:assets:ai")],
+            [_btn("🔀 Мои + кадры ИИ", "sh:remix:assets:mix")],
+            [_btn("⬅️ Назад", "sh:remix")]]))
+    elif data.startswith("sh:remix:assets:"):
+        source_type=data.rsplit(":",1)[1]
+        await state.update_data(remix_source_type=source_type)
         await state.set_state(RemixState.source)
-        await show("Пришли исходное видео файлом (до 20 МБ). Оно сохранится отдельно; результат будет новым черновиком.",
+        await show("Пришли исходное видео файлом (до 20 МБ). Оригинал останется нетронутым.",
+                   InlineKeyboardMarkup(inline_keyboard=[[_btn("Отмена", "sh:menu")]]))
+    elif data == "sh:remix:audio":
+        await state.update_data(remix_mode="audio",remix_source_type="none")
+        await state.set_state(RemixState.source)
+        await show("Пришли исходное видео файлом (до 20 МБ). Оригинал останется нетронутым.",
                    InlineKeyboardMarkup(inline_keyboard=[[_btn("Отмена", "sh:menu")]]))
     elif data.startswith("sh:sec:") and data[7:] in SHORTS_SECTIONS:
         await show(SHORTS_SECTIONS[data[7:]][1], shorts_section(data[7:]))
@@ -10635,8 +10683,6 @@ async def custom_video(message: Message, state: FSMContext) -> None:
     await show_plan(message, state, found["title"] or "Подборка фильмов", found["films"])
 
 
-
-
 @router.message(RemixState.source, F.video | F.document)
 async def remix_source(message: Message, state: FSMContext) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
@@ -10656,14 +10702,16 @@ async def remix_source(message: Message, state: FSMContext) -> None:
     data=await state.get_data()
     if data["remix_mode"] in {"audio","both"}:
         await state.set_state(RemixState.text)
-        await message.answer("Вставь текст новой озвучки. Исходное видео и оригинал сохранятся отдельно.")
+        await message.answer("Вставь текст новой озвучки. В режиме «только видеоряд» оригинальная озвучка сохранится.")
+    elif data.get("remix_source_type") == "ai":
+        await state.clear()
+        _run_job(lambda: remix_visual_job(message,data))
     else:
         await state.set_state(RemixState.assets)
-        await message.answer("Добавляй свои фото/видео по одному. Когда закончишь — отправь /done. "
-                             "ИИ сопоставит их с распознанными репликами; кадры не будут повторяться.")
+        await message.answer("Добавляй свои фото/видео по одному. Когда закончишь — отправь /done. ИИ проверит соответствие сцен.")
 
 @router.message(RemixState.text, F.text)
-async def remix_text(message: Message,state:FSMContext)->None:
+async def remix_text(message: Message,state: FSMContext)->None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS: return
     text=(message.text or "").strip()
     if len(text)<20:
@@ -10673,34 +10721,39 @@ async def remix_text(message: Message,state:FSMContext)->None:
     if data.get("remix_mode")=="audio":
         await state.clear()
         _run_job(lambda: remix_audio_job(message,data))
+    elif data.get("remix_source_type") == "ai":
+        await state.clear()
+        _run_job(lambda: remix_visual_job(message,data))
     else:
         await state.set_state(RemixState.assets)
         await message.answer("Теперь добавляй свои фото/видео для нового видеоряда. Закончив, отправь /done.")
 
 @router.message(RemixState.assets, F.photo | F.video | F.document)
-async def remix_asset(message:Message,state:FSMContext)->None:
+async def remix_asset(message: Message,state: FSMContext)->None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:return
     media=message.photo[-1] if message.photo else message.video or message.document
     if not media:return
+    if message.document and not str(message.document.mime_type or "").startswith(("image/","video/")):
+        await message.answer("Пришли фото или видео.");return
     if (media.file_size or 0)>TG_DOWNLOAD_LIMIT:
         await message.answer("Материал больше 20 МБ. Отправь сжатую версию.");return
     data=await state.get_data();work=Path(data["remix_work"])
-    ext=".jpg" if message.photo else ".mp4"
+    ext=".jpg" if message.photo or str(getattr(media,"mime_type","")).startswith("image/") else ".mp4"
     path=work/f"asset_{len(data.get('remix_assets',[])):03d}{ext}"
     await message.bot.download(media.file_id,destination=path)
     assets=data.get("remix_assets",[]);assets.append(str(path));await state.update_data(remix_assets=assets)
     await message.answer(f"Материал добавлен ({len(assets)}). Ещё отправь или /done.")
 
 @router.message(RemixState.assets, Command("done"))
-async def remix_done(message:Message,state:FSMContext)->None:
+async def remix_done(message: Message,state: FSMContext)->None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:return
     data=await state.get_data()
-    if not data.get("remix_assets"):
+    if not data.get("remix_assets") and data.get("remix_source_type") != "ai":
         await message.answer("Сначала пришли хотя бы один кадр.");return
     await state.clear()
     _run_job(lambda: remix_visual_job(message,data))
 
-async def remix_audio_job(message:Message,data:dict[str,Any])->None:
+async def remix_audio_job(message: Message,data: dict[str,Any])->None:
     from shorts import remix as remix_engine
     work=Path(data["remix_work"]);wait=await message.answer("🎙 Создаю новую озвучку…")
     try:
@@ -10711,21 +10764,21 @@ async def remix_audio_job(message:Message,data:dict[str,Any])->None:
     except Exception as exc:
         await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:350])}</code>")
 
-async def remix_visual_job(message:Message,data:dict[str,Any])->None:
+async def remix_visual_job(message: Message,data: dict[str,Any])->None:
     from shorts import remix as remix_engine
-    work=Path(data["remix_work"]);wait=await message.answer("🎞 Подбираю кадры к репликам и собираю новый черновик…")
+    work=Path(data["remix_work"]);wait=await message.answer("🎞 Создаю видеоряд и проверяю соответствие сцен…")
     try:
         async with shorts_lock:
             out=await remix_engine.replace_visuals(Path(data["remix_source"]),
-                [Path(x) for x in data["remix_assets"]],work/"новый_черновик.mp4",work,GEMINI_API_KEY,
-                data.get("remix_text") if data.get("remix_mode")=="both" else None)
-        caption=("Черновик: новый видеоряд и новая озвучка. Оригинал сохранён." if data.get("remix_mode")=="both"
-                 else "Черновик: новый видеоряд и исходная озвучка. Оригинал сохранён.")
+                [Path(x) for x in data.get("remix_assets",[])],work/"новый_черновик.mp4",work,GEMINI_API_KEY,
+                data.get("remix_text") if data.get("remix_mode")=="both" else None,
+                data.get("remix_source_type","user"))
+        caption=("Черновик: новый видеоряд и новая озвучка. Оригинал сохранён; перед публикацией проверь результат." if data.get("remix_mode")=="both"
+                 else "Черновик: новый видеоряд и исходная озвучка. Оригинал сохранён; перед публикацией проверь результат.")
         await message.answer_video(FSInputFile(out),caption=caption)
         await wait.delete()
     except Exception as exc:
         await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:350])}</code>")
-
 
 @router.callback_query(F.data.startswith("cs:"))
 async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
@@ -17618,8 +17671,9 @@ async def send_fixed(bot: Bot, chat_id: int, folder: Path, video: Path, note: st
     """Исправленный шортс/обзор: тот же текст подписи и SEO, кнопки публикации и правки — как у первого."""
     send = (shorts_project.load(folder) or {}).get("send") or {}
     review = send.get("mode") == "review"
+    telegram_video = await _telegram_short_file(video)
     msg = await bot.send_video(
-        chat_id, FSInputFile(video, filename="kinomir360_review.mp4" if review else "kinomir360_short.mp4"),
+        chat_id, FSInputFile(telegram_video, filename="kinomir360_review.mp4" if review else "kinomir360_short.mp4"),
         caption=send.get("caption") or None, width=1280 if review else 1080, height=720 if review else 1920,
         supports_streaming=True, request_timeout=600)
     if send.get("seo"):
