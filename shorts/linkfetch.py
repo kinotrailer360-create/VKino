@@ -63,6 +63,23 @@ class _Article(HTMLParser):
             self.buf.append(data)
 
 
+def _instagram_html_images(html: str) -> list[str]:
+    """Extract CDN image URLs from public Instagram page embedded data."""
+    from urllib.parse import urlparse as parse_url
+    pattern = re.compile(r'"(?:display_url|thumbnail_src|image_url|url)"\s*:\s*"(https?:[^"]+)"', re.I)
+    found: list[str] = []
+    for match in pattern.finditer(html):
+        try:
+            candidate = json.loads('"' + match.group(1) + '"')
+        except ValueError:
+            continue
+        host = (parse_url(candidate).hostname or "").lower()
+        if parse_url(candidate).scheme == "https" and (host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net")):
+            if candidate not in found:
+                found.append(candidate)
+    return found[:20]
+
+
 async def _instagram_metadata(url: str) -> dict[str, Any]:
     """Try yt-dlp's Instagram extractor, including carousel entries, without downloading media."""
     proc = await asyncio.create_subprocess_exec(
@@ -135,7 +152,7 @@ async def fetch(url: str) -> dict[str, Any]:
     if INSTAGRAM.fullmatch(url):
         description = unescape(parser.meta.get("og:description", ""))
         title = unescape(parser.meta.get("og:title", ""))
-        pictures = list(dict.fromkeys(parser.images))[:8]
+        pictures = list(dict.fromkeys(_instagram_html_images(html) + parser.images))[:20]
         # Instagram's OpenGraph usually exposes only the first carousel image.
         # Use yt-dlp metadata to discover remaining public slides.
         try:
