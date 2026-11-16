@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import sys
 from urllib.parse import urlparse
 from html import unescape
 from html.parser import HTMLParser
@@ -60,6 +63,43 @@ class _Article(HTMLParser):
             self.buf.append(data)
 
 
+async def _instagram_metadata(url: str) -> dict[str, Any]:
+    """Try yt-dlp's Instagram extractor, including carousel entries, without downloading media."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "yt_dlp", "--dump-single-json", "--skip-download",
+        "--no-warnings", "--no-playlist", "--socket-timeout", "12", url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=45)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("Instagram: истекло время получения публикации")
+    if proc.returncode:
+        raise RuntimeError("Instagram: не удалось получить медиа: " +
+                           err.decode(errors="replace")[-180:])
+    try:
+        info = json.loads(out)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Instagram вернул некорректные метаданные") from exc
+    entries = info.get("entries") or [info]
+    images: list[str] = []
+    for entry in entries[:20]:
+        if not isinstance(entry, dict):
+            continue
+        # For carousel images, yt-dlp exposes the image URL as the entry URL.
+        candidate = entry.get("url") if entry.get("ext") in ("jpg", "jpeg", "png", "webp") else None
+        candidate = candidate or entry.get("thumbnail")
+        if isinstance(candidate, str) and candidate.startswith("https://"):
+            images.append(candidate)
+    return {
+        "title": str(info.get("title") or ""),
+        "text": str(info.get("description") or ""),
+        "images": list(dict.fromkeys(images))[:20],
+    }
+
+
 async def fetch(url: str) -> dict[str, Any]:
     """{"url", "title", "text", "image", "video", "thumb"} — пост Telegram (через веб-версию) или статья сайта;
     thumb — маленькая обложка видео, которое веб-версия Telegram не отдаёт."""
@@ -85,9 +125,19 @@ async def fetch(url: str) -> dict[str, Any]:
     if INSTAGRAM.fullmatch(url):
         description = unescape(parser.meta.get("og:description", ""))
         title = unescape(parser.meta.get("og:title", ""))
-        if not description and not title:
-            raise RuntimeError("Instagram не предоставил содержимое. Пришли видео или скриншоты публикации.")
         pictures = list(dict.fromkeys(parser.images))[:8]
+        # Instagram's OpenGraph usually exposes only the first carousel image.
+        # Use yt-dlp metadata to discover remaining public slides.
+        try:
+            extra = await _instagram_metadata(url)
+            description = extra["text"] or description
+            title = extra["title"] or title
+            pictures = list(dict.fromkeys(extra["images"] + pictures))[:20]
+        except Exception:
+            if not description and not title and not pictures:
+                raise
+        if not description and not title and not pictures:
+            raise RuntimeError("Instagram не предоставил содержимое публикации")
         return {"url": url, "title": title, "text": description[:TEXT_MAX],
                 "image": pictures[0] if pictures else None,
                 "video": _direct_video(parser.meta.get("og:video:url") or parser.meta.get("og:video") or ""),
