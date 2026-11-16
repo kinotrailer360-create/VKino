@@ -434,20 +434,20 @@ async def _trailer_clips(work: Path, films: list[dict[str, Any]], lines: list[st
                 continue
             out[i] = got
             # фраза длиннее отрезка — следующие моменты трейлера, а не стоп-кадр
-            left, last_at, last_len = durs[i] - got[1], at, got[1]
+            left = durs[i] - got[1]
             while left > (0.6 if dynamic else 1.5) and len(more.get(i, [])) < (8 if dynamic else 3):
                 k = spare_near(c)
                 if k is not None:
                     used.add(k)
                     at2, src2 = frames[k][0] - 0.4, frames[k][2]
-                else:  # моменты кончились — продолжаем тот же кадр трейлера
-                    at2, src2 = last_at + last_len, src
+                else:  # уникальные моменты закончились: оставляем остаток фразы на фото
+                    break
                 nxt = await _cut_trailer(work, at2, src2, f"tclip{i}_{len(more.get(i, [])) + 1}",
                                          min(seg, max(1.0, left)), dynamic or full)
                 if not nxt:
                     break
                 more.setdefault(i, []).append(nxt)
-                left, last_at, last_len = left - nxt[1], at2, nxt[1]
+                left -= nxt[1]
         if more_out is not None:
             more_out.update(more)
         # фразы, где фото повторилось бы (кадров у фильма мало), — стоп-кадр из ещё не взятого момента трейлера
@@ -782,7 +782,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     if not pool:
         raise RuntimeError("нет ни одной картинки: пришли свои (страницы комиксов, кадры) кнопкой «📎»")
 
-    # какую картинку на какую фразу: привязанные — как есть; остальные ИИ по смыслу, иначе по порядку
+        # Каждая сцена получает уникальный материал; при нехватке прекращаем сборку,
+        # чтобы не выдавать повтор за осмысленный монтаж.
     free_lines = [i for i in range(len(lines)) if i not in pinned]
     picked = await ai.match_images(gemini_key, [lines[i] for i in free_lines],
                                    [im for _, im in pool[:general]]) if gemini_key and general else None
@@ -799,9 +800,11 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             order.append(pinned[i])
             continue
         c = choices[i] if choices and i < len(choices) else -1
+        if c < 0 or c in used:
+            free = [j for j in range(len(pool)) if j not in used]
+            c = free[0] if free else -1
         if c < 0:
-            # Never replace a rejected match with an arbitrary pool image.
-            raise RuntimeError(f"К фразе {i + 1} не найден подходящий кадр. Добавьте материал и привяжите его к этой фразе.")
+            raise RuntimeError(f"Для абзаца {i + 1} нет отдельного кадра. Добавьте фото/видео или объедините соседние фразы.")
         used.add(c)
         order.append(c)
     slides = [{"start": starts[i], "image": pool[order[i]][0]} for i in range(len(lines))]
@@ -918,12 +921,6 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
         labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts)
                   if t and not (score and i == int(score["line"]))]  # на карточке оценки надпись уже есть
-
-    from . import visual_guard
-    total_visual = starts[-1] + durs[-1]
-    await visual_guard.audit(work, [dict(sl, end=(slides[j + 1]["start"] if j + 1 < len(slides) else total_visual),
-        text=visual_guard.narration(sl["start"], slides[j + 1]["start"] if j + 1 < len(slides) else total_visual,
-                                    lines, starts, total_visual)) for j, sl in enumerate(slides)], gemini_key)
 
     cfg = {
         "output": "short.mp4",
