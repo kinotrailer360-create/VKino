@@ -680,7 +680,10 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             failed("Gemini", exc, "Gemini не ответил")
     if RESERVE_KEY and not skip("reserve"):
         try:
-            result = await asyncio.wait_for(_ask_reserve(prompt, image, reserve_max_tokens), RESERVE_BUDGET)
+            reserve_call = (_ask_reserve(prompt, image)
+                            if reserve_max_tokens == RESERVE_MAX_OUTPUT_TOKENS
+                            else _ask_reserve(prompt, image, reserve_max_tokens))
+            result = await asyncio.wait_for(reserve_call, RESERVE_BUDGET)
             log.info("shorts: reserve AI (%s) answered", RESERVE_MODEL)
             last_engine = "reserve"
             return result
