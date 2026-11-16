@@ -14070,6 +14070,7 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
     Список часто только на постере — картинки поста (и присланные фото) тоже показываем ИИ."""
     texts = []
     image_urls: list[str] = []
+    source_errors: list[str] = []
     for url in urls:
         try:
             src = await shorts_linkfetch.fetch(url)
@@ -14078,13 +14079,18 @@ async def make_link_list_post(bot: Bot, chat_id: int, raw: str, urls: list[str],
                 [src["image"]] if src.get("image") else [])
         except Exception as exc:  # noqa: BLE001
             logging.info("List link %s failed: %s", url, exc)
+            source_errors.append(str(exc)[:160])
     rest = URL_RE.sub("", raw).strip()
     if rest:
         texts.append(rest)
     material = "\n\n".join(t for t in texts if t.strip())
     images = list(photos or []) + await _web_images(list(dict.fromkeys(image_urls)), 8)
     if len(material) < 20 and not images:
-        raise RuntimeError("не получилось прочитать ссылку — вставь список фильмов текстом")
+        reason = source_errors[0] if source_errors else "Источник не вернул текст и изображения"
+        if any(shorts_linkfetch.INSTAGRAM.fullmatch(u) for u in urls):
+            raise RuntimeError("Instagram не предоставил материалы публикации: " + reason
+                               + ". Пришли скриншоты карусели или видео файлом — бот распознает список.")
+        raise RuntimeError("Не получилось прочитать ссылку: " + reason)
     try:
         plan = await shorts_ai.extract_plan(GEMINI_API_KEY, material, max_films=10)
     except shorts_ai.AIError:
