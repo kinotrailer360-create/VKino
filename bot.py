@@ -9008,6 +9008,13 @@ async def shorts_panel(
     if data == "sh:menu":
         await state.clear()
         await show(SHORTS_MENU_TEXT, shorts_menu())
+    elif data == "sh:remix:done":
+        draft = await state.get_data()
+        if not draft.get("remix_assets"):
+            await message.answer("Сначала пришли хотя бы одно фото или видео.")
+            return
+        await state.clear()
+        _run_job(lambda: remix_visual_job(message, draft))
     elif data == "sh:remix":
         await state.clear()
         await show("✂️ <b>Перемонтировать своё видео</b>\n\nВыбери, что менять. Исходник останется нетронутым.",
@@ -10708,7 +10715,9 @@ async def remix_source(message: Message, state: FSMContext) -> None:
         _run_job(lambda: remix_visual_job(message,data))
     else:
         await state.set_state(RemixState.assets)
-        await message.answer("Добавляй свои фото/видео по одному. Когда закончишь — отправь /done. ИИ проверит соответствие сцен.")
+        await message.answer("Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
 
 @router.message(RemixState.text, F.text)
 async def remix_text(message: Message,state: FSMContext)->None:
@@ -10726,7 +10735,9 @@ async def remix_text(message: Message,state: FSMContext)->None:
         _run_job(lambda: remix_visual_job(message,data))
     else:
         await state.set_state(RemixState.assets)
-        await message.answer("Теперь добавляй свои фото/видео для нового видеоряда. Закончив, отправь /done.")
+        await message.answer("Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                 [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
 
 @router.message(RemixState.assets, F.photo | F.video | F.document)
 async def remix_asset(message: Message,state: FSMContext)->None:
@@ -10742,7 +10753,9 @@ async def remix_asset(message: Message,state: FSMContext)->None:
     path=work/f"asset_{len(data.get('remix_assets',[])):03d}{ext}"
     await message.bot.download(media.file_id,destination=path)
     assets=data.get("remix_assets",[]);assets.append(str(path));await state.update_data(remix_assets=assets)
-    await message.answer(f"Материал добавлен ({len(assets)}). Ещё отправь или /done.")
+    await message.answer(f"✅ Добавлено материалов: {len(assets)}. Можно прислать ещё или закончить.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
 
 @router.message(RemixState.assets, Command("done"))
 async def remix_done(message: Message,state: FSMContext)->None:
@@ -10778,7 +10791,19 @@ async def remix_visual_job(message: Message,data: dict[str,Any])->None:
         await message.answer_video(FSInputFile(out),caption=caption)
         await wait.delete()
     except Exception as exc:
-        await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:350])}</code>")
+        error = _safe_err(exc)
+        if "ИИ не создал кадр для сцены" in error:
+            match = re.search(r"сцены (\d+)", error)
+            scene = f" {match.group(1)}" if match else ""
+            await wait.edit_text(
+                f"⚠️ <b>Не удалось создать ИИ-кадр для сцены{scene}.</b>\n\n"
+                "Генератор изображений сейчас не ответил или достиг лимита. Попробуй позже. "
+                "Открой «Перемонтировать своё видео» и выбери «Мои фото/видео» или «Мои + кадры ИИ». "
+                "Исходник не изменён.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [_btn("🔁 Выбрать источник кадров", "sh:remix")]]))
+        else:
+            await wait.edit_text(f"❌ Не получилось: <code>{escape(error[:350])}</code>")
 
 @router.callback_query(F.data.startswith("cs:"))
 async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
@@ -10849,6 +10874,7 @@ post_lock = asyncio.Lock()
 
 
 class PostState(StatesGroup):
+    manual = State()
     media = State()
     narrate = State()
     edit = State()
@@ -11637,6 +11663,7 @@ def posts_menu() -> InlineKeyboardMarkup:
     rows = [[_btn(f"{HOLIDAYS[k][0]}: подборка к празднику", f"pt:l:h:{k}")]
             for k in holidays_now(datetime.now(MSK).date())]
     rows.append([_btn("📰 Свежая новость", "pt:make"), _btn("⚡ Инсайды раньше всех", "pt:fast")])
+    rows.append([_btn("✍️ Написать свой пост", "pt:manual")])
     rows += [[_btn(POST_SECTIONS[a][0] + " ▸", f"pt:sec:{a}"), _btn(POST_SECTIONS[b][0] + " ▸", f"pt:sec:{b}")]
              for a, b in (("news", "lists"), ("dates", "fun"))]
     rows.append([_btn(POST_SECTIONS["promo"][0] + " ▸", "pt:sec:promo")])
@@ -13825,6 +13852,12 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     message, action = callback.message, (callback.data or "")[3:]
     chat_id = message.chat.id
     kind, _, arg = action.partition(":")
+    if action == "manual":
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PostState.manual)
+        await message.answer("✍️ Напиши текст поста. Я сохраню его как черновик; затем можно будет добавить фото/видео, отредактировать текст, опубликовать сейчас или поставить в расписание.\n\n/cancel — отмена.")
+        return
     if kind == "vis" and arg.isdigit():
         await callback.answer()
         await show_scene_review(message.bot, chat_id, int(arg))
@@ -14795,6 +14828,24 @@ async def post_set_media(bot: Bot, chat_id: int, first: int, new: list[dict[str,
         reply_markup=post_keyboard(ids[0], yt=bool(meta.get("yt"))))
 
 
+@router.message(PostState.manual, F.text, ~F.text.startswith("/"))
+async def manual_post_text(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    raw = re.sub(r"\s*🎬 KinoMir360 \| YouTube( \| KinoMir360 в MAX)?\s*$", "", raw).strip()
+    if not raw:
+        await message.answer("Пришли текст поста или нажми /cancel.")
+        return
+    if len(raw) > 3800:
+        await message.answer("Текст слишком длинный. Сократи его до 3800 символов и пришли заново.")
+        return
+    await state.clear()
+    preview = await message.answer(escape(raw) + SIGNATURE, disable_web_page_preview=True)
+    await offer_post(message.bot, message.chat.id, [preview.message_id], "text",
+                     what="Твой пост сохранён как черновик")
+
 @router.message(PostState.edit, F.text, ~F.text.startswith("/"))
 async def post_edit_text(message: Message, state: FSMContext) -> None:
     first = (await state.get_data()).get("post_first")
@@ -14802,7 +14853,15 @@ async def post_edit_text(message: Message, state: FSMContext) -> None:
     if not first:
         return
     meta = await _post_meta(message.chat.id, first)
-    caption = post_caption(message.text or "")
+    new_text = (message.text or "").strip()
+    if meta.get("kind") == "text" or meta.get("text_id"):
+        new_text = re.sub(r"\s*🎬 KinoMir360 \| YouTube( \| KinoMir360 в MAX)?\s*$", "", new_text).strip()
+        if len(new_text) > 3800:
+            await message.answer("Текст слишком длинный. Сократи его до 3800 символов.")
+            return
+        caption = escape(new_text) + SIGNATURE
+    else:
+        caption = post_caption(new_text)
     try:
         if meta["kind"] == "text":
             await message.bot.edit_message_text(caption, chat_id=message.chat.id,
