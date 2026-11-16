@@ -106,7 +106,7 @@ async def pick(query: str, phrase: str, gemini_key: str) -> bytes | None:
         if choice and 0 <= choice[0] < len(cands):
             order.remove(choice[0])
             order.insert(0, choice[0])
-        elif choice is not None:
+        else:
             return None  # ИИ посмотрел: ни одна не подходит
         for k in order[:3]:
             try:
@@ -126,3 +126,4 @@ async def pick(query: str, phrase: str, gemini_key: str) -> bytes | None:
             except Exception:  # noqa: BLE001
                 continue
     return None
+

@@ -1904,6 +1904,10 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
              "boom_slide": boom_slide, "intro_live": intro_live}
     voice, starts, voiced, spans = await synthesize(lines, work)
     voice_meta = dict(last_voice)
+    from . import visual_guard
+    visual_end = starts[-1] + float(spans[-1]["speech"])
+    await visual_guard.audit(work, [dict(card, text=lines[i + 1], start=starts[i + 1],
+        end=starts[i + 2] if i + 2 < len(starts) else visual_end) for i, card in enumerate(cards)])
     plan_path: str | None = None
     if scene_plan:
         rerun["scene_plan_enabled"] = True
@@ -1960,6 +1964,9 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         for c in cfg["cards"]:
             c.pop("clip", None)
             c.pop("overlay", None)
+        await visual_guard.audit(work, [dict(card, text=lines[i + 1], start=starts[i + 1],
+            end=starts[i + 2] if i + 2 < len(starts) else visual_end) for i, card in enumerate(cfg["cards"])],
+            name="visual_review_fallback")
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
         await _progress(50, "Монтаж встал — собираю без отрывков трейлеров")
         await _run_render(cfg_path, "Монтаж без отрывков")
@@ -2842,3 +2849,4 @@ async def _list_short(work: Path, theme: Theme, films: list[dict[str, Any]], mus
     if not voiced or tts_note:
         result.seo["warning"] = no_voice_note(voiced)
     return result
+

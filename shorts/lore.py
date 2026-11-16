@@ -794,16 +794,14 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         choices[i] = c
     used: set[int] = set(pinned.values())
     order: list[int] = []
-    nxt = 0
     for i in range(len(lines)):
         if i in pinned:
             order.append(pinned[i])
             continue
         c = choices[i] if choices and i < len(choices) else -1
-        if c < 0 or c in used:
-            free = [j for j in range(len(pool)) if j not in used]
-            c = free[0] if free else nxt % (general or len(pool))
-            nxt += 1
+        if c < 0:
+            # Never replace a rejected match with an arbitrary pool image.
+            raise RuntimeError(f"К фразе {i + 1} не найден подходящий кадр. Добавьте материал и привяжите его к этой фразе.")
         used.add(c)
         order.append(c)
     slides = [{"start": starts[i], "image": pool[order[i]][0]} for i in range(len(lines))]
@@ -920,6 +918,12 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
         labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts)
                   if t and not (score and i == int(score["line"]))]  # на карточке оценки надпись уже есть
+
+    from . import visual_guard
+    total_visual = starts[-1] + durs[-1]
+    await visual_guard.audit(work, [dict(sl, end=(slides[j + 1]["start"] if j + 1 < len(slides) else total_visual),
+        text=visual_guard.narration(sl["start"], slides[j + 1]["start"] if j + 1 < len(slides) else total_visual,
+                                    lines, starts, total_visual)) for j, sl in enumerate(slides)], gemini_key)
 
     cfg = {
         "output": "short.mp4",
@@ -1284,3 +1288,4 @@ async def write_own(text: str, tmdb_key: str, heading: str = "") -> dict[str, An
             "score": score, "name": name, "en": "", "title": title, "lines": lines,
             "hashtags": [], "films": films, "article": "сценарий автора", "url": "", "missing": missing,
             "images": list(dict.fromkeys(images))[:MAX_IMAGES]}
+
