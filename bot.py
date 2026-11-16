@@ -10492,16 +10492,18 @@ async def _state_photos(message: Message, state: FSMContext) -> list[Image.Image
 
 async def custom_text_go(message: Message, state: FSMContext, text: str) -> None:
     link = shorts_linkfetch.TG_POST.search(text)
-    if link and len(text.strip()) - len(link.group(0)) < 40 and shorts_ai.available(GEMINI_API_KEY):
+    instagram_link = next((u for u in URL_RE.findall(text) if shorts_linkfetch.INSTAGRAM.fullmatch(u.rstrip(").,>"))), None)
+    source_url = link.group(0) if link else instagram_link
+    if source_url and len(text.strip()) - len(source_url) < 40 and shorts_ai.available(GEMINI_API_KEY):
         # ссылка на пост Telegram: берём его текст и картинки (список фильмов часто только на постере)
         await state.set_state(None)
         wait = await message.answer("🔗 Открываю пост…")
         try:
-            post = await shorts_linkfetch.fetch(link.group(0))
+            post = await shorts_linkfetch.fetch(source_url)
         except Exception as exc:  # noqa: BLE001
             await state.set_state(CustomState.text)
             await wait.edit_text(f"❌ Пост не открылся: <code>{escape(_safe_err(exc)[:300])}</code>\n"
-                                 "Перешли сам пост боту или пришли скриншот.")
+                                 "Пришли видео, сам пост или скриншоты публикации.")
             return
         urls = [m["image"] for m in post.get("media") or [] if m.get("image")] or (
             [post["image"]] if post.get("image") else [])
