@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import json
+from urllib.parse import urlparse
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any
@@ -14,6 +16,7 @@ from . import netsafe, tgsearch
 HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/120.0 Mobile Safari/537.36", "Accept-Language": "ru,en;q=0.8"}
 TEXT_MAX = 6000
+INSTAGRAM = re.compile(r"^https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+/?(?:\?[^#]*)?$", re.I)
 TG_POST = re.compile(r"(?:https?://)?t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,31})/(\d+)")
 
 
@@ -26,6 +29,7 @@ class _Article(HTMLParser):
         super().__init__()
         self.meta: dict[str, str] = {}
         self.paras: list[str] = []
+        self.images: list[str] = []
         self.skip = 0
         self.in_p = 0
         self.buf: list[str] = []
@@ -34,6 +38,8 @@ class _Article(HTMLParser):
         a = dict(attrs)
         if tag == "meta":
             key = (a.get("property") or a.get("name") or "").lower()
+            if key == "og:image" and a.get("content"):
+                self.images.append(str(a["content"]))
             if key in ("og:title", "og:description", "og:image", "og:video", "og:video:url", "twitter:image"):
                 self.meta.setdefault(key, str(a.get("content") or ""))
         elif tag in self.SKIP:
@@ -58,6 +64,8 @@ class _Article(HTMLParser):
 async def fetch(url: str) -> dict[str, Any]:
     """{"url", "title", "text", "image", "video", "thumb"} — пост Telegram (через веб-версию) или статья сайта;
     thumb — маленькая обложка видео, которое веб-версия Telegram не отдаёт."""
+    if "instagram.com" in (urlparse(url).hostname or "").lower() and not INSTAGRAM.fullmatch(url):
+        raise RuntimeError("Поддерживаются только публичные Instagram-публикации и Reels")
     timeout = aiohttp.ClientTimeout(total=25)
     async with netsafe.safe_session(timeout=timeout, headers=HEADERS) as session:
         m = TG_POST.search(url)
@@ -75,6 +83,16 @@ async def fetch(url: str) -> dict[str, Any]:
         html, _ = await netsafe.fetch_page(session, url)
     parser = _Article()
     parser.feed(html)
+    if INSTAGRAM.fullmatch(url):
+        description = unescape(parser.meta.get("og:description", ""))
+        title = unescape(parser.meta.get("og:title", ""))
+        if not description and not title:
+            raise RuntimeError("Instagram не предоставил содержимое. Пришли видео или скриншоты публикации.")
+        pictures = list(dict.fromkeys(parser.images))[:8]
+        return {"url": url, "title": title, "text": description[:TEXT_MAX],
+                "image": pictures[0] if pictures else None,
+                "video": _direct_video(parser.meta.get("og:video:url") or parser.meta.get("og:video") or ""),
+                "media": [{"image": img} for img in pictures], "source": "instagram"}
     text = "\n".join(parser.paras)[:TEXT_MAX] or parser.meta.get("og:description", "")
     if not text and not parser.meta.get("og:title"):
         raise RuntimeError("на странице не нашлось текста")
