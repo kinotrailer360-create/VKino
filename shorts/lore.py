@@ -22,7 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageEnhance, ImageOps
 
-from . import ai, clips, daily, library, project, pronounce, tmdb
+from . import ai, clips, daily, library, project, pronounce, tmdb, visual_guard
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -921,6 +921,19 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
         labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts)
                   if t and not (score and i == int(score["line"]))]  # на карточке оценки надпись уже есть
+
+    # Сверяем каждый реально назначенный кадр с речью до рендера; сбой ИИ не считается одобрением.
+    await _progress(48, "Проверяю соответствие кадров тексту")
+    voice_total = await daily._duration(voice)
+    review_scenes = []
+    for index, slide in enumerate(slides):
+        start = float(slide["start"])
+        end = float(slides[index + 1]["start"]) if index + 1 < len(slides) else voice_total
+        asset = {key: value for key, value in slide.items() if key in ("image", "clip", "offset")}
+        asset.update({"start": start, "end": end,
+                      "text": visual_guard.narration(start, end, lines, starts, voice_total)})
+        review_scenes.append(asset)
+    await visual_guard.audit(work, review_scenes, gemini_key)
 
     cfg = {
         "output": "short.mp4",

@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from . import ai, daily
+from . import ai, daily, visual_guard
 
 
 async def run(*args: str) -> str:
@@ -134,6 +134,14 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         stills[c].save(frame, quality=92)
         seconds = max(.5, float(phrase.get("end") or 0) - float(phrase.get("start") or 0))
         selected.append((frame, seconds))
+
+    review_scenes = []
+    for i, (frame, seconds) in enumerate(selected):
+        phrase = phrases[i]
+        review_scenes.append({"image": frame.name, "text": texts[i],
+                              "start": float(phrase.get("start") or 0),
+                              "end": float(phrase.get("end") or seconds)})
+    await visual_guard.audit(work, review_scenes, key, name="remix_visual_review")
 
     listing = work / "scenes.txt"
     listing.write_text("\n".join(f"file '{p.name}'\nduration {seconds:.3f}"
