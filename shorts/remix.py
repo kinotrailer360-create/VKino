@@ -197,8 +197,14 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             raise ValueError("Не удалось распознать речь. Проверь аудио или выбери замену только озвучки.")
         total = await duration(work / "source.mp3")
 
-    if assets_mode in {"ai", "mix"}:
-        phrases = limit_phrases(phrases, total_duration=total)
+    # Rebuild a complete timeline from start to end of the narration/audio.
+    # AI-assisted modes are capped at eight scenes; user-media mode keeps its
+    # phrase count but fills leading, internal, and trailing pauses as well.
+    phrases = limit_phrases(
+        phrases,
+        limit=MAX_AI_REMIX_SCENES if assets_mode in {"ai", "mix"} else len(phrases),
+        total_duration=total,
+    )
     texts = [str(p.get("text") or p.get("ru") or "").strip() for p in phrases]
     if not texts:
         raise ValueError("В ролике не найдены сцены для видеоряда.")
@@ -536,4 +542,10 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         "-af", "acompressor=threshold=0.20:ratio=3:attack=5:release=180:makeup=1",
         "-movflags", "+faststart", str(output),
     )
+    rendered_seconds = await duration(output)
+    if abs(rendered_seconds - total) > 1.0:
+        raise RuntimeError(
+            f"Длительность черновика {rendered_seconds:.1f} с не совпала "
+            f"с озвучкой {total:.1f} с. Черновик не отправлен, чтобы не выдавать обрезанный ролик."
+        )
     return output
