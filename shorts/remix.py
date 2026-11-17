@@ -280,63 +280,82 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                     continue
             available.append((candidate_index, candidate, start_at))
 
-        async def generate_fallback() -> dict[str, Any] | None:
-            if assets_mode not in {"ai", "mix"}:
-                return None
-            try:
-                raw = await ai.generate_illustration(key, text)
-                if not raw:
-                    return None
-                with Image.open(io.BytesIO(raw)) as im:
-                    image = im.convert("RGB").copy()
-                    if visually_repeats(image, used_visuals):
-                        return None
-                    return {"kind": "image", "image": image}
-            except Exception as exc:  # generator/provider failures must not discard supplied footage
-                log.warning("shorts remix: illustration fallback failed for scene %s: %s", scene_number, exc)
-                return None
-
         async def reserve_unused_video() -> tuple[int, dict[str, Any], float] | None:
-            # The sampled-frame anchors can all collide even when unused footage
-            # remains. Find a real free interval and use its midpoint as a new
-            # candidate; this keeps every source interval unique.
+            # If no full-length anchor remains, assemble this narrative scene from
+            # several free, non-overlapping pieces of the uploaded videos.
             free_gaps: list[tuple[float, Path, float]] = []
             for video_path, length in video_durations.items():
                 cursor = 0.0
                 occupied = sorted(used_ranges.get(video_path, []))
                 for used_start, used_end in occupied:
-                    if used_start - cursor + 0.001 >= scene_seconds:
+                    if used_start > cursor:
                         free_gaps.append((used_start - cursor, video_path, cursor))
                     cursor = max(cursor, used_end)
-                if length - cursor + 0.001 >= scene_seconds:
+                if length > cursor:
                     free_gaps.append((length - cursor, video_path, cursor))
-            # Best-fit first leaves longer free runs for later, longer scenes.
+            # Use short gaps first so longer continuous takes stay available.
             free_gaps.sort(key=lambda item: item[0])
-            for _, video_path, clip_start in free_gaps:
-                sample_at = clip_start + scene_seconds / 2
-                frame_path = work / f"free_scene_{scene_number:03d}_{len(candidates):03d}.jpg"
-                try:
-                    await run(
-                        "ffmpeg", "-v", "error", "-y", "-ss", f"{sample_at:.3f}",
-                        "-i", str(video_path), "-frames:v", "1", "-vf", "scale=640:-2",
-                        str(frame_path),
-                    )
-                    with Image.open(frame_path) as im:
-                        picture = im.convert("RGB").copy()
-                    frame_path.unlink(missing_ok=True)
-                    if visually_repeats(picture, used_visuals):
-                        continue
-                except Exception as exc:  # try another free run if one file is unreadable
-                    log.warning("shorts remix: free footage sample failed: %s", exc)
-                    frame_path.unlink(missing_ok=True)
+
+            segments: list[dict[str, Any]] = []
+            remaining = scene_seconds
+            for gap_length, video_path, gap_start in free_gaps:
+                if remaining <= 0.03:
+                    break
+                take = min(gap_length, remaining)
+                if take < 0.15:
                     continue
-                candidate = {
-                    "kind": "video", "image": picture, "path": video_path,
-                    "timestamp": sample_at, "duration": video_durations[video_path],
-                }
-                candidates.append(candidate)
-                return len(candidates) - 1, candidate, clip_start
-            return None
+                segments.append({
+                    "path": video_path, "start": gap_start, "seconds": take,
+                })
+                remaining -= take
+            if remaining > 0.08 or not segments:
+                return None
+
+            pieces: list[Path] = []
+            for piece_index, segment in enumerate(segments):
+                piece = work / f"free_scene_{scene_number:03d}_{piece_index:02d}.mp4"
+                await run(
+                    "ffmpeg", "-v", "error", "-y", "-ss", f"{segment['start']:.3f}",
+                    "-i", str(segment["path"]), "-t", f"{segment['seconds']:.3f}",
+                    "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,"
+                           "pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25",
+                    "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                    "-pix_fmt", "yuv420p", "-r", "25", str(piece),
+                )
+                pieces.append(piece)
+
+            piece_list = work / f"free_scene_{scene_number:03d}.txt"
+            piece_list.write_text(
+                "\n".join(f"file '{piece.name}'" for piece in pieces) + "\n",
+                encoding="utf-8",
+            )
+            assembled = work / f"free_scene_{scene_number:03d}_assembled.mp4"
+            await run(
+                "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "1",
+                "-i", str(piece_list), "-c", "copy", str(assembled),
+            )
+            frame_path = work / f"free_scene_{scene_number:03d}_sample.jpg"
+            try:
+                await run(
+                    "ffmpeg", "-v", "error", "-y", "-ss", f"{scene_seconds / 2:.3f}",
+                    "-i", str(assembled), "-frames:v", "1", "-vf", "scale=640:-2",
+                    str(frame_path),
+                )
+                with Image.open(frame_path) as im:
+                    picture = im.convert("RGB").copy()
+            finally:
+                frame_path.unlink(missing_ok=True)
+            if visually_repeats(picture, used_visuals):
+                # Source time is still reserved below; do not reuse a visually
+                # duplicate shot as a different scene.
+                return None
+            candidate = {
+                "kind": "video", "image": picture, "path": assembled,
+                "timestamp": scene_seconds / 2, "duration": scene_seconds,
+                "source_segments": segments,
+            }
+            candidates.append(candidate)
+            return len(candidates) - 1, candidate, 0.0
 
         candidate_index = -1
         candidate: dict[str, Any] | None = None
@@ -370,34 +389,35 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 candidate_index, candidate, start_at = available[retry_index]
                 matched_by_ai = True
 
-        # Use any remaining uploaded image/clip before asking an image generator.
+        # Use an unused uploaded photo or clip before assembling fallback footage.
         if candidate is None and available:
             candidate_index, candidate, start_at = available[0]
 
-        # If the sampled frame anchors ran out, allocate a fresh non-overlapping
-        # window from unused footage before treating generation as a fallback.
+        # Sample anchors can run out before the actual source footage does. Search
+        # every unused interval and stitch distinct pieces if no single take fits.
         if candidate is None:
             reserved = await reserve_unused_video()
             if reserved is not None:
                 candidate_index, candidate, start_at = reserved
 
         if candidate is None:
-            generated = await generate_fallback()
-            if generated is not None:
-                candidates.append(generated)
-                candidate_index = len(candidates) - 1
-                candidate = generated
-            else:
-                raise ValueError(
-                    f"Для сцены {scene_number} не осталось свободного видео или фото, "
-                    "а запасной кадр ИИ сейчас недоступен."
-                )
+            raise ValueError(
+                f"Для сцены {scene_number} не осталось уникальных фото или видеофрагментов. "
+                "Добавь ещё материал или сократи ролик."
+            )
 
         used_candidates.add(candidate_index)
         used_visuals.append(candidate["image"])
         if candidate["kind"] == "video":
             end_at = start_at + scene_seconds
-            used_ranges.setdefault(candidate["path"], []).append((start_at, end_at))
+            source_segments = candidate.get("source_segments")
+            if source_segments:
+                for segment in source_segments:
+                    used_ranges.setdefault(segment["path"], []).append(
+                        (segment["start"], segment["start"] + segment["seconds"])
+                    )
+            else:
+                used_ranges.setdefault(candidate["path"], []).append((start_at, end_at))
         else:
             end_at = float(phrase.get("end") or scene_seconds)
 
