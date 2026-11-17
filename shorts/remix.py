@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageStat
 
 from . import ai, daily, visual_guard
 
@@ -76,43 +76,48 @@ def split_caption_chunks(text: str, max_chars: int = 52) -> list[str]:
     return chunks or [""]
 
 
+def visually_repeats(image: Image.Image, previous: list[Image.Image], threshold: float = 2.5) -> bool:
+    """Reject almost identical sampled frames, even when they came from different timestamps."""
+    sample = image.convert("RGB").resize((32, 56))
+    for old in previous:
+        other = old.convert("RGB").resize((32, 56))
+        difference = ImageChops.difference(sample, other).convert("L")
+        if ImageStat.Stat(difference).mean[0] < threshold:
+            return True
+    return False
+
+
 def render_caption_card(text: str, output: Path) -> None:
-    """Draw a clean, high-contrast vertical-video subtitle card with bundled fonts."""
+    """Draw bold, readable subtitles with words only and no panel or frame."""
     canvas = Image.new("RGBA", (720, 1280), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    font_path = Path(__file__).parent / "assets" / "Montserrat.ttf"
-    size = 42
+    font_path = Path(__file__).parent / "assets" / "Oswald.ttf"
+    size = 58
     lines: list[str] = []
-    while size >= 28:
+    while size >= 42:
         font = ImageFont.truetype(str(font_path), size=size)
         lines = []
         for word in str(text or "").split():
             candidate = f"{lines[-1]} {word}".strip() if lines else word
-            if lines and draw.textbbox((0, 0), candidate, font=font)[2] > 600:
+            if lines and draw.textbbox((0, 0), candidate, font=font, stroke_width=3)[2] > 636:
                 lines.append(word)
             elif lines:
                 lines[-1] = candidate
             else:
                 lines.append(candidate)
-        if len(lines) <= 4:
+        if len(lines) <= 3:
             break
         size -= 2
 
-    line_height = int(size * 1.28)
-    panel_height = max(126, 52 + line_height * len(lines))
-    top = 1110 - panel_height
-    draw.rounded_rectangle(
-        (30, top, 690, 1110), radius=28,
-        fill=(7, 12, 24, 218), outline=(70, 211, 255, 205), width=3,
-    )
-    draw.rounded_rectangle((48, top + 24, 56, 1110 - 24), radius=4, fill=(70, 211, 255, 255))
+    line_height = int(size * 1.18)
+    y = 930 - line_height * len(lines) // 2
     font = ImageFont.truetype(str(font_path), size=size)
-    y = top + (panel_height - line_height * len(lines)) // 2
-    for line_index, line in enumerate(lines):
-        color = (255, 211, 92, 255) if line_index == 0 else (255, 255, 255, 255)
-        box = draw.textbbox((0, 0), line, font=font, stroke_width=1)
+    for line in lines:
+        box = draw.textbbox((0, 0), line, font=font, stroke_width=3)
         x = (720 - (box[2] - box[0])) // 2
-        draw.text((x, y), line, font=font, fill=color, stroke_width=2, stroke_fill=(0, 0, 0, 210))
+        # Strong black outline preserves contrast on bright and dark footage.
+        draw.text((x, y), line, font=font, fill=(255, 255, 255, 255),
+                  stroke_width=4, stroke_fill=(0, 0, 0, 255))
         y += line_height
     canvas.save(output)
 
@@ -247,6 +252,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     batch_matches = await ai.match_images(key, texts, [item["image"] for item in candidates])
     used_candidates: set[int] = set()
     used_ranges: dict[Path, list[tuple[float, float]]] = {}
+    used_visuals: list[Image.Image] = []
     selected: list[dict[str, Any]] = []
 
     for scene_number, (phrase, text) in enumerate(zip(phrases, texts), 1):
@@ -256,7 +262,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         )
         available: list[tuple[int, dict[str, Any], float]] = []
         for candidate_index, candidate in enumerate(candidates):
-            if candidate_index in used_candidates:
+            if candidate_index in used_candidates or visually_repeats(candidate["image"], used_visuals):
                 continue
             start_at = 0.0
             if candidate["kind"] == "video":
@@ -282,7 +288,10 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 if not raw:
                     return None
                 with Image.open(io.BytesIO(raw)) as im:
-                    return {"kind": "image", "image": im.convert("RGB").copy()}
+                    image = im.convert("RGB").copy()
+                    if visually_repeats(image, used_visuals):
+                        return None
+                    return {"kind": "image", "image": image}
             except Exception as exc:  # generator/provider failures must not discard supplied footage
                 log.warning("shorts remix: illustration fallback failed for scene %s: %s", scene_number, exc)
                 return None
@@ -315,6 +324,8 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                     with Image.open(frame_path) as im:
                         picture = im.convert("RGB").copy()
                     frame_path.unlink(missing_ok=True)
+                    if visually_repeats(picture, used_visuals):
+                        continue
                 except Exception as exc:  # try another free run if one file is unreadable
                     log.warning("shorts remix: free footage sample failed: %s", exc)
                     frame_path.unlink(missing_ok=True)
@@ -383,6 +394,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 )
 
         used_candidates.add(candidate_index)
+        used_visuals.append(candidate["image"])
         if candidate["kind"] == "video":
             end_at = start_at + scene_seconds
             used_ranges.setdefault(candidate["path"], []).append((start_at, end_at))
@@ -502,6 +514,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     await run(
         "ffmpeg", "-v", "error", "-y", "-i", str(silent), "-i", str(audio),
         "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", "copy", "-c:a", "aac",
+        "-af", "acompressor=threshold=0.20:ratio=3:attack=5:release=180:makeup=1",
         "-movflags", "+faststart", str(output),
     )
     return output
