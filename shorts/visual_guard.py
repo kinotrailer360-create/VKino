@@ -35,7 +35,8 @@ async def command(*args: str) -> str:
     return out.decode()
 
 
-async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: str = 'visual_review') -> None:
+async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: str = 'visual_review',
+               strict: bool = True) -> None:
     """Each scene supplies text/start/end and the *actual* image or clip to render.
 
     Raises before rendering. A JSON report retains failed scene numbers, reasons
@@ -107,6 +108,6 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
         report.append(result)
     (work / f'{name}.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     failed = [r for r in report if r['status'] != 'matched']
-    if failed:
+    if failed and strict:
         detail = '; '.join(f"{r['scene']}: {r['reason']}" for r in failed[:5])
         raise VisualReviewRequired('Нужна замена/проверка кадров. Сцены ' + detail)

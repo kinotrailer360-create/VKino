@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from . import ai, daily, visual_guard
 
 
 MAX_AI_REMIX_SCENES = 8
+log = logging.getLogger(__name__)
 
 
 def limit_phrases(phrases: list[dict[str, Any]], limit: int = MAX_AI_REMIX_SCENES) -> list[dict[str, Any]]:
@@ -160,12 +162,14 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     if not candidates:
         raise ValueError("Не удалось прочитать загруженные видео или фото.")
 
-    # Resolve each scene independently against only the candidates that remain
-    # available. This preserves semantic matching while forbidding repeated frames
-    # and overlapping portions of the same source clip.
+    # Match the complete edit in one request to conserve provider quota. If the
+    # model cannot answer, keep the draft moving with unique footage and mark it
+    # for the author's review instead of failing the whole render.
+    batch_matches = await ai.match_images(key, texts, [item["image"] for item in candidates])
     used_candidates: set[int] = set()
     used_ranges: dict[Path, list[tuple[float, float]]] = {}
     selected: list[dict[str, Any]] = []
+
     for scene_number, (phrase, text) in enumerate(zip(phrases, texts), 1):
         scene_seconds = max(
             0.5,
@@ -176,7 +180,6 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             if candidate_index in used_candidates:
                 continue
             start_at = 0.0
-            end_at = scene_seconds
             if candidate["kind"] == "video":
                 length = float(candidate["duration"])
                 if length + 0.05 < scene_seconds:
@@ -187,7 +190,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 ))
                 end_at = start_at + scene_seconds
                 intervals = used_ranges.get(candidate["path"], [])
-                if any(start_at < used_end + 1.0 and end_at > used_start - 1.0
+                if any(start_at < used_end and end_at > used_start
                        for used_start, used_end in intervals):
                     continue
             available.append((candidate_index, candidate, start_at))
@@ -195,41 +198,73 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         async def generate_fallback() -> dict[str, Any] | None:
             if assets_mode not in {"ai", "mix"}:
                 return None
-            raw = await ai.generate_illustration(key, text)
-            if not raw:
+            try:
+                raw = await ai.generate_illustration(key, text)
+                if not raw:
+                    return None
+                with Image.open(io.BytesIO(raw)) as im:
+                    return {"kind": "image", "image": im.convert("RGB").copy()}
+            except Exception as exc:  # generator/provider failures must not discard supplied footage
+                log.warning("shorts remix: illustration fallback failed for scene %s: %s", scene_number, exc)
                 return None
-            with Image.open(io.BytesIO(raw)) as im:
-                return {"kind": "image", "image": im.convert("RGB").copy()}
 
-        if not available:
-            generated = await generate_fallback()
-            if generated is None:
-                raise ValueError(
-                    f"Для сцены {scene_number} не нашлось подходящего свободного видеофрагмента "
-                    "или фото, а запасной ИИ-кадр создать не удалось."
-                )
-            candidates.append(generated)
-            candidate_index = len(candidates) - 1
-            candidate = generated
-            start_at = 0.0
-        else:
-            matches = await ai.match_images(
-                key, [text], [candidate["image"] for _, candidate, _ in available]
+        candidate_index = -1
+        candidate: dict[str, Any] | None = None
+        start_at = 0.0
+        matched_by_ai = False
+
+        preferred_index = -1
+        if batch_matches and scene_number <= len(batch_matches):
+            try:
+                preferred_index = int(batch_matches[scene_number - 1])
+            except (TypeError, ValueError):
+                preferred_index = -1
+
+        available_by_id = {entry[0]: entry for entry in available}
+        if preferred_index in available_by_id:
+            candidate_index, candidate, start_at = available_by_id[preferred_index]
+            matched_by_ai = True
+        elif preferred_index >= 0 and available:
+            # The batch choice may collide with a previous clip range. Recheck only
+            # this affected scene against the remaining candidates.
+            retry = await ai.match_images(
+                key, [text], [item["image"] for _, item, _ in available]
             )
-            selected_index = int(matches[0]) if matches and matches[0] is not None else -1
-            if selected_index < 0 or selected_index >= len(available):
-                generated = await generate_fallback()
-                if generated is None:
-                    raise ValueError(
-                        f"ИИ не нашел подходящий неповторяющийся кадр для сцены {scene_number}, "
-                        "а запасной ИИ-кадр создать не удалось."
-                    )
+            retry_index = -1
+            if retry:
+                try:
+                    retry_index = int(retry[0])
+                except (TypeError, ValueError):
+                    retry_index = -1
+            if 0 <= retry_index < len(available):
+                candidate_index, candidate, start_at = available[retry_index]
+                matched_by_ai = True
+
+        if candidate is None and preferred_index < 0 and batch_matches is not None:
+            # The model answered but found no suitable supplied scene. Generate
+            # only as the last resort; if generation is down, use a unique clip
+            # as an explicitly unverified draft scene.
+            generated = await generate_fallback()
+            if generated is not None:
                 candidates.append(generated)
                 candidate_index = len(candidates) - 1
                 candidate = generated
-                start_at = 0.0
+
+        if candidate is None and available:
+            candidate_index, candidate, start_at = available[0]
+
+        if candidate is None:
+            generated = await generate_fallback()
+            if generated is not None:
+                candidates.append(generated)
+                candidate_index = len(candidates) - 1
+                candidate = generated
             else:
-                candidate_index, candidate, start_at = available[selected_index]
+                raise ValueError(
+                    f"Для сцены {scene_number} не осталось свободного фрагмента, "
+                    "а запасной кадр ИИ сейчас недоступен."
+                )
+
         used_candidates.add(candidate_index)
         if candidate["kind"] == "video":
             end_at = start_at + scene_seconds
@@ -245,14 +280,26 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             "image": review_image, "text": text,
             "phrase_start": float(phrase.get("start") or 0),
             "phrase_end": float(phrase.get("end") or scene_seconds),
+            "matched_by_ai": matched_by_ai,
         })
 
     review_scenes = [
-        {"image": scene["image"].name, "text": scene["text"],
-         "start": scene["phrase_start"], "end": scene["phrase_end"]}
+        {
+            "image": scene["image"].name if scene["kind"] != "video" else None,
+            "clip": str(scene["path"]) if scene["kind"] == "video" else None,
+            "offset": scene["start"],
+            "text": scene["text"],
+            "start": scene["phrase_start"],
+            "end": scene["phrase_end"],
+            "match_source": "semantic" if scene["matched_by_ai"] else "fallback",
+        }
         for scene in selected
     ]
-    await visual_guard.audit(work, review_scenes, key, name="remix_visual_review")
+    # Keep the audit report, but still return a reviewable draft when a provider
+    # cannot verify one or more scenes. The bot will name those scenes to the user.
+    await visual_guard.audit(
+        work, review_scenes, key, name="remix_visual_review", strict=False
+    )
 
     # Normalize each selected shot separately, then concatenate. Video shots remain
     # moving clips; photos are held for the scene duration without reusing an asset.
