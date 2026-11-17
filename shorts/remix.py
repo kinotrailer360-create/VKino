@@ -287,6 +287,46 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 log.warning("shorts remix: illustration fallback failed for scene %s: %s", scene_number, exc)
                 return None
 
+        async def reserve_unused_video() -> tuple[int, dict[str, Any], float] | None:
+            # The sampled-frame anchors can all collide even when unused footage
+            # remains. Find a real free interval and use its midpoint as a new
+            # candidate; this keeps every source interval unique.
+            free_gaps: list[tuple[float, Path, float]] = []
+            for video_path, length in video_durations.items():
+                cursor = 0.0
+                occupied = sorted(used_ranges.get(video_path, []))
+                for used_start, used_end in occupied:
+                    if used_start - cursor + 0.001 >= scene_seconds:
+                        free_gaps.append((used_start - cursor, video_path, cursor))
+                    cursor = max(cursor, used_end)
+                if length - cursor + 0.001 >= scene_seconds:
+                    free_gaps.append((length - cursor, video_path, cursor))
+            # Best-fit first leaves longer free runs for later, longer scenes.
+            free_gaps.sort(key=lambda item: item[0])
+            for _, video_path, clip_start in free_gaps:
+                sample_at = clip_start + scene_seconds / 2
+                frame_path = work / f"free_scene_{scene_number:03d}_{len(candidates):03d}.jpg"
+                try:
+                    await run(
+                        "ffmpeg", "-v", "error", "-y", "-ss", f"{sample_at:.3f}",
+                        "-i", str(video_path), "-frames:v", "1", "-vf", "scale=640:-2",
+                        str(frame_path),
+                    )
+                    with Image.open(frame_path) as im:
+                        picture = im.convert("RGB").copy()
+                    frame_path.unlink(missing_ok=True)
+                except Exception as exc:  # try another free run if one file is unreadable
+                    log.warning("shorts remix: free footage sample failed: %s", exc)
+                    frame_path.unlink(missing_ok=True)
+                    continue
+                candidate = {
+                    "kind": "video", "image": picture, "path": video_path,
+                    "timestamp": sample_at, "duration": video_durations[video_path],
+                }
+                candidates.append(candidate)
+                return len(candidates) - 1, candidate, clip_start
+            return None
+
         candidate_index = -1
         candidate: dict[str, Any] | None = None
         start_at = 0.0
@@ -319,18 +359,16 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 candidate_index, candidate, start_at = available[retry_index]
                 matched_by_ai = True
 
-        if candidate is None and preferred_index < 0 and batch_matches is not None:
-            # The model answered but found no suitable supplied scene. Generate
-            # only as the last resort; if generation is down, use a unique clip
-            # as an explicitly unverified draft scene.
-            generated = await generate_fallback()
-            if generated is not None:
-                candidates.append(generated)
-                candidate_index = len(candidates) - 1
-                candidate = generated
-
+        # Use any remaining uploaded image/clip before asking an image generator.
         if candidate is None and available:
             candidate_index, candidate, start_at = available[0]
+
+        # If the sampled frame anchors ran out, allocate a fresh non-overlapping
+        # window from unused footage before treating generation as a fallback.
+        if candidate is None:
+            reserved = await reserve_unused_video()
+            if reserved is not None:
+                candidate_index, candidate, start_at = reserved
 
         if candidate is None:
             generated = await generate_fallback()
@@ -340,7 +378,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 candidate = generated
             else:
                 raise ValueError(
-                    f"Для сцены {scene_number} не осталось свободного фрагмента, "
+                    f"Для сцены {scene_number} не осталось свободного видео или фото, "
                     "а запасной кадр ИИ сейчас недоступен."
                 )
 
