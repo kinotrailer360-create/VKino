@@ -1907,7 +1907,9 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     from . import visual_guard
     visual_end = starts[-1] + float(spans[-1]["speech"])
     await visual_guard.audit(work, [dict(card, text=lines[i + 1], start=starts[i + 1],
-        end=starts[i + 2] if i + 2 < len(starts) else visual_end) for i, card in enumerate(cards)])
+        end=starts[i + 2] if i + 2 < len(starts) else visual_end,
+        match_source="semantic" if (card.get("visual_match") or {}).get("status") == "matched" else "fallback")
+        for i, card in enumerate(cards)], strict=False)
     plan_path: str | None = None
     if scene_plan:
         rerun["scene_plan_enabled"] = True
@@ -1965,8 +1967,10 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
             c.pop("clip", None)
             c.pop("overlay", None)
         await visual_guard.audit(work, [dict(card, text=lines[i + 1], start=starts[i + 1],
-            end=starts[i + 2] if i + 2 < len(starts) else visual_end) for i, card in enumerate(cfg["cards"])],
-            name="visual_review_fallback")
+            end=starts[i + 2] if i + 2 < len(starts) else visual_end,
+            match_source="semantic" if (card.get("visual_match") or {}).get("status") == "matched" else "fallback")
+            for i, card in enumerate(cfg["cards"])],
+            name="visual_review_fallback", strict=False)
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
         await _progress(50, "Монтаж встал — собираю без отрывков трейлеров")
         await _run_render(cfg_path, "Монтаж без отрывков")
