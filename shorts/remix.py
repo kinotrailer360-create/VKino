@@ -262,7 +262,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         )
         available: list[tuple[int, dict[str, Any], float]] = []
         for candidate_index, candidate in enumerate(candidates):
-            if candidate_index in used_candidates:
+            if candidate_index in used_candidates or visually_repeats(candidate["image"], used_visuals):
                 continue
             start_at = 0.0
             if candidate["kind"] == "video":
@@ -288,7 +288,10 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
                 if not raw:
                     return None
                 with Image.open(io.BytesIO(raw)) as im:
-                    image = im.convert("RGB").copy()\n                    if visually_repeats(image, used_visuals):\n                        return None\n                    return {"kind": "image", "image": image}
+                    image = im.convert("RGB").copy()
+                    if visually_repeats(image, used_visuals):
+                        return None
+                    return {"kind": "image", "image": image}
             except Exception as exc:  # generator/provider failures must not discard supplied footage
                 log.warning("shorts remix: illustration fallback failed for scene %s: %s", scene_number, exc)
                 return None
