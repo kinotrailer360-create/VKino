@@ -1925,7 +1925,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
                 card["caption"] = ""
             else:
                 card["karaoke"] = spans[i]
-    sfx = [[max(st - 0.15, 0), str(ASSETS / "whoosh.wav"), -6] for st in starts[1:]]
+    sfx = [[max(st - 0.15, 0), str(ASSETS / "whoosh.wav"), -16] for st in starts[1:]]
     if boom_slide is not None and boom_slide < len(starts):
         sfx.append([max(starts[boom_slide] - 0.05, 0), str(ASSETS / "boom.wav"), -5])
     cfg = {
