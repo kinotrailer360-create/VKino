@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from . import ai, daily, visual_guard
 
 
 MAX_AI_REMIX_SCENES = 8
+log = logging.getLogger(__name__)
 
 
 def limit_phrases(phrases: list[dict[str, Any]], limit: int = MAX_AI_REMIX_SCENES) -> list[dict[str, Any]]:
