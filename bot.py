@@ -10738,9 +10738,9 @@ async def remix_source(message: Message, state: FSMContext) -> None:
     else:
         await state.set_state(RemixState.assets)
         source_type = data.get("remix_source_type", "user")
-        prompt = ("Можешь добавить свои фото/видео. Сначала ИИ подберёт подходящие неповторяющиеся фрагменты; "
-                  "генерацию кадров включит только если подходящего материала не найдётся. "
-                  "Если ничего не добавлять, будет использован исходный ролик."
+        prompt = ("Добавь фото/видео: ИИ подберёт смысловые фрагменты из них без повторов. "
+                  "Новые изображения не генерируются; если материала не хватит, бот сообщит об этом. "
+                  "Если ничего не добавить, будет использован исходный ролик."
                   if source_type in {"ai", "mix"} else
                   "Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.")
         await message.answer(prompt,
@@ -10761,9 +10761,9 @@ async def remix_text(message: Message,state: FSMContext)->None:
     else:
         await state.set_state(RemixState.assets)
         source_type = data.get("remix_source_type", "user")
-        prompt = ("Можешь добавить свои фото/видео. Сначала ИИ подберёт подходящие неповторяющиеся фрагменты; "
-                  "генерацию кадров включит только если подходящего материала не найдётся. "
-                  "Если ничего не добавлять, будет использован исходный ролик."
+        prompt = ("Добавь фото/видео: ИИ подберёт смысловые фрагменты из них без повторов. "
+                  "Новые изображения не генерируются; если материала не хватит, бот сообщит об этом. "
+                  "Если ничего не добавить, будет использован исходный ролик."
                   if source_type in {"ai", "mix"} else
                   "Добавляй фото/видео для нового видеоряда. Когда закончишь, нажми кнопку ниже.")
         await message.answer(prompt,
@@ -10838,18 +10838,7 @@ async def remix_visual_job(message: Message,data: dict[str,Any])->None:
         await wait.delete()
     except Exception as exc:
         error = _safe_err(exc)
-        if "ИИ не создал кадр для сцены" in error:
-            match = re.search(r"сцены (\d+)", error)
-            scene = f" {match.group(1)}" if match else ""
-            await wait.edit_text(
-                f"⚠️ <b>Не удалось создать ИИ-кадр для сцены{scene}.</b>\n\n"
-                "Генератор изображений сейчас не ответил или достиг лимита. Попробуй позже. "
-                "Открой «Перемонтировать своё видео» и выбери «Мои фото/видео» или «Мои + кадры ИИ». "
-                "Исходник не изменён.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [_btn("🔁 Выбрать источник кадров", "sh:remix")]]))
-        else:
-            await wait.edit_text(f"❌ Не получилось: <code>{escape(error[:350])}</code>")
+        await wait.edit_text(f"❌ Не получилось: <code>{escape(error[:350])}</code>")
 
 @router.callback_query(F.data.startswith("cs:"))
 async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
