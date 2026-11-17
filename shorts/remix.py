@@ -196,7 +196,11 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         async def generate_fallback() -> dict[str, Any] | None:
             if assets_mode not in {"ai", "mix"}:
                 return None
-            raw = await ai.generate_illustration(key, text)
+            try:
+                raw = await ai.generate_illustration(key, text)
+            except Exception as exc:  # generator/provider failures must not discard supplied footage
+                log.warning("shorts remix: illustration fallback failed for scene %s: %s", scene_number, exc)
+                return None
             if not raw:
                 return None
             with Image.open(io.BytesIO(raw)) as im:
