@@ -15,6 +15,23 @@ class VisualReviewRequired(RuntimeError):
     pass
 
 
+def review_notice(report: list[dict[str, Any]]) -> str:
+    """Describe unavailable verification separately from rejected material."""
+    failed = [item for item in report if item.get('status') != 'matched']
+    groups = [('provider', 'Проверка ИИ недоступна для сцен'),
+              ('uncertain', 'ИИ не уверен в соответствии сцен'),
+              ('semantic', 'ИИ отметил возможное несоответствие сцен'),
+              ('media', 'Техническая проблема с материалом сцен')]
+    messages = []
+    for issue, label in groups:
+        rows = [item for item in failed if (item.get('issue') or 'provider') == issue]
+        if rows:
+            reasons = list(dict.fromkeys(str(row.get('reason') or '')[:170] for row in rows))
+            messages.append(label + ' ' + ', '.join(str(row.get('scene')) for row in rows)
+                            + '. ' + '; '.join(reasons[:2]))
+    return ('⚠️ ' + '\n'.join(messages) + '\nПроверь отмеченные фрагменты перед публикацией.') if messages else ''
+
+
 def narration(start: float, end: float, lines: list[str], starts: list[float], total: float) -> str:
     """All overlapping phrases, not just the phrase at a shot's midpoint."""
     ends = starts[1:] + [total]
@@ -36,7 +53,7 @@ async def command(*args: str) -> str:
 
 
 async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: str = 'visual_review',
-               strict: bool = True) -> None:
+               strict: bool = True, context: str = '') -> None:
     """Each scene supplies text/start/end and the *actual* image or clip to render.
 
     Raises before rendering. A JSON report retains failed scene numbers, reasons
@@ -50,7 +67,7 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
         path = work / str(scene.get('clip') or scene.get('image') or '')
         result = {'scene': index + 1, 'start': scene.get('start', 0), 'text': text,
                   'asset': str(path), 'match_source': scene.get('match_source', 'fallback'),
-                  'status': 'unverified', 'reason': ''}
+                  'status': 'unverified', 'reason': '', 'issue': ''}
         samples: list[Image.Image] = []
         scratch: list[Path] = []
         try:
@@ -66,7 +83,7 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                 length = float(probe['format']['duration'])
                 needed = float(scene['end']) - float(scene['start'])
                 offset = float(scene.get('offset', 0))
-                if not math.isfinite(offset) or not math.isfinite(length) or offset < 0 or length < offset + needed:
+                if not math.isfinite(offset) or not math.isfinite(length) or offset < 0 or length + .08 < offset + needed:
                     raise ValueError('Видео короче фразы: повтор/заморозка запрещены')
                 with path.open('rb') as source:
                     digest = hashlib.file_digest(source, 'sha256').hexdigest()
@@ -92,6 +109,16 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                     status='matched',
                     reason='Сцена выбрана семантическим подборщиком ИИ; дополнительная проверка пропущена',
                 )
+            elif context == 'remix':
+                # Review the shot jointly as an illustration, not as three news photos.
+                fits, reason = await ai.remix_media_fits(key, samples, text)
+                result.update(
+                    status='matched' if fits is True else 'rejected' if fits is False else 'unverified',
+                    reason=reason,
+                    issue='' if fits is True else 'semantic' if fits is False else
+                          'provider' if reason.startswith(('Проверка ИИ недоступна', 'Проверка недоступна'))
+                          else 'uncertain',
+                )
             else:
                 verdicts = []
                 for sample in samples:
@@ -102,13 +129,13 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                         cache[token] = await ai.media_fits(key, sample, text)
                     verdicts.append(cache[token])
                 if any(fits is False for fits, _ in verdicts):
-                    result.update(status='rejected', reason='; '.join(reason for fits, reason in verdicts if fits is False))
+                    result.update(status='rejected', issue='semantic', reason='; '.join(reason for fits, reason in verdicts if fits is False))
                 elif not verdicts or any(fits is not True for fits, _ in verdicts):
-                    result['reason'] = 'ИИ не подтвердил соответствие. Повторите проверку или замените материал'
+                    result.update(issue='provider', reason='ИИ не подтвердил соответствие. Повторите проверку или замените материал')
                 else:
                     result.update(status='matched', reason='Проверка ИИ; утверждение автора всё равно требуется')
         except (ValueError, OSError, KeyError, TypeError) as exc:
-            result.update(status='rejected', reason=str(exc)[:240])
+            result.update(status='rejected', issue='media', reason=str(exc)[:240])
         finally:
             for sample in samples:
                 sample.close()
