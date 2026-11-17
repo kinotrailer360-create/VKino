@@ -17,12 +17,16 @@ MAX_AI_REMIX_SCENES = 8
 log = logging.getLogger(__name__)
 
 
-def limit_phrases(phrases: list[dict[str, Any]], limit: int = MAX_AI_REMIX_SCENES) -> list[dict[str, Any]]:
-    """Merge adjacent transcript phrases into at most limit scenes, preserving timing and text."""
+def limit_phrases(
+    phrases: list[dict[str, Any]],
+    limit: int = MAX_AI_REMIX_SCENES,
+    total_duration: float | None = None,
+) -> list[dict[str, Any]]:
+    """Group narration into scenes and cover the complete audio timeline."""
     if limit < 1:
         raise ValueError("Лимит сцен должен быть больше нуля.")
-    if len(phrases) <= limit:
-        return [dict(phrase) for phrase in phrases]
+    if not phrases:
+        return []
 
     scene_count = min(limit, len(phrases))
     grouped: list[dict[str, Any]] = []
@@ -36,6 +40,22 @@ def limit_phrases(phrases: list[dict[str, Any]], limit: int = MAX_AI_REMIX_SCENE
             "end": float(chunk[-1].get("end") or chunk[-1].get("start") or 0),
             "text": text,
         })
+
+    if total_duration is None:
+        return grouped
+
+    full_duration = max(0.0, float(total_duration))
+    boundaries = [0.0]
+    for left, right in zip(grouped, grouped[1:]):
+        left_end = float(left.get("end") or left.get("start") or 0)
+        right_start = float(right.get("start") or left_end)
+        midpoint = (left_end + right_start) / 2
+        boundaries.append(max(boundaries[-1], min(full_duration, midpoint)))
+    boundaries.append(full_duration)
+
+    for index, scene in enumerate(grouped):
+        scene["start"] = boundaries[index]
+        scene["end"] = boundaries[index + 1]
     return grouped
 
 
@@ -113,9 +133,10 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         phrases = await transcribe(source, work, key)
         if not phrases:
             raise ValueError("Не удалось распознать речь. Проверь аудио или выбери замену только озвучки.")
+        total = await duration(work / "source.mp3")
 
     if assets_mode in {"ai", "mix"}:
-        phrases = limit_phrases(phrases)
+        phrases = limit_phrases(phrases, total_duration=total)
     texts = [str(p.get("text") or p.get("ru") or "").strip() for p in phrases]
     if not texts:
         raise ValueError("В ролике не найдены сцены для видеоряда.")
