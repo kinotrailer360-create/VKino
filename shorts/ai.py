@@ -625,14 +625,15 @@ RESERVE_BUDGET = 90  # с на ответ резервного ИИ
 
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
                         image: Image.Image | None = None, premium: bool = False,
-                        reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS) -> Any:
+                        reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS,
+                        paid_first: bool = False, paid_max_tokens: int = 4000) -> Any:
     """Порядок ИИ. Важное (premium) или режим «all» — сначала сильная модель Lumean (платно), потом Gemini и
     резервные. Остальное — бесплатные Gemini и Groq, а Lumean — только если они не ответили.
     Ошибка — с причинами всех."""
     errors = []
     # картинки в запросе, а листа для резервных моделей нет — сильной модели нечего показать, сразу Gemini
     blind = image is None and any("inline_data" in p for p in gemini_parts)
-    lumean_first = lumean_llm_on() and not blind and (premium or LUMEAN_MODE == "all")
+    lumean_first = lumean_llm_on() and not blind and (premium or paid_first or LUMEAN_MODE == "all")
 
     global last_engine
 
@@ -656,7 +657,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             return None
         # платная модель: длинное задание урезаем (середина), чтобы один запрос не стоил как десять; важному —
         # длинный ответ (сценарий выпуска из 7 новостей в 4000 токенов не влезал)
-        text, tokens = _fit(prompt, LUMEAN_MAX_CHARS), 12000 if premium else 4000
+        text, tokens = _fit(prompt, LUMEAN_MAX_CHARS), 12000 if premium else paid_max_tokens
         wait = lumean_timeout(text, tokens) + 10
         try:
             result = await asyncio.wait_for(_ask_lumean(text, image, tokens), wait)
@@ -1001,8 +1002,8 @@ async def match_images(key: str, texts: list[str], images: list[Image.Image]) ->
               "в жёлтом квадрате в углу кадра. " + task + "\n\n" + facts)
     try:
         data = await _with_reserve(
-            key, parts, prompt, _sheet(images) if RESERVE_KEY else None,
-            reserve_max_tokens=128,
+            key, parts, prompt, _sheet(images),
+            reserve_max_tokens=128, paid_first=True, paid_max_tokens=256,
         )
         raw = list(data["choices"])[: len(texts)]
     except Exception as exc:  # noqa: BLE001
@@ -2971,7 +2972,10 @@ async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | No
         "false}\n\nНОВОСТЬ:\n" + post[:1200])
     try:
         # сильная модель первой: слабая запасная пропускала чужие постеры («Мстители» к новости о «Рокки»)
-        data = await _with_reserve(key, [{"text": prompt}, _thumb(image, 768)], prompt, image, premium=True)
+        data = await _with_reserve(
+            key, [{"text": prompt}, _thumb(image, 768)], prompt, image,
+            premium=True, reserve_max_tokens=256,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI media_fits failed: %s", exc)
         return None, ""
