@@ -9054,7 +9054,7 @@ async def shorts_panel(
         await show("🎞 <b>Откуда взять кадры?</b>", InlineKeyboardMarkup(inline_keyboard=[
             [_btn("📂 Мои фото/видео", "sh:remix:assets:user")],
             [_btn("🤖 ИИ подберёт сцены из видео", "sh:remix:assets:ai")],
-            [_btn("🔀 Мои материалы + ИИ при нехватке", "sh:remix:assets:mix")],
+            [_btn("🔀 Мои материалы — умная нарезка", "sh:remix:assets:mix")],
             [_btn("⬅️ Назад", "sh:remix")]]))
     elif data.startswith("sh:remix:assets:"):
         source_type=data.rsplit(":",1)[1]
@@ -10824,14 +10824,10 @@ async def remix_visual_job(message: Message,data: dict[str,Any])->None:
             try:
                 import json as _json
                 report = _json.loads(review_path.read_text(encoding="utf-8"))
-                unchecked = [str(item.get("scene")) for item in report
-                             if item.get("status") != "matched"]
-                if unchecked:
-                    await message.answer(
-                        "⚠️ ИИ не смог подтвердить соответствие сцен "
-                        + ", ".join(unchecked[:8])
-                        + ". Я собрал черновик без повторов — проверь эти фрагменты перед публикацией."
-                    )
+                from shorts.visual_guard import review_notice
+                notice = review_notice(report)
+                if notice:
+                    await message.answer(escape(notice))
             except (OSError, ValueError, TypeError):
                 pass
         await message.answer_video(FSInputFile(out),caption=caption)

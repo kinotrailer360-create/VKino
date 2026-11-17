@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageStat
 
-from . import ai, daily, visual_guard
+from . import ai, daily, visual_guard, remix_captions
 
 
 MAX_AI_REMIX_SCENES = 8
@@ -180,7 +180,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         lines = [line.strip() for line in narration.splitlines() if line.strip()]
         if not lines:
             raise ValueError("Не найден текст новой озвучки.")
-        voice, _, ok, _ = await daily.synthesize(lines, work, careful=True)
+        voice, voice_starts, ok, voice_spans = await daily.synthesize(lines, work, careful=True)
         if not ok:
             raise RuntimeError("Не удалось создать новую озвучку.")
         total = await duration(voice)
@@ -195,7 +195,34 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         phrases = await transcribe(source, work, key)
         if not phrases:
             raise ValueError("Не удалось распознать речь. Проверь аудио или выбери замену только озвучки.")
-        total = await duration(work / "source.mp3")
+        # MP3 encoder padding is for recognition only, not extra narration time.
+        total = await duration(source)
+
+    # Caption timing must retain speech boundaries before scenes are grouped.
+    speech_phrases = [dict(phrase) for phrase in phrases]
+    timing_basis = "estimated"
+    word_marks: list[dict[str, Any]] = []
+    if voice:
+        word_marks = await daily.word_timeline(voice, voice_starts, voice_spans)
+        timing_basis = "voice_alignment"
+    else:
+        try:
+            heard = await ai.transcribe_words((work / "source.mp3").read_bytes())
+            if heard:
+                script = [(word, float(p["start"]), float(p["end"]))
+                          for p in speech_phrases
+                          for word in str(p.get("text") or p.get("ru") or "").split()]
+                word_marks = daily._align_words(script, heard)
+                timing_basis = "speech_recognition"
+        except Exception as exc:
+            log.warning("remix: word timing unavailable; original phrase timing: %s", exc)
+    if not word_marks:
+        word_marks = remix_captions.estimated_words(speech_phrases, total)
+    caption_events = remix_captions.caption_events(word_marks, total)
+    (work / "remix_caption_timing.json").write_text(
+        json.dumps({"basis": timing_basis, "events": caption_events}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     # Keep the edit at eight scenes or fewer and cover the full audio timeline,
     # including leading, internal, and trailing pauses, in every media mode.
@@ -251,7 +278,8 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     # Match the complete edit in one request to conserve provider quota. If the
     # model cannot answer, keep the draft moving with unique footage and mark it
     # for the author's review instead of failing the whole render.
-    batch_matches = await ai.match_images(key, texts, [item["image"] for item in candidates])
+    batch_matches = await ai.match_images(key, texts, [item["image"] for item in candidates], context="remix")
+    headlines = await ai.remix_headlines(key, texts)
     used_candidates: set[int] = set()
     used_ranges: dict[Path, list[tuple[float, float]]] = {}
     used_visuals: list[Image.Image] = []
@@ -379,7 +407,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             # The batch choice may collide with a previous clip range. Recheck only
             # this affected scene against the remaining candidates.
             retry = await ai.match_images(
-                key, [text], [item["image"] for _, item, _ in available]
+                key, [text], [item["image"] for _, item, _ in available], context="remix"
             )
             retry_index = -1
             if retry:
@@ -432,6 +460,8 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             "phrase_start": float(phrase.get("start") or 0),
             "phrase_end": float(phrase.get("end") or scene_seconds),
             "matched_by_ai": matched_by_ai,
+            "headline": headlines[scene_number - 1] if scene_number <= len(headlines)
+                        else remix_captions.fallback_headline(text),
         })
 
     review_scenes = [
@@ -449,16 +479,19 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     # Keep the audit report, but still return a reviewable draft when a provider
     # cannot verify one or more scenes. The bot will name those scenes to the user.
     await visual_guard.audit(
-        work, review_scenes, key, name="remix_visual_review", strict=False
+        work, review_scenes, key, name="remix_visual_review", strict=False, context="remix"
     )
 
-    # Render each scene with timed, high-contrast subtitles. Photos receive a
-    # subtle Ken Burns push-in so the finished short keeps moving between clips.
+    # Render footage separately from captions: a single ASS track avoids a new
+    # looped PNG input for every word and keeps caption time global and monotonic.
     selected_paths: list[Path] = []
     video_filter = (
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,"
-        "eq=contrast=1.035:saturation=1.06"
+        "[0:v]setpts=PTS-STARTPTS,split[bgsrc][fgsrc];"
+        "[bgsrc]scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280,boxblur=20:2,eq=brightness=-0.12[bg];"
+        "[fgsrc]scale=720:1280:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=25,"
+        "eq=contrast=1.035:saturation=1.06,format=yuv420p[outv]"
     )
     photo_filter = (
         "scale=820:1458:force_original_aspect_ratio=increase,"
@@ -468,52 +501,19 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     for index, scene in enumerate(selected):
         clip = work / f"scene_{index:03d}.mp4"
         seconds = float(scene["seconds"])
-        chunks = split_caption_chunks(scene["text"])
-        max_cards = max(1, min(5, int(seconds / 1.4)))
-        if len(chunks) > max_cards:
-            words = " ".join(chunks).split()
-            chunks = []
-            for start in range(0, len(words), (len(words) + max_cards - 1) // max_cards):
-                chunks.append(" ".join(words[start:start + (len(words) + max_cards - 1) // max_cards]))
-        caption_paths: list[Path] = []
-        weights = [max(1, len(chunk)) for chunk in chunks]
-        total_weight = sum(weights)
-        card_ranges: list[tuple[float, float]] = []
-        at = 0.0
-        for card_index, (chunk, weight) in enumerate(zip(chunks, weights)):
-            end_at = seconds if card_index == len(chunks) - 1 else at + seconds * weight / total_weight
-            caption = work / f"caption_{index:03d}_{card_index:02d}.png"
-            render_caption_card(chunk, caption)
-            caption_paths.append(caption)
-            card_ranges.append((at, end_at))
-            at = end_at
-
         command = ["ffmpeg", "-v", "error", "-y"]
         if scene["kind"] == "video":
             command += [
                 "-ss", f"{scene['start']:.3f}", "-i", str(scene["path"]),
             ]
-            base_filter = video_filter
+            filters = video_filter
         else:
             command += [
                 "-loop", "1", "-framerate", "25", "-i", str(scene["image"]),
             ]
-            base_filter = photo_filter
-        for caption in caption_paths:
-            command += ["-loop", "1", "-framerate", "25", "-t", f"{seconds:.3f}", "-i", str(caption)]
-
-        filters = [f"[0:v]{base_filter}[base]"]
-        current = "base"
-        for card_index, (caption, (start_at, end_at)) in enumerate(zip(caption_paths, card_ranges), 1):
-            target = f"cap{card_index}"
-            filters.append(
-                f"[{current}][{card_index}:v]overlay=0:0:"
-                f"enable='between(t,{start_at:.3f},{end_at:.3f})'[{target}]"
-            )
-            current = target
-        filters.append(f"[{current}]format=yuv420p[outv]")
+            filters = f"[0:v]{photo_filter},format=yuv420p[outv]"
         command += [
-            "-filter_complex", ";".join(filters), "-map", "[outv]",
+            "-filter_complex", filters, "-map", "[outv]",
             "-t", f"{seconds:.3f}", "-an", "-c:v", "libx264", "-preset", "veryfast",
             "-crf", "21", "-pix_fmt", "yuv420p", "-r", "25", str(clip),
         ]
@@ -528,14 +528,26 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     silent = work / "visual_draft.mp4"
     await run(
         "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "1", "-i", str(listing),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(silent),
+        "-c:v", "copy", "-an", str(silent),
     )
     audio = voice or work / "source_audio.m4a"
     if not voice:
         await run("ffmpeg", "-v", "error", "-y", "-i", str(source), "-vn", "-c:a", "aac", str(audio))
+    subtitles = work / "remix_subtitles.ass"
+    remix_captions.write_ass(subtitles, caption_events, selected)
+    # Escape filter metacharacters in both the work path and the font directory.
+    def filter_path(path: Path) -> str:
+        return str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
+
+    subtitle_filter = (
+        f"subtitles=filename='{filter_path(subtitles)}':"
+        f"fontsdir='{filter_path(Path(__file__).parent / 'assets')}'"
+    )
     await run(
         "ffmpeg", "-v", "error", "-y", "-i", str(silent), "-i", str(audio),
-        "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", "copy", "-c:a", "aac",
+        "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-t", f"{total:.3f}",
+        "-vf", subtitle_filter, "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-c:a", "aac",
         "-af", "acompressor=threshold=0.20:ratio=3:attack=5:release=180:makeup=1",
         "-movflags", "+faststart", str(output),
     )
