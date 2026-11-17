@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from . import ai, daily, visual_guard
 
@@ -57,6 +57,64 @@ def limit_phrases(
         scene["start"] = boundaries[index]
         scene["end"] = boundaries[index + 1]
     return grouped
+
+
+def split_caption_chunks(text: str, max_chars: int = 52) -> list[str]:
+    """Split a scene narration into short readable subtitle cards."""
+    words = str(text or "").split()
+    chunks: list[str] = []
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and len(candidate) > max_chars:
+            chunks.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks or [""]
+
+
+def render_caption_card(text: str, output: Path) -> None:
+    """Draw a clean, high-contrast vertical-video subtitle card with bundled fonts."""
+    canvas = Image.new("RGBA", (720, 1280), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    font_path = Path(__file__).parent / "assets" / "Montserrat.ttf"
+    size = 42
+    lines: list[str] = []
+    while size >= 28:
+        font = ImageFont.truetype(str(font_path), size=size)
+        lines = []
+        for word in str(text or "").split():
+            candidate = f"{lines[-1]} {word}".strip() if lines else word
+            if lines and draw.textbbox((0, 0), candidate, font=font)[2] > 600:
+                lines.append(word)
+            elif lines:
+                lines[-1] = candidate
+            else:
+                lines.append(candidate)
+        if len(lines) <= 4:
+            break
+        size -= 2
+
+    line_height = int(size * 1.28)
+    panel_height = max(126, 52 + line_height * len(lines))
+    top = 1110 - panel_height
+    draw.rounded_rectangle(
+        (30, top, 690, 1110), radius=28,
+        fill=(7, 12, 24, 218), outline=(70, 211, 255, 205), width=3,
+    )
+    draw.rounded_rectangle((48, top + 24, 56, 1110 - 24), radius=4, fill=(70, 211, 255, 255))
+    font = ImageFont.truetype(str(font_path), size=size)
+    y = top + (panel_height - line_height * len(lines)) // 2
+    for line_index, line in enumerate(lines):
+        color = (255, 211, 92, 255) if line_index == 0 else (255, 255, 255, 255)
+        box = draw.textbbox((0, 0), line, font=font, stroke_width=1)
+        x = (720 - (box[2] - box[0])) // 2
+        draw.text((x, y), line, font=font, fill=color, stroke_width=2, stroke_fill=(0, 0, 0, 210))
+        y += line_height
+    canvas.save(output)
 
 
 async def run(*args: str) -> str:
@@ -322,29 +380,72 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
         work, review_scenes, key, name="remix_visual_review", strict=False
     )
 
-    # Normalize each selected shot separately, then concatenate. Video shots remain
-    # moving clips; photos are held for the scene duration without reusing an asset.
+    # Render each scene with timed, high-contrast subtitles. Photos receive a
+    # subtle Ken Burns push-in so the finished short keeps moving between clips.
     selected_paths: list[Path] = []
     video_filter = (
         "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25"
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,"
+        "eq=contrast=1.035:saturation=1.06"
+    )
+    photo_filter = (
+        "scale=820:1458:force_original_aspect_ratio=increase,"
+        "crop=720:1280,zoompan=z='min(zoom+0.00018,1.06)':"
+        "d=1:s=720x1280:fps=25,setsar=1,eq=contrast=1.035:saturation=1.06"
     )
     for index, scene in enumerate(selected):
         clip = work / f"scene_{index:03d}.mp4"
+        seconds = float(scene["seconds"])
+        chunks = split_caption_chunks(scene["text"])
+        max_cards = max(1, min(5, int(seconds / 1.4)))
+        if len(chunks) > max_cards:
+            words = " ".join(chunks).split()
+            chunks = []
+            for start in range(0, len(words), (len(words) + max_cards - 1) // max_cards):
+                chunks.append(" ".join(words[start:start + (len(words) + max_cards - 1) // max_cards]))
+        caption_paths: list[Path] = []
+        weights = [max(1, len(chunk)) for chunk in chunks]
+        total_weight = sum(weights)
+        card_ranges: list[tuple[float, float]] = []
+        at = 0.0
+        for card_index, (chunk, weight) in enumerate(zip(chunks, weights)):
+            end_at = seconds if card_index == len(chunks) - 1 else at + seconds * weight / total_weight
+            caption = work / f"caption_{index:03d}_{card_index:02d}.png"
+            render_caption_card(chunk, caption)
+            caption_paths.append(caption)
+            card_ranges.append((at, end_at))
+            at = end_at
+
+        command = ["ffmpeg", "-v", "error", "-y"]
         if scene["kind"] == "video":
-            await run(
-                "ffmpeg", "-v", "error", "-y", "-ss", f"{scene['start']:.3f}",
-                "-i", str(scene["path"]), "-t", f"{scene['seconds']:.3f}",
-                "-vf", video_filter, "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-r", "25", str(clip),
-            )
+            command += [
+                "-ss", f"{scene['start']:.3f}", "-i", str(scene["path"]),
+            ]
+            base_filter = video_filter
         else:
-            await run(
-                "ffmpeg", "-v", "error", "-y", "-loop", "1", "-framerate", "25",
-                "-i", str(scene["image"]), "-t", f"{scene['seconds']:.3f}",
-                "-vf", video_filter, "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-r", "25", str(clip),
+            command += [
+                "-loop", "1", "-framerate", "25", "-i", str(scene["image"]),
+            ]
+            base_filter = photo_filter
+        for caption in caption_paths:
+            command += ["-loop", "1", "-framerate", "25", "-t", f"{seconds:.3f}", "-i", str(caption)]
+
+        filters = [f"[0:v]{base_filter}[base]"]
+        current = "base"
+        for card_index, (caption, (start_at, end_at)) in enumerate(zip(caption_paths, card_ranges), 1):
+            target = f"cap{card_index}"
+            filters.append(
+                f"[{current}][{card_index}:v]overlay=0:0:"
+                f"enable='between(t,{start_at:.3f},{end_at:.3f})'[{target}]"
             )
+            current = target
+        filters.append(f"[{current}]format=yuv420p[outv]")
+        command += [
+            "-filter_complex", ";".join(filters), "-map", "[outv]",
+            "-t", f"{seconds:.3f}", "-an", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "21", "-pix_fmt", "yuv420p", "-r", "25", str(clip),
+        ]
+        await run(*command)
         selected_paths.append(clip)
 
     listing = work / "scenes.txt"
