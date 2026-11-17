@@ -10794,6 +10794,21 @@ async def remix_visual_job(message: Message,data: dict[str,Any])->None:
                 data.get("remix_source_type","user"))
         caption=("Черновик: новый видеоряд и новая озвучка. Оригинал сохранён; перед публикацией проверь результат." if data.get("remix_mode")=="both"
                  else "Черновик: новый видеоряд и исходная озвучка. Оригинал сохранён; перед публикацией проверь результат.")
+        review_path = work / "remix_visual_review.json"
+        if review_path.is_file():
+            try:
+                import json as _json
+                report = _json.loads(review_path.read_text(encoding="utf-8"))
+                unchecked = [str(item.get("scene")) for item in report
+                             if item.get("status") != "matched"]
+                if unchecked:
+                    await message.answer(
+                        "⚠️ ИИ не смог подтвердить соответствие сцен "
+                        + ", ".join(unchecked[:8])
+                        + ". Я собрал черновик без повторов — проверь эти фрагменты перед публикацией."
+                    )
+            except (OSError, ValueError, TypeError):
+                pass
         await message.answer_video(FSInputFile(out),caption=caption)
         await wait.delete()
     except Exception as exc:
