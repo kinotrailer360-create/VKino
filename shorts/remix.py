@@ -197,13 +197,10 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             raise ValueError("Не удалось распознать речь. Проверь аудио или выбери замену только озвучки.")
         total = await duration(work / "source.mp3")
 
-    # Rebuild a complete timeline from start to end of the narration/audio.
-    # AI-assisted modes are capped at eight scenes; user-media mode keeps its
-    # phrase count but fills leading, internal, and trailing pauses as well.
+    # Keep the edit at eight scenes or fewer and cover the full audio timeline,
+    # including leading, internal, and trailing pauses, in every media mode.
     phrases = limit_phrases(
-        phrases,
-        limit=MAX_AI_REMIX_SCENES if assets_mode in {"ai", "mix"} else len(phrases),
-        total_duration=total,
+        phrases, limit=MAX_AI_REMIX_SCENES, total_duration=total,
     )
     texts = [str(p.get("text") or p.get("ru") or "").strip() for p in phrases]
     if not texts:
