@@ -49,7 +49,8 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
         text = str(scene.get('text') or '').strip()
         path = work / str(scene.get('clip') or scene.get('image') or '')
         result = {'scene': index + 1, 'start': scene.get('start', 0), 'text': text,
-                  'asset': str(path), 'status': 'unverified', 'reason': ''}
+                  'asset': str(path), 'match_source': scene.get('match_source', 'fallback'),
+                  'status': 'unverified', 'reason': ''}
         samples: list[Image.Image] = []
         scratch: list[Path] = []
         try:
@@ -84,20 +85,28 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                     sample = im.convert('RGB')
                     sample.thumbnail((768, 768))
                     samples.append(sample)
-            verdicts = []
-            for sample in samples:
-                data = io.BytesIO()
-                sample.save(data, 'PNG')
-                token = hashlib.sha256(data.getvalue() + text.encode()).hexdigest()
-                if token not in cache:
-                    cache[token] = await ai.media_fits(key, sample, text)
-                verdicts.append(cache[token])
-            if any(fits is False for fits, _ in verdicts):
-                result.update(status='rejected', reason='; '.join(reason for fits, reason in verdicts if fits is False))
-            elif not verdicts or any(fits is not True for fits, _ in verdicts):
-                result['reason'] = 'ИИ не подтвердил соответствие. Повторите проверку или замените материал'
+            if scene.get('match_source') == 'semantic':
+                # The scene matcher already compared this clip with the narration.
+                # Avoid a second expensive vision request for the same scene.
+                result.update(
+                    status='matched',
+                    reason='Сцена выбрана семантическим подборщиком ИИ; дополнительная проверка пропущена',
+                )
             else:
-                result.update(status='matched', reason='Проверка ИИ; утверждение автора всё равно требуется')
+                verdicts = []
+                for sample in samples:
+                    data = io.BytesIO()
+                    sample.save(data, 'PNG')
+                    token = hashlib.sha256(data.getvalue() + text.encode()).hexdigest()
+                    if token not in cache:
+                        cache[token] = await ai.media_fits(key, sample, text)
+                    verdicts.append(cache[token])
+                if any(fits is False for fits, _ in verdicts):
+                    result.update(status='rejected', reason='; '.join(reason for fits, reason in verdicts if fits is False))
+                elif not verdicts or any(fits is not True for fits, _ in verdicts):
+                    result['reason'] = 'ИИ не подтвердил соответствие. Повторите проверку или замените материал'
+                else:
+                    result.update(status='matched', reason='Проверка ИИ; утверждение автора всё равно требуется')
         except (ValueError, OSError, KeyError, TypeError) as exc:
             result.update(status='rejected', reason=str(exc)[:240])
         finally:
