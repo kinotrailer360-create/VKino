@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,54 @@ async def transcribe(source: Path, work: Path, key: str) -> list[dict[str, Any]]
     return await ai.transcribe_dub(key, audio.read_bytes(), await duration(source))
 
 
+async def publication_metadata(work: Path, key: str, narration: str | None = None) -> dict[str, str]:
+    """Prepare copyable YouTube metadata from the narration actually rendered."""
+    text = str(narration or '').strip()
+    if not text:
+        try:
+            phrases = json.loads((work / 'remix_narration.json').read_text(encoding='utf-8'))
+            text = ' '.join(str(p.get('text') or p.get('ru') or '').strip() for p in phrases)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    if not text:
+        try:
+            timing = json.loads((work / 'remix_caption_timing.json').read_text(encoding='utf-8'))
+            text = ' '.join(str(event.get('text') or '') for event in timing.get('events', []))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    first = re.split(r'[.!?\n]', text, maxsplit=1)[0].strip()
+    footer = '\n\nБольше кино: t.me/KinoMir360\n#Shorts #кино #KinoMir360'
+    seo = {
+        'title': ((first or 'Короткий ролик KinoMir360')[:90].rstrip() + ' #Shorts')[:100],
+        'description': (text[:2200].strip() or 'Кино с KinoMir360.') + footer,
+        'tags': 'кино, фильмы, KinoMir360, shorts',
+    }
+    if text and ai.available(key):
+        prompt = (
+            'Подготовь название и описание для готового YouTube Shorts канала KinoMir360. '
+            'Используй только содержание озвучки ниже: не добавляй факты, имена, оценки, даты или спойлеры. '
+            'Название на русском, цепляющее и точное, до 100 символов. Описание до 1800 символов, '
+            'кратко по теме, в конце t.me/KinoMir360 и 3–5 подходящих хэштегов. '
+            'Не используй Markdown-разметку. Теги через запятую до 400 символов. '
+            'Ответь JSON: {"title": "...", "description": "...", "tags": "..."}.\nОЗВУЧКА:\n' + text[:12000]
+        )
+        try:
+            data = await asyncio.wait_for(ai._with_reserve(
+                key, [{'text': prompt}], prompt, paid_first=True,
+                paid_max_tokens=800, reserve_max_tokens=800,
+            ), timeout=60)
+            for name, limit in [('title', 100), ('description', 2200), ('tags', 400)]:
+                value = data.get(name)
+                if isinstance(value, str) and value.strip():
+                    seo[name] = value.strip()[:limit]
+        except Exception as exc:
+            log.warning('remix: YouTube metadata uses narration fallback: %s', exc)
+    from .youtube_upload import no_links
+    seo['description'] = no_links(seo['description'])
+    (work / 'remix_seo.json').write_text(json.dumps(seo, ensure_ascii=False, indent=2), encoding='utf-8')
+    return seo
+
+
 async def replace_visuals(source: Path, assets: list[Path], output: Path, work: Path,
                           key: str, narration: str | None = None,
                           assets_mode: str = "user") -> Path:
@@ -200,6 +249,9 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
 
     # Caption timing must retain speech boundaries before scenes are grouped.
     speech_phrases = [dict(phrase) for phrase in phrases]
+    (work / 'remix_narration.json').write_text(
+        json.dumps(speech_phrases, ensure_ascii=False, indent=2), encoding='utf-8',
+    )
     timing_basis = "estimated"
     word_marks: list[dict[str, Any]] = []
     if voice:

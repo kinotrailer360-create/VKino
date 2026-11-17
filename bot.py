@@ -10797,13 +10797,37 @@ async def remix_done(message: Message,state: FSMContext)->None:
     await state.clear()
     _run_job(lambda: remix_visual_job(message,data))
 
+async def send_remix_ready(message: Message, output: Path, work: Path, caption: str,
+                           narration: str | None = None) -> None:
+    """Show the finished edit, copyable metadata, then the existing YouTube action."""
+    from shorts import remix as remix_engine
+    telegram_video = await _telegram_short_file(output)
+    sent = await message.answer_video(FSInputFile(telegram_video), caption=caption, supports_streaming=True)
+    seo = await remix_engine.publication_metadata(work, GEMINI_API_KEY, narration)
+    keep_for_upload(message.chat.id, sent.message_id, SimpleNamespace(video=output, seo=seo))
+    upload_path = READY_DIR / f"{message.chat.id}_{sent.message_id}.mp4"
+    available = upload_path.is_file() and upload_path.with_suffix('.json').is_file()
+    await message.answer(f"<b>Название для YouTube:</b>\n<pre>{escape(seo['title'])}</pre>")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("▶️ Опубликовать в YouTube", f"yt:{sent.message_id}")],
+    ]) if available else None
+    await message.answer(
+        f"<b>Описание для YouTube:</b>\n<pre>{escape(seo['description'])}</pre>",
+        reply_markup=keyboard,
+    )
+    if not available:
+        await message.answer("Не удалось сохранить файл для загрузки в YouTube. Ролик и текст выше доступны для скачивания и копирования.")
+
+
 async def remix_audio_job(message: Message,data: dict[str,Any])->None:
     from shorts import remix as remix_engine
     work=Path(data["remix_work"]);wait=await message.answer("🎙 Создаю новую озвучку…")
     try:
         async with shorts_lock:
             out=await remix_engine.replace_audio(Path(data["remix_source"]),data["remix_text"],work)
-        await message.answer_video(FSInputFile(out),caption="Черновик: новая озвучка, исходный видеоряд сохранён. Оригинал не изменён.")
+        await send_remix_ready(message, out, work,
+                               "Черновик: новая озвучка, исходный видеоряд сохранён. Оригинал не изменён.",
+                               data["remix_text"])
         await wait.delete()
     except Exception as exc:
         await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:350])}</code>")
@@ -10830,7 +10854,8 @@ async def remix_visual_job(message: Message,data: dict[str,Any])->None:
                     await message.answer(escape(notice))
             except (OSError, ValueError, TypeError):
                 pass
-        await message.answer_video(FSInputFile(out),caption=caption)
+        await send_remix_ready(message, out, work, caption,
+                               data.get("remix_text") if data.get("remix_mode") == "both" else None)
         await wait.delete()
     except Exception as exc:
         error = _safe_err(exc)
