@@ -11826,10 +11826,21 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                 seen += "\n\n🔎 <b>Не подтвердилось источниками новости — проверь:</b>\n" + "\n".join(
                     f"• {'❌ расходится' if f['status'] == 'conflict' else '⚠️ нет в источниках'}: "
                     f"«{escape(f['text'][:120])}»" + (f" — {escape(f['note'])}" if f.get("note") else "")
+                    + (f"\n  Источник: {escape(f['source'])}\n  «{escape(f['evidence'][:160])}»"
+                       if f.get("evidence") and f.get("source") else "")
                     for f in res["fact_flags"][:4])
             if res.get("unverified_names"):
                 seen += ("\n\n⚠️ Этих имён нет в источниках новости — проверь, не перепутал ли ИИ человека: "
                          + escape(", ".join(res["unverified_names"])))
+            if res.get("fact_comparison"):
+                labels = {"confirmed": "подтверждено", "single": "частично", "conflict": "расходится",
+                          "unverified": "не подтверждено"}
+                seen += "\n\n🧪 <b>Пилот Luna — расхождения</b>\n" + "\n".join(
+                    f"• «{escape(item['text'][:100])}» — текущая проверка: {labels[item['status']]}, "
+                    f"Luna: {labels[item['luna_status']]}. {escape(item['luna_note'][:100])}"
+                    + (f"\n  {escape(item['luna_source'])}: «{escape(item['luna_evidence'][:100])}»"
+                       if item["luna_evidence"] else "")
+                    for item in res["fact_comparison"][:2])
             for chat_id in chat_ids:
                 ids, kind = await _send_media(bot, chat_id, files, caption)
                 await offer_post(bot, chat_id, ids, kind, "pt:fast" if mode == "fast" else "pt:make",
