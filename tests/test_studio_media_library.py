@@ -1,5 +1,7 @@
 """Tests for safe project-scoped media selection; no paid AI or network."""
 import asyncio
+import shutil
+import subprocess
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -87,3 +89,34 @@ def test_no_library_is_safe_noop(tmp_path):
                                          {"mediaLibrary": [], "sourceUrls": []},
                                          tmp_path, ""))
     assert result is None
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="ffmpeg required")
+def test_real_ffmpeg_video_sampling_and_cutting(tmp_path):
+    """Exercise actual video files and FFmpeg, with model judgment mocked."""
+    from shorts import clips
+    source = tmp_path / "input.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=size=320x180:rate=15:duration=12",
+         "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p", str(source)],
+        check=True, timeout=30)
+    async def scenario():
+        async def always_fit(path, text, key):
+            return True
+        with patch.object(library.ai, "available", return_value=True), patch.object(
+            library, "matches", new=always_fit
+        ):
+            window = await library.choose_video(
+                source, {"text": "Тест", "duration": 3},
+                tmp_path / "analysis", "key")
+        assert window is not None
+        begin, end = window
+        assert 0 <= begin < end <= 12
+        assert end - begin == pytest.approx(6, abs=.1)
+        result = tmp_path / "cut.mp4"
+        await clips.cut_clip(source, result, begin, end - begin)
+        assert result.is_file() and result.stat().st_size > 1000
+        assert 4 <= await library.video_duration(result) <= 7
+    asyncio.run(scenario())
