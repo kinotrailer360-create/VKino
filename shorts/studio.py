@@ -65,6 +65,20 @@ def validate_job(data: Any) -> dict[str, Any]:
     for key, maximum in (("title", 180), ("input", 30000), ("script", 30000), ("sourceUrl", 2000)):
         if not isinstance(p.get(key, ""), str) or len(p.get(key, "")) > maximum:
             raise ValueError("Слишком длинный или неверный текст")
+    # Project-scoped uploads are references to the existing owner-controlled
+    # file store. Never accept paths or arbitrary file URLs in this field.
+    library = p.get("mediaLibrary", [])
+    if not isinstance(library, list) or len(library) > 20:
+        raise ValueError("Медиабиблиотека проекта: не больше 20 файлов")
+    for identifier in library:
+        uuid(identifier)
+    sources = p.get("sourceUrls", [])
+    if not isinstance(sources, list) or len(sources) > 5:
+        raise ValueError("Можно указать до 5 ссылок на видео")
+    from .studio_media_library import allowed_source
+    for url in sources:
+        if not isinstance(url, str) or len(url) > 2000 or not allowed_source(url):
+            raise ValueError("Используйте HTTPS-ссылки поддерживаемых видеоплощадок")
     scenes = p.get("scenes", [])
     if not isinstance(scenes, list) or len(scenes) > 100:
         raise ValueError("Не больше 100 абзацев")
@@ -136,7 +150,8 @@ class Studio:
         for method, path, fn in [("POST", "/pair", self.pair), ("GET", "/status", self.status),
                                   ("POST", "/disconnect", self.disconnect), ("POST", "/jobs", self.submit),
                                   ("GET", "/jobs/{id}", self.job), ("POST", "/files", self.upload),
-                                  ("POST", "/files/batch", self.upload_batch), ("GET", "/files/{id}", self.file),
+                                  ("POST", "/files/batch", self.upload_batch), ("GET", "/files", self.list_files),
+                                  ("GET", "/files/{id}", self.file),
                                   ("GET", "/inbox", self.inbox)]:
             async def route(request: web.Request, handler=fn) -> web.StreamResponse:
                 try:
@@ -263,6 +278,23 @@ class Studio:
         if not path.is_file():
             raise ValueError("Файл уже удалён. Загрузите его снова")
         return path, meta
+
+    async def list_files(self, request: web.Request) -> web.Response:
+        """List owner media for the multi-select picker, never another admin's."""
+        admin = await self.authenticate(request)
+        rows = await self.pool.fetch(
+            "SELECT id,metadata FROM studio_files WHERE admin_id=$1 "
+            "ORDER BY created_at DESC LIMIT 100", admin)
+        files = []
+        for row in rows:
+            metadata = obj(row["metadata"])
+            files.append({"id": str(row["id"]),
+                          "name": str(metadata.get("name") or "media")[:180],
+                          "mime": metadata.get("mime"),
+                          "size": metadata.get("size"),
+                          "hash": metadata.get("hash")})
+        return web.json_response({"files": files, "maxSelection": 20,
+                                  "maxFileBytes": MAX_FILE})
 
     async def upload(self, request: web.Request) -> web.Response:
         admin = await self.authenticate(request)
