@@ -30,6 +30,12 @@ KANG_PRESS_IMAGE = ("https://lumiere-a.akamaihd.net/v1/images/pcl3080_mp01_v001_
 KANG_LOGO_PAGE = "https://www.marvel.com/articles/movies/sdcc-2022-marvel-studios-avengers-the-kang-dynasty-announced"
 KANG_LOGO = "https://cdn.marvel.com/content/2x/sdcc_avengerskangdynasty.webp"
 
+DOOM_PRESS = "https://movies.disney.com/avengers-doomsday"
+DOOM_PRESS_IMAGE = "https://lumiere-a.akamaihd.net/v1/images/g_disneymovies_avengersdoomsday_dr_doom_6cc246af.jpeg"
+FEIGE_PHOTO_PAGE = "https://commons.wikimedia.org/wiki/File:Kevin_Feige_by_Gage_Skidmore.jpg"
+FEIGE_PHOTO = "https://upload.wikimedia.org/wikipedia/commons/1/1a/Kevin_Feige_by_Gage_Skidmore.jpg"
+FEIGE_CREDIT = "Фото: Gage Skidmore · CC BY-SA 3.0"
+
 SECTION = re.compile(r"(?m)^##\s+\d+\.\s+(.+)$")
 SCENE = re.compile(r"(?m)^###\s+Сцена\s+(\d+)\s*[—–-]\s*(.+)$", re.I)
 FIELD = re.compile(r"(?m)^(?:- )?\*\*([^*]+?):\*\*[ \t]*(.*)$")
@@ -323,6 +329,11 @@ async def verify_cut(path: Path, target: str, key: str, seconds: float) -> bool:
             image.close()
 
 
+def wants_still(target: str) -> bool:
+    return bool(re.search(r"логотип|портрет|\bфото\b|промокадр|официальн\w* образ|title reveal|press photo",
+                          target, re.I))
+
+
 def studio_still(target: str) -> tuple[str, str] | None:
     if is_quantumania_kang(target):
         return KANG_PRESS_IMAGE, KANG_PRESS
@@ -330,12 +341,22 @@ def studio_still(target: str) -> tuple[str, str] | None:
         r"the kang dynasty|династи[яию] канга", target, re.I
     ):
         return KANG_LOGO, KANG_LOGO_PAGE
+    if (re.search(r"доктор\w* дум|doctor doom|виктор\w* фон дум", target, re.I)
+            and re.search(r"судн\w* день|doomsday", target, re.I) and wants_still(target)):
+        return DOOM_PRESS_IMAGE, DOOM_PRESS
+    if re.search(r"кевин\w* файги|kevin feige", target, re.I) and wants_still(target):
+        return FEIGE_PHOTO, FEIGE_PHOTO_PAGE
     return None
 
 
 def still_ref(image: str, source: str) -> dict:
-    return {"id": "still:" + hashlib.sha256(image.split("?")[0].encode()).hexdigest()[:24],
-            "url": source, "kind": "still"}
+    ref = {"id": "still:" + hashlib.sha256(image.split("?")[0].encode()).hexdigest()[:24],
+           "url": source, "kind": "still"}
+    if source == FEIGE_PHOTO_PAGE:
+        ref["credit"] = FEIGE_CREDIT
+    elif source == DOOM_PRESS:
+        ref["credit"] = "Фото Marvel · проверь право использования перед публикацией"
+    return ref
 
 
 async def opened_still(session: aiohttp.ClientSession, url: str) -> Image.Image | None:
@@ -370,7 +391,13 @@ async def find_still(scene: dict, target: str, queries: list[str], key: str, use
         if known:
             ref = still_ref(*known)
             if ref["id"] not in seen:
-                image = await opened_still(session, known[0])
+                if known[1] == FEIGE_PHOTO_PAGE:
+                    async with netsafe.safe_session(timeout=session.timeout, headers={
+                        "User-Agent": "VKino/1.0 (https://github.com/kinotrailer360-create/VKino)"
+                    }) as commons_session:
+                        image = await opened_still(commons_session, known[0])
+                else:
+                    image = await opened_still(session, known[0])
                 if image:
                     return image, ref
 
@@ -429,7 +456,7 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         return []
     seconds = video_duration(scene, narration)
     part_duration = seconds if layout == "split" else math.ceil(seconds / len(targets) * 100) / 100
-    if len(targets) == 1 and any(word in targets[0].casefold() for word in ("карточка", "портрет", "официальное фото")):
+    if len(targets) == 1 and (wants_still(targets[0]) or "карточка" in targets[0].casefold()):
         return []
     refs, parts = [], []
     for j, target in enumerate(targets):
@@ -437,7 +464,7 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         is_graphic = bool(re.search(r"^(авторская|собственная|чистая авторская)\s", target, re.I))
         specific = queries[j::len(targets)] if len(targets) > 1 else queries
         piece = None
-        is_still = bool(re.search(r"логотип|портрет|официальное фото|title reveal", target, re.I))
+        is_still = wants_still(target)
         if not is_graphic and not is_still:
             try:
                 piece = await asyncio.wait_for(matching_clip(path.parent, stem, specific, target,
