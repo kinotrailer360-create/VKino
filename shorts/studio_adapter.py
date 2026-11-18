@@ -21,7 +21,7 @@ async def run(*args: str, timeout: int = 240) -> str:
 
 
 async def duration(path: Path) -> float:
-    value = await run("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,wav,mp3,image2,jpeg_pipe,png_pipe,webp_pipe", "-show_entries", "format=duration", "-of", "json", str(path))
+    value = await run("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,avi,wav,mp3,image2,jpeg_pipe,png_pipe,webp_pipe", "-show_entries", "format=duration", "-of", "json", str(path))
     return float(json.loads(value)["format"]["duration"])
 
 
@@ -123,14 +123,17 @@ async def render_scene(bridge: Any, admin: int, scene: dict[str, Any], work: Pat
         raise ValueError("Озвучка длиннее 30 секунд. Разделите абзац.")
     if meta["mime"].startswith("video/"):
         total = clip_window(scene, await duration(media), voice_duration)
-        inputs = ["-ss", str(scene["start"]), "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm", "-i", str(media)]
+        inputs = ["-ss", str(scene["start"]), "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,avi", "-i", str(media)]
     else:
         # Decode as an image before passing an untrusted upload to ffmpeg.
         with Image.open(media) as im:
             if im.width * im.height > 30_000_000:
                 raise ValueError("Слишком большое изображение: максимум 30 мегапикселей")
             im.verify()
-        inputs = ["-loop", "1", "-i", str(media)]
+        # Preserve motion for animated GIFs rather than freezing their first frame.
+        inputs = (["-stream_loop", "-1", "-i", str(media)]
+                  if meta["mime"] == "image/gif"
+                  else ["-loop", "1", "-i", str(media)])
     from . import visual_guard
     await visual_guard.audit(work, [{"text": scene["text"], "start": 0, "end": total,
         "offset": scene.get("start", 0),
@@ -190,10 +193,10 @@ async def assemble(bridge: Any, admin: int, scenes: list[dict[str, Any]], work: 
             raise ValueError("Проверьте длительность утверждённых блоков")
         # Normalize one block at a time; no parallel encodes on the 2 GB VPS.
         dst = work / f"part_{i}.mp4"
-        probe = json.loads(await run("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm", "-show_streams", "-of", "json", str(src)))
+        probe = json.loads(await run("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,avi", "-show_streams", "-of", "json", str(src)))
         if not any(s.get("codec_type") == "audio" for s in probe.get("streams", [])):
             raise ValueError("В одном из блоков нет звука. Загрузите озвученный монтаж.")
-        await run("ffmpeg", "-v", "error", "-y", "-filter_threads", "1", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm", "-i", str(src), "-map", "0:v:0",
+        await run("ffmpeg", "-v", "error", "-y", "-filter_threads", "1", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,avi", "-i", str(src), "-map", "0:v:0",
                   "-map", "0:a:0", "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25",
                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-threads", "1", "-pix_fmt", "yuv420p",
                   "-c:a", "aac", "-ar", "48000", "-ac", "2", "-t", str(length), str(dst))
@@ -266,7 +269,7 @@ async def execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path, 
                 raise ValueError("Проверьте границы видеофрагмента")
             for i, point in enumerate([start, (start + end) / 2, max(start, end - .2)]):
                 frame = work / f"check{i}.jpg"
-                await run("ffmpeg", "-v", "error", "-y", "-ss", str(point), "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm", "-i", str(path),
+                await run("ffmpeg", "-v", "error", "-y", "-ss", str(point), "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,avi", "-i", str(path),
                           "-frames:v", "1", "-vf", "scale=640:-2", str(frame))
                 with Image.open(frame) as im:
                     fits, reason = await ai.media_fits(key, im.convert("RGB"), scene["text"])
