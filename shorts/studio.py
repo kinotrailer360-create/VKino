@@ -20,12 +20,15 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from aiohttp import web
+from PIL import Image, UnidentifiedImageError
 
 log = logging.getLogger("vkino.studio")
 PREFIX = "/api/studio/v1"
 MAX_FILE = 50 * 1024 * 1024
 MIMES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
-         "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov"}
+         "image/gif": ".gif", "image/bmp": ".bmp", "image/tiff": ".tiff",
+         "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+         "video/x-matroska": ".mkv", "video/x-msvideo": ".avi", "video/x-m4v": ".m4v"}
 OPERATIONS = {"source", "script", "media", "check", "render", "assemble", "notify"}
 
 
@@ -133,7 +136,8 @@ class Studio:
         for method, path, fn in [("POST", "/pair", self.pair), ("GET", "/status", self.status),
                                   ("POST", "/disconnect", self.disconnect), ("POST", "/jobs", self.submit),
                                   ("GET", "/jobs/{id}", self.job), ("POST", "/files", self.upload),
-                                  ("GET", "/files/{id}", self.file), ("GET", "/inbox", self.inbox)]:
+                                  ("POST", "/files/batch", self.upload_batch), ("GET", "/files/{id}", self.file),
+                                  ("GET", "/inbox", self.inbox)]:
             async def route(request: web.Request, handler=fn) -> web.StreamResponse:
                 try:
                     response = await handler(request)
@@ -208,6 +212,22 @@ class Studio:
     async def store_file(self, admin: int, path: Path, mime: str, name: str = "") -> dict[str, Any]:
         if mime not in MIMES or not 0 < path.stat().st_size <= MAX_FILE:
             raise ValueError("Файл должен быть до 50 МБ и иметь поддерживаемый формат")
+        if mime.startswith("image/"):
+            # The client-provided MIME is untrusted. Reject fake images and
+            # decompression bombs before copying them to durable storage.
+            expected = {
+                "image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP",
+                "image/gif": "GIF", "image/bmp": "BMP", "image/tiff": "TIFF",
+            }
+            try:
+                with Image.open(path) as im:
+                    if im.format != expected[mime] or im.width * im.height > 30_000_000:
+                        raise ValueError("Неверный формат или изображение больше 30 мегапикселей")
+                    if getattr(im, "n_frames", 1) > 600:
+                        raise ValueError("Слишком длинная анимация: максимум 600 кадров")
+                    im.verify()
+            except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+                raise ValueError("Повреждённое или неподдерживаемое изображение") from exc
         identifier = str(uuid4())
         folder = self.root / str(admin) / "files"
         folder.mkdir(parents=True, exist_ok=True)
@@ -266,6 +286,63 @@ class Studio:
             return web.json_response(await self.store_file(admin, path, mime))
         finally:
             path.unlink(missing_ok=True)
+
+    async def upload_batch(self, request: web.Request) -> web.Response:
+        """Sequential multipart upload, bounded to protect the 2 GB VPS.
+
+        The frontend may select up to 20 media items at once. Partial success
+        is explicit; existing POST /files remains supported.
+        """
+        admin = await self.authenticate(request)
+        if not request.content_type.startswith("multipart/"):
+            raise ValueError("Ожидается multipart/form-data")
+        reader = await request.multipart()
+        uploaded: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        count = 0
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            count += 1
+            if count > 20:
+                raise ValueError("За один раз можно отправить не больше 20 файлов")
+            mime = (part.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            name = str(part.filename or f"media-{count}")[:180]
+            if mime not in MIMES:
+                errors.append({"name": name, "error": "Неподдерживаемый формат"})
+                # Drain the invalid part to let the parser read subsequent files.
+                while await part.read_chunk(65536):
+                    pass
+                continue
+            path = self.root / (str(uuid4()) + ".upload")
+            size = 0
+            too_large = False
+            try:
+                with path.open("wb") as dest:
+                    while True:
+                        chunk = await part.read_chunk(65536)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_FILE:
+                            too_large = True
+                            # Continue reading the part without storing it.
+                            continue
+                        if not too_large:
+                            dest.write(chunk)
+                if too_large or size == 0:
+                    errors.append({"name": name, "error": "Файл пустой или больше 50 МБ"})
+                    continue
+                try:
+                    uploaded.append(await self.store_file(admin, path, mime, name))
+                except (ValueError, OSError) as exc:
+                    errors.append({"name": name, "error": str(exc)[:180]})
+            finally:
+                path.unlink(missing_ok=True)
+        if count == 0:
+            raise ValueError("Файлы не переданы")
+        return web.json_response({"files": uploaded, "errors": errors, "count": count})
 
     async def file(self, request: web.Request) -> web.Response:
         admin = await self.authenticate(request)
