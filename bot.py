@@ -15633,10 +15633,12 @@ async def structured_find_asset(folder: Path, plan: dict, index: int, used: list
         path.unlink(missing_ok=True)
         refs = []
     if refs:
-        sources = " · ".join(f"{r['url']}&t={int(r['start'])}s" for r in refs)
+        sources = " · ".join(r["url"] if r.get("kind") == "still" else f"{r['url']}&t={int(r['start'])}s"
+                             for r in refs)
         _, targets = shorts_script_task.motion_targets(scene)
         if len(refs) < len(targets):
-            sources = "Видео + авторская графика\n" + sources
+            label = "Кадр студии" if all(r.get("kind") == "still" for r in refs) else "Видео"
+            sources = f"{label} + авторская графика\n" + sources
         return {"file": path.name, "revision": revision, "source": sources, "refs": refs,
                 "external": True, "fallback": False}
     if video_only:
