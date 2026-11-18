@@ -24,6 +24,7 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from . import budget
+from . import luna
 from . import usage as usage_log
 from . import websearch
 
@@ -1456,9 +1457,12 @@ async def write_post(key: str, posts: list[dict[str, Any]], recent: list[str],
         wrong = ungrounded_names(post, sources)
     # каждое утверждение поста — со сверкой с источниками новости: автор видит, что не подтвердилось
     claims = post_claims(post)
-    checks = await check_facts(key, claims, {"Источники новости": sources}) if claims else []
+    evidence_sources = {str(posts[i].get("url") or f"Пост {i + 1}"): posts[i]["text"] for i in media}
+    checks = await check_facts(key, claims, evidence_sources or {"Источники новости": sources}) if claims else []
     flags = [{"text": c, **chk} for c, chk in zip(claims, checks) if chk["status"] in ("conflict", "unverified")]
-    return {"post": post[:1020], "unverified_names": wrong, "fact_flags": flags, "topic": str(data.get("topic") or "").strip()[:80], "media": media,
+    comparison = [{"text": c, **chk} for c, chk in zip(claims, checks) if chk.get("luna_status")]
+    return {"post": post[:1020], "unverified_names": wrong, "fact_flags": flags, "fact_comparison": comparison,
+            "topic": str(data.get("topic") or "").strip()[:80], "media": media,
             "film": str(data.get("film") or "").strip(" «»\""), "film_en": str(data.get("film_en") or "").strip(" «»\""),
             "person": str(data.get("person") or "").strip(), "person_en": str(data.get("person_en") or "").strip(),
             "trailer": data.get("trailer") is True or str(data.get("trailer")).lower() == "true",
@@ -2804,7 +2808,20 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
     note — что именно расходится. ИИ не ответил — все unverified: неизвестность видна автору, а не скрыта."""
     blank = [{"status": "unverified", "source": "", "note": ""} for _ in facts]
     body = "\n\n".join(f"=== {name} ===\n{text[:7000]}" for name, text in material.items() if text and text.strip())
-    if not facts or not body or not available(key):
+    if not facts or not body:
+        return blank
+    comparison = None
+    if luna.KEY and luna.MODE in {"shadow", "active"} and not cooling("luna"):
+        try:
+            comparison = await luna.check(facts, material)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shorts: Luna fact check unavailable (%s)", type(exc).__name__)
+            cooldown("luna", 120, "проверка недоступна")
+    if luna.KEY and luna.MODE == "active":
+        return comparison if comparison is not None else [
+            {**row, "note": "Проверка источников временно недоступна."} for row in blank
+        ]
+    if not available(key):
         return blank
     prompt = (UNTRUSTED + "Ты фактчекер. Сверь каждый ФАКТ с МАТЕРИАЛАМИ (только с ними, не с памятью). "
               "status: confirmed — факт прямо подтверждается материалом (имена, цифры, годы совпадают); single — "
@@ -2828,6 +2845,14 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
         if 0 <= i < len(facts) and status in FACT_STATUS:
             blank[i] = {"status": status, "source": str(item.get("source") or "")[:80],
                         "note": str(item.get("note") or "")[:160]}
+    if comparison is not None:
+        agreed = sum(a["status"] == b["status"] for a, b in zip(blank, comparison))
+        evidence = sum(bool(item.get("evidence")) for item in comparison)
+        log.info("luna_factcheck_shadow claims=%d agreement=%d verifiable_quotes=%d", len(facts), agreed, evidence)
+        for prior, candidate in zip(blank, comparison):
+            if prior["status"] != candidate["status"]:
+                prior.update(luna_status=candidate["status"], luna_note=candidate["note"],
+                             luna_source=candidate["source"], luna_evidence=candidate.get("evidence", ""))
     return blank
 
 
