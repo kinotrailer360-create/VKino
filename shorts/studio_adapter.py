@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from . import ai, clips, daily, imgsearch, linkfetch, process as media_process
+from . import ai, clips, daily, imgsearch, linkfetch, studio_media_library, process as media_process
 import re
 import logging
 
@@ -80,25 +80,26 @@ async def trailer_candidate(
                         fits, _ = await ai.media_fits(key, im.convert("RGB"), scene["text"])
                     if not fits:
                         continue
+                    length = studio_media_library.required_length(scene)
                     start = max(0.0, timestamp - 1.5)
-                    if start + 4.0 > float(match["duration"]):
+                    if start + length > float(match["duration"]):
                         continue
                     # Check a second frame so a brief unrelated shot cannot
                     # be mistaken for a usable four-second sequence.
                     check = work / "candidate_check.jpg"
                     await run("ffmpeg", "-v", "error", "-y", "-ss",
-                              str(start + 2.7), "-i", str(full),
+                              str(start + min(length - .1, length * .7)), "-i", str(full),
                               "-frames:v", "1", "-vf", "scale=448:-2", str(check))
                     with Image.open(check) as im:
                         fits_second, _ = await ai.media_fits(key, im.convert("RGB"), scene["text"])
                     if not fits_second:
                         continue
                     result = work / "candidate_trailer.mp4"
-                    await clips.cut_clip(full, result, start, 4.0)
+                    await clips.cut_clip(full, result, start, length)
                     if not result.is_file() or result.stat().st_size == 0:
                         continue
                     asset = await bridge.store_file(admin, result, "video/mp4", "trailer-candidate.mp4")
-                    return {"asset": asset, "source": match["url"], "start": 0, "end": 4.0,
+                    return {"asset": asset, "source": match["url"], "start": 0, "end": length,
                             "sourceStart": round(start, 2),
                             "note": "Движущийся фрагмент трейлера. ИИ проверил два кадра, "
                                     "но актёра, контекст и права обязан подтвердить автор. "
@@ -240,7 +241,13 @@ async def execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path, 
         return {"script": script, "factCheck": "Требуется проверка автора"}
     if operation == "media":
         scene = p["scenes"][payload["sceneIndex"]]
-        # Reconnect Studio's media search to VKino's existing trailer cutter.
+        # Uploaded media and author-supplied links come before general searching.
+        # Every candidate remains subject to manual approval.
+        library_candidate = await studio_media_library.select(
+            bridge, admin, scene, p, work, key)
+        if library_candidate:
+            return library_candidate
+        # Existing trailer and image discovery remain available as fallbacks.
         # If there is no explicit movie title or verified matching shot,
         # preserve the original image-search behavior.
         moving = await trailer_candidate(bridge, admin, scene, p.get("title", ""), work, key)
