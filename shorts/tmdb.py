@@ -385,6 +385,30 @@ def _kp_like(kind: str, d: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def russian_theatrical_releases(key: str, start: date, end: date, limit: int) -> list[dict[str, Any]]:
+    """Regional theatrical dates from TMDB discover; exclude digital and TV releases."""
+    if not key:
+        return []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+        data = await _get(session, key, "/discover/movie", language="ru-RU", region="RU",
+                          sort_by="popularity.desc", with_release_type="3|2",
+                          **{"release_date.gte": start.isoformat(), "release_date.lte": end.isoformat()})
+    films = []
+    for row in data.get("results") or []:
+        if not row.get("id") or not (row.get("title") or row.get("original_title")):
+            continue
+        try:
+            release = date.fromisoformat(str(row.get("release_date") or ""))
+        except ValueError:
+            continue
+        if not start <= release <= end:
+            continue
+        film = _kp_like("movie", row)
+        film.update(year=None, premiere={"russia": release.isoformat()})
+        films.append(film)
+    return films[:limit]
+
+
 async def kp_like_by_id(key: str, ref: str) -> dict[str, Any] | None:
     """«tmdb:movie:123» → карточка в виде Кинопоиска (с актёрами и рейтингом TMDB)."""
     try:

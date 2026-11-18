@@ -385,6 +385,57 @@ def _one_season(doc: dict[str, Any]) -> bool:
     return bool(years.get("start")) and years.get("start") == years.get("end")
 
 
+async def telegram_week_premieres(fetch: Fetch, tmdb_key: str, today: date,
+                                 limit: int = 5) -> tuple[date, date, list[dict[str, Any]]]:
+    """Russian cinema openings for the current calendar week. Artwork is optional."""
+    start = today - timedelta(days=today.weekday())
+    end = start + timedelta(days=6)
+    primary = await _query(fetch, isSeries="false", year=f"{today.year - 1}-{today.year + 1}",
+                           sortField="votes.kp", sortType="-1", limit=30,
+                           **{"premiere.russia": _range(start, end)})
+    picked = []
+    seen_titles = set()
+    seen_tmdb = set()
+
+    def add(film: dict[str, Any]) -> None:
+        if not film.get("id") or film.get("isSeries") or not _title(film):
+            return
+        raw = (film.get("premiere") or {}).get("russia")
+        try:
+            release = date.fromisoformat(str(raw or "")[:10])
+        except ValueError:
+            return
+        if not start <= release <= end:
+            return
+        names = {re.sub(r"[^\w]+", "", str(film.get(k) or "").casefold().replace("ё", "е"))
+                 for k in ("name", "enName", "alternativeName")}
+        names.discard("")
+        external = str((film.get("externalId") or {}).get("tmdb") or "")
+        if not names or names & seen_titles or (external and external in seen_tmdb):
+            return
+        seen_titles.update(names)
+        if external:
+            seen_tmdb.add(external)
+        picked.append(film)
+
+    for film in primary:
+        add(film)
+        if len(picked) == limit:
+            break
+    if len(picked) < limit and tmdb_key:
+        try:
+            secondary = await tmdb.russian_theatrical_releases(tmdb_key, start, end, limit * 3)
+        except (aiohttp.ClientError, TimeoutError, ValueError, RuntimeError):
+            log.info("TMDB weekly RU theatrical releases unavailable")
+        else:
+            for film in secondary:
+                add(film)
+                if len(picked) == limit:
+                    break
+    picked.sort(key=lambda film: str(film["premiere"]["russia"])[:10])
+    return start, end, picked
+
+
 async def pick_films(fetch: Fetch, theme: Theme, today: date, exclude: set[int]) -> list[dict[str, Any]]:
     common = {"sortField": "votes.kp", "sortType": "-1", "notNullFields": "name"}
     if theme.key == "online":
