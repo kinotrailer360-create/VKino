@@ -43,7 +43,7 @@ async def ddg(session: aiohttp.ClientSession, query: str, limit: int = 12) -> li
     for r in json.loads(raw.decode("utf-8", "ignore")).get("results") or []:
         image = str(r.get("image") or "")
         if _ok(image + " " + str(r.get("url") or ""), int(r.get("width") or 0)):
-            out.append({"image": image, "thumb": str(r.get("thumbnail") or image)})
+            out.append({"image": image, "thumb": str(r.get("thumbnail") or image), "source": str(r.get("url") or "")})
         if len(out) >= limit:
             break
     return out
@@ -60,7 +60,7 @@ async def bing(session: aiohttp.ClientSession, query: str, limit: int = 12) -> l
             continue
         image, thumb = str(meta.get("murl") or ""), str(meta.get("turl") or "")
         if _ok(image + " " + str(meta.get("purl") or "")):
-            out.append({"image": image, "thumb": thumb or image})
+            out.append({"image": image, "thumb": thumb or image, "source": str(meta.get("purl") or "")})
         if len(out) >= limit:
             break
     return out

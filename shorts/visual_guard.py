@@ -107,7 +107,9 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                     sample = im.convert('RGB')
                     sample.thumbnail((768, 768))
                     samples.append(sample)
-            if scene.get('match_source') == 'semantic':
+            if scene.get('match_source') == 'author_approved':
+                result.update(status='matched', reason='Материал утверждён автором до сборки')
+            elif scene.get('match_source') == 'semantic':
                 # The scene matcher already compared this clip with the narration.
                 # Avoid a second expensive vision request for the same scene.
                 result.update(

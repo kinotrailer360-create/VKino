@@ -668,6 +668,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                     user_pins: dict[int, int] | None = None) -> ShortResult:
     """user_pins — своя картинка (номер в user_media) -> фраза (с 1), к которой автор её подписал."""
     lines = script["lines"]
+    structured = bool(script.get("structured"))
     news = script.get("kind") == "news"
     # динамичный монтаж: видео на весь экран, новый кадр каждые ~1,8 с, переходы, субтитры по слову, без заставки
     dynamic = script.get("style") == "dynamic"
@@ -679,6 +680,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     # он обрывается на самой сильной фразе
     spoken = spoken_lines(script)
     voice, starts, voiced, spans = await daily.synthesize(spoken, work)
+    if structured and not voiced:
+        raise RuntimeError("Озвучка не готова. Повтори сборку после восстановления голоса.")
     voice_meta = dict(daily.last_voice)
     await _progress(30, "Субтитры по слову")
     words = await daily.word_timeline(voice, starts, spans) if voiced else []
@@ -689,14 +692,18 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     # свои видео автора (сцена, о которой ролик) — ИИ ищет в них моменты под фразы, как в трейлере
     videos = [m for m in user_media or [] if m.suffix.lower() in VIDEO_EXT]
     for n, path in enumerate(user_media or []):
+        out = work / f"luser{n}.jpg"
         if path in videos:
-            continue
+            if not structured:
+                continue
+            await daily._run("ffmpeg", "-v", "error", "-y", "-i", str(path), "-frames:v", "1",
+                             "-vf", "scale=720:-2", str(out))
+            path = out
         try:
             img = _frame_ready(Image.open(path))
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: lore user image %s skipped: %s", path.name, exc)
             continue
-        out = work / f"luser{n}.jpg"
         img.save(out, quality=90)
         img.thumbnail((480, 480))
         user_at[n] = len(pool)
@@ -785,8 +792,10 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         # Каждая сцена получает уникальный материал; при нехватке прекращаем сборку,
         # чтобы не выдавать повтор за осмысленный монтаж.
     free_lines = [i for i in range(len(lines)) if i not in pinned]
+    if structured and free_lines:
+        raise ValueError("Для каждой сцены нужен утверждённый материал.")
     picked = await ai.match_images(gemini_key, [lines[i] for i in free_lines],
-                                   [im for _, im in pool[:general]]) if gemini_key and general else None
+                                   [im for _, im in pool[:general]]) if gemini_key and general and free_lines else None
     choices = [-1] * len(lines)
     for k, i in enumerate(free_lines):
         if picked and k < len(picked):
@@ -810,6 +819,11 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     slides = [{"start": starts[i], "image": pool[order[i]][0]} for i in range(len(lines))]
     durs = [((starts[i + 1] if i + 1 < len(starts) else starts[i] + float(spans[i]["speech"]) + 0.3) - starts[i])
             for i in range(len(lines))]
+    if structured:
+        for n, line in (user_pins or {}).items():
+            path = (user_media or [])[n]
+            if path in videos:
+                slides[line - 1] = {"start": starts[line - 1], "clip": path.name, "hard": True}
     clip_notes: list[str] = []
     # библиотека сцен: сцена из проиндексированного видео автора/лицензии/официального трейлера — раньше трейлера
     lib_refs: dict[int, dict[str, Any]] = {}
@@ -844,7 +858,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
             slides[int(score["line"])]["image"] = card.name
         except Exception as exc:  # noqa: BLE001
             log.info("shorts: score card failed: %s", exc)
-    if (tfilm or videos) and gemini_key:
+    if (tfilm or videos) and gemini_key and not structured:
         # отрезки трейлера под фразы: кроме фраз со своими картинками автора и с карточкой оценки
         skip = pinned_lines | set(lib_refs) | ({int(score["line"])} if score else set())
         await _progress(44, "Трейлер: подбираю отрезки")
@@ -892,7 +906,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         slides = sorted(slides + extra, key=lambda sl: sl["start"])
     # последняя фраза — призыв («пиши в комментариях», «подписывайся»): к ней нет своего кадра, и ИИ брал конец
     # видео (чёрный экран с титрами) — ставим кадр, с которого ролик начался
-    if len(slides) > 2 and CTA.search(lines[-1]):
+    if not structured and len(slides) > 2 and CTA.search(lines[-1]):
         last = starts[-1]
         slides = [sl for sl in slides if sl["start"] < last - 0.05]
         first = next((sl for sl in slides if sl["start"] <= starts[0] + 0.05), slides[0])
@@ -917,7 +931,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     if any(fixed_labels):
         labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": str(t)[:60]}
                   for i, t in enumerate(fixed_labels[:len(lines)]) if t]
-    elif news and gemini_key and script.get("kind_own"):
+    elif news and gemini_key and script.get("kind_own") and not structured:
         texts = await ai.screen_labels(gemini_key, lines, script.get("title") or "")
         labels = [{"start": starts[i], "end": starts[i] + durs[i], "text": t} for i, t in enumerate(texts)
                   if t and not (score and i == int(score["line"]))]  # на карточке оценки надпись уже есть
@@ -932,6 +946,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         asset = {key: value for key, value in slide.items() if key in ("image", "clip", "offset")}
         asset.update({"start": start, "end": end,
                       "text": visual_guard.narration(start, end, lines, starts, voice_total)})
+        if structured:
+            asset["match_source"] = "author_approved"
         review_scenes.append(asset)
     await visual_guard.audit(work, review_scenes, gemini_key)
 
@@ -940,7 +956,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "voice": voice.name,
         "music": str(music or musiclib.pick(script.get("title") or "", " ".join(script.get("lines") or []))
                      or ASSETS / "music.mp3"),
-        "music_db": -17 if voiced else -6,
+        "music_db": -90 if structured else -17 if voiced else -6,
         "logo": str(ASSETS / "logo.png"),
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
         "slides": slides,
@@ -954,7 +970,7 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "words": words,
         "highlights": script.get("highlights") or [],
         "marks": marks,
-        "sfx": [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
+        "sfx": [] if structured else [[max(st - 0.1, 0), str(ASSETS / "whoosh.wav"), -12] for st in starts[1:]],
         "outro": {"question": "СВЕТЛАЯ\nПАМЯТЬ" if mourning else "ЧТО\nДУМАЕШЬ?" if news
                   else "ПРО КОГО\nРАССКАЗАТЬ\nДАЛЬШЕ?", "channel": "KinoMir360", "youtube": "@kinomir360",
                   "telegram": "@KinoMir360", "note": "ссылки в описании"},
@@ -963,6 +979,11 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     # план сцен для проверки автором (как у «Фактов»): кадр каждой фразы, откуда он и права
     plan = scene_plan_for(lines, starts, durs, slides, lib_refs, lib_misses, script)
+    if structured:
+        for scene, approved in zip(plan["scenes"], script["structured"]):
+            scene["asset"].update(ref=approved["source"], rights="unconfirmed" if approved.get("external") else
+                                  "author" if approved.get("fallback") else "unconfirmed")
+            scene["match"].update(status="author_reviewed", reason="Материал согласован до сборки.")
     (work / "scene_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     await _progress(50, "Монтаж видео")
     proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "shorts.make_lore", str(cfg_path),
@@ -993,6 +1014,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         theme = Theme("news_own", tag, script["name"].upper(), script.get("title") or script["name"],
                       script.get("title") or script["name"], [])
         seo = build_news_seo(script)
+        if structured:
+            seo.update(title=script["title"], description=script.get("description", ""),
+                       hashtags=" ".join(script.get("hashtags", [])))
     else:
         cover = await asyncio.to_thread(make_cover, cover_src, "ИСТОРИЯ", f"Кто такой {script['name']}?")
         theme = Theme("lore", "ИСТОРИЯ", script["name"].upper(), f"История: {script['name']}",
@@ -1003,7 +1027,11 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     film = {"name": script["name"], "en": script.get("en") or ""}
     result = ShortResult(work / "short.mp4", cover_path, theme, [film], seo)
     notes = []
-    if own == 0 and news:
+    if structured:
+        used_fallbacks = [str(i) for i, asset in enumerate(script["structured"], 1) if asset.get("fallback")]
+        if used_fallbacks:
+            notes.append("🎨 Авторские карточки вместо проверенных кадров: " + ", ".join(used_fallbacks) + ".")
+    elif own == 0 and news:
         notes.append("🖼 Фото подобраны автоматически (TMDB, Википедия). Хочешь свои — кнопка «📎 Свои картинки».")
     elif own == 0:
         notes.append("🖼 Картинки взяты из статьи Википедии. Со своими страницами комиксов и кадрами "
