@@ -20,6 +20,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from aiohttp import web
+from PIL import Image, UnidentifiedImageError
 
 log = logging.getLogger("vkino.studio")
 PREFIX = "/api/studio/v1"
@@ -211,6 +212,22 @@ class Studio:
     async def store_file(self, admin: int, path: Path, mime: str, name: str = "") -> dict[str, Any]:
         if mime not in MIMES or not 0 < path.stat().st_size <= MAX_FILE:
             raise ValueError("Файл должен быть до 50 МБ и иметь поддерживаемый формат")
+        if mime.startswith("image/"):
+            # The client-provided MIME is untrusted. Reject fake images and
+            # decompression bombs before copying them to durable storage.
+            expected = {
+                "image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP",
+                "image/gif": "GIF", "image/bmp": "BMP", "image/tiff": "TIFF",
+            }
+            try:
+                with Image.open(path) as im:
+                    if im.format != expected[mime] or im.width * im.height > 30_000_000:
+                        raise ValueError("Неверный формат или изображение больше 30 мегапикселей")
+                    if getattr(im, "n_frames", 1) > 600:
+                        raise ValueError("Слишком длинная анимация: максимум 600 кадров")
+                    im.verify()
+            except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+                raise ValueError("Повреждённое или неподдерживаемое изображение") from exc
         identifier = str(uuid4())
         folder = self.root / str(admin) / "files"
         folder.mkdir(parents=True, exist_ok=True)
