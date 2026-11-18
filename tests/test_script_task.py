@@ -1,4 +1,6 @@
 from pathlib import Path
+import asyncio
+import json
 
 import pytest
 
@@ -64,3 +66,30 @@ def test_only_exact_approved_media_can_be_rendered(tmp_path):
     assets["2"]["approved"] = script_task.fingerprint(files[1])
     with pytest.raises(ValueError, match="тот же материал"):
         script_task.require_approved(tmp_path, plan, assets)
+
+
+def test_edit_keeps_numbered_scene_mapping():
+    assert script_task.edited_lines("2. Новая вторая реплика.", ["Первая", "Вторая"]) == [
+        "Первая", "Новая вторая реплика."]
+    with pytest.raises(ValueError, match="номер"):
+        script_task.edited_lines("2. Правка\n2. Повтор", ["Первая", "Вторая"])
+
+
+def test_only_official_video_uploaders_are_accepted(monkeypatch):
+    async def run(*args, **kwargs):
+        return json.dumps({"entries": [
+            {"title": "Official trailer", "id": "abcdeFGHijk", "uploader_id": "@fan", "duration": 60},
+            {"id": "testTrailer", "channel_id": script_task.MARVEL_CHANNEL, "duration": 90},
+            {"id": "anotherClip", "uploader_id": "@waltdisneystudios", "duration": 600},
+        ]})
+
+    monkeypatch.setattr(script_task.process, "run", run)
+    assert asyncio.run(script_task.official_videos("test trailer")) == ["testTrailer"]
+
+
+def test_motion_keeps_split_and_ab_targets_and_proposed_length():
+    scene = {"targets": ["сплит-экран: слева Первый герой, справа Второй герой. Если нет — графика."],
+             "heading": "Вступление (0:00–0:06)"}
+    assert script_task.motion_targets(scene) == ("split", ["Первый герой", "Второй герой"])
+    assert script_task.video_duration(scene, "Реплика") == 8
+    assert script_task.motion_targets({"targets": ["Кадр A", "Кадр B"]}) == ("sequence", ["Кадр A", "Кадр B"])

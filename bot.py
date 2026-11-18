@@ -337,6 +337,7 @@ class LoreState(StatesGroup):
     edit = State()
     media = State()
     task_media = State()
+    task_edit = State()
 
 
 class LibraryState(StatesGroup):
@@ -15568,6 +15569,7 @@ async def own_script_text(message: Message, state: FSMContext) -> None:
 
 
 structured_task_lock = asyncio.Lock()
+structured_searches: set[str] = set()
 
 
 async def structured_task_start(message: Message, state: FSMContext, text: str) -> None:
@@ -15584,12 +15586,65 @@ async def structured_task_start(message: Message, state: FSMContext, text: str) 
         await state.set_state(None)
         await state.update_data(structured_id=draft, structured_plan=plan, structured_assets={},
                                 structured_rendering=False, structured_replace=None)
-        await message.answer(
-            f"📝 <b>{escape(plan['title'])}</b>\n\n" +
-            "\n\n".join(f"{i}. {escape(line)}" for i, line in enumerate(plan["lines"], 1)),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [_btn("✅ Утвердить текст и подобрать кадры", f"scplan:{draft}:start")],
-            ]), disable_web_page_preview=True)
+        await structured_text(message, plan, draft)
+
+
+async def structured_text(message: Message, plan: dict, draft: str) -> None:
+    text = f"📝 {plan['title']}\n\n" + "\n\n".join(f"{i}. {line}" for i, line in enumerate(plan["lines"], 1))
+    await message.answer(text, parse_mode=None, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Утвердить текст и подобрать кадры", f"scplan:{draft}:start")],
+        [_btn("✍️ Редактировать", f"scplan:{draft}:edit"), _btn("🔄 Перегенерировать", f"scplan:{draft}:regen")],
+    ]), disable_web_page_preview=True)
+
+
+async def structured_set_lines(message: Message, state: FSMContext, data: dict, lines: list[str]) -> None:
+    old = data["structured_id"]
+    draft = secrets.token_hex(8)
+    plan = {**data["structured_plan"], "lines": lines}
+    await state.set_state(None)
+    await state.update_data(structured_id=draft, structured_plan=plan, structured_assets={}, structured_replace=None)
+    await asyncio.to_thread(shutil.rmtree, SHORTS_DIR / f"script_{old}", True)
+    await structured_text(message, plan, draft)
+
+
+@router.message(LoreState.task_edit, F.text, ~F.text.startswith("/"), F.chat.type == "private")
+async def structured_task_edit(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    async with structured_task_lock:
+        data = await state.get_data()
+        try:
+            lines = shorts_script_task.edited_lines(message.text or "", data["structured_plan"]["lines"])
+        except ValueError as exc:
+            await message.answer(escape(str(exc)))
+            return
+        await structured_set_lines(message, state, data, lines)
+
+
+async def structured_find_asset(folder: Path, plan: dict, index: int, used: list[dict],
+                                video_only: bool = False) -> dict | None:
+    scene = plan["scenes"][index - 1]
+    revision = secrets.token_hex(4)
+    path = folder / f"scene_{index}_{revision}.mp4"
+    try:
+        refs = await asyncio.wait_for(shorts_script_task.find_motion(
+            path, scene, plan["lines"][index - 1], index, GEMINI_API_KEY, used), timeout=145)
+    except (RuntimeError, OSError, ValueError, TimeoutError):
+        path.unlink(missing_ok=True)
+        refs = []
+    if refs:
+        sources = " · ".join(f"{r['url']}&t={int(r['start'])}s" for r in refs)
+        _, targets = shorts_script_task.motion_targets(scene)
+        if len(refs) < len(targets):
+            sources = "Видео + авторская графика\n" + sources
+        return {"file": path.name, "revision": revision, "source": sources, "refs": refs,
+                "external": True, "fallback": False}
+    if video_only:
+        return None
+    path = path.with_suffix(".jpg")
+    source = await shorts_script_task.prepare_still(path, scene, plan["lines"][index - 1], index, GEMINI_API_KEY)
+    return {"file": path.name, "revision": revision, "source": source or "Резервная авторская графика",
+            "external": bool(source), "fallback": not source}
 
 
 async def structured_preview(message: Message, plan: dict, draft: str, folder: Path, i: int, asset: dict) -> None:
@@ -15606,13 +15661,48 @@ async def structured_preview(message: Message, plan: dict, draft: str, folder: P
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _btn("✅ Утвердить кадр", f"scplan:{draft}:ok:{i}:{asset['revision']}"),
         _btn("📎 Заменить", f"scplan:{draft}:replace:{i}:{asset['revision']}"),
-    ]])
+    ], *([[_btn("🔎 Найти другой фрагмент", f"scplan:{draft}:retry:{i}:{asset['revision']}")]]
+           if scene["queries"] else [])])
     path = folder / asset["file"]
     if path.suffix == ".mp4":
         await message.answer_video(FSInputFile(path), caption=caption, parse_mode=None, reply_markup=kb,
                                    supports_streaming=True)
     else:
         await message.answer_photo(FSInputFile(path), caption=caption, parse_mode=None, reply_markup=kb)
+
+
+async def structured_prepare(message: Message, state: FSMContext, draft: str, plan: dict, folder: Path) -> None:
+    try:
+        for index in range(1, len(plan["scenes"]) + 1):
+            async with structured_task_lock:
+                current = await state.get_data()
+                if current.get("structured_id") != draft:
+                    return
+                assets = current["structured_assets"]
+                asset = assets.get(str(index))
+                if asset and (folder / asset["file"]).is_file():
+                    if not asset.get("approved"):
+                        await structured_preview(message, plan, draft, folder, index, asset)
+                    continue
+                used = [ref for other in assets.values() for ref in other.get("refs", [])]
+            asset = await structured_find_asset(folder, plan, index, used)
+            if asset is None:
+                continue
+            async with structured_task_lock:
+                current = await state.get_data()
+                if current.get("structured_id") != draft:
+                    (folder / asset["file"]).unlink(missing_ok=True)
+                    return
+                assets = current["structured_assets"]
+                assets[str(index)] = asset
+                await state.update_data(structured_assets=assets)
+                await structured_preview(message, plan, draft, folder, index, asset)
+    except Exception:  # noqa: BLE001
+        logging.exception("Structured Shorts visual search failed")
+        await message.answer("Подбор прервался. Нажми «Утвердить текст и подобрать кадры» ещё раз, "
+                             "чтобы продолжить с сохранённых сцен.")
+    finally:
+        structured_searches.discard(draft)
 
 
 @router.callback_query(F.data.startswith("scplan:"))
@@ -15633,24 +15723,34 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
             return
         plan, assets = data["structured_plan"], data["structured_assets"]
         folder = SHORTS_DIR / f"script_{draft}"
-        if action == "start":
-            folder.mkdir(parents=True, exist_ok=True)
-            await message.answer("Сценарий утверждён. Покажу материалы по сценам. Кадры из интернета проверь по источнику и правам.")
-            for i, scene in enumerate(plan["scenes"], 1):
-                asset = assets.get(str(i))
-                if asset is None:
-                    revision = secrets.token_hex(4)
-                    path = folder / f"scene_{i}_{revision}.jpg"
-                    source = await shorts_script_task.prepare_still(path, scene, plan["lines"][i - 1], i, GEMINI_API_KEY)
-                    asset = {"file": path.name, "revision": revision,
-                             "source": source or "Резервная авторская карточка · unverified",
-                             "external": bool(source), "fallback": not source}
-                    assets[str(i)] = asset
-                    await state.update_data(structured_assets=assets)
-                if not asset.get("approved"):
-                    await structured_preview(message, plan, draft, folder, i, asset)
-            if all(asset.get("approved") for asset in assets.values()):
+        if action == "edit":
+            await state.set_state(LoreState.task_edit)
+            await message.answer("Напиши только изменённые реплики, каждую с номером своей сцены. "
+                                 "Например: <code>3. Новый текст третьей сцены.</code>")
+        elif action == "regen":
+            wait = await message.answer("Переформулирую реплики, сохраняя их порядок и смысл.")
+            try:
+                lines = await asyncio.wait_for(shorts_script_task.regenerate_lines(GEMINI_API_KEY, plan["lines"]), 80)
+            except Exception as exc:  # noqa: BLE001
+                logging.info("Shorts script regeneration failed: %s", type(exc).__name__)
+                await _edit_quiet(wait, "Не удалось получить новую версию. Текущий сценарий сохранён.")
+                return
+            await structured_set_lines(message, state, data, lines)
+            await _edit_quiet(wait, "Новая редакция готова. Проверь её перед утверждением.")
+        elif action == "start":
+            if draft in structured_searches:
+                await message.answer("Поиск уже идёт. Материалы появятся по сценам.")
+                return
+            if len(assets) == len(plan["scenes"]) and all(asset.get("approved") and
+                    (folder / asset["file"]).is_file() for asset in assets.values()):
                 await message.answer("Все сцены утверждены.", reply_markup=structured_render_button(draft))
+                return
+            await state.set_state(None)
+            folder.mkdir(parents=True, exist_ok=True)
+            await message.answer("Сценарий утверждён. Ищу официальные видео, вырезаю подходящие фрагменты "
+                                 "и показываю их по одному. Если фрагмент не найдётся, предложу фото или графику.")
+            structured_searches.add(draft)
+            _run_job(lambda: structured_prepare(message, state, draft, plan, folder))
         elif action == "render":
             if shorts_lock.locked():
                 await message.answer("Сейчас собирается другой ролик. Повтори, когда он будет готов.")
@@ -15685,11 +15785,26 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
                             await state.update_data(structured_rendering=False)
 
             _run_job(job)
-        elif action in {"ok", "replace"} and len(args) == 2 and args[0].isdigit():
+        elif action in {"ok", "replace", "retry"} and len(args) == 2 and args[0].isdigit():
             index, revision = args
             asset = assets.get(index)
             if not asset or asset["revision"] != revision:
                 await message.answer("Кадр уже заменён. Используй кнопки под новым кадром.")
+                return
+            if action == "retry":
+                if draft in structured_searches:
+                    await message.answer("Основной подбор ещё идёт. После него можно поискать другой фрагмент.")
+                    return
+                wait = await message.answer(f"🔎 Ищу новый видеофрагмент для сцены {index}.")
+                used = [ref for other in assets.values() for ref in other.get("refs", [])]
+                new_asset = await structured_find_asset(folder, plan, int(index), used, video_only=True)
+                if new_asset is None:
+                    await _edit_quiet(wait, "Другого подходящего видео не нашёл. Текущий материал сохранён.")
+                    return
+                assets[index] = new_asset
+                await state.update_data(structured_assets=assets)
+                await structured_preview(message, plan, draft, folder, int(index), new_asset)
+                await _edit_quiet(wait, "Новый фрагмент готов к согласованию.")
                 return
             if action == "replace":
                 await state.set_state(LoreState.task_media)
