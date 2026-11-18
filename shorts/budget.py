@@ -95,6 +95,17 @@ async def spent(pool: str) -> float:
     return float(await _pool_getter().fetchval(SPENT_SQL, pool))
 
 
+async def reconcile_interrupted() -> int:
+    """Keep the estimate for calls whose worker disappeared; never pretend they were free."""
+    if not _pool_getter:
+        return 0
+    result = await _pool_getter().execute(
+        "UPDATE ai_usage SET status = 'settled', settled_at=NOW(), "
+        "units=COALESCE(units,'{}'::jsonb) || '{\"recovered\":true,\"cost_basis\":\"estimate_after_interruption\"}'::jsonb "
+        "WHERE status='reserved' AND created_at < NOW() - INTERVAL '2 hours'")
+    return int(result.split()[-1])
+
+
 class Reservation:
     def __init__(self, rid: int | None, pool: str, estimate: float) -> None:
         self.id, self.pool, self.estimate, self.done = rid, pool, estimate, False

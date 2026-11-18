@@ -1,6 +1,5 @@
 """Shared pre-render visual check. A model failure never counts as approval."""
 from __future__ import annotations
-import asyncio
 import hashlib
 import io
 import json
@@ -9,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 from PIL import Image
+from . import process as media_process
 
 
 class VisualReviewRequired(RuntimeError):
@@ -39,17 +39,10 @@ def narration(start: float, end: float, lines: list[str], starts: list[float], t
 
 
 async def command(*args: str) -> str:
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), 60)
-    except BaseException:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.communicate()
-        raise
-    if proc.returncode:
-        raise ValueError('Не удалось прочитать медиа')
-    return out.decode()
+        return await media_process.run(*args, timeout=60)
+    except RuntimeError as exc:
+        raise ValueError('Не удалось прочитать медиа') from exc
 
 
 async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: str = 'visual_review',

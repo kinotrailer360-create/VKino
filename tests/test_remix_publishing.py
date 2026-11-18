@@ -32,6 +32,9 @@ def test_finished_remix_has_copyable_metadata_and_existing_upload_button(tmp_pat
     async def metadata(*args):
         return dict(title='Название <фильма>', description='Описание & смысл', tags='кино, KinoMir360')
     monkeypatch.setattr(remix, 'publication_metadata', metadata, raising=False)
+    async def qc(*args, **kwargs):
+        return []
+    monkeypatch.setattr(bot.shorts_qc, 'check', qc)
     class Message:
         chat = SimpleNamespace(id=123)
         def __init__(self):

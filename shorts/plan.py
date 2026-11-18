@@ -111,7 +111,17 @@ def publish_time(day: date) -> str:
 
 
 def today(day: date) -> tuple[str, str] | None:
-    return PLAN.get(day.isoformat())
+    if day.isoformat() in PLAN:
+        return PLAN[day.isoformat()]
+    if day.isoformat() <= max(PLAN):
+        return None
+    # Evergreen rotation after the dated editorial plan ends. Facts and dates
+    # still come from the normal source checks when the draft is generated.
+    rolling = [('news', 'Главные новости кино'), ('mini', 'Мини-сериалы на вечер'),
+               ('facts', 'Пять фактов о фильме'), ('detective', 'Зарубежные детективы'),
+               ('real', 'Фильмы на реальных событиях'), ('thriller', 'Триллеры на вечер'),
+               ('series', 'Сериалы, которые уже вышли целиком')]
+    return rolling[day.weekday()]
 
 
 def long_today(day: date) -> str | None:

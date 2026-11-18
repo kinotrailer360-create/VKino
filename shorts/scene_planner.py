@@ -8,6 +8,8 @@ treated as an approved semantic match.
 from __future__ import annotations
 
 import hashlib
+import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -43,17 +45,20 @@ def rights(source: str) -> str:
     return RIGHTS.get(source, "unconfirmed")
 
 
+@lru_cache(maxsize=256)
+def _file_digest(path: str, size: int, modified: int, changed: int) -> str:
+    # The stat values invalidate the cache after any ordinary file replacement.
+    with Path(path).open('rb') as file:
+        return hashlib.file_digest(file, 'sha256').hexdigest()
+
+
 def _digest(path: Path) -> str:
-    """Отпечаток файла: размер + начало и конец (видео бывают большими — целиком не читаем)."""
+    """Streaming full-file digest; cache unchanged files without loading them into RAM."""
     try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            head = f.read(1 << 20)
-            f.seek(max(0, size - (1 << 20)))
-            tail = f.read(1 << 20)
+        stat = path.stat()
+        return _file_digest(str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     except OSError:
         return "missing"
-    return hashlib.sha256(str(size).encode() + head + tail).hexdigest()[:24]
 
 
 def scene_hash(scene: dict[str, Any], folder: Path) -> str:
@@ -61,8 +66,11 @@ def scene_hash(scene: dict[str, Any], folder: Path) -> str:
     asset = scene.get("asset") or {}
     path = Path(str(asset.get("path") or ""))
     path = path if path.is_absolute() else folder / path
-    raw = "|".join([str(scene.get("text") or ""), f"{float(scene.get('start') or 0):.2f}",
-                    f"{float(scene.get('end') or 0):.2f}", str(asset.get("type") or ""), _digest(path)])
+    render = {key: scene.get(key) for key in ('text', 'start', 'end', 'offset', 'headline',
+              'style', 'captions', 'voice', 'music', 'render_settings')}
+    render['asset'] = {key: value for key, value in asset.items() if key != 'path'}
+    render['file_sha256'] = _digest(path)
+    raw = json.dumps(render, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 

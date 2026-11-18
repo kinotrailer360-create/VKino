@@ -1,7 +1,6 @@
 """Use VKino's existing model, budget, pronunciation and TTS stack for Sites jobs."""
 from __future__ import annotations
 
-import asyncio
 import io
 import json
 from pathlib import Path
@@ -9,23 +8,14 @@ from typing import Any
 
 from PIL import Image
 
-from . import ai, daily, imgsearch, linkfetch
+from . import ai, daily, imgsearch, linkfetch, process as media_process
 
 
 async def run(*args: str, timeout: int = 240) -> str:
-    process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                   stderr=asyncio.subprocess.PIPE)
     try:
-        out, err = await asyncio.wait_for(process.communicate(), timeout)
-    except BaseException:
-        if process.returncode is None:
-            process.kill()
-        await process.communicate()
-        raise
-    if process.returncode:
-        # Input paths and provider URLs must not leak through ffmpeg's stderr.
-        raise ValueError("Не удалось прочитать или смонтировать медиа. Проверьте формат и границы фрагмента.")
-    return out.decode("utf-8", "replace")
+        return await media_process.run(*args, timeout=timeout)
+    except RuntimeError as exc:
+        raise ValueError("Не удалось прочитать или смонтировать медиа. Проверьте формат и границы фрагмента.") from exc
 
 
 async def duration(path: Path) -> float:
