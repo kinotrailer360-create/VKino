@@ -116,7 +116,7 @@ def test_split_keeps_verified_image_when_video_is_unavailable(monkeypatch, tmp_p
     async def no_video(*args):
         return None
 
-    async def press(path, scene, target, queries, key, used):
+    async def press(path, scene, target, queries, key, used, **kwargs):
         if "Канг" in target:
             path.write_bytes(b"press-image")
             return {"id": "studio-press", "url": "https://press.disney.co.uk/gallery/test", "kind": "still"}
@@ -200,6 +200,77 @@ def test_storyboard_keeps_planned_card_and_uses_distinct_confirmed_sources():
     assert script_task.motion_targets({"targets": [final]}) == ("single", [final])
     assert script_task.card_text("КАНГ ИЛИ ДУМ? 👇") == "КАНГ ИЛИ ДУМ?"
     assert script_task.card_text("ROBERT DOWNEY JR. → DOCTOR DOOM") == "ROBERT DOWNEY JR. — DOCTOR DOOM"
+
+
+def test_endgame_storyboard_uses_exact_stills_and_explicit_alternative(monkeypatch, tmp_path):
+    from PIL import Image
+
+    attempted = []
+
+    async def no_video(folder, stem, queries, target, *args):
+        attempted.append(target)
+
+    async def opened(session, url):
+        assert url in (script_task.ENDGAME_STEVE, script_task.ENDGAME_POSTER)
+        return Image.new("RGB", (640, 480))
+
+    async def no_image_search(*args):
+        return []
+
+    async def render(*args, **kwargs):
+        assert any("concat=n=2" in arg for arg in args)
+        Path(args[-1]).touch()
+
+    monkeypatch.setattr(script_task, "matching_clip", no_video)
+    monkeypatch.setattr(script_task, "opened_still", opened)
+    monkeypatch.setattr(imgsearch, "broad_search", no_image_search)
+    monkeypatch.setattr(script_task.process, "run", render)
+    scene = {"queries": ["Avengers Endgame"], "control": "", "heading": "0:00–0:06", "label": "", "fallback": ""}
+    first = "Крупный план Криса Эванса из официального материала «Финала», затем собственная графика «НЕТ» → «ДА»"
+    second = ("Стив передаёт щит Сэму, затем танец Стива и Пегги; "
+              "альтернативно — постер «Финала» + собственная графика «СЧАСТЛИВЫЙ ФИНАЛ»")
+    for visual, expected in ((first, script_task.ENDGAME_STEVE), (second, script_task.ENDGAME_POSTER)):
+        path = tmp_path / "scene.mp4"
+        refs = asyncio.run(script_task.find_motion(path, {**scene, "targets": [visual]}, "Реплика", 1, "", []))
+        assert refs == [{**script_task.still_ref(expected, script_task.ENDGAME_PRESS), "animated": True}]
+        assert path.is_file()
+    assert attempted == ["Стив передаёт щит Сэму", "танец Стива и Пегги"]
+
+    async def direct_shield_source():
+        return await anext(script_task.trailer_sources([], attempted[0], []))
+
+    assert asyncio.run(direct_shield_source()) == (
+        script_task.ENDGAME_SHIELD_CLIP, f"https://www.youtube.com/watch?v={script_task.ENDGAME_SHIELD_CLIP}")
+    assert script_task.studio_still("танец Стива и Пегги из «Финала»") is None
+
+
+def test_missing_part_does_not_render_editorial_instruction(monkeypatch, tmp_path):
+    async def still(path, scene, target, *args, **kwargs):
+        if "Руссо" not in target:
+            return None
+        path.touch()
+        return {"id": "russo", "url": script_task.RUSSO_PANEL, "kind": "still"}
+
+    def card(path, scene, index):
+        assert scene["missing"]
+        assert scene["heading"] == "КАДР НЕ НАЙДЕН"
+        assert not scene["label"] and not scene["fallback"]
+        path.touch()
+
+    async def render(*args, **kwargs):
+        Path(args[-1]).touch()
+
+    monkeypatch.setattr(script_task, "target_still", still)
+    monkeypatch.setattr(script_task, "fallback_card", card)
+    monkeypatch.setattr(script_task.process, "run", render)
+    russo = "Официальная фотография братьев Руссо"
+    downey = "официальное фото Дауни на анонсе роли Дума; не выдавать фан-арт за промо"
+    assert script_task.studio_still(russo) == (script_task.RUSSO_PANEL_IMAGE, script_task.RUSSO_PANEL)
+    assert script_task.studio_still(downey) == (script_task.DOWNEY_REVEAL_IMAGE, script_task.DOWNEY_REVEAL)
+    scene = {"targets": [f"{russo}, затем {downey}"], "control": "",
+             "heading": "Сцена 3", "label": "РУССО + ДУМ", "fallback": ""}
+    refs = asyncio.run(script_task.find_motion(tmp_path / "scene.mp4", scene, "Реплика", 3, "", []))
+    assert [ref["id"] for ref in refs] == ["russo"]
 
 
 def test_structured_trailer_uses_official_rutube_before_broad_search(monkeypatch):

@@ -23,6 +23,13 @@ log = logging.getLogger("shorts")
 STUDIO_HANDLES = {"@marvel", "@marvelstudios", "@disney", "@waltdisneystudios"}
 MARVEL_CHANNEL = "UCvC4D8onUfXzvjTOM-dBfEA"
 QUANTUMANIA_TRAILERS = ("ZlNFpri-Y40", "5WfTEZJnv_8")
+ENDGAME_SHIELD_CLIP = "ESdg6lXNJA4"
+ENDGAME_PRESS = "https://movies.disney.com/avengers-endgame"
+ENDGAME_STEVE = "https://lumiere-a.akamaihd.net/v1/images/g_avengersendgame_17_17734_43d7e80f.jpeg"
+ENDGAME_POSTER = "https://lumiere-a.akamaihd.net/v1/images/p_avengersendgame_19751_e14a0104.jpeg"
+RUSSO_PANEL = ("https://thewaltdisneycompany.com/news/marvel-studios-announces-robert-downey-jr-"
+               "and-the-russo-brothers-to-return-for-avengers-doomsday/")
+RUSSO_PANEL_IMAGE = "https://thewaltdisneycompany.com/app/uploads/2024/07/1920_JG2_0525_JNRquTYA-1024x683.jpg"
 KANG_PRESS = "https://press.disney.co.uk/gallery/ant-man-and-the-wasp-quantumania-logos-and-key-art"
 KANG_PRESS_IMAGE = ("https://lumiere-a.akamaihd.net/v1/images/pcl3080_mp01_v001_wr_g_r709_1124_13a8a9e5.jpeg"
                     "?region=426%2C0%2C3034%2C1707&width=1400")
@@ -397,8 +404,19 @@ def card_text(value: str) -> str:
     return re.sub(r"[\U0001F000-\U0001FAFF]", "", value).strip()
 
 
-def motion_targets(scene: dict) -> tuple[str, list[str]]:
+def planned_alternative(scene: dict) -> tuple[list[str], list[str]]:
     targets = [s.replace("**", "") for s in scene["targets"]]
+    if len(targets) == 1:
+        primary, *alternatives = re.split(r";\s*альтернативно\s*[—–:-]\s*", targets[0], maxsplit=1, flags=re.I)
+        if alternatives:
+            alternate = re.split(r"\s+\+\s+(?=(?:авторская|собственная)\s)", alternatives[0], maxsplit=1, flags=re.I)
+            if len(alternate) == 2 and primary.strip() and alternate[0].strip():
+                return [primary], alternate
+    return targets, []
+
+
+def motion_targets(scene: dict) -> tuple[str, list[str]]:
+    targets, _ = planned_alternative(scene)
     if len(targets) == 1:
         split = re.search(r"слева\s+(.+?),\s*справа\s+(.+)", targets[0], re.I)
         if split and not author_graphic(targets[0]):
@@ -428,8 +446,13 @@ def rutube_id(url: str) -> str:
 async def trailer_sources(queries: list[str], target: str, urls: list[str]):
     # Try a known studio upload and any direct Rutube links first. Then reuse
     # the older Rutube search before broad YouTube discovery takes the budget.
-    for ident in (QUANTUMANIA_TRAILERS[:1] if is_quantumania_kang(target) else ()):
-        yield ident, f"https://www.youtube.com/watch?v={ident}"
+    direct = ""
+    if is_quantumania_kang(target):
+        direct = QUANTUMANIA_TRAILERS[0]
+    elif re.search(r"\bстив\w*\s+переда[её]т щит с[эе]му\b", target, re.I):
+        direct = ENDGAME_SHIELD_CLIP
+    if direct:
+        yield direct, f"https://www.youtube.com/watch?v={direct}"
     seen = set()
     for ident in list(filter(None, map(rutube_id, urls)))[:2]:
         if ident not in seen:
@@ -446,7 +469,7 @@ async def trailer_sources(queries: list[str], target: str, urls: list[str]):
         except (aiohttp.ClientError, OSError, RuntimeError, TimeoutError, ValueError):
             log.info("Structured Shorts Rutube search unavailable")
     async for ident in studio_candidates(queries, target, urls):
-        if not (is_quantumania_kang(target) and ident == QUANTUMANIA_TRAILERS[0]):
+        if ident != direct:
             yield ident, f"https://www.youtube.com/watch?v={ident}"
 
 
@@ -531,10 +554,18 @@ async def verify_cut(path: Path, target: str, key: str, seconds: float) -> bool:
 def wants_still(target: str) -> bool:
     if re.search(r"(?:видео\s*(?:/|или|и)\s*фото|фото\s*(?:/|или|и)\s*видео)|видеофрагмент|трейлер|trailer", target, re.I):
         return False
-    return bool(re.search(r"логотип|портрет|\bфото\b|промокадр|официальн\w* образ|title reveal|press photo",
+    return bool(re.search(r"логотип|портрет|\bфото\b|фотографи|постер|промокадр|официальн\w* образ|title reveal|press photo",
                           target, re.I))
 
+
 def studio_still(target: str) -> tuple[str, str] | None:
+    endgame = re.search(r"avengers:? endgame|«(?:мстители:\s*)?финал(?:а)?»", target, re.I)
+    if endgame and re.match(r"(?:официальн\w*\s+)?постер\b", target, re.I):
+        return ENDGAME_POSTER, ENDGAME_PRESS
+    if endgame and re.match(r"крупный план (?:криса эванса|стива роджерса)\b", target, re.I):
+        return ENDGAME_STEVE, ENDGAME_PRESS
+    if re.fullmatch(r"официальная фотография братьев руссо[ .]*", target, re.I):
+        return RUSSO_PANEL_IMAGE, RUSSO_PANEL
     if is_quantumania_kang(target):
         if re.search(r"трейлер|trailer", target, re.I):
             return KANG_THRONE, KANG_PRESS
@@ -542,7 +573,7 @@ def studio_still(target: str) -> tuple[str, str] | None:
     if re.search(r"логотип|титр|logo", target, re.I) and re.search(r"doomsday|судн\w* день", target, re.I):
         return DOOMSDAY_LOGO, DOOM_PRESS
     if (re.search(r"дауни|downey", target, re.I) and re.search(r"дум\w*|doom", target, re.I)
-            and re.search(r"презентаци|comic.con|reveal", target, re.I)):
+            and re.search(r"презентаци|анонс|comic.con|reveal", target, re.I)):
         return DOWNEY_REVEAL_IMAGE, DOWNEY_REVEAL
     if re.search(r"джонатан\w* м[эе]йджорс|jonathan majors", target, re.I) and wants_still(target):
         return MAJORS_PORTRAIT, MAJORS_PORTRAIT_PAGE
@@ -563,7 +594,7 @@ def still_ref(image: str, source: str) -> dict:
            "url": source, "kind": "still"}
     if source in PHOTO_CREDITS:
         ref["credit"] = PHOTO_CREDITS[source][0]
-    elif source in (DOOM_PRESS, DOWNEY_REVEAL):
+    elif source in (DOOM_PRESS, DOWNEY_REVEAL, ENDGAME_PRESS, RUSSO_PANEL):
         ref["credit"] = "Материал Marvel · проверь право использования перед публикацией"
     elif source == KANG_PRESS:
         ref["credit"] = "Пресс-кадр Disney · только для редакционного использования"
@@ -644,9 +675,10 @@ async def find_still(scene: dict, target: str, queries: list[str], key: str, use
     return None
 
 
-async def target_still(path: Path, scene: dict, target: str, queries: list[str], key: str, used: list[dict]) -> dict | None:
+async def target_still(path: Path, scene: dict, target: str, queries: list[str], key: str, used: list[dict],
+                       *, timeout: int = 27) -> dict | None:
     try:
-        candidate = await asyncio.wait_for(find_still(scene, target, queries, key, used), 27)
+        candidate = await asyncio.wait_for(find_still(scene, target, queries, key, used), timeout)
     except (OSError, RuntimeError, TimeoutError, ValueError, aiohttp.ClientError):
         return None
     if not candidate:
@@ -675,13 +707,15 @@ async def target_still(path: Path, scene: dict, target: str, queries: list[str],
 async def find_motion(path: Path, scene: dict, narration: str, index: int, key: str, used: list[dict]) -> list[dict]:
     """Prepare one preview from studio clips and, for mixed layouts, labelled editorial graphics."""
     layout, targets = motion_targets(scene)
+    _, alternate = planned_alternative(scene)
     queries = scene.get("queries") or []
     urls = scene.get("sources") or []
-    if not queries and not urls and not any(map(studio_still, targets)):
+    if not queries and not urls and not any(map(studio_still, targets + alternate)):
         return []
     seconds = video_duration(scene, narration)
     part_duration = seconds if layout == "split" else math.ceil(seconds / len(targets) * 100) / 100
-    if len(targets) == 1 and (wants_still(targets[0]) or author_graphic(targets[0])):
+    if len(targets) == 1 and (wants_still(targets[0]) or author_graphic(targets[0])
+                              or studio_still(targets[0]) == (ENDGAME_STEVE, ENDGAME_PRESS)):
         return []
     refs, parts = [], []
     for j, target in enumerate(targets):
@@ -689,11 +723,11 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         is_graphic = author_graphic(target)
         specific = queries[j::len(targets)] if len(targets) > 1 else queries
         piece = None
-        is_still = wants_still(target)
+        is_still = wants_still(target) or studio_still(target) == (ENDGAME_STEVE, ENDGAME_PRESS)
         if not is_graphic and not is_still:
             try:
                 piece = await asyncio.wait_for(matching_clip(path.parent, stem, scene_search(specific, scene, "video", 2), target,
-                    scene["control"], key, part_duration, used + refs, urls), timeout=62)
+                    scene["control"], key, part_duration, used + refs, urls), timeout=30 if alternate else 62)
             except (TimeoutError, OSError, RuntimeError, ValueError):
                 log.info("Shorts studio search unavailable for scene %s", index)
         if piece:
@@ -702,18 +736,24 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
             parts.append(part)
         elif len(targets) > 1:
             still = path.with_name(stem + ".jpg")
-            ref = None if is_graphic else await target_still(
-                still, scene, target, scene_search(specific, scene, "image", 3), key, used + refs)
+            if is_graphic:
+                ref = None
+            else:
+                search = scene_search(specific, scene, "image", 3)
+                ref = await target_still(still, scene, target, search, key, used + refs,
+                                         timeout=12 if alternate else 27)
             if ref:
                 refs.append(ref)
             else:
                 graphic = {**scene, "label": "", "fallback": target if is_graphic else "",
-                           "heading": target.strip(" .")[:95]}
+                           "heading": target.strip(" .")[:95] if is_graphic else "КАДР НЕ НАЙДЕН",
+                           "missing": not is_graphic}
                 if is_graphic and "→" in target:
                     graphic["steps"] = re.findall(r"`([^`]+)`", target)[:3]
                     graphic["heading"] = "ИЗНАЧАЛЬНЫЙ ЗАМЫСЕЛ"
-                if re.search(r"доктор\w* дум|doctor doom", target, re.I):
-                    graphic.update(heading="ДОКТОР ДУМ", mask=True)
+                if (layout == "split" and j == 1 and re.search(r"доктор\w* дум|doctor doom", target, re.I)
+                        and re.search(r"справа\s*[—–-]\s*собственная графика", " ".join(scene["targets"]), re.I)):
+                    graphic.update(heading="ДОКТОР ДУМ", mask=True, missing=False)
                 await asyncio.to_thread(fallback_card, still, graphic, index + j)
             parts.append(still)
         else:
@@ -721,6 +761,8 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
     if not refs:
         for part in parts:
             part.unlink(missing_ok=True)
+        if alternate:
+            return await find_motion(path, {**scene, "targets": alternate}, narration, index, key, used)
         return []
     if layout == "single":
         parts[0].replace(path)
@@ -793,7 +835,8 @@ def fallback_card(path: Path, scene: dict, index: int) -> None:
                 break
         draw.multiline_text((540, 1180 if scene.get("mask") else 850), "\n".join(pieces), font=font, anchor="mm",
                             align="center", spacing=16, fill="#f8f1e3")
-        draw.text((540, 1300), "АВТОРСКАЯ ГРАФИКА", font=sans, anchor="mm", fill="#e6ba63")
+        footer = "НУЖЕН МАТЕРИАЛ" if scene.get("missing") else "АВТОРСКАЯ ГРАФИКА"
+        draw.text((540, 1300), footer, font=sans, anchor="mm", fill="#e6ba63")
         steps = scene.get("steps", [])
         if steps:
             timeline_font = ImageFont.truetype(str(head), 64)
