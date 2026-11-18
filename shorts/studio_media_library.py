@@ -123,11 +123,11 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
     if not ai.available(key):
         raise ValueError("Для проверки видеоряда настройте ИИ в /ai")
     failures: list[str] = []
-    sources: list[tuple[Path, dict[str, Any], str]] = []
+    sources: list[tuple[Path, dict[str, Any], str, str | None]] = []
     for identifier in ids[:MAX_MEDIA]:
         try:
             path, meta = await bridge.resolve_file(admin, identifier)
-            sources.append((path, meta, str(meta.get("name") or identifier)))
+            sources.append((path, meta, str(meta.get("name") or identifier), identifier))
         except (ValueError, OSError) as exc:
             failures.append(f"Файл недоступен: {type(exc).__name__}")
 
@@ -139,7 +139,7 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
         directory.mkdir(parents=True, exist_ok=True)
         try:
             downloaded = await clips.download_full(url, directory, timeout=90)
-            sources.append((downloaded, {"mime": "video/mp4", "remote": True}, url))
+            sources.append((downloaded, {"mime": "video/mp4", "remote": True}, url, None))
         except Exception as exc:  # noqa: BLE001 - individual platform may block fetching
             failures.append(f"Видео по ссылке недоступно: {type(exc).__name__}")
             log.warning("External source could not be fetched: %s", type(exc).__name__)
@@ -147,7 +147,7 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
     videos = [entry for entry in sources if entry[1].get("mime", "").startswith("video/")]
     images = [entry for entry in sources if entry not in videos]
     # Store remote video only after it has passed semantic inspection.
-    for index, (path, meta, label) in enumerate(videos):
+    for index, (path, meta, label, source_id) in enumerate(videos):
         try:
             location = work / f"video_{index}"
             location.mkdir(parents=True, exist_ok=True)
@@ -164,18 +164,7 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
                 asset = await bridge.store_file(admin, cut, "video/mp4", "source-clip.mp4")
                 start, end = 0.0, end - start
             else:
-                asset = {"id": str(meta.get("id") or ids[0]), "mime": meta["mime"],
-                         "name": label}
-                # The resolved metadata need not contain an id.
-                # For user media use the exact lookup id instead (see below).
-                for lookup_id in ids:
-                    try:
-                        candidate_path, _ = await bridge.resolve_file(admin, lookup_id)
-                        if candidate_path == path:
-                            asset["id"] = lookup_id
-                            break
-                    except (ValueError, OSError):
-                        pass
+                asset = {"id": source_id, "mime": meta["mime"], "name": label}
             return {"asset": asset, "start": start, "end": end, "source": label,
                     "rights": "unconfirmed" if meta.get("remote") else "author_uploaded",
                     "note": "Подобран движущийся фрагмент из медиабиблиотеки. "
@@ -184,27 +173,13 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
         except Exception as exc:  # noqa: BLE001
             failures.append(f"Ошибка анализа видео: {type(exc).__name__}")
             log.warning("Media candidate error: %s", type(exc).__name__)
-    for path, meta, label in images:
+    for path, meta, label, source_id in images:
         try:
-            if await matches(path, scene["text"], key):
-                identifier = next((i for i in ids
-                                   if str(bridge.root / str(admin) / "files" / (i + Path(path).suffix)) == str(path)),
-                                  None)
-                # Some adapters return different storage layouts.
-                if identifier is None:
-                    for i in ids:
-                        try:
-                            candidate_path, _ = await bridge.resolve_file(admin, i)
-                            if candidate_path == path:
-                                identifier = i
-                                break
-                        except (ValueError, OSError):
-                            pass
-                if identifier:
-                    return {"asset": {"id": identifier, "mime": meta["mime"], "name": label},
-                            "source": label, "rights": "author_uploaded",
-                            "note": "Кадр подобран из файлов автора; проверьте смысл перед утверждением.",
-                            "errors": failures[:8]}
+            if source_id and await matches(path, scene["text"], key):
+                return {"asset": {"id": source_id, "mime": meta["mime"], "name": label},
+                        "source": label, "rights": "author_uploaded",
+                        "note": "Кадр подобран из файлов автора; проверьте смысл перед утверждением.",
+                        "errors": failures[:8]}
         except Exception as exc:  # noqa: BLE001
             failures.append(f"Ошибка фото: {type(exc).__name__}")
     return None
