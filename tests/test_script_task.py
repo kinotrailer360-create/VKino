@@ -222,6 +222,7 @@ def test_structured_trailer_uses_official_rutube_before_broad_search(monkeypatch
     assert result[0][0] == script_task.QUANTUMANIA_TRAILERS[0]
     assert result[1] == ("rutube_" + video_id, url)
     assert not script_task.wants_still("официальное видео/фото с презентации")
+    assert not script_task.wants_still("официальное фото или видео с презентации")
     assert not script_task.rutube_id(f"https://rutube.ru/video/private/{video_id}/")
 
 
@@ -238,3 +239,7 @@ def test_approved_still_camera_moves_without_changing_size(tmp_path):
     with scene.frame(0, 4) as start, scene.frame(4, 4) as end:
         assert end.size == start.size
         assert start.tobytes() != end.tobytes()
+        reverse = ApprovedStill(path, reverse=True)
+        with reverse.frame(0, 4) as reverse_start, reverse.frame(4, 4) as reverse_end:
+            assert reverse_start.tobytes() == end.tobytes()
+            assert reverse_end.tobytes() == start.tobytes()
