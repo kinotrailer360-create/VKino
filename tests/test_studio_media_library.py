@@ -1,6 +1,5 @@
 """Tests for safe project-scoped media selection; no paid AI or network."""
 import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
