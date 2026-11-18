@@ -1001,9 +1001,9 @@ def _hook(theme: Theme, films: list[dict[str, Any]]) -> str:
     По Studio (ноябрь 2026) подборки теряли зрителей ровно на 4,5–6-й секунде, когда кончалась длинная фраза
     «5 свежих онлайн-премьер, которые стоит посмотреть! Номер один — …, досмотри до конца». Тема и так на обложке."""
     best = films[-1] if films else {}
-    rating, src = _rating(best) if best and not theme.upcoming else (0, "")
+    rating, _ = _rating(best) if best and not theme.upcoming else (0, "")
     if rating and rating >= 7.5:
-        return f"Номер один тут — {src} {rating:.1f}!"
+        return "Что посмотреть вечером?"
     return f"{theme.header.capitalize()}!"
 
 
@@ -1897,6 +1897,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     voice, starts, voiced, spans = await synthesize(lines, work)
     voice_meta = dict(last_voice)
     from . import visual_guard
+    (work / "visual_review_fallback.json").unlink(missing_ok=True)
     visual_end = starts[-1] + float(spans[-1]["speech"])
     await visual_guard.audit(work, [dict(card, text=lines[i + 1], start=starts[i + 1],
         end=starts[i + 2] if i + 2 < len(starts) else visual_end,
@@ -1956,7 +1957,8 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
         log.warning("shorts: render stalled — retrying without trailer clips")
         cfg.pop("intro_live", None)
         for c in cfg["cards"]:
-            c.pop("clip", None)
+            if c.pop("clip", None):
+                c.pop("visual_match", None)
             c.pop("overlay", None)
         await visual_guard.audit(work, [dict(card, text=lines[i + 1], start=starts[i + 1],
             end=starts[i + 2] if i + 2 < len(starts) else visual_end,
