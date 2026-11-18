@@ -96,6 +96,7 @@ from shorts import lore as shorts_lore
 from shorts import review as shorts_review
 from shorts import project as shorts_project
 from shorts import plan as shorts_plan
+from shorts import plan_import as shorts_plan_import
 from shorts import imgsearch as shorts_imgsearch
 from shorts.daily import say_to_file as shorts_say_to_file
 from shorts.daily import make_daily_short
@@ -7593,7 +7594,29 @@ async def report_interrupted_short(bot: Bot) -> None:
 PLAN_HOUR = 11  # МСК: напоминание о ролике по контент-плану (публиковать 12:00–15:00)
 
 
-def plan_text(day: date) -> tuple[str, InlineKeyboardMarkup | None]:
+def plan_week_key(day: date) -> str:
+    return f"editorial_plan:{shorts_plan_import.week_start(day):%Y-%m-%d}"
+
+
+async def imported_plan(day: date) -> dict[str, dict[str, Any]] | None:
+    raw = await shorts_setting(plan_week_key(day))
+    return json.loads(raw) if raw else None
+
+
+def plan_text(day: date, imported: dict[str, dict[str, Any]] | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
+    if imported is not None:
+        entry = imported.get(day.isoformat())
+        if not entry:
+            return "📅 На этот день в контент-плане ничего нет.", None
+        is_short = "narration" in entry
+        label = "🎬 Shorts" if is_short else "🎞 Длинное видео"
+        text = (f"📅 <b>По плану на {day:%d.%m}</b> (публиковать в {shorts_plan.publish_time(day)} МСК)\n"
+                f"{label}: <b>{escape(entry['title'])}</b>")
+        when = day.isoformat()
+        rows = [[_btn("📄 Показать сценарий", f"pl:txt:{when}"), _btn("🎨 Видеоряд и источники", f"pl:media:{when}")]]
+        if is_short:
+            rows.insert(0, [_btn("🎬 Собрать по готовому сценарию", f"pl:go:{when}")])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
     item, long_video = shorts_plan.today(day), shorts_plan.long_today(day)
     if not item and not long_video:
         return "📅 На сегодня в контент-плане ничего нет.", None
@@ -7622,8 +7645,8 @@ async def plan_reminder(bot: Bot) -> None:
     now = datetime.now(MSK)
     if now.hour < PLAN_HOUR or await shorts_setting("plan_last") == now.date().isoformat():
         return
+    text, kb = plan_text(now.date(), await imported_plan(now.date()))
     await set_shorts_setting("plan_last", now.date().isoformat())
-    text, kb = plan_text(now.date())
     if kb is None:
         return
     for admin_id in sorted(ADMIN_IDS):
@@ -7641,10 +7664,22 @@ async def plan_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     _, action, day = (callback.data or "").split(":", 2)
     try:
-        ready = shorts_plan.script(date.fromisoformat(day))
+        target = date.fromisoformat(day)
     except ValueError:
-        ready = None
+        await callback.answer()
+        return
     await callback.answer()
+    imported = await imported_plan(target) if callback.message.chat.type == "private" else None
+    entry = imported.get(day) if imported is not None else None
+    if entry and action in {"txt", "media"}:
+        await send_plan_entry(callback.message, entry, visual=action == "media")
+        return
+    if action not in {"txt", "go"}:
+        return
+    if imported is None:
+        ready = shorts_plan.script(target)
+    else:
+        ready = (entry["title"], entry["narration"]) if entry and "narration" in entry else None
     if not ready:
         await callback.message.answer("Готового сценария на этот день нет.")
         return
@@ -7654,19 +7689,83 @@ async def plan_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     # дальше — как «🎬 Свой сценарий»: показ текста, кнопки «📎 Свои картинки и видео», «✅ Собрать шортс»
     await state.update_data(own_scripts=[(title, f"**Заголовок:** {title}\n{body}")], own_pick=0, lore_kind="own",
-                            lore_name=title, lore_hook="", lore_script=None, lore_media=[])
+                            lore_name=title, lore_hook="", lore_script=None, lore_media=[], task_labels=[])
     await own_generate(callback.message, state)
 
 
-@router.message(Command("plan"))
+async def send_plan_entry(message: Message, entry: dict[str, Any], visual: bool) -> None:
+    sections = entry.get("sections", [])
+    if visual:
+        blocks = list(entry.get("visuals", []))
+        blocks += ["\n".join([part["heading"], *part["visuals"]]) for part in sections]
+        blocks += entry.get("notes", [])
+    else:
+        blocks = ([entry["narration"]] if "narration" in entry else
+                  [f"{part['heading']}\n{part['narration']}" for part in sections])
+        blocks += [entry[field] for field in ("description", "hashtags") if entry.get(field)]
+    current = f"📄 <b>{escape(entry['title'])}</b>"
+    for block in blocks:
+        for start in range(0, len(block), 700):
+            piece = escape(block[start:start + 700])
+            if len(current) + len(piece) + 2 > 3900:
+                await message.answer(current, disable_web_page_preview=True)
+                current = piece
+            else:
+                current += "\n\n" + piece if start == 0 else piece
+    await message.answer(current, disable_web_page_preview=True)
+
+
+@router.message(Command("planimport"), F.chat.type == "private")
+async def plan_import_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    document = message.document or (message.reply_to_message.document if message.reply_to_message else None)
+    if not document or not (document.file_name or "").lower().endswith(".docx"):
+        await message.answer("Пришли Word-файл с подписью /planimport или ответь командой /planimport на файл.")
+        return
+    if (document.file_size or 0) > shorts_plan_import.MAX_FILE_SIZE:
+        await message.answer("Файл должен быть до 2 МБ.")
+        return
+    buf = io.BytesIO()
+    await message.bot.download(document.file_id, destination=buf)
+    try:
+        start, days = shorts_plan_import.parse(buf.getvalue())
+    except ValueError as exc:
+        await message.answer(f"⚠️ {escape(str(exc))}")
+        return
+    await set_shorts_setting(plan_week_key(start), json.dumps(days, ensure_ascii=False))
+    if datetime.now(MSK).date().isoformat() in days:
+        await set_shorts_setting("plan_last", None)
+    end = start + timedelta(days=6)
+    items = "\n".join(f"• {date.fromisoformat(day):%d.%m} — {escape(entry['title'])}"
+                      for day, entry in sorted(days.items()))
+    await message.answer(f"✅ <b>План на {start:%d.%m}–{end:%d.%m} сохранён</b>\n{items}\n\n"
+                         f"Открыть неделю: <code>/plan {start:%Y-%m-%d}</code>")
+
+
+@router.message(Command("plan"), F.chat.type == "private")
 async def plan_command(message: Message) -> None:
     """/plan — что по контент-плану сегодня и на неделю вперёд."""
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         return
-    today = datetime.now(MSK).date()
-    text, kb = plan_text(today)
+    parts = (message.text or "").split(maxsplit=1)
+    try:
+        today = date.fromisoformat(parts[1].strip()) if len(parts) > 1 else datetime.now(MSK).date()
+    except ValueError:
+        await message.answer("Формат даты: /plan 2026-11-23")
+        return
+    current = await imported_plan(today)
+    text, kb = plan_text(today, current)
+    end = today + timedelta(days=6)
+    next_plan = await imported_plan(end) if plan_week_key(end) != plan_week_key(today) else current
     rows = []
     for day, item, long_video in shorts_plan.week(today + timedelta(days=1), 6):
+        imported = current if plan_week_key(day) == plan_week_key(today) else next_plan
+        if imported is not None:
+            entry = imported.get(day.isoformat())
+            title = ("🎞 " if "sections" in entry else "") + escape(entry["title"]) if entry else "—"
+            rows.append(f"• {day:%d.%m}: {title}")
+            continue
         part = escape(item[1]) if item else "—"
         rows.append(f"• {day:%d.%m}: {part}" + (f"\n   🎞 {escape(long_video)}" if long_video else ""))
     await message.answer(text + "\n\n<b>Дальше:</b>\n" + "\n".join(rows), reply_markup=kb)
@@ -19240,6 +19339,8 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="studio", description="🌐 Подключить KinoMir360 Studio"),
         BotCommand(command="studio_export", description="📁 Перенести текст в студию (ответом на сообщение)"),
         BotCommand(command="report", description="📊 Отчёт за неделю и план"),
+        BotCommand(command="plan", description="📅 Контент-план на неделю"),
+        BotCommand(command="planimport", description="📥 Загрузить контент-план из Word"),
         BotCommand(command="direct", description="📊 Статистика рекламы в Директе"),
         BotCommand(command="hype", description="🔥 Инфоповоды: проверить сейчас, /hype on|off"),
         BotCommand(command="shorts", description="▶️ YouTube и видео (кнопки)"),
