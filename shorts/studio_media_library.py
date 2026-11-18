@@ -131,48 +131,68 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
         except (ValueError, OSError) as exc:
             failures.append(f"Файл недоступен: {type(exc).__name__}")
 
+    # Inspect *all* uploaded video files before choosing, rather than returning
+    # the first matching shot. A shortlist lets the Site offer alternatives.
+    videos = [entry for entry in sources if entry[1].get("mime", "").startswith("video/")]
+    images = [entry for entry in sources if entry not in videos]
+    suggestions: list[dict[str, Any]] = []
+    for index, (path, meta, label, source_id) in enumerate(videos):
+        try:
+            location = work / f"video_{index}"
+            location.mkdir(parents=True, exist_ok=True)
+            window = await choose_video(path, scene, location, key)
+            if window is None:
+                failures.append(f"Нет подходящего фрагмента: {label[:45]}")
+                continue
+            start, end = window
+            suggestions.append({"asset": {"id": source_id, "mime": meta["mime"], "name": label},
+                                "start": start, "end": end, "source": label,
+                                "rights": "author_uploaded"})
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"Ошибка анализа видео: {type(exc).__name__}")
+            log.warning("Media candidate error: %s", type(exc).__name__)
+    if suggestions:
+        chosen = dict(suggestions[0])
+        chosen["alternatives"] = suggestions[1:4]
+        chosen["note"] = (
+            f"Проверено {len(videos)} видео; найдено подходящих вариантов: {len(suggestions)}. "
+            "ИИ сверил два кадра каждого предложенного фрагмента. "
+            "Подтвердите актёра, сцену и права перед монтажом; ничего не утверждено автоматически.")
+        chosen["errors"] = failures[:8]
+        return chosen
+
+    # External source links are fetched sequentially *only if* author videos
+    # had no match. This avoids caching five 80 MB videos needlessly.
     for index, url in enumerate(urls[:MAX_LINKS]):
         if not allowed_source(url):
             failures.append("Ссылка на неподдерживаемую площадку")
             continue
         directory = work / f"external_{index}"
         directory.mkdir(parents=True, exist_ok=True)
+        downloaded = None
         try:
             downloaded = await clips.download_full(url, directory, timeout=90)
-            sources.append((downloaded, {"mime": "video/mp4", "remote": True}, url, None))
-        except Exception as exc:  # noqa: BLE001 - individual platform may block fetching
-            failures.append(f"Видео по ссылке недоступно: {type(exc).__name__}")
-            log.warning("External source could not be fetched: %s", type(exc).__name__)
-
-    videos = [entry for entry in sources if entry[1].get("mime", "").startswith("video/")]
-    images = [entry for entry in sources if entry not in videos]
-    # Store remote video only after it has passed semantic inspection.
-    for index, (path, meta, label, source_id) in enumerate(videos):
-        try:
-            location = work / f"video_{index}"
-            location.mkdir(parents=True, exist_ok=True)
-            window = await choose_video(path, scene, location, key)
+            window = await choose_video(downloaded, scene, directory, key)
             if not window:
-                failures.append(f"Нет подходящего фрагмента: {label[:45]}")
+                failures.append(f"Нет подходящего фрагмента по ссылке: {url[:40]}")
                 continue
             start, end = window
-            if meta.get("remote"):
-                # Keep only the selected muted excerpt instead of retaining a full
-                # third-party clip as durable upload. Rights remain unconfirmed.
-                cut = work / f"selected_{index}.mp4"
-                await clips.cut_clip(path, cut, start, end - start)
-                asset = await bridge.store_file(admin, cut, "video/mp4", "source-clip.mp4")
-                start, end = 0.0, end - start
-            else:
-                asset = {"id": source_id, "mime": meta["mime"], "name": label}
-            return {"asset": asset, "start": start, "end": end, "source": label,
-                    "rights": "unconfirmed" if meta.get("remote") else "author_uploaded",
-                    "note": "Подобран движущийся фрагмент из медиабиблиотеки. "
-                            "ИИ проверил два кадра; подтвердите смысл, лицо и права перед монтажом.",
+            cut = work / f"selected_{index}.mp4"
+            await clips.cut_clip(downloaded, cut, start, end - start)
+            asset = await bridge.store_file(admin, cut, "video/mp4", "source-clip.mp4")
+            return {"asset": asset, "start": 0.0, "end": end - start,
+                    "source": url, "sourceStart": start, "rights": "unconfirmed",
+                    "alternatives": [],
+                    "note": "Фрагмент найден по предоставленной ссылке. "
+                            "Подтвердите его содержание и право использования; "
+                            "публикация автоматически не разрешена.",
                     "errors": failures[:8]}
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"Ошибка анализа видео: {type(exc).__name__}")
-            log.warning("Media candidate error: %s", type(exc).__name__)
+            failures.append(f"Видео по ссылке недоступно: {type(exc).__name__}")
+            log.warning("External source could not be used: %s", type(exc).__name__)
+        finally:
+            if downloaded is not None:
+                downloaded.unlink(missing_ok=True)
     for path, meta, label, source_id in images:
         try:
             if source_id and await matches(path, scene["text"], key):
