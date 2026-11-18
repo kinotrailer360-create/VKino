@@ -136,7 +136,8 @@ def lumean_timeout(prompt: str, max_tokens: int = 4000) -> int:
     return 300 if len(prompt) > 20000 or max_tokens > 4000 else 150
 
 
-async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens: int = 4000) -> Any:
+async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens: int = 4000,
+                      *, model_override: str = "") -> Any:
     """Запрос к сильной модели через ИИ-шлюз Lumean (OpenAI Chat Completions), ответ — JSON."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     if image is not None:
@@ -147,21 +148,27 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
         content.append({"type": "image_url", "image_url": {
             "url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}})
     started = time.monotonic()
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=lumean_timeout(prompt, max_tokens))) as session:
-        model = await _lumean_pick_model(session)
+    is_factcheck = model_override == luna.MODEL
+    wait = 40 if is_factcheck else lumean_timeout(prompt, max_tokens)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=wait)) as session:
+        model = model_override or await _lumean_pick_model(session)
         body = {"model": model, "temperature": 0.3, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": "Отвечай только валидным JSON, без пояснений."},
                              {"role": "user", "content": content}]}
         # платный вызов — через бюджет (цена за вызов из .env; не задана — считается, но по 0$)
-        estimate = budget.lumean_cost(len(json.dumps(body, ensure_ascii=False)) // 3, max_tokens)
-        async with budget.guard("ai", "lumean_llm", estimate, f"lumean:{model}") as r:
+        if is_factcheck:
+            body.pop("temperature")
+        cost = luna.cost if model == luna.MODEL else budget.lumean_cost
+        estimate = cost(len(json.dumps(body, ensure_ascii=False)) // 3, max_tokens)
+        operation = "luna_factcheck" if is_factcheck else "lumean_llm"
+        async with budget.guard("ai", operation, estimate, f"lumean:{model}") as r:
             async with session.post(f"{LUMEAN_LLM_URL}/chat/completions", json=body,
                                     headers={"Authorization": f"Bearer {LUMEAN_LLM_KEY}"}) as resp:
                 data = await resp.json(content_type=None)
                 status, headers = resp.status, resp.headers
             used = (data.get("usage") or {}) if isinstance(data, dict) else {}
             t_in, t_out = int(used.get("prompt_tokens") or 0), int(used.get("completion_tokens") or 0)
-            actual = 0.0 if status != 200 else (budget.lumean_cost(t_in, t_out) if used else None)
+            actual = 0.0 if status != 200 else (cost(t_in, t_out) if used else None)
             await r.settle(actual, {"http": status, "in": t_in, "out": t_out})
     choices = data.get("choices") if isinstance(data, dict) else None
     choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
@@ -174,14 +181,15 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
         err = (data.get("error") or {}) if isinstance(data, dict) else {}
         text = str(err.get('message') or err.get('code') or data)[:200]
         if status == 429 or status >= 500:  # перегрузка или лимит шлюза — минуты не беспокоим
-            cooldown("lumean", _retry_after(headers, data, text) or 300, f"HTTP {status}")
+            cooldown("luna" if is_factcheck else "lumean", _retry_after(headers, data, text) or 300, f"HTTP {status}")
         elif status in (401, 402, 403):  # ключ или баланс — само не пройдёт, час не тратим время
-            cooldown("lumean", 3600, "ключ не принят или кончился баланс")
+            cooldown("luna" if is_factcheck else "lumean", 3600, "ключ не принят или кончился баланс")
         raise AIError(f"Lumean ИИ HTTP {status} ({model}): {text}")
     if truncated:
         raise OutputTruncated(f"Lumean ИИ: ответ обрезан на {max_tokens} токенах ({model})")
     try:
-        return _json_from(choice["message"]["content"])
+        content = choice["message"]["content"]
+        return json.loads(content) if is_factcheck else _json_from(content)
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise AIError(f"Lumean ИИ: неожиданный ответ ({exc})") from exc
 
@@ -827,6 +835,9 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
     if LUMEAN_LLM_KEY:
         await run("ИИ Lumean (главный автор текстов)" + ("" if lumean_llm_on() else " — выключен: LLM_PRIMARY=gemini"),
                   _ask_lumean(ask, max_tokens=50), lambda r: f"отвечает, модель {LUMEAN_LLM_MODEL or _lumean_model}")
+        if luna.MODE in {"shadow", "active"}:
+            await run(f"Фактчек Lumean ({luna.MODE})", _ask_lumean(ask, max_tokens=256, model_override=luna.MODEL),
+                      lambda r: f"отвечает, модель {luna.MODEL}")
     out += await websearch.probe()
     return out
 
@@ -2811,13 +2822,15 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
     if not facts or not body:
         return blank
     comparison = None
-    if luna.KEY and luna.MODE in {"shadow", "active"} and not cooling("luna"):
+    if LUMEAN_LLM_KEY and luna.MODE in {"shadow", "active"} and not cooling("luna"):
         try:
-            comparison = await luna.check(facts, material)
+            prompt, sources = luna.prepare(facts, material)
+            data = await _ask_lumean(prompt, max_tokens=min(6000, 800 + 220 * len(facts)), model_override=luna.MODEL)
+            comparison = luna.validate(data, facts, sources)
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Luna fact check unavailable (%s)", type(exc).__name__)
             cooldown("luna", 120, "проверка недоступна")
-    if luna.KEY and luna.MODE == "active":
+    if luna.MODE == "active":
         return comparison if comparison is not None else [
             {**row, "note": "Проверка источников временно недоступна."} for row in blank
         ]
