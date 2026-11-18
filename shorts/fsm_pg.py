@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
 import logging
 from typing import Any, Mapping
 
 from aiogram.fsm.state import State
-from aiogram.fsm.storage.base import BaseStorage, DefaultKeyBuilder, StorageKey
+from aiogram.fsm.storage.memory import SimpleEventIsolation
+from aiogram.fsm.storage.base import BaseEventIsolation, BaseStorage, DefaultKeyBuilder, StorageKey
 
 log = logging.getLogger("vkino.fsm")
 
@@ -64,3 +66,25 @@ class PgStorage(BaseStorage):
         done = await self._pool().execute(
             "DELETE FROM fsm_states WHERE updated_at < NOW() - make_interval(days => $1)", KEEP_DAYS)
         return int(str(done).split()[-1] or 0)
+
+
+class RemixEventIsolation(BaseEventIsolation):
+    """Serialize remix FSM changes without holding album debounce handlers in a queue.
+
+    Aiogram reloads the FSM state *inside* this context before matching handlers.
+    """
+    def __init__(self, storage: BaseStorage) -> None:
+        self.storage = storage
+        self.remix = SimpleEventIsolation()
+
+    @asynccontextmanager
+    async def lock(self, key: StorageKey):
+        state = await self.storage.get_state(key)
+        if state and state.startswith('RemixState:'):
+            async with self.remix.lock(key):
+                yield
+        else:
+            yield
+
+    async def close(self) -> None:
+        await self.remix.close()

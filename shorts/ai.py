@@ -663,6 +663,20 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
     Ошибка — с причинами всех."""
     errors = []
     # картинки в запросе, а листа для резервных моделей нет — сильной модели нечего показать, сразу Gemini
+    if image is None:
+        pictures = []
+        for part in gemini_parts:
+            inline = part.get('inline_data') or {}
+            if str(inline.get('mime_type') or '').startswith('image/'):
+                try:
+                    with Image.open(io.BytesIO(base64.b64decode(inline['data']))) as original:
+                        pictures.append(original.convert('RGB'))
+                except (KeyError, ValueError, OSError):
+                    continue
+                if len(pictures) >= 32:
+                    break
+        if pictures:
+            image = pictures[0] if len(pictures) == 1 else _sheet(pictures)
     blind = image is None and any("inline_data" in p for p in gemini_parts)
     lumean_first = lumean_llm_on() and not blind and (premium or paid_first or LUMEAN_MODE == "all")
 

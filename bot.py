@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import time
+import weakref
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -58,6 +59,8 @@ from shorts import studio_adapter as shorts_studio_adapter
 from shorts import ai as shorts_ai
 from shorts import budget as shorts_budget
 from shorts import migrations as shorts_migrations
+from shorts import jobs as shorts_render_jobs
+from shorts import publications as shorts_publications
 from shorts import fsm_pg as shorts_fsm
 from shorts import narrator as shorts_narrator
 from shorts import yttrailers as shorts_yttrailers
@@ -7257,7 +7260,7 @@ async def broadcast(
 
 MSK = timezone(timedelta(hours=3))
 SHORTS_HOUR = int(os.getenv("SHORTS_HOUR", "8"))
-SHORTS_DIR = Path(os.getenv("SHORTS_DIR", "/tmp/kinomir_shorts"))
+SHORTS_DIR = Path(os.getenv("SHORTS_DIR", str(shorts_daily.DATA_DIR / "work")))
 if not os.getenv("MUSIC_DIR"):
     shorts_music.DIR = SHORTS_DIR / "music"  # копии треков библиотеки; сами треки хранятся в Telegram
 SHORT_THEMES = {
@@ -9035,12 +9038,7 @@ async def shorts_panel(
         await state.clear()
         await show(SHORTS_MENU_TEXT, shorts_menu())
     elif data == "sh:remix:done":
-        draft = await state.get_data()
-        if not draft.get("remix_assets"):
-            await message.answer("Сначала пришли хотя бы одно фото или видео.")
-            return
-        await state.clear()
-        _run_job(lambda: remix_visual_job(message, draft))
+        await remix_done(message, state)
     elif data == "sh:remix":
         await state.clear()
         await show("✂️ <b>Перемонтировать своё видео</b>\n\nВыбери, что менять. Исходник останется нетронутым.",
@@ -10731,7 +10729,8 @@ async def remix_source(message: Message, state: FSMContext) -> None:
     work.mkdir(parents=True,exist_ok=True)
     src=work/"original.mp4"
     await message.bot.download(media.file_id,destination=src)
-    await state.update_data(remix_work=str(work),remix_source=str(src),remix_assets=[],remix_revision=0)
+    await state.update_data(remix_work=str(work),remix_source=str(src),remix_assets=[],remix_revision=0,
+                            remix_source_file_id=media.file_id, remix_asset_files=[])
     data=await state.get_data()
     if data["remix_mode"] in {"audio","both"}:
         await state.set_state(RemixState.text)
@@ -10757,8 +10756,8 @@ async def remix_text(message: Message,state: FSMContext)->None:
     await state.update_data(remix_text=text)
     data=await state.get_data()
     if data.get("remix_mode")=="audio":
+        await enqueue_remix(message, data, 'audio')
         await state.clear()
-        _run_job(lambda: remix_audio_job(message,data))
     else:
         await state.set_state(RemixState.assets)
         source_type = data.get("remix_source_type", "user")
@@ -10771,8 +10770,21 @@ async def remix_text(message: Message,state: FSMContext)->None:
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                  [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
 
+remix_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
 @router.message(RemixState.assets, F.photo | F.video | F.document)
 async def remix_asset(message: Message,state: FSMContext)->None:
+    snapshot = await state.get_data()
+    key = str(snapshot.get("remix_work") or "")
+    if not key:
+        return
+    lock = remix_upload_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        await _save_remix_asset(message, state)
+
+
+async def _save_remix_asset(message: Message,state: FSMContext)->None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:return
     media=message.photo[-1] if message.photo else message.video or message.document
     if not media:return
@@ -10782,9 +10794,16 @@ async def remix_asset(message: Message,state: FSMContext)->None:
         await message.answer("Материал больше 20 МБ. Отправь сжатую версию.");return
     data=await state.get_data();work=Path(data["remix_work"])
     ext=".jpg" if message.photo or str(getattr(media,"mime_type","")).startswith("image/") else ".mp4"
-    path=work/f"asset_{len(data.get('remix_assets',[])):03d}{ext}"
-    await message.bot.download(media.file_id,destination=path)
-    assets=data.get("remix_assets",[]);assets.append(str(path));await state.update_data(remix_assets=assets)
+    path=work/f"asset_{secrets.token_hex(8)}{ext}"
+    try:
+        await message.bot.download(media.file_id,destination=path)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    assets=list(data.get("remix_assets",[]));assets.append(str(path))
+    files=list(data.get("remix_asset_files",[]))
+    files.append({"path": str(path), "file_id": media.file_id, "kind": "image" if ext == ".jpg" else "video"})
+    await state.update_data(remix_assets=assets, remix_asset_files=files)
     await message.answer(f"✅ Добавлено материалов: {len(assets)}. Можно прислать ещё или закончить.",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                              [_btn("✅ Готово — собрать черновик", "sh:remix:done")]]))
@@ -10795,8 +10814,85 @@ async def remix_done(message: Message,state: FSMContext)->None:
     data=await state.get_data()
     if not data.get("remix_assets") and data.get("remix_source_type") not in {"ai", "mix"}:
         await message.answer("Сначала пришли хотя бы один кадр.");return
+    await enqueue_remix(message, data, 'visual')
     await state.clear()
-    _run_job(lambda: remix_visual_job(message,data))
+
+
+render_jobs: shorts_render_jobs.Jobs | None = None
+
+
+async def enqueue_remix(message: Message, data: dict[str, Any], kind: str) -> None:
+    if render_jobs is None:
+        raise RuntimeError('Очередь сборки ещё запускается. Повтори через несколько секунд.')
+    work = Path(data['remix_work'])
+    work.mkdir(parents=True, exist_ok=True)
+    source = Path(data['remix_source'])
+    if not source.is_file():
+        if not data.get('remix_source_file_id'):
+            await message.answer('Исходник старой сборки не сохранился. Пришли исходное видео заново через «Перемонтировать».')
+            return
+        await message.bot.download(data['remix_source_file_id'], destination=source)
+    for item in data.get('remix_asset_files', []):
+        if not Path(item['path']).is_file():
+            await message.bot.download(item['file_id'], destination=Path(item['path']))
+    await render_jobs.enqueue(kind, message.chat.id, data)
+    await message.answer('✅ Материалы сохранены. Ролик в очереди сборки; статус и продолжение — /projects.')
+
+
+async def execute_render_job(bot: Bot, kind: str, chat: int, data: dict[str, Any],
+                              identifier: str, result: dict[str, Any]) -> None:
+    task = asyncio.current_task()
+    shorts_jobs.add(task)
+    data = dict(data, render_job_id=identifier, render_checkpoint=result)
+    try:
+        message = await bot.send_message(chat, '▶️ Начинаю сохранённую сборку…')
+        await set_shorts_setting('running', json.dumps({'chats':[chat], 'theme':'перемонтаж'}))
+        await (remix_audio_job(message, data) if kind == 'audio' else remix_visual_job(message, data))
+    finally:
+        shorts_jobs.discard(task)
+        await clear_running()
+
+
+@router.message(Command('projects'))
+async def projects_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    rows = await db().fetch('SELECT id,kind,status,error FROM render_jobs WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 10', message.chat.id)
+    for row in rows:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            _btn('▶️ Продолжить', f"job:resume:{row['id']}")]]) if row['status'] in {'failed','cancelled','interrupted'} else None
+        name = {'audio':'Новая озвучка','visual':'Перемонтаж видео'}.get(row['kind'], 'Ролик')
+        status = {'queued':'В очереди','running':'Собирается','succeeded':'Готов',
+                  'failed':'Нужен повтор','interrupted':'Прерван при перезапуске','cancelled':'Остановлен',
+                  'expired':'Срок хранения завершён'}.get(row['status'], row['status'])
+        await message.answer(escape(f"🎞 {name}: {status}\n{_safe_err(row['error'])}"), reply_markup=keyboard)
+    if not rows:
+        await message.answer('Сохранённых сборок пока нет.')
+
+
+@router.callback_query(F.data.startswith("job:"))
+async def projects_button(callback: CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS or not callback.message:
+        await callback.answer()
+        return
+    identifier = (callback.data or '').removeprefix('job:resume:')
+    ok = render_jobs and await render_jobs.resume(identifier, callback.message.chat.id)
+    await callback.answer('Добавлено в очередь' if ok else 'Сборка уже выполняется или недоступна')
+
+
+async def saved_render(data: dict[str, Any]) -> Path | None:
+    checkpoint = data.get('render_checkpoint') or {}
+    path = Path(checkpoint.get('output') or '')
+    if path.is_file() and await asyncio.to_thread(shorts_scene_planner._digest, path) == checkpoint.get('sha256'):
+        return path
+    return None
+
+
+async def checkpoint_render(data: dict[str, Any], output: Path) -> None:
+    if render_jobs and data.get('render_job_id'):
+        await render_jobs.checkpoint(data['render_job_id'], {
+            'output':str(output), 'sha256':await asyncio.to_thread(shorts_scene_planner._digest, output),
+        })
 
 async def send_remix_ready(message: Message, output: Path, work: Path, caption: str,
                            narration: str | None = None) -> None:
@@ -10804,8 +10900,21 @@ async def send_remix_ready(message: Message, output: Path, work: Path, caption: 
     from shorts import remix as remix_engine
     telegram_video = await _telegram_short_file(output)
     sent = await message.answer_video(FSInputFile(telegram_video), caption=caption, supports_streaming=True)
+    expected_stills = []
+    if (work / 'remix_edit.json').is_file():
+        manifest = json.loads((work / 'remix_edit.json').read_text())
+        expected_stills = [(scene['phrase_start'],scene['phrase_end'])
+                           for scene in manifest.get('selected',[]) if scene.get('kind')=='image']
+    issues = await shorts_qc.check(output, True, expected_size=(720,1280) if (work/'remix_edit.json').is_file() else None,
+                                    expected_stills=expected_stills)
+    (work / 'remix_qc.json').write_text(json.dumps(issues,ensure_ascii=False),encoding='utf-8')
+    if issues:
+        await message.answer(shorts_qc.report(issues))
     seo = await remix_engine.publication_metadata(work, GEMINI_API_KEY, narration)
     keep_for_upload(message.chat.id, sent.message_id, SimpleNamespace(video=output, seo=seo))
+    if (work / shorts_project.FILE).is_file():
+        await keep_project(message.chat.id, sent.message_id, work,
+                           {'mode':'remix','caption':caption,'seo':seo})
     upload_path = READY_DIR / f"{message.chat.id}_{sent.message_id}.mp4"
     available = upload_path.is_file() and upload_path.with_suffix('.json').is_file()
     await message.answer(f"<b>Название для YouTube:</b>\n<pre>{escape(seo['title'])}</pre>")
@@ -10825,23 +10934,30 @@ async def remix_audio_job(message: Message,data: dict[str,Any])->None:
     work=Path(data["remix_work"]);wait=await message.answer("🎙 Создаю новую озвучку…")
     try:
         async with shorts_lock:
-            out=await remix_engine.replace_audio(Path(data["remix_source"]),data["remix_text"],work)
+            out=await saved_render(data)
+            if out is None:
+                out=await remix_engine.replace_audio(Path(data["remix_source"]),data["remix_text"],work)
+                await checkpoint_render(data, out)
         await send_remix_ready(message, out, work,
                                "Черновик: новая озвучка, исходный видеоряд сохранён. Оригинал не изменён.",
                                data["remix_text"])
         await wait.delete()
     except Exception as exc:
         await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:350])}</code>")
+        raise
 
 async def remix_visual_job(message: Message,data: dict[str,Any])->None:
     from shorts import remix as remix_engine
     work=Path(data["remix_work"]);wait=await message.answer("🎞 Создаю видеоряд и проверяю соответствие сцен…")
     try:
         async with shorts_lock:
-            out=await remix_engine.replace_visuals(Path(data["remix_source"]),
-                [Path(x) for x in data.get("remix_assets",[])],work/"новый_черновик.mp4",work,GEMINI_API_KEY,
-                data.get("remix_text") if data.get("remix_mode")=="both" else None,
-                data.get("remix_source_type","user"))
+            out=await saved_render(data)
+            if out is None:
+                out=await remix_engine.replace_visuals(Path(data["remix_source"]),
+                    [Path(x) for x in data.get("remix_assets",[])],work/"новый_черновик.mp4",work,GEMINI_API_KEY,
+                    data.get("remix_text") if data.get("remix_mode")=="both" else None,
+                    data.get("remix_source_type","user"))
+                await checkpoint_render(data, out)
         caption=("Черновик: новый видеоряд и новая озвучка. Оригинал сохранён; перед публикацией проверь результат." if data.get("remix_mode")=="both"
                  else "Черновик: новый видеоряд и исходная озвучка. Оригинал сохранён; перед публикацией проверь результат.")
         review_path = work / "remix_visual_review.json"
@@ -10861,6 +10977,7 @@ async def remix_visual_job(message: Message,data: dict[str,Any])->None:
     except Exception as exc:
         error = _safe_err(exc)
         await wait.edit_text(f"❌ Не получилось: <code>{escape(error[:350])}</code>")
+        raise
 
 @router.callback_query(F.data.startswith("cs:"))
 async def custom_buttons(callback: CallbackQuery, state: FSMContext) -> None:
@@ -11119,7 +11236,8 @@ async def _queue_json_remove(pairs: set[tuple[int, int]]) -> None:
 async def queue_add(chat_id: int, first: int, at: int) -> None:
     """Поставить пост в отложенную публикацию (ai_queue, миграция 004); тот же пост — новое время."""
     await db().execute("INSERT INTO ai_queue (chat_id, first_id, at) VALUES ($1, $2, to_timestamp($3)) "
-                       "ON CONFLICT (chat_id, first_id) DO UPDATE SET at = EXCLUDED.at", chat_id, first, at)
+                       "ON CONFLICT (chat_id, first_id) DO UPDATE SET at = EXCLUDED.at, status='queued', "
+                       "claimed_at=NULL, attempts=0, next_attempt=EXCLUDED.at, last_error=''", chat_id, first, at)
     queue = [q for q in await _json_setting("posts_queue", []) if not (q["chat"] == chat_id and q["first"] == first)]
     await set_shorts_setting("posts_queue", json.dumps(queue + [{"chat": chat_id, "first": first, "at": at}]))
 
@@ -11131,14 +11249,24 @@ async def _unqueue(chat_id: int, first: int) -> bool:
     return done.endswith(" 1")
 
 
+async def recover_post_publications() -> None:
+    # Single bot instance: no send from the previous process can still be active.
+    await db().execute("UPDATE ai_drafts SET status='uncertain', updated_at=NOW() WHERE status='publishing'")
+
+
+async def post_publication_state(chat_id: int, first: int):
+    return await db().fetchrow("SELECT status FROM ai_drafts WHERE chat_id=$1 AND first_id=$2", chat_id, first)
+
+
+class PublicationNeedsReview(RuntimeError):
+    pass
+
+
 class AlreadyPublishing(RuntimeError):
     pass
 
 
-PUBLISH_CLAIM = timedelta(minutes=5)  # «публикуется» дольше — публикация оборвалась (перезапуск), можно снова
-
-
-async def _claim_publish(chat_id: int, first: int) -> bool:
+async def _claim_publish(chat_id: int, first: int, force: bool = False) -> bool:
     """Атомарно занять пост для публикации: True — можно публиковать. Второе нажатие, кнопка + расписание или
     повтор после перезапуска получат False, пока идёт первая публикация."""
     meta = await _post_meta(chat_id, first)
@@ -11148,25 +11276,30 @@ async def _claim_publish(chat_id: int, first: int) -> bool:
         chat_id, first, json.dumps(meta, ensure_ascii=False))
     got = await db().fetchval(
         "UPDATE ai_drafts SET status = 'publishing', claimed_at = NOW(), updated_at = NOW() "
-        "WHERE chat_id = $1 AND first_id = $2 AND (status <> 'publishing' OR claimed_at < NOW() - $3::interval) "
-        "RETURNING 1", chat_id, first, PUBLISH_CLAIM)
+        "WHERE chat_id = $1 AND first_id = $2 AND (status NOT IN ('publishing','published','uncertain') "
+        "OR ($3 AND status IN ('published','uncertain'))) RETURNING 1", chat_id, first, force)
     return bool(got)
 
 
-async def publish_post(bot: Bot, chat_id: int, first: int, actor: int | None = None) -> None:
+async def publish_post(bot: Bot, chat_id: int, first: int, actor: int | None = None, force: bool = False) -> None:
     """Публикация в канал ровно один раз: занимаем пост в базе (status='publishing'), публикуем, отмечаем
     'published' (или 'failed'). Повторно тот же пост — только после подтверждения автора («📢 Да, ещё раз»)."""
-    if not await _claim_publish(chat_id, first):
+    if not await _claim_publish(chat_id, first, force):
+        previous = await post_publication_state(chat_id, first)
+        if previous and previous['status'] in ('uncertain', 'published'):
+            raise PublicationNeedsReview('проверь канал перед повтором')
         raise AlreadyPublishing("этот пост уже публикуется")
     try:
         await _publish_post(bot, chat_id, first)
     except Exception as exc:
-        await db().execute("UPDATE ai_drafts SET status = 'failed', updated_at = NOW() "
-                           "WHERE chat_id = $1 AND first_id = $2", chat_id, first)
+        status = 'failed' if isinstance(exc, (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter)) else 'uncertain'
+        await db().execute("UPDATE ai_drafts SET status = $3, updated_at = NOW() "
+                           "WHERE chat_id = $1 AND first_id = $2", chat_id, first, status)
         await audit(chat_id, first, actor, "publish_failed", {"error": _safe_err(exc)[:300]})
         raise
     await db().execute("UPDATE ai_drafts SET status = 'published', published_at = NOW(), published_by = $3, "
                        "updated_at = NOW() WHERE chat_id = $1 AND first_id = $2", chat_id, first, actor)
+    await _unqueue(chat_id, first)
     shorts_usage.record("tg_posts")  # для недельного отчёта
     await audit(chat_id, first, actor, "published", {"channel": POST_CHANNEL, "scheduled": actor is None})
     old = await _json_setting("posts_meta", {})  # двойная запись: отметка в старом JSON
@@ -11179,7 +11312,6 @@ async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
     """Копия поста (альбом целиком) в канал автора; у подборки — опрос «Что посмотрите первым?».
     Пост снимается с отложенной публикации (вышел сейчас — по расписанию повторно не выйдет) и помечается
     опубликованным (повторное нажатие спросит подтверждение)."""
-    await _unqueue(chat_id, first)
     meta = await _post_meta(chat_id, first)
     button = meta.get("button")
     if button and len(meta["ids"]) == 1:  # пост со ссылкой-кнопкой (бот, буст): копируем вместе с кнопкой
@@ -11187,6 +11319,15 @@ async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
             inline_keyboard=[[InlineKeyboardButton(text=button["text"], url=button["url"])]]))
     else:
         await bot.copy_messages(POST_CHANNEL, chat_id, meta["ids"])
+    try:
+        await _publish_post_poll(bot, meta)
+    except Exception:
+        # The post itself has already been delivered. A failed optional poll must
+        # never make the whole post retry and duplicate it in the channel.
+        logging.exception("Post delivered; attached poll failed")
+
+
+async def _publish_post_poll(bot: Bot, meta: dict[str, Any]) -> None:
     vote = meta.get("vote")
     if vote:  # «Выбор подписчиков»: опрос запоминаем — в пятницу бот подведёт итог и сделает пост о победителе
         sent = await bot.send_poll(POST_CHANNEL, VOTE_QUESTION, vote["titles"], is_anonymous=True)
@@ -11198,7 +11339,7 @@ async def _publish_post(bot: Bot, chat_id: int, first: int) -> None:
         await bot.send_poll(POST_CHANNEL, "Что это за фильм? 🎬", quiz["options"], type="quiz",
                             correct_option_id=quiz["correct"], is_anonymous=True, explanation=quiz["explanation"])
         return
-    options = list(dict.fromkeys(t[:100] for t in meta["poll"] if t))[:10]
+    options = list(dict.fromkeys(t[:100] for t in meta.get("poll", []) if t))[:10]
     if len(options) >= 2:
         try:
             await bot.send_poll(POST_CHANNEL, meta.get("question") or POLL_QUESTION, options, is_anonymous=True)
@@ -13522,6 +13663,8 @@ async def youtube_button(callback: CallbackQuery) -> None:
 
     async def job() -> None:
         async with yt_lock:
+            upload_version, claimed = '', False
+            uploads = shorts_publications.Uploads(db())
             try:
                 refresh = await shorts_setting("yt_refresh") or await _yt_login(message)
                 try:
@@ -13531,13 +13674,35 @@ async def youtube_button(callback: CallbackQuery) -> None:
                     await message.answer("Вход в YouTube устарел — войдём заново.")
                     token = await shorts_yt.access_token(YT_CLIENT_ID, YT_CLIENT_SECRET, await _yt_login(message))
                 seo = json.loads(seo_file.read_text())
+                upload_version = await asyncio.to_thread(shorts_publications.version, video, seo)
+                claimed = await uploads.claim(upload_version, message.chat.id, int(first), seo, again)
+                if not claimed:
+                    previous = await db().fetchrow('SELECT status,video_id FROM youtube_publications WHERE version=$1', upload_version)
+                    link = f"https://youtu.be/{previous['video_id']}" if previous and previous['video_id'] else ''
+                    await message.answer('⚠️ Эта версия уже загружена или исход прошлой загрузки требует проверки. '
+                                         + link + '\nПроверь YouTube перед повтором.',
+                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                             _btn('Проверил — загрузить ещё раз', f'yt:again:{first}')]]))
+                    return
                 long = bool(seo.get("long"))
                 wait = await message.answer("▶️ Загружаю выпуск на YouTube (большой файл — до 10–15 минут)…"
                                             if long else "▶️ Загружаю шортс на YouTube…")
                 hidden = await shorts_setting("yt_privacy") == "unlisted"
                 res = await shorts_yt.upload(token, video, seo, "unlisted" if hidden else "public")
-                await link_episode(str(seo.get("title") or ""), res["id"])  # выпуск рубрики — к реестру
                 link = f"https://youtu.be/{res['id']}" if long else f"https://youtube.com/shorts/{res['id']}"
+                # Save the external ID before optional analytics can fail.
+                try:
+                    marker = done_file.with_suffix('.yt.tmp')
+                    marker.write_text(link)
+                    marker.replace(done_file)
+                except OSError:
+                    logging.exception('YouTube local outcome marker failed')
+                await uploads.complete(upload_version, res['id'], res['privacy'])
+                claimed = False
+                try:
+                    await link_episode(str(seo.get("title") or ""), res["id"])
+                except Exception:
+                    logging.exception('YouTube uploaded; episode analytics link failed')
                 shorts_usage.record("yt_long" if long else "yt_shorts")  # для недельного отчёта
                 try:
                     done_file.write_text(link)
@@ -13567,7 +13732,15 @@ async def youtube_button(callback: CallbackQuery) -> None:
                         "с роликами из непроверенных проектов. Открой YouTube Studio → ролик → «Доступ» → "
                         "«Открытый доступ», а чтобы дальше загружались сразу открытыми — подай заявку на аудит "
                         "(support.google.com/youtube/contact/yt_api_form).")
+            except asyncio.CancelledError:
+                if claimed:
+                    with contextlib.suppress(Exception):
+                        await uploads.cancel(upload_version)
+                raise
             except Exception as exc:  # noqa: BLE001
+                if claimed:
+                    with contextlib.suppress(Exception):
+                        await uploads.fail(upload_version, _safe_err(exc))
                 logging.exception("YouTube upload failed")
                 await message.answer(f"❌ YouTube: <code>{escape(_safe_err(exc)[:300])}</code>")
 
@@ -13598,9 +13771,9 @@ def _when(at: datetime, now: datetime) -> str:
 
 async def _scheduled() -> list[dict[str, Any]]:
     """Отложенные посты в канал (у всех админов — канал общий), по времени."""
-    rows = await db().fetch("SELECT chat_id, first_id, EXTRACT(EPOCH FROM at)::BIGINT AS at FROM ai_queue "
-                            "WHERE at > NOW() - INTERVAL '60 seconds' ORDER BY at")
-    return [{"chat": r["chat_id"], "first": r["first_id"], "at": int(r["at"])} for r in rows]
+    rows = await db().fetch("SELECT chat_id, first_id, status, EXTRACT(EPOCH FROM at)::BIGINT AS at "
+                            "FROM ai_queue ORDER BY at")
+    return [{"chat": r["chat_id"], "first": r["first_id"], "at": int(r["at"]), "status": r["status"]} for r in rows]
 
 
 def _busy_note(queue: list[dict[str, Any]], now: datetime) -> str:
@@ -13611,24 +13784,46 @@ def _busy_note(queue: list[dict[str, Any]], now: datetime) -> str:
 
 
 async def publish_due(bot: Bot) -> None:
-    """Очередь «⏰ Опубликовать позже»: подошло время — публикуем и сообщаем автору."""
-    # подошедшие посты забираем из очереди одним запросом: вторая копия цикла (или повтор) их уже не увидит
-    rows = await db().fetch("DELETE FROM ai_queue WHERE at <= NOW() RETURNING chat_id, first_id")
-    due = [{"chat": r["chat_id"], "first": r["first_id"]} for r in rows]
-    if not due:
-        return
-    await _queue_json_remove({(q["chat"], q["first"]) for q in due})
-    for q in due:
+    """Claim durable jobs; only an explicit Telegram refusal is safe to retry."""
+    expired = await db().fetch(
+        "UPDATE ai_queue SET status='uncertain',last_error='Перезапуск во время отправки' "
+        "WHERE status='running' AND claimed_at < NOW() - INTERVAL '15 minutes' RETURNING chat_id,first_id")
+    for row in expired:
+        with contextlib.suppress(Exception):
+            await bot.send_message(row["chat_id"], "⚠️ Отправка поста была прервана. Проверь канал перед повтором; задание сохранено.",
+                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                       _btn("Проверил канал — повторить", f"pt:pf:{row['first_id']}")]]))
+    rows = await db().fetch(
+        "UPDATE ai_queue SET status='running',claimed_at=NOW(),attempts=attempts+1 "
+        "WHERE (chat_id,first_id) IN (SELECT chat_id,first_id FROM ai_queue "
+        "WHERE status='queued' AND at <= NOW() AND next_attempt <= NOW() "
+        "ORDER BY at FOR UPDATE SKIP LOCKED LIMIT 10) RETURNING chat_id,first_id,attempts")
+    for row in rows:
+        chat, first = row["chat_id"], row["first_id"]
+        status = ''
         try:
-            await publish_post(bot, q["chat"], q["first"])
+            await publish_post(bot, chat, first)
             text = "✅ Пост вышел в канале по расписанию."
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logging.exception("Scheduled post failed")
-            text = (f"❌ Пост по расписанию не вышел: <code>{escape(_safe_err(exc)[:200])}</code>\n\n" + PUBLISH_HELP)
-        try:
-            await bot.send_message(q["chat"], text)
-        except Exception:  # noqa: BLE001
-            logging.exception("Scheduled post report failed")
+            if isinstance(exc, TelegramRetryAfter) and row["attempts"] < 5:
+                status, delay = "queued", max(30, int(exc.retry_after))
+                text = f"⏳ Telegram ограничил отправку. Задание сохранено; повторю через {delay} с."
+            elif isinstance(exc, (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter)):
+                status, delay = "failed", 0
+                text = "❌ Пост не отправлен. Задание сохранено: " + _safe_err(exc)[:200]
+            else:
+                status, delay = "uncertain", 0
+                text = "⚠️ Исход отправки неизвестен. Задание сохранено; проверь канал перед ручным повтором. " + _safe_err(exc)[:160]
+            await db().execute(
+                "UPDATE ai_queue SET status=$3,claimed_at=NULL,last_error=$4, "
+                "next_attempt=NOW()+make_interval(secs => $5) WHERE chat_id=$1 AND first_id=$2",
+                chat, first, status, _safe_err(exc)[:500], delay)
+        with contextlib.suppress(Exception):
+            keyboard = (InlineKeyboardMarkup(inline_keyboard=[[
+                _btn("Проверил канал — повторить", f"pt:pf:{first}")]])
+                if status in {'uncertain', 'failed'} else None)
+            await bot.send_message(chat, escape(text), reply_markup=keyboard)
 
 
 POST_MAKERS: dict[str, tuple[str, Any]] = {}  # заполняется ниже: код → (что пишем автору, функция)
@@ -13983,7 +14178,13 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             return
     if (kind == "p" or kind == "pf") and arg.isdigit():
         try:
-            await publish_post(message.bot, chat_id, int(arg), callback.from_user.id)
+            await publish_post(message.bot, chat_id, int(arg), callback.from_user.id, force=kind == "pf")
+        except PublicationNeedsReview:
+            await callback.answer()
+            await message.answer('⚠️ Исход прошлой публикации требует проверки. Проверь канал перед повтором.',
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                     _btn('Проверил канал — опубликовать повторно', f'pt:pf:{arg}')]]))
+            return
         except AlreadyPublishing:
             await callback.answer("⏳ Уже публикую — секунду")
             return
@@ -14021,6 +14222,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         rows = []
         for q in queue[:10]:
             label = _when(datetime.fromtimestamp(q["at"], POST_TZ), now)
+            label += {"failed": " · ошибка", "uncertain": " · проверь канал", "running": " · отправляется"}.get(q.get("status"), "")
             mine = q["chat"] == chat_id
             rows.append([_btn(f"👁 {label}", f"pt:v:{q['chat']}:{q['first']}") if mine else
                          _btn(f"📌 {label} (у другого админа)", f"pt:q:{arg}")]
@@ -18081,6 +18283,8 @@ async def heartbeat() -> None:
             last_clean = time.monotonic()
             try:
                 await shorts_fsm.PgStorage(db).cleanup()
+                if render_jobs:
+                    await render_jobs.cleanup(SHORTS_DIR)
             except Exception:  # noqa: BLE001
                 logging.exception("FSM cleanup failed")
         await asyncio.sleep(30)
@@ -19081,6 +19285,7 @@ async def set_admin_commands(bot: Bot) -> None:
 
 
 async def main() -> None:
+    global render_jobs
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -19092,7 +19297,15 @@ async def main() -> None:
     for handler in logging.getLogger().handlers:  # ключи из адресов запросов — не в журнал
         handler.addFilter(_RedactSecrets())
 
+    SHORTS_DIR.mkdir(parents=True, exist_ok=True)
+    legacy_work = Path('/tmp/kinomir_shorts')
+    if not legacy_work.exists() and not legacy_work.is_symlink() and legacy_work != SHORTS_DIR:
+        # Existing FSM paths keep resolving after deploy/update.sh copied files.
+        legacy_work.symlink_to(SHORTS_DIR.resolve(), target_is_directory=True)
     await init_db()
+    await shorts_budget.reconcile_interrupted()
+    await shorts_publications.Uploads(db()).recover()
+    await recover_post_publications()
     try:
         await load_ai_mode()
     except Exception:  # noqa: BLE001
@@ -19124,6 +19337,15 @@ async def main() -> None:
 
     shorts_budget.on_warning = budget_warning
 
+    render_jobs = shorts_render_jobs.Jobs(db())
+    await render_jobs.cleanup(SHORTS_DIR)
+    interrupted = await render_jobs.recover()
+    for row in interrupted:
+        with contextlib.suppress(Exception):
+            await bot.send_message(row['chat_id'], '⚠️ Сборка прервалась при обновлении. Исходники сохранены; продолжить — /projects.')
+    render_task = asyncio.create_task(render_jobs.worker(
+        lambda kind, chat, data, identifier, result: execute_render_job(bot, kind, chat, data, identifier, result)))
+
     reminder_task = asyncio.create_task(
         premiere_reminder_loop(bot)
     )
@@ -19137,7 +19359,7 @@ async def main() -> None:
 
     # состояния диалогов — в PostgreSQL (таблица fsm_states, миграция 002): переживают перезапуск бота
     fsm_storage = shorts_fsm.PgStorage(db)
-    dp = Dispatcher(storage=fsm_storage)
+    dp = Dispatcher(storage=fsm_storage, events_isolation=shorts_fsm.RemixEventIsolation(fsm_storage))
     dp.message.outer_middleware(activity_tracker)
     dp.callback_query.outer_middleware(activity_tracker)
     dp.message.outer_middleware(subscription_gate)
@@ -19165,6 +19387,10 @@ async def main() -> None:
     finally:
         global stopping
         stopping = True
+        await render_jobs.stop()
+        render_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await render_task
         heartbeat_task.cancel()
         provider_task.cancel()
         blender_task.cancel()

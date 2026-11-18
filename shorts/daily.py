@@ -23,6 +23,7 @@ from PIL import Image
 
 from . import ai, clips, imgsearch, lumean, news, pronounce, project, scene_planner, stressdb, tgsearch, tmdb, wiki
 from . import music as musiclib
+from . import process as media_process
 from .cards import card_overlay, make_card, make_cover
 
 ROOT = Path(__file__).resolve().parent
@@ -1036,16 +1037,7 @@ def _rank_key(item: dict[str, Any]) -> tuple[float, int]:
 
 
 async def _run(*cmd: str) -> str:
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent)
-    try:
-        out, err = await proc.communicate()
-    except asyncio.CancelledError:
-        proc.kill()  # сборку прервали по таймауту — не оставляем рендер жрать память
-        raise
-    if proc.returncode:
-        raise RuntimeError(f"{cmd[0]} failed: {err.decode(errors='ignore')[-800:]}")
-    return out.decode(errors="ignore")
+    return await media_process.run(*cmd, timeout=1800, cwd=str(ROOT.parent))
 
 
 async def _duration(path: Path) -> float:
@@ -1993,7 +1985,8 @@ async def _run_render(cfg_path: Path, stage: str = "Монтаж видео") ->
     Нет новой строки RENDER_STALL секунд — процесс убиваем (RenderStalled)."""
     proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "shorts.make_short", str(cfg_path),
                                                 stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent)
+                                                stderr=asyncio.subprocess.PIPE, cwd=ROOT.parent,
+                                                start_new_session=os.name == "posix")
     errors = asyncio.create_task(proc.stderr.read())  # читаем параллельно, иначе процесс может встать
     started = False  # до первой строки рендер готовит кадры трейлеров и звук — даём вдвое больше времени
     try:
@@ -2001,8 +1994,6 @@ async def _run_render(cfg_path: Path, stage: str = "Монтаж видео") ->
             try:
                 line = await asyncio.wait_for(proc.stdout.readline(), RENDER_STALL * (1 if started else 2))
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
                 raise RenderStalled(f"монтаж не двигался {RENDER_STALL // 60} минуты") from None
             if not line:
                 break
@@ -2011,8 +2002,11 @@ async def _run_render(cfg_path: Path, stage: str = "Монтаж видео") ->
                 started = True
                 await _progress(50 + round(48 * float(m.group(1))), stage)
         await proc.wait()
-    except asyncio.CancelledError:
-        proc.kill()  # сборку прервали по таймауту — не оставляем рендер жрать память
+    except BaseException:
+        # readline has unwound; drain the remaining stdout alongside the stderr
+        # reader that already owns that stream. Kill ffmpeg descendants too.
+        drained = asyncio.gather(proc.stdout.read(), errors, proc.wait())
+        await media_process.terminate_group(proc, drained)
         raise
     err = await errors
     if proc.returncode:

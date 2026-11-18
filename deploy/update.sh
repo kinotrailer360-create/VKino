@@ -24,6 +24,14 @@ cd "$DIR/deploy"
 # идёт сборка ролика — перезапуск её оборвёт; попробуем через 5 минут
 running=$(docker compose exec -T db psql -U vkino -d vkino -tAc \
   "SELECT 1 FROM shorts_settings WHERE key = 'running'" 2>/dev/null | tr -d '[:space:]')
+for table in render_jobs studio_jobs; do
+  active=$(docker compose exec -T db psql -U vkino -d vkino -tAc \
+    "SELECT 1 FROM $table WHERE status='running' LIMIT 1" 2>/dev/null | tr -d '[:space:]')
+  [ "$active" = "1" ] && running=1
+done
+active=$(docker compose exec -T db psql -U vkino -d vkino -tAc \
+  "SELECT 1 FROM youtube_publications WHERE status='uploading' LIMIT 1" 2>/dev/null | tr -d '[:space:]')
+[ "$active" = "1" ] && running=1
 since=/var/lib/vkino-update-wait
 if [ "$running" = "1" ]; then
   [ -f "$since" ] || date +%s > "$since"

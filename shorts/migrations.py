@@ -264,6 +264,32 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
         );
     """, None),
 
+    (12, "durable scheduled publication state", """
+        ALTER TABLE ai_queue ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued';
+        ALTER TABLE ai_queue ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+        ALTER TABLE ai_queue ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+        ALTER TABLE ai_queue ADD COLUMN IF NOT EXISTS next_attempt TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        ALTER TABLE ai_queue ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_ai_queue_pending ON ai_queue(status,next_attempt,at);
+    """, None),
+
+    (13, "recoverable render jobs", """
+        CREATE TABLE IF NOT EXISTS render_jobs (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, chat_id BIGINT NOT NULL,
+            payload JSONB NOT NULL, status TEXT NOT NULL, result JSONB,
+            error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_render_jobs_pending ON render_jobs(status,created_at);
+    """, None),
+    (14, "versioned YouTube upload outcomes", """
+        CREATE TABLE IF NOT EXISTS youtube_publications (
+            version TEXT PRIMARY KEY, chat_id BIGINT NOT NULL, first_id BIGINT NOT NULL,
+            metadata JSONB NOT NULL, status TEXT NOT NULL, video_id TEXT, privacy TEXT,
+            last_error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """, None),
 ]
 
 

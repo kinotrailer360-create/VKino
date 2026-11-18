@@ -10,7 +10,7 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageStat
 
-from . import ai, daily, visual_guard, remix_captions
+from . import ai, daily, visual_guard, remix_captions, process, scene_planner
 
 
 MAX_AI_REMIX_SCENES = 8
@@ -123,12 +123,7 @@ def render_caption_card(text: str, output: Path) -> None:
 
 
 async def run(*args: str) -> str:
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
-    if proc.returncode:
-        raise RuntimeError(err.decode("utf-8", "replace")[-500:])
-    return out.decode("utf-8", "replace")
+    return await process.run(*args)
 
 
 async def duration(path: Path) -> float:
@@ -157,10 +152,34 @@ async def replace_audio(source: Path, text: str, work: Path) -> Path:
 
 
 async def transcribe(source: Path, work: Path, key: str) -> list[dict[str, Any]]:
+    cache = work / 'remix_transcript.json'
+    source_sha = await asyncio.to_thread(scene_planner._digest, source)
+    try:
+        saved = json.loads(cache.read_text())
+        if saved.get('source_sha') == source_sha and saved.get('phrases'):
+            # Recreate recognition audio only if word timing still needs it.
+            if not (work / 'source.mp3').is_file():
+                await run('ffmpeg','-v','error','-y','-i',str(source),'-vn','-ac','1','-ar','22050',str(work / 'source.mp3'))
+            return saved['phrases']
+    except (OSError, ValueError, AttributeError):
+        pass
     audio = work / "source.mp3"
     await run("ffmpeg", "-v", "error", "-y", "-i", str(source), "-vn", "-ac", "1",
               "-ar", "22050", "-b:a", "96k", str(audio))
-    return await ai.transcribe_dub(key, audio.read_bytes(), await duration(source))
+    phrases = await ai.transcribe_dub(key, audio.read_bytes(), await duration(source))
+    cache.write_text(json.dumps({'source_sha':source_sha,'phrases':phrases},ensure_ascii=False), encoding='utf-8')
+    return phrases
+
+
+async def unique_assets(assets: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result = []
+    for path in assets:
+        digest = await asyncio.to_thread(scene_planner._digest, path)
+        if digest != 'missing' and digest not in seen:
+            seen.add(digest)
+            result.append(path)
+    return result
 
 
 async def publication_metadata(work: Path, key: str, narration: str | None = None) -> dict[str, str]:
@@ -289,7 +308,7 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
     # The timestamp lets the renderer cut an actual moving shot instead of holding a still.
     candidates: list[dict[str, Any]] = []
     video_durations: dict[Path, float] = {}
-    for asset_number, path in enumerate(assets):
+    for asset_number, path in enumerate(await unique_assets(assets)):
         try:
             with Image.open(path) as im:
                 candidates.append({"kind": "image", "image": im.convert("RGB").copy()})
@@ -609,4 +628,22 @@ async def replace_visuals(source: Path, assets: list[Path], output: Path, work: 
             f"Длительность черновика {rendered_seconds:.1f} с не совпала "
             f"с озвучкой {total:.1f} с. Черновик не отправлен, чтобы не выдавать обрезанный ролик."
         )
+    manifest = {'schema_version':2, 'kind':'remix', 'video':str(output), 'duration':total,
+                'selected':selected, 'captions':caption_events, 'subtitle_file':str(subtitles),
+                'source':str(source), 'audio':str(audio), 'assets':[str(path) for path in assets]}
+    (work / 'remix_edit.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+    plan_scenes = []
+    for index, scene in enumerate(selected):
+        plan_scenes.append({'id':f'scene-{index+1:02d}', 'text':scene['text'],
+            'start':scene['phrase_start'], 'end':scene['phrase_end'], 'headline':scene['headline'],
+            'asset':{'type':'clip' if scene['kind']=='video' else 'still',
+                     'path':str(scene['path'] if scene['kind']=='video' else scene['image']),
+                     'offset':scene['start'], 'source':'user_media', 'rights':'author'},
+            'match':{'status':'matched' if scene['matched_by_ai'] else 'unverified'},
+            'review':{'required':False,'approved':False}})
+    (work / 'scene_plan.json').write_text(json.dumps({'schema_version':2, 'review_mode':'author_final',
+        'scenes':plan_scenes},ensure_ascii=False,indent=2),encoding='utf-8')
+    from . import project
+    project.save(work, 'remix', 'shorts.remix', 'remix_edit.json', output.name,
+                 voice={}, rerun={})
     return output

@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import html
 import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
+from . import process as media_process
 
 log = logging.getLogger("shorts")
 
@@ -22,12 +22,13 @@ SHORT_MAX = 180.0  # вертикальный Shorts на YouTube — до 3 м�
 
 
 async def _run(*args: str) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
-    return proc.returncode or 0, out.decode(errors="ignore"), err.decode(errors="ignore")
+    code, out, err = await media_process.communicate(*args, timeout=600)
+    return code, out.decode(errors="ignore"), err.decode(errors="ignore")
 
 
-def parse(probe: dict[str, Any], log_text: str, vertical: bool | None = None) -> list[str]:
+def parse(probe: dict[str, Any], log_text: str, vertical: bool | None = None,
+          expected_size: tuple[int, int] | None = None,
+          expected_stills: list[tuple[float, float]] | None = None) -> list[str]:
     """Предупреждения по ffprobe (JSON) и журналу фильтров ffmpeg. Пустой список — всё в порядке."""
     issues: list[str] = []
     streams = probe.get("streams") or []
@@ -38,8 +39,9 @@ def parse(probe: dict[str, Any], log_text: str, vertical: bool | None = None) ->
         return ["❌ в файле нет видео"]
     w, h = int(video.get("width") or 0), int(video.get("height") or 0)
     vertical = h > w if vertical is None else vertical
-    if vertical and (w, h) != (1080, 1920):
-        issues.append(f"формат {w}×{h}, а для Shorts нужен 1080×1920")
+    wanted = expected_size or ((1080, 1920) if vertical else (w, h))
+    if (w, h) != wanted:
+        issues.append(f"формат {w}×{h}, выбран профиль {wanted[0]}×{wanted[1]}")
     if not audio:
         issues.append("❌ в ролике нет звука")
     if duration < 5:
@@ -50,7 +52,9 @@ def parse(probe: dict[str, Any], log_text: str, vertical: bool | None = None) ->
         if float(dur) >= BLACK_MIN:
             issues.append(f"чёрный экран {float(dur):.1f} с на {_tc(float(start))}")
     for start, dur in re.findall(r"freeze_start: ([\d.]+)[\s\S]*?freeze_duration: ([\d.]+)", log_text):
-        if float(dur) >= FREEZE_MIN:
+        intended_still = any(float(start) >= a and float(start) + float(dur) <= b + .1
+                             for a, b in expected_stills or [])
+        if float(dur) >= FREEZE_MIN and not intended_still:
             issues.append(f"картинка застыла на {float(dur):.1f} с с {_tc(float(start))}")
     for start, dur in re.findall(r"silence_start: ([\d.]+)[\s\S]*?silence_duration: ([\d.]+)", log_text):
         if float(dur) >= SILENCE_MIN and float(start) < duration - 1.5:  # тишина в самом конце — норма
@@ -70,7 +74,9 @@ def _tc(sec: float) -> str:
     return f"{int(sec) // 60}:{int(sec) % 60:02d}"
 
 
-async def check(video: Path, vertical: bool | None = None) -> list[str]:
+async def check(video: Path, vertical: bool | None = None,
+                expected_size: tuple[int, int] | None = None,
+                expected_stills: list[tuple[float, float]] | None = None) -> list[str]:
     """Проверить ролик. Не получилось проверить — одно предупреждение об этом, а не «всё хорошо»."""
     try:
         code, out, err = await _run("ffprobe", "-v", "error", "-print_format", "json", "-show_streams",
@@ -86,7 +92,7 @@ async def check(video: Path, vertical: bool | None = None) -> list[str]:
         code, _, err = await _run(*args, "-f", "null", "-")
         if code:
             return [f"проверка не запустилась: {err.strip()[-120:]}"]
-        return parse(probe, err, vertical)
+        return parse(probe, err, vertical, expected_size, expected_stills)
     except Exception as exc:  # noqa: BLE001 — проверка не должна ломать отправку ролика
         log.warning("shorts: qc failed for %s: %s", video, exc)
         return [f"проверка не запустилась: {type(exc).__name__}"]

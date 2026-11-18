@@ -37,7 +37,7 @@ if [ ! -f .env ]; then
     echo "# Адрес для мини-приложения: бесплатное имя по IP сервера (можно заменить на свой домен)"
     echo "DOMAIN=${IP//./-}.sslip.io"
     echo "POSTGRES_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
-    echo "SHORTS_DIR=/tmp/kinomir_shorts"
+    echo "SHORTS_DIR=/data/work"
     echo
     echo "# ↓ Вставьте сюда переменные из Railway (Variables → Raw Editor), кроме DATABASE_URL и PORT"
   } > .env
@@ -82,6 +82,14 @@ if [ ! -f /etc/cron.d/vkino-backup ]; then
   echo "47 3 * * * root /bin/bash $DIR/deploy/backup.sh >> /var/log/vkino-backup.log 2>&1" > /etc/cron.d/vkino-backup
   chmod 644 /etc/cron.d/vkino-backup
 fi
+
+# Before replacing even the FIRST old container, preserve temporary project files.
+# The helper runs in that container using only Python's standard library.
+if [ -n "$(docker compose ps -q --status running bot)" ]; then
+  docker compose exec -T bot python < "$DIR/deploy/preserve-work.py"
+fi
+# Only migrate the old default; preserve explicitly configured custom directories.
+sed -i -E "s|^SHORTS_DIR=['\"]?/tmp/kinomir_shorts['\"]?[[:space:]]*$|SHORTS_DIR=/data/work|" .env
 
 echo "== Собираю и запускаю бота (первый раз 5–10 минут)"
 docker compose up -d --build

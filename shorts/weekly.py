@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from . import process as media_process
+
 import asyncio
 import io
 import json
@@ -51,19 +53,8 @@ class Episode:
 
 
 async def _run(*args: str) -> None:
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
-                                                stderr=asyncio.subprocess.PIPE)
-    try:
-        _, err = await proc.communicate()
-    except asyncio.CancelledError:  # таймаут сборки — ffmpeg не должен работать дальше и писать в удалённую папку
-        proc.kill()
-        try:  # дождаться, чтобы не остался зомби, даже если отмену повторят
-            await asyncio.shield(proc.wait())
-        except asyncio.CancelledError:
-            pass
-        raise
-    if proc.returncode:
-        raise RuntimeError(f"{args[0]}: {err.decode(errors='ignore')[-500:]}")
+    await media_process.run(*args, timeout=1800)
+
 
 
 async def _duration(path: Path) -> float:
