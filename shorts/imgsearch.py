@@ -68,22 +68,34 @@ async def bing(session: aiohttp.ClientSession, query: str, limit: int = 12) -> l
 
 
 async def search(query: str, limit: int = 12) -> list[dict[str, str]]:
-    """Выдача картинок: DuckDuckGo, если отказал или пусто — Bing."""
+    """Search across DDG/Bing/Yandex and deduplicate image URLs."""
     global last_error
+    last_error = ""
     errors = []
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
     async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=40), headers=BROWSER) as session:
-        for name, engine in (("DuckDuckGo", ddg), ("Bing", bing)):
+        for name, engine in (("DuckDuckGo", ddg), ("Bing", bing), ("Yandex", yandex_images)):
             try:
-                found = await engine(session, query, limit)
+                result = await asyncio.wait_for(engine(session, query, limit), timeout=12)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{name}: {str(exc)[:80]}")
                 log.info("shorts: image search %s %r failed: %s", name, query, exc)
                 continue
-            if found:
-                return found
-            errors.append(f"{name}: пусто")
+            if not result:
+                errors.append(f"{name}: пусто")
+            for item in result:
+                url = str(item.get("image") or "")
+                if not _ok(url) or url in seen:
+                    continue
+                seen.add(url)
+                found.append(item)
+                if len(found) >= limit:
+                    break
+            if len(found) >= limit:
+                break
     last_error = "; ".join(errors)
-    return []
+    return found
 
 
 def yandex_results(page: str, limit: int) -> list[dict[str, str]]:
@@ -150,7 +162,8 @@ async def pick(query: str, phrase: str, gemini_key: str) -> bytes | None:
             order.insert(0, choice[0])
         else:
             return None  # ИИ посмотрел: ни одна не подходит
-        for k in order[:3]:
+        # Never fall back to a runner-up which was not verified for this scene.
+        for k in order[:1]:
             try:
                 raw, ctype = await netsafe._get(session, cands[k]["image"], 15 * 1024 * 1024, "")
                 if ctype.startswith("image/"):
