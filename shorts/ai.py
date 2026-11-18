@@ -838,6 +838,8 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
         if luna.MODE in {"shadow", "active"}:
             await run(f"Фактчек Lumean ({luna.MODE})", _ask_lumean(ask, max_tokens=256, model_override=luna.MODEL),
                       lambda r: f"отвечает, модель {luna.MODEL}")
+        else:
+            out.append(("Фактчек Lumean", False, "пилот выключен (VKINO_LUNA_FACTCHECK)"))
     out += await websearch.probe()
     return out
 
