@@ -54,12 +54,113 @@ SCENE = re.compile(r"(?m)^###\s+Сцена\s+(\d+)\s*[—–-]\s*(.+)$", re.I)
 FIELD = re.compile(r"(?m)^(?:- )?\*\*([^*]+?):\*\*[ \t]*(.*)$")
 
 
+TABLE_SECTION = re.compile(r"(?m)^##[ 	]+(?:\d+\.[ 	]+)?([^\n]+)$")
+TABLE_COLUMNS = ("сцена", "реплика", "что показать", "запрос ru / en", "экранный текст")
+WORDS = re.compile(r"\w+")
+
+
+def table_sections(text: str) -> dict[str, str]:
+    headings = list(TABLE_SECTION.finditer(text))
+    return {heading[1].strip().casefold():
+            text[heading.end():headings[i + 1].start() if i + 1 < len(headings) else len(text)].strip()
+            for i, heading in enumerate(headings)}
+
+
+def section_body(sections: dict[str, str], prefix: str) -> str:
+    return next((body for name, body in sections.items() if name.startswith(prefix)), "")
+
+
+def table_cells(row: str) -> list[str]:
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", row.strip().strip("|"))]
+
+
+def table_header(row: str) -> bool:
+    cells = [re.sub(r"\s*/\s*", " / ", cell.casefold().strip("* ")) for cell in table_cells(row)]
+    return tuple(cells[:5]) == TABLE_COLUMNS
+
+
 def marked(text: str) -> bool:
     headings = [m[1].casefold() for m in SECTION.finditer(text)]
-    return any(x.startswith("озвучка") for x in headings) and any("покадровая карта" in x for x in headings)
+    if any(x.startswith("озвучка") for x in headings) and any("покадровая карта" in x for x in headings):
+        return True
+    sections = table_sections(text)
+    return bool(section_body(sections, "озвучка") and any(
+        table_header(row) for name, body in sections.items()
+        if name.startswith(("карта видеоряда", "покадровая карта")) for row in body.splitlines()))
+
+
+def table_clock(value: str) -> str:
+    if ":" in value:
+        minutes, seconds = map(int, value.split(":"))
+    else:
+        minutes, seconds = divmod(int(value), 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def table_plan(sections: dict[str, str], storyboard: str) -> dict:
+    rows = [row for row in storyboard.splitlines() if "|" in row]
+    first = next(i for i, row in enumerate(rows) if table_header(row))
+    table = rows[first + 1:]
+    if table and all(re.fullmatch(r":?-{3,}:?", cell) for cell in table_cells(table[0])):
+        table = table[1:]
+    if not 2 <= len(table) <= 12:
+        raise ValueError("В таблице должно быть от 2 до 12 сцен.")
+    source_hint = section_body(sections, "где искать")
+    urls = re.findall(r'https://[^\s<>»;)]+', source_hint)
+    rules = section_body(sections, "правила для vkino")
+    visual_rules = [row.strip("- ") for row in rules.splitlines()
+                    if row.startswith("- ") and re.search(r"кадр|график|промо|сюжет", row, re.I)]
+    control = " ".join(visual_rules)[:600]
+    scenes, replies = [], []
+    for i, row in enumerate(table, 1):
+        cells = table_cells(row)
+        if len(cells) < 5:
+            raise ValueError(f"В строке сцены {i} не хватает столбцов.")
+        scene, reply, visual, search, label = cells[:5]
+        timing = re.fullmatch(r"(\d+)(?:\s*\((\d+(?::\d{2})?)\s*[–—-]\s*(\d+(?::\d{2})?)\s*с?\))?",
+                              scene, re.I)
+        if not timing or int(timing[1]) != i or not visual or not reply:
+            raise ValueError(f"Проверь номер, реплику и видеоряд сцены {i}.")
+        heading = f"{table_clock(timing[2])}–{table_clock(timing[3])}" if timing[2] else "Видеоряд"
+        scene_urls = list(dict.fromkeys(re.findall(r'https://[^\s<>»;)]+', visual) + urls))
+        scenes.append({"heading": heading, "targets": [visual], "label": label.strip("«» "),
+                       "queries": re.findall(r"`([^`]+)`", search), "sources": scene_urls,
+                       "source_hint": "\n".join(scene_urls)[:240], "fallback": "", "control": control})
+        replies.append(reply.strip("«» "))
+
+    voice = " ".join(section_body(sections, "озвучка").split())
+    source_words = list(WORDS.finditer(voice))
+    table_words = [WORDS.findall(reply) for reply in replies]
+    if [m[0].casefold() for m in source_words] != [w.casefold() for row in table_words for w in row]:
+        raise ValueError("Реплики в таблице должны совпадать с озвучкой по порядку. Проверь оба раздела.")
+    if len(voice) > 2800 or not all(table_words):
+        raise ValueError("Озвучка должна быть непустой и не длиннее 2800 знаков.")
+    lines, offset, word_index = [], 0, 0
+    for words in table_words:
+        word_index += len(words)
+        end = source_words[word_index - 1].end()
+        remaining = voice[end:]
+        punctuation = re.match(r"[^\w\s«“]*", remaining)
+        end += len(punctuation[0])
+        lines.append(voice[offset:end].strip())
+        offset = end
+    title = section_body(sections, "заголовок").strip("* \n")
+    if not title:
+        raise ValueError("Добавь раздел «Заголовок» для YouTube.")
+    description = section_body(sections, "описание")
+    hashtags = re.findall(r"(?m)^#[\w# \t]+$", description)
+    if hashtags:
+        description = description.removesuffix(hashtags[-1]).rstrip()
+    return {"title": title, "description": description, "hashtags": hashtags[-1] if hashtags else "",
+            "lines": lines, "scenes": scenes}
 
 
 def parse(text: str) -> dict:
+    table = table_sections(text)
+    for name, storyboard in table.items():
+        if name.startswith(("карта видеоряда", "покадровая карта")) and any(
+                table_header(row) for row in storyboard.splitlines()):
+            return table_plan(table, storyboard)
     sections = list(SECTION.finditer(text))
     bodies = {m[1].casefold(): text[m.end():sections[i + 1].start() if i + 1 < len(sections) else len(text)]
               for i, m in enumerate(sections)}

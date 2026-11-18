@@ -243,3 +243,46 @@ def test_approved_still_camera_moves_without_changing_size(tmp_path):
         with reverse.frame(0, 4) as reverse_start, reverse.frame(4, 4) as reverse_end:
             assert reverse_start.tobytes() == end.tobytes()
             assert reverse_end.tobytes() == start.tobytes()
+
+
+TABLE_TASK = """# Шортс
+## Заголовок
+**Проверка импорта #Shorts**
+## Озвучка — целиком
+После «Финала» студия позвала Эванса. Джо Руссо предложил новую историю.
+
+Как вам такое решение?
+## Карта видеоряда
+| Сцена | Реплика | Что показать | Запрос RU / EN | Экранный текст |
+|---|---|---|---|---|
+| 1 (0–6 с) | «После “Финала” студия позвала Эванса.» | Официальный кадр фильма | `кадр фильма` / `official still` | «ПОСЛЕ ФИНАЛА» |
+| 2 (6–12 с) | «Джо Руссо предложил новую историю.» | Фото режиссёра | `Джо Руссо` | «ПРЕДЛОЖЕНИЕ» |
+| 3 (12–16 с) | «Как вам такое решение?» | Авторская карточка | | «КАК ВАМ?» |
+## Правила для VKino
+- Не подменять героя чужим кадром.
+## Где искать
+- Marvel: https://www.marvel.com/
+## Описание YouTube
+Эванс и Руссо.
+
+#Marvel #Shorts
+"""
+
+
+def test_markdown_table_preserves_original_voice_and_visual_search():
+    assert script_task.marked(TABLE_TASK)
+    plan = script_task.parse(TABLE_TASK)
+    assert plan["lines"] == ["После «Финала» студия позвала Эванса.", "Джо Руссо предложил новую историю.",
+                             "Как вам такое решение?"]
+    assert [scene["heading"] for scene in plan["scenes"]] == ["0:00–0:06", "0:06–0:12", "0:12–0:16"]
+    assert plan["scenes"][0]["queries"] == ["кадр фильма", "official still"]
+    assert plan["scenes"][0]["sources"] == ["https://www.marvel.com/"]
+    assert plan["scenes"][0]["label"] == "ПОСЛЕ ФИНАЛА"
+    assert plan["scenes"][0]["control"] == "Не подменять героя чужим кадром."
+    assert plan["description"] == "Эванс и Руссо."
+    assert plan["hashtags"] == "#Marvel #Shorts"
+
+
+def test_markdown_table_rejects_rewritten_voice():
+    with pytest.raises(ValueError, match="совпадать с озвучкой"):
+        script_task.parse(TABLE_TASK.replace("«Как вам такое решение?»", "«Что думаете?»"))
