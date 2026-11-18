@@ -86,6 +86,7 @@ from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
 from shorts import scene_planner as shorts_scene_planner
+from shorts import script_task as shorts_script_task
 from shorts import qc as shorts_qc
 from shorts import health as shorts_health
 from shorts import library as shorts_library
@@ -335,6 +336,7 @@ class LoreState(StatesGroup):
     hook = State()
     edit = State()
     media = State()
+    task_media = State()
 
 
 class LibraryState(StatesGroup):
@@ -7450,10 +7452,11 @@ async def send_short(bot: Bot, chat_id: int, result: Any) -> None:
         ("Описание", "description"),
         ("Теги", "tags"),
         ("Закреплённый комментарий", "pinned"),
+        *((("Хэштеги", "hashtags"),) if seo.get("hashtags") else ()),
     ):
         await bot.send_message(
             chat_id,
-            f"<b>{label}:</b>\n<pre>{escape(shorts_yt.no_links(seo[key]) if key == 'description' else seo[key])}</pre>",
+            f"<b>{label}:</b>\n<pre>{escape(shorts_yt.no_links(seo[key]) if key == 'description' and 'hashtags' not in seo else seo[key])}</pre>",
         )
     await bot.send_message(
         chat_id,
@@ -15429,7 +15432,9 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
-                    if item.get("url"):  # картинка по ссылке автора — скачиваем сами
+                    if item.get("local") and (data.get("lore_script") or {}).get("structured"):
+                        await asyncio.to_thread(shutil.copyfile, item["local"], path)
+                    elif item.get("url"):  # картинка по ссылке автора — скачиваем сами
                         lines = (data.get("lore_script") or {}).get("lines") or []
                         line = int(item.get("line") or 0)
                         await fetch_image_url(item["url"], path, lines[line - 1] if 0 < line <= len(lines) else "")
@@ -15442,16 +15447,23 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
                     lost.append((f"к фразе {item['line']}: " if item.get("line") else "")
                                 + (str(exc)[:160] if item.get("url") else str(k)))
+            if lost and (data.get("lore_script") or {}).get("structured"):
+                raise RuntimeError("Утверждённый материал недоступен. Открой сцену и прикрепи его заново.")
             if lost:
                 await bot.send_message(chat_id, "⚠️ Не скачались картинки (ссылка не открылась или это не картинка):\n"
                                        + "\n".join(f"• {escape(x)}" for x in lost[:10])
                                        + "\nНа этих фразах будут другие кадры.")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
-            script = dict(data["lore_script"], style=await lore_style(), media_mode=await lore_media_mode())
+            script = dict(data["lore_script"])
+            if script.get("structured"):
+                script.update(style="dynamic", media_mode="own")
+            else:
+                script.update(style=await lore_style(), media_mode=await lore_media_mode())
             result = await asyncio.wait_for(shorts_lore.make_lore(
                 work, script, music, files, GEMINI_API_KEY, pins), timeout=LORE_TIMEOUT)
-            shorts_daily.add_english_seo(result)
+            if not script.get("structured"):
+                shorts_daily.add_english_seo(result)
             await progress(100, "Готово — отправляю ролик")
             await send_short(bot, chat_id, result)
             if (data.get("lore_script") or {}).get("theory"):
@@ -15520,9 +15532,12 @@ async def wwk_film(message: Message, state: FSMContext) -> None:
                              "Если что-то всё равно давно известно — «✏️ Поправить текст».")
 
 
+@router.message(Command("shortscript"), F.document, F.chat.type == "private")
 @router.message(LoreState.own, F.text & ~F.text.startswith("/") | F.document)
 async def own_script_text(message: Message, state: FSMContext) -> None:
     """«🎬 Свой сценарий»: текст или файл .md/.txt; несколько сценариев в файле — кнопки выбора."""
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
     text = message.text or ""
     if message.document:
         name = (message.document.file_name or "").lower()
@@ -15532,6 +15547,9 @@ async def own_script_text(message: Message, state: FSMContext) -> None:
         buf = io.BytesIO()
         await message.bot.download(message.document.file_id, destination=buf)
         text = docx_text(buf.getvalue()) if name.endswith(".docx") else buf.getvalue().decode("utf-8", "ignore")
+    if shorts_script_task.marked(text):
+        await structured_task_start(message, state, text)
+        return
     if looks_like_task(text) or (await state.get_data()).get("task_buf"):
         await task_collect(message, state, text)  # задание целиком (озвучка + кадры + надписи) — разбирает ИИ
         return
@@ -15547,6 +15565,186 @@ async def own_script_text(message: Message, state: FSMContext) -> None:
         return
     await message.answer("В файле несколько сценариев — какой собрать?", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[_btn(f"🎬 {head[:50]}", f"lo:ownpick:{k}")] for k, (head, _) in enumerate(scripts[:10])]))
+
+
+structured_task_lock = asyncio.Lock()
+
+
+async def structured_task_start(message: Message, state: FSMContext, text: str) -> None:
+    if message.chat.type != "private":
+        await message.answer("Открой личный чат с ботом для согласования сценария.")
+        return
+    try:
+        plan = shorts_script_task.parse(text)
+    except ValueError as exc:
+        await message.answer(f"⚠️ {escape(str(exc))}")
+        return
+    async with structured_task_lock:
+        draft = secrets.token_hex(8)
+        await state.set_state(None)
+        await state.update_data(structured_id=draft, structured_plan=plan, structured_assets={},
+                                structured_rendering=False, structured_replace=None)
+        await message.answer(
+            f"📝 <b>{escape(plan['title'])}</b>\n\n" +
+            "\n\n".join(f"{i}. {escape(line)}" for i, line in enumerate(plan["lines"], 1)),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("✅ Утвердить текст и подобрать кадры", f"scplan:{draft}:start")],
+            ]), disable_web_page_preview=True)
+
+
+async def structured_preview(message: Message, plan: dict, draft: str, folder: Path, i: int, asset: dict) -> None:
+    scene = plan["scenes"][i - 1]
+    source = asset["source"]
+    caption = (f"Сцена {i}. {scene['heading'][:80]}\n"
+               f"{plan['lines'][i - 1][:190]}\n\n"
+               + " / ".join(scene["targets"]).replace("**", "")[:290]
+               + (f"\nНадпись: {scene['label'][:65]}" if scene["label"] else "")
+               + (f"\nКонтроль: {scene['control'].replace('**', '')[:140]}" if scene["control"] else "")
+               + f"\n{source[:180]}"
+               + (f"\nГде искать: {scene['source_hint'][:120]}"
+                  if asset.get("fallback") and scene["source_hint"] else ""))[:945]
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        _btn("✅ Утвердить кадр", f"scplan:{draft}:ok:{i}:{asset['revision']}"),
+        _btn("📎 Заменить", f"scplan:{draft}:replace:{i}:{asset['revision']}"),
+    ]])
+    path = folder / asset["file"]
+    if path.suffix == ".mp4":
+        await message.answer_video(FSInputFile(path), caption=caption, parse_mode=None, reply_markup=kb,
+                                   supports_streaming=True)
+    else:
+        await message.answer_photo(FSInputFile(path), caption=caption, parse_mode=None, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("scplan:"))
+async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) -> None:
+    message = callback.message
+    if callback.from_user.id not in ADMIN_IDS or not message or message.chat.type != "private":
+        await callback.answer()
+        return
+    _, draft, action, *args = (callback.data or "").split(":")
+    await callback.answer()
+    async with structured_task_lock:
+        data = await state.get_data()
+        if data.get("structured_id") != draft:
+            await message.answer("Это кнопка старого сценария. Открой текущий сценарий.")
+            return
+        if data.get("structured_rendering"):
+            await message.answer("Идёт сборка по утверждённым сценам.")
+            return
+        plan, assets = data["structured_plan"], data["structured_assets"]
+        folder = SHORTS_DIR / f"script_{draft}"
+        if action == "start":
+            folder.mkdir(parents=True, exist_ok=True)
+            await message.answer("Сценарий утверждён. Покажу материалы по сценам. Кадры из интернета проверь по источнику и правам.")
+            for i, scene in enumerate(plan["scenes"], 1):
+                asset = assets.get(str(i))
+                if asset is None:
+                    revision = secrets.token_hex(4)
+                    path = folder / f"scene_{i}_{revision}.jpg"
+                    source = await shorts_script_task.prepare_still(path, scene, plan["lines"][i - 1], i, GEMINI_API_KEY)
+                    asset = {"file": path.name, "revision": revision,
+                             "source": source or "Резервная авторская карточка · unverified",
+                             "external": bool(source), "fallback": not source}
+                    assets[str(i)] = asset
+                    await state.update_data(structured_assets=assets)
+                if not asset.get("approved"):
+                    await structured_preview(message, plan, draft, folder, i, asset)
+            if all(asset.get("approved") for asset in assets.values()):
+                await message.answer("Все сцены утверждены.", reply_markup=structured_render_button(draft))
+        elif action == "render":
+            if shorts_lock.locked():
+                await message.answer("Сейчас собирается другой ролик. Повтори, когда он будет готов.")
+                return
+            try:
+                files = await asyncio.to_thread(shorts_script_task.require_approved, folder, plan, assets)
+            except ValueError as exc:
+                await message.answer(escape(str(exc)))
+                return
+            await state.set_state(None)
+            await state.update_data(structured_rendering=True)
+            status = await message.answer(progress_bar(0, "Собираю по утверждённым сценам"))
+            script = {"title": plan["title"], "name": plan["title"], "description": plan["description"],
+                      "hashtags": plan["hashtags"].split(), "lines": plan["lines"], "kind": "news", "kind_own": True,
+                      "screen_labels": [scene["label"] for scene in plan["scenes"]],
+                      "structured": [assets[str(i)] for i in range(1, len(files) + 1)]}
+            job_data = {"lore_script": script, "lore_media": [
+                {"local": str(path), "ext": path.suffix, "line": i} for i, path in enumerate(files, 1)]}
+
+            async def job() -> None:
+                try:
+                    await run_lore(message.bot, message.chat.id, job_data, status)
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("Structured Shorts render failed")
+                    await _edit_quiet(status, f"❌ Шортс не собрался: {escape(_safe_err(exc)[:480])}")
+                else:
+                    shutil.rmtree(folder, ignore_errors=True)
+                finally:
+                    async with structured_task_lock:
+                        current = await state.get_data()
+                        if current.get("structured_id") == draft:
+                            await state.update_data(structured_rendering=False)
+
+            _run_job(job)
+        elif action in {"ok", "replace"} and len(args) == 2 and args[0].isdigit():
+            index, revision = args
+            asset = assets.get(index)
+            if not asset or asset["revision"] != revision:
+                await message.answer("Кадр уже заменён. Используй кнопки под новым кадром.")
+                return
+            if action == "replace":
+                await state.set_state(LoreState.task_media)
+                await state.update_data(structured_replace=index)
+                await message.answer(f"Пришли фото или MP4 до 20 МБ для сцены {index}.")
+                return
+            path = folder / asset["file"]
+            if not path.is_file():
+                await message.answer(f"Файл сцены {index} недоступен. Прикрепи замену.")
+                return
+            asset["approved"] = await asyncio.to_thread(shorts_script_task.fingerprint, path)
+            await state.update_data(structured_assets=assets)
+            remaining = len(plan["scenes"]) - sum(bool(x.get("approved")) for x in assets.values())
+            await message.answer(f"✅ Сцена {index} утверждена" + (f". Осталось {remaining}." if remaining else "."),
+                                 reply_markup=None if remaining else structured_render_button(draft))
+
+
+def structured_render_button(draft: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[_btn("🎬 Собрать утверждённые сцены", f"scplan:{draft}:render")]])
+
+
+@router.message(LoreState.task_media, F.photo | F.video, F.chat.type == "private")
+async def structured_task_replace(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    async with structured_task_lock:
+        data = await state.get_data()
+        draft, index = data.get("structured_id"), data.get("structured_replace")
+        if not draft or not index or data.get("structured_rendering"):
+            return
+        folder = SHORTS_DIR / f"script_{draft}"
+        folder.mkdir(parents=True, exist_ok=True)
+        content = message.video or message.photo[-1]
+        if (content.file_size or 0) > 20 * 1024 * 1024:
+            await message.answer("Файл должен быть до 20 МБ.")
+            return
+        ext = ".mp4" if message.video else ".jpg"
+        revision = secrets.token_hex(4)
+        path = folder / f"scene_{index}_{revision}{ext}"
+        try:
+            await message.bot.download(content.file_id, destination=path)
+            if not message.video:
+                await asyncio.to_thread(shorts_script_task.normalize_photo, path)
+        except Exception:  # noqa: BLE001
+            path.unlink(missing_ok=True)
+            await message.answer("Не удалось прочитать файл. Пришли другое фото или видео.")
+            return
+        assets = data["structured_assets"]
+        previous = assets[index]
+        asset = {"file": path.name, "revision": revision, "source": "Материал, присланный автором"}
+        assets[index] = asset
+        await state.update_data(structured_assets=assets, structured_replace=None)
+        await state.set_state(None)
+        (folder / previous["file"]).unlink(missing_ok=True)
+        await structured_preview(message, data["structured_plan"], draft, folder, int(index), asset)
 
 
 def docx_text(raw: bytes) -> str:
