@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 from .make_short import (
     FPS,
@@ -157,12 +157,45 @@ class FillSlide:
         return img
 
 
+def gentle_zoom(img: Image.Image, t: float, dur: float) -> Image.Image:
+    """Subpixel push-in for static material; keep captions outside this transform."""
+    k = min(max(t / max(dur, 0.1), 0.0), 1.0)
+    factor = 1.0 + 0.04 * k * k * (3 - 2 * k)
+    if factor == 1.0:
+        return img.copy()
+    w, h = img.size
+    dx, dy = w * (1 - 1 / factor) / 2, h * (1 - 1 / factor) / 2
+    return img.transform((w, h), Image.Transform.EXTENT, (dx, dy, w - dx, h - dy), Image.BILINEAR)
+
+
+class ApprovedStill:
+    def __init__(self, path: Path):
+        with Image.open(path) as original:
+            still = original.convert("RGB")
+        if abs(still.width / still.height - W / H) < 0.015:
+            self.canvas = ImageOps.fit(still, (W, H), Image.Resampling.LANCZOS)
+        else:
+            base = ImageOps.fit(still, (W // 8, H // 8), Image.Resampling.LANCZOS)
+            self.canvas = ImageEnhance.Brightness(base.filter(ImageFilter.GaussianBlur(6))).enhance(0.48).resize((W, H))
+            fg = ImageOps.contain(still, (round(W * .96), round(H * .96)), Image.Resampling.LANCZOS)
+            self.canvas.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
+
+    def frame(self, t: float, dur: float) -> Image.Image:
+        return gentle_zoom(self.canvas, t, dur)
+
+
 class ClipSlide:
     """Отрезок трейлера (уже 1080×1920, 30 к/с, без звука): кадры читаются из ffmpeg по ходу монтажа, в памяти —
     только текущий. Кончился отрезок — держим последний кадр (на время перехода к следующей картинке)."""
 
-    def __init__(self, path: Path):
-        self.proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"fps={FPS},scale={W}:{H}",
+    def __init__(self, path: Path, animate_stills: bool = False, fit_duration: float | None = None):
+        self.animate_stills = animate_stills
+        filters = f"fps={FPS},scale={W}:{H}"
+        if fit_duration:
+            length = duration(path)
+            if length > 0:
+                filters = f"setpts={fit_duration / length:.6f}*PTS," + filters
+        self.proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vf", filters,
                                       "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.idx = -1
@@ -178,7 +211,7 @@ class ClipSlide:
                 break
             self.last = Image.frombytes("RGB", (W, H), buf)
             self.idx += 1
-        return self.last
+        return gentle_zoom(self.last, t, dur) if self.animate_stills else self.last
 
     def close(self) -> None:
         self.proc.kill()
@@ -360,16 +393,19 @@ def render(cfg: dict, base: Path) -> Path:
             kinds[k] = TRANSITIONS[len(kinds) % len(TRANSITIONS)]
     ends = [s["start"] for s in slides[1:]] + [speech_end]
 
-    loaded: dict[int, PanSlide | FitSlide | FillSlide | ClipSlide] = {}
+    loaded: dict[int, PanSlide | FitSlide | FillSlide | ApprovedStill | ClipSlide] = {}
 
-    def slide(k: int) -> PanSlide | FitSlide | FillSlide | ClipSlide:
+    def slide(k: int) -> PanSlide | FitSlide | FillSlide | ApprovedStill | ClipSlide:
         if k not in loaded:
             for old in [j for j in loaded if j < k - 1]:
                 gone = loaded.pop(old)
                 if isinstance(gone, ClipSlide):
                     gone.close()
             if slides[k].get("clip"):  # отрезок трейлера
-                loaded[k] = ClipSlide(p(slides[k]["clip"]))
+                loaded[k] = ClipSlide(p(slides[k]["clip"]), animate_stills=bool(slides[k].get("animate_stills")),
+                                      fit_duration=ends[k] - slides[k]["start"] if slides[k].get("fit_clip") else None)
+            elif cfg.get("approved_motion"):
+                loaded[k] = ApprovedStill(p(slides[k]["image"]))
             else:
                 path = p(slides[k]["image"])
                 with Image.open(path) as probe:
