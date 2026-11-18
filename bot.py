@@ -7528,28 +7528,9 @@ async def run_short(
                 gemini_key=GEMINI_API_KEY,
                 trailer_clips=await shorts_setting("clips") != "off",
             ), timeout=SHORTS_TIMEOUT)
-            # Visual review now blocks neither daily renders nor preview delivery.
-            # Report scenes that still need an author's check alongside the finished draft.
-            visual_warnings: list[str] = []
-            for review_name in ("visual_review.json", "visual_review_fallback.json"):
-                review_path = work / review_name
-                if not review_path.is_file():
-                    continue
-                try:
-                    review_rows = json.loads(review_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                visual_warnings.extend(
-                    str(row.get("scene")) for row in review_rows
-                    if row.get("status") != "matched" and row.get("scene") is not None
-                )
-            visual_warnings = list(dict.fromkeys(visual_warnings))
-            if visual_warnings:
-                note = (
-                    "⚠️ ИИ не подтвердил видеоряд в сценах "
-                    + ", ".join(visual_warnings[:8])
-                    + ". Черновик собран — проверь эти сцены перед публикацией."
-                )
+            from shorts.visual_guard import daily_review_notice
+            note = daily_review_notice(work)
+            if note:
                 old_warning = str(result.seo.get("warning") or "").strip()
                 result.seo["warning"] = (old_warning + "\n" + note).strip()
 

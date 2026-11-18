@@ -1017,15 +1017,16 @@ def test_own_video_moments_cut_full_screen(tmp_path, monkeypatch):
     assert probe == "1080,1920"
 
 
-def test_list_hook_promises_number_one():
+def test_list_rating_appears_in_the_intro_graphic():
     from datetime import date
 
     from shorts import daily
     theme = daily.theme_for("online", date(2026, 11, 12))
     films = [{"name": "Фильм В", "rating": {"imdb": 7.0}}, {"name": "Фильм Б"}, {"name": "Фильм А", "rating": {"imdb": 8.4}}]
-    # обещание номера один осталось, но короткое: длинную фразу смахивали на 4,5–6-й секунде (Studio, ноябрь 2026)
     hook = daily.voice_lines(theme, films)[0]
-    assert hook.startswith("Номер один") and "8.4" in hook and len(hook.split()) <= 6
+    intro = daily.live_intro(theme, films, [{"raw": "first.jpg"}, {"raw": "second.jpg"}, {"raw": "last.jpg"}])
+    assert "8.4" in intro["sub"]
+    assert "8.4" not in hook
 
 
 def test_yt_commands_parse_links_and_batches() -> None:
@@ -1130,7 +1131,24 @@ def test_list_hook_is_short() -> None:
     for films in ([best], [{"name": "X"}]):
         hook = _hook(online, films)
         assert len(hook.split()) <= 6, hook
+    assert _hook(online, [best]) == "Что посмотреть вечером?"
     assert _hook(online, [{"name": "X"}]) == "Онлайн-премьеры!"
+
+
+def test_daily_warning_uses_the_final_render_review(tmp_path):
+    import json
+
+    from shorts.visual_guard import daily_review_notice
+
+    before = [{"scene": 1, "status": "unverified", "issue": "provider", "reason": "Нет ответа."}]
+    after = [{"scene": 1, "status": "matched"},
+             {"scene": 2, "status": "rejected", "issue": "semantic", "reason": "В кадре другой фильм."}]
+    (tmp_path / "visual_review.json").write_text(json.dumps(before))
+    assert "недоступна для сцен 1" in daily_review_notice(tmp_path)
+    (tmp_path / "visual_review_fallback.json").write_text(json.dumps(after))
+    notice = daily_review_notice(tmp_path)
+    assert "несоответствие сцен 2" in notice and "В кадре другой фильм." in notice
+    assert "недоступна" not in notice
 
 
 def test_live_intro_uses_number_two_clip_not_number_one() -> None:

@@ -32,6 +32,18 @@ def review_notice(report: list[dict[str, Any]]) -> str:
     return ('⚠️ ' + '\n'.join(messages) + '\nПроверь отмеченные фрагменты перед публикацией.') if messages else ''
 
 
+def daily_review_notice(work: Path) -> str:
+    """Use the review of the final render, including a retry with replacement material."""
+    for name in ('visual_review_fallback.json', 'visual_review.json'):
+        try:
+            rows = json.loads((work / name).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+            return review_notice([row for row in rows if row.get('scene') is not None])
+    return ''
+
+
 def narration(start: float, end: float, lines: list[str], starts: list[float], total: float) -> str:
     """All overlapping phrases, not just the phrase at a shot's midpoint."""
     ends = starts[1:] + [total]
