@@ -150,7 +150,7 @@ class Studio:
         for method, path, fn in [("POST", "/pair", self.pair), ("GET", "/status", self.status),
                                   ("POST", "/disconnect", self.disconnect), ("POST", "/jobs", self.submit),
                                   ("GET", "/jobs/{id}", self.job), ("POST", "/files", self.upload),
-                                  ("POST", "/files/batch", self.upload_batch), ("GET", "/files", self.list_files),
+                                  ("POST", "/files/batch", self.upload_batch), ("GET", "/media-picker.js", self.media_picker_js), ("GET", "/files", self.list_files),
                                   ("GET", "/files/{id}", self.file),
                                   ("GET", "/inbox", self.inbox)]:
             async def route(request: web.Request, handler=fn) -> web.StreamResponse:
@@ -278,6 +278,13 @@ class Studio:
         if not path.is_file():
             raise ValueError("Файл уже удалён. Загрузите его снова")
         return path, meta
+
+    async def media_picker_js(self, request: web.Request) -> web.StreamResponse:
+        # The script is public code; all data and mutating API endpoints still
+        # require owner-scoped Bearer authentication.
+        return web.FileResponse(Path(__file__).with_name("studio_media_picker.js"),
+                                headers={"Content-Type": "text/javascript; charset=utf-8",
+                                         "X-Content-Type-Options": "nosniff"})
 
     async def list_files(self, request: web.Request) -> web.Response:
         """List owner media for the multi-select picker, never another admin's."""
