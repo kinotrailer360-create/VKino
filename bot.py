@@ -8,6 +8,7 @@ import hmac
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -16944,20 +16945,19 @@ async def _make_weekly_video(bot: Bot, chat_ids: list[int], status: Message | No
     if status:
         await _edit_quiet(status, "🎞 ИИ выбирает главные новости недели и пишет сценарий выпуска…")
     script = None
-    for attempt in range(3):  # Gemini упёрся в минутный лимит — ждём и пробуем снова, а не бросаем выпуск
-        script = await shorts_ai.write_weekly_episode(
-            GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
-            await shorts_setting("weekly_last") or "", period=period, next_day=next_day,
-            keep=(await shorts_setting("weekly_last") or "") if remake else "")
-        if script:
+    for attempt in range(3):
+        try:
+            script = await shorts_ai.write_weekly_episode(
+                GEMINI_API_KEY, "\n\n".join(listing), f"{today.day} {months[today.month - 1]} {today.year}",
+                await shorts_setting("weekly_last") or "", period=period, next_day=next_day,
+                keep=(await shorts_setting("weekly_last") or "") if remake else "")
             break
-        wait = re.search(r"снова через (\d+) мин", shorts_ai.last_error or "")
-        if not wait or attempt == 2 or int(wait.group(1)) > 20:
-            break
-        mins = int(wait.group(1)) + 1
-        if status:
-            await _edit_quiet(status, f"⏳ ИИ сейчас на минутном лимите — подожду {mins} мин и продолжу сценарий выпуска…")
-        await asyncio.sleep(mins * 60)
+        except shorts_ai.AllBusy as exc:
+            wait = exc.retry_in
+            if attempt == 2 or wait is None or wait > 20 * 60:
+                raise
+            await _edit_quiet(status, f"⏳ ИИ пока недоступен. Повторю подготовку сценария через {math.ceil(wait / 60)} мин…")
+            await asyncio.sleep(wait + 1)
     if not script:
         raise RuntimeError(shorts_ai.last_error or "ИИ не написал сценарий выпуска")
     if remake:
@@ -17214,7 +17214,7 @@ async def wd_text_action(callback: CallbackQuery, action: str, key: str) -> None
     except Exception as exc:  # noqa: BLE001
         wait = getattr(exc, "retry_in", None)
         await message.answer(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>"
-                             + (f"\n⏸ Все ИИ на лимитах — ближайший освободится через ≈{max(1, round(wait / 60))} мин. "
+                             + (f"\n⏸ ИИ сейчас недоступен. Повтор можно попробовать через ≈{math.ceil(wait / 60)} мин. "
                                 "Тексты и принятые новости сохранены, нажми кнопку снова позже." if wait else ""))
         return
 
@@ -17973,7 +17973,7 @@ async def rt_watch_job(bot: Bot) -> None:
             logging.exception("RT watch failed")
 
 
-async def weekly_video_job(bot: Bot) -> None:
+async def weekly_video_job(bot: Bot, issue_date: str) -> None:
     """По расписанию: полоска сборки — первому админу, готовый выпуск — всем админам."""
     admins = sorted(ADMIN_IDS)
     status = None
@@ -17981,27 +17981,29 @@ async def weekly_video_job(bot: Bot) -> None:
         status = await bot.send_message(admins[0], "🎞 Собираю выпуск «Новости кино» для YouTube по расписанию "
                                                    "(15–40 минут)…")
         await make_weekly_video(bot, admins, status)
+        await set_shorts_setting("weekly_video_retry_at", None)
         await status.delete()
     except Exception as exc:  # noqa: BLE001
         logging.exception("Weekly video failed")
-        # упал (сбой ИИ, сети, перезапуск) — ещё одна попытка через полчаса, но не больше двух за воскресенье
-        now = datetime.now(POST_TZ)
-        week = now.date().isoformat()  # попытки — на этот день выпуска
         tries = await shorts_setting("weekly_video_tries") or ""
-        n = int(tries.split(":")[1]) if tries.startswith(week + ":") else 0
-        # все ИИ на лимитах — повтор, когда освободится ближайший (а не через 30 минут в тот же отказ)
+        n = int(tries.split(":")[1]) if tries.startswith(issue_date + ":") else 0
+        # Если известно время восстановления, не запускаем повтор до него.
         wait = getattr(exc, "retry_in", None)
         retry = (n < 1 or wait is not None and n < 3) and "уже собирается" not in str(exc)
-        delay = min(max((wait or 0) + 120, 1800), 6 * 3600)
-        await set_shorts_setting("weekly_video_tries", f"{week}:{n + 1}")
+        delay = wait + 120 if wait is not None else 1800
+        await set_shorts_setting("weekly_video_tries", f"{issue_date}:{n + 1}")
         if retry:
             await set_shorts_setting("weekly_video_retry_at", str(time.time() + delay))
             await set_shorts_setting("weekly_video_done", None)
-        when = (datetime.now(POST_TZ) + timedelta(seconds=delay)).strftime("%H:%M")
+        else:
+            await set_shorts_setting("weekly_video_retry_at", None)
+        now = datetime.now(POST_TZ)
+        next_try = now + timedelta(seconds=delay)
+        when = next_try.strftime("%H:%M" if next_try.date() == now.date() else "%d.%m в %H:%M")
         for admin_id in admins:
             try:
                 await bot.send_message(admin_id, f"❌ Выпуск «Новости кино» не собрался: <code>{escape(_safe_err(exc)[:300])}"
-                                                 "</code>\n" + (f"Все ИИ сейчас на лимитах — сам повторю в {when} "
+                                                 "</code>\n" + (f"ИИ сейчас недоступен. Повторю в {when} "
                                                                  f"({POST_TZ_NAME}). " if retry and wait else
                                                                  "Попробую ещё раз через 30 минут. " if retry else "")
                                        + "Собрать вручную — ▶️ YouTube и видео → «🎞 Выпуск «Новости кино»».")
@@ -18112,14 +18114,17 @@ async def growth_loop(bot: Bot) -> None:
             now = datetime.now(POST_TZ)
             week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
             today_key = now.date().isoformat()  # выпуск в каждый из дней (среда, воскресенье) — по одному
-            if (now.weekday() in WEEKLY_DAYS and now.hour >= WEEKLY_HOUR and ADMIN_IDS
-                    and await shorts_setting("weekly_video") != "off"
-                    and await shorts_setting("weekly_video_done") != today_key
-                    and time.time() - float(await shorts_setting("weekly_video_at") or 0) > 20 * 3600
-                    and time.time() > float(await shorts_setting("weekly_video_retry_at") or 0)
-                    and not weekly_busy):
-                await set_shorts_setting("weekly_video_done", today_key)
-                _run_job(lambda: weekly_video_job(bot))
+            if ADMIN_IDS and not weekly_busy and await shorts_setting("weekly_video") != "off":
+                done = await shorts_setting("weekly_video_done")
+                retry_at = float(await shorts_setting("weekly_video_retry_at") or 0)
+                pending = bool(retry_at and not done)
+                scheduled = now.weekday() in WEEKLY_DAYS and now.hour >= WEEKLY_HOUR and done != today_key
+                due = time.time() >= retry_at if pending else scheduled
+                if due and time.time() - float(await shorts_setting("weekly_video_at") or 0) > 20 * 3600:
+                    tries = (await shorts_setting("weekly_video_tries") or "") if pending else ""
+                    issue_date = tries.partition(":")[0] or today_key
+                    await set_shorts_setting("weekly_video_done", today_key)
+                    _run_job(lambda run_date=issue_date: weekly_video_job(bot, run_date))
             # прогноз уикенда: пятница–суббота — открыть (ИИ ищет кандидатов), понедельник после 12:00 — итоги
             if (now.weekday() in (4, 5) and now.hour >= 11 and await shorts_setting("predict_open_try") != week
                     and not await db().fetchval("SELECT 1 FROM predict_round WHERE week=$1", week)):

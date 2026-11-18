@@ -786,6 +786,111 @@ def test_lumean_timeout_grows_for_big_tasks():
     assert ai._retry_after({}, {}, "try again in 1m30.5s") == 90.5
 
 
+def test_lumean_retries_truncated_script_once(monkeypatch):
+    import asyncio
+    from shorts import ai
+
+    calls = []
+    truncated = {"choices": [{"finish_reason": "length", "message": {"content": '{"partial": true}'}}]}
+    complete = {"choices": [{"finish_reason": "stop", "message": {"content": '{"complete": true}'}}]}
+    monkeypatch.setattr(ai, "_cool", {})
+    monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_LLM_MODEL", "claude-sonnet-5-5")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "_count_lumean", lambda data: None)
+    monkeypatch.setattr(ai.aiohttp, "ClientSession", _fake_session([(200, truncated, {}), (200, complete, {})], calls))
+    assert asyncio.run(ai._with_reserve("", [{"text": "script"}], "script", premium=True)) == {"complete": True}
+    assert [call["max_tokens"] for call in calls] == [12000, 24000]
+    assert calls[0]["messages"] == calls[1]["messages"]
+
+
+def test_reserve_daily_quota_does_not_retry_even_with_short_reset(monkeypatch):
+    import asyncio
+    import pytest
+    from shorts import ai
+
+    calls = []
+    busy = {"error": {"message": "Token limit per day (TPD); please try again in 5s"}}
+    monkeypatch.setattr(ai, "_cool", {})
+    monkeypatch.setattr(ai.aiohttp, "ClientSession", _fake_session([(429, busy, {}), (429, busy, {})], calls))
+    with pytest.raises(ai.AIError, match="HTTP 429"):
+        asyncio.run(ai._ask_reserve("script"))
+    assert len(calls) == 1
+    assert "лимит на день" in ai.cooling("reserve")
+
+
+def test_weekly_script_keeps_eligible_provider_retry_time(monkeypatch):
+    import asyncio
+    import time
+    import pytest
+    from shorts import ai
+
+    now = time.monotonic()
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "off")
+    monkeypatch.setattr(ai, "RESERVE_KEY", "test-reserve")
+    monkeypatch.setattr(ai, "BEAT_KEY", "")
+    monkeypatch.setattr(ai, "EXTRA_KEYS", ["second"])
+    monkeypatch.setattr(ai, "_slow_until", 0.0)
+    monkeypatch.setattr(ai, "_cool", {"beat": (now + 45, "тайм-аут"), "reserve": (now + 780, "лимит на день")})
+    monkeypatch.setattr(ai, "_quota_until", {
+        ("first", False): now + 8580, ("second", False): now + 8580,
+        ("first", True): now + 30, ("second", True): now + 30,
+    })
+
+    async def no_search(*args, **kwargs):
+        raise ai.AIError("search unavailable")
+
+    monkeypatch.setattr(ai, "_ask_key", no_search)
+    with pytest.raises(ai.AllBusy, match="ключ 2") as err:
+        asyncio.run(ai.write_weekly_episode("first", "1. Новость", "18 ноября"))
+    assert 779 <= err.value.retry_in <= 780
+    assert "лимит на день" in str(err.value)
+
+
+def test_beat_stream_rejects_truncated_output(monkeypatch):
+    import asyncio
+    import json
+    import pytest
+    from types import SimpleNamespace
+    from shorts import ai
+
+    async def events(reason):
+        for delta, finish in [({"reasoning_content": "ignore"}, None), ({"content": '{"script":'}, None),
+                              ({"content": '"complete"}'}, None), ({}, reason)]:
+            yield b"data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}).encode() + b"\n"
+        yield b"data: [DONE]\n"
+
+    assert asyncio.run(ai._beat_stream(SimpleNamespace(content=events("stop")), "test")) == {"script": "complete"}
+    with pytest.raises(ai.OutputTruncated):
+        asyncio.run(ai._beat_stream(SimpleNamespace(content=events("length")), "test"))
+    with pytest.raises(ai.AIError, match="поток не завершил"):
+        asyncio.run(ai._beat_stream(SimpleNamespace(content=events(None)), "test"))
+
+
+def test_beat_long_job_uses_separate_deadline_and_cools_after_timeout(monkeypatch):
+    import asyncio
+    import pytest
+    from shorts import ai
+
+    async def timeout(prompt, image, *, max_tokens, timeout):
+        calls.append((max_tokens, timeout))
+        raise asyncio.TimeoutError
+
+    calls = []
+    monkeypatch.setattr(ai, "_cool", {})
+    monkeypatch.setattr(ai, "RESERVE_KEY", "")
+    monkeypatch.setattr(ai, "BEAT_KEY", "test-beat")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "off")
+    monkeypatch.setattr(ai, "_ask_beat", timeout)
+    with pytest.raises(ai.AllBusy, match="BeatAPI не ответил за 180 с") as err:
+        asyncio.run(ai._with_reserve("", [{"text": "script"}], "script", premium=True))
+    assert 119 <= err.value.retry_in <= 120
+    with pytest.raises(ai.AllBusy, match="BeatAPI: тайм-аут"):
+        asyncio.run(ai._with_reserve("", [{"text": "script"}], "script", premium=True))
+    assert calls == [(12000, 180)]
+
+
 def test_say_many_pairs_in_one_line():
     """/say несколькими парами в одну строку — каждая пара отдельно (раньше голос читал весь список)."""
     from shorts import pronounce

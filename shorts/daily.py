@@ -950,7 +950,7 @@ async def make_news_short(fetch: Fetch, work: Path, feeds: list[str], exclude: s
     theme = Theme("news", "НОВОСТИ", "НОВОСТИ КИНО", f"Главные новости кино на {day}", title, [])
     result = ShortResult(work / "short.mp4", cover_path, theme,
                          [{"id": it.uid, "name": it.title} for it, _ in chosen], seo)
-    if retold and text_engine == "reserve":  # ни Gemini, ни Lumean не ответили — писал слабый запасной ИИ
+    if retold and text_engine in {"reserve", "beat"}:  # ни Gemini, ни Lumean не ответили — писал запасной ИИ
         result.seo["warning"] = ("⚠️ Gemini на лимите, Lumean не ответил — текст писал запасной ИИ, он может звучать "
                                  "коряво. Послушай перед загрузкой; лучше пересобрать позже (лимит Gemini "
                                  "обновляется около 13:00 по Екатеринбургу) или пополнить Lumean.")
