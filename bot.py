@@ -13522,11 +13522,52 @@ def _norm_title(text: str) -> str:
     return re.sub(r"[^\w]+", "", str(text or "").lower().replace("ё", "е"))
 
 
+async def make_week_premiere_post(bot: Bot, chat_id: int, today: date, title: str) -> None:
+    start, end, films = await shorts_daily.telegram_week_premieres(kp._get, TMDB_API_KEY, today)
+
+    def day_label(value: date) -> str:
+        return f"{value.day} {shorts_daily.MONTHS[value.month - 1]}"
+
+    period = f"{day_label(start)} — {day_label(end)}"
+    if not films:
+        raise RuntimeError(f"Не удалось подтвердить даты российского кинопроката за {period} "
+                           "по Кинопоиску и TMDB. Черновик не создан.")
+
+    heading = title or "Премьеры недели в кино"
+    rows = [f"🍿 {heading.upper()}", BRAND, f"Российский прокат · {period}", ""]
+    names, items, extras = [], [], []
+    for number, film in enumerate(films, 1):
+        name = shorts_daily._title(film)
+        release = date.fromisoformat(str(film["premiere"]["russia"])[:10])
+        when = day_label(release)
+        names.append(name)
+        items.append((name, shorts_daily._poster_url(film), film))
+        extras.append(f"В кино с {when}")
+        rows.append(f"{number}. «{name[:65]}» — с {when}")
+        description = " ".join(str(film.get("shortDescription") or "").split())
+        if description:
+            rows.append(description[:68].rstrip(" .") + "…" if len(description) > 68 else description)
+        rows.append("")
+    rows += ["❤️ — хочу в кино · 🔥 — уже выбрал фильм",
+             "📤 Перешли другу, с кем пойдёшь в кино", "", "#ПремьерыНедели #Кино #KinoMir360"]
+    work = SHORTS_DIR / f"list_{time.time_ns()}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        ids, kind = await _send_album(bot, chat_id, await _list_cards(work, items, extras=extras),
+                                      _brand("\n".join(rows)), "#подборка")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    await offer_post(bot, chat_id, ids, kind, "pt:l:week", names, "Подборка готова")
+
+
 async def make_list_post(bot: Bot, chat_id: int, key: str, title: str = "") -> None:
     """Пост-подборка («Новинки онлайн», «Топ сериалов», жанр) в стиле канала: ИИ выбирает фильмы везде —
     кандидаты Кинопоиска, свежие посты Telegram-каналов и поиск Google; альбом постеров, текст — подписью к
     первому; ниже — кнопки публикации. Фильмы не повторяются подряд."""
     today = datetime.now(MSK).date()
+    if key == "week":
+        await make_week_premiere_post(bot, chat_id, today, title)
+        return
     hist = await _posts_history()
     hint = ""
     if key.startswith("h:") and key[2:] in HOLIDAYS:  # подборка к празднику
