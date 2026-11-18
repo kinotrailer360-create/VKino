@@ -171,3 +171,14 @@ def test_sequence_places_official_logo_before_illustrated_timeline(monkeypatch, 
     result = asyncio.run(script_task.find_motion(path, scene, "Реплика.", 3, "", []))
     assert result == [script_task.still_ref(script_task.KANG_LOGO, script_task.KANG_LOGO_PAGE)]
     assert path.read_bytes() == b"sequence"
+
+
+def test_known_doom_and_feige_photos_are_scoped_to_requested_subjects():
+    feige = "официальное фото Кевина Файги на Comic-Con"
+    doom = "официальный образ Доктора Дума из «Мстителей: Судный день»"
+    assert script_task.wants_still(feige)
+    assert script_task.studio_still(feige) == (script_task.FEIGE_PHOTO, script_task.FEIGE_PHOTO_PAGE)
+    assert script_task.studio_still(doom) == (script_task.DOOM_PRESS_IMAGE, script_task.DOOM_PRESS)
+    assert script_task.studio_still("драка Доктора Дума в «Мстителях: Судный день»") is None
+    assert script_task.studio_still("официальное фото режиссёров Руссо") is None
+    assert "Gage Skidmore" in script_task.still_ref(*script_task.studio_still(feige))["credit"]

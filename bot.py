@@ -15651,21 +15651,36 @@ async def structured_find_asset(folder: Path, plan: dict, index: int, used: list
 
 async def structured_preview(message: Message, plan: dict, draft: str, folder: Path, i: int, asset: dict) -> None:
     scene = plan["scenes"][i - 1]
-    source = asset["source"]
+    refs = asset.get("refs", [])
+    path = folder / asset["file"]
+    if path.suffix == ".mp4" and refs:
+        moving = sum(ref.get("kind") != "still" for ref in refs)
+        _, targets = shorts_script_task.motion_targets(scene)
+        if moving == len(targets):
+            kind = "Видеофрагменты"
+        elif moving:
+            kind = "Видео со статичными вставками"
+        else:
+            kind = "Композиция из статичных кадров"
+        media_note = f"\nПредпросмотр без озвучки · {kind}"
+    elif path.suffix == ".mp4":
+        media_note = "\nЗагруженное видео"
+    else:
+        media_note = "\nРезервная карточка" if asset.get("fallback") else "\nФото"
+    credit = "\n".join(dict.fromkeys(ref["credit"] for ref in refs if ref.get("credit")))
     caption = (f"Сцена {i}. {scene['heading'][:80]}\n"
-               f"{plan['lines'][i - 1][:190]}\n\n"
-               + " / ".join(scene["targets"]).replace("**", "")[:290]
+               f"{plan['lines'][i - 1][:190]}{media_note}\n"
+               + (f"{credit}\n" if credit else "")
+               + f"{asset['source'][:315]}\n\n"
+               + " / ".join(scene["targets"]).replace("**", "")[:150]
                + (f"\nНадпись: {scene['label'][:65]}" if scene["label"] else "")
-               + (f"\nКонтроль: {scene['control'].replace('**', '')[:140]}" if scene["control"] else "")
-               + f"\n{source[:180]}"
-               + (f"\nГде искать: {scene['source_hint'][:120]}"
-                  if asset.get("fallback") and scene["source_hint"] else ""))[:945]
+               + (f"\nКонтроль: {scene['control'].replace('**', '')[:100]}" if scene["control"] else "")
+               + (f"\nГде искать: {scene['source_hint'][:120]}" if asset.get("fallback") else ""))[:945]
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _btn("✅ Утвердить кадр", f"scplan:{draft}:ok:{i}:{asset['revision']}"),
         _btn("📎 Заменить", f"scplan:{draft}:replace:{i}:{asset['revision']}"),
     ], *([[_btn("🔎 Найти другое фото или видео", f"scplan:{draft}:retry:{i}:{asset['revision']}")]]
            if scene["queries"] else [])])
-    path = folder / asset["file"]
     if path.suffix == ".mp4":
         await message.answer_video(FSInputFile(path), caption=caption, parse_mode=None, reply_markup=kb,
                                    supports_streaming=True)
@@ -15765,7 +15780,12 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
             await state.set_state(None)
             await state.update_data(structured_rendering=True)
             status = await message.answer(progress_bar(0, "Собираю по утверждённым сценам"))
-            script = {"title": plan["title"], "name": plan["title"], "description": plan["description"],
+            description = plan["description"]
+            if any(ref.get("url") == shorts_script_task.FEIGE_PHOTO_PAGE
+                   for asset in assets.values() for ref in asset.get("refs", [])):
+                description = (f"{description}\n\n{shorts_script_task.FEIGE_CREDIT} · кадрирование\n"
+                               f"{shorts_script_task.FEIGE_PHOTO_PAGE}\nhttps://creativecommons.org/licenses/by-sa/3.0/").strip()
+            script = {"title": plan["title"], "name": plan["title"], "description": description,
                       "hashtags": plan["hashtags"].split(), "lines": plan["lines"], "kind": "news", "kind_own": True,
                       "screen_labels": [scene["label"] for scene in plan["scenes"]],
                       "structured": [assets[str(i)] for i in range(1, len(files) + 1)]}
@@ -15798,8 +15818,15 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
                     await message.answer("Основной подбор ещё идёт. После него можно поискать другое фото или видео.")
                     return
                 wait = await message.answer(f"🔎 Ищу другое фото или видео для сцены {index}.")
-                used = [ref for other in assets.values() for ref in other.get("refs", [])]
+                _, targets = shorts_script_task.motion_targets(plan["scenes"][int(index) - 1])
+                current_refs = asset.get("refs", [])
+                has_missing = 0 < len(current_refs) < len(targets)
+                used = [ref for number, other in assets.items() for ref in other.get("refs", [])
+                        if number != index or not has_missing]
                 new_asset = await structured_find_asset(folder, plan, int(index), used, retry=True)
+                if has_missing and new_asset is not None and len(new_asset.get("refs", [])) <= len(current_refs):
+                    (folder / new_asset["file"]).unlink(missing_ok=True)
+                    new_asset = None
                 if new_asset is None:
                     await _edit_quiet(wait, "Подходящего фото или видео не нашёл. Текущий материал сохранён.")
                     return
