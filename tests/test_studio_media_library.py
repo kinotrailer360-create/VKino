@@ -72,13 +72,14 @@ def test_selects_second_matching_uploaded_video_not_first(tmp_path):
         project = {"mediaLibrary": [first, second], "sourceUrls": []}
         scene = {"text": "Канг из фильма", "duration": 6}
         with patch.object(library.ai, "available", return_value=True), patch.object(
-            library, "choose_video", new=AsyncMock(side_effect=[None, (12.0, 21.0)])
+            library, "choose_windows", new=AsyncMock(side_effect=[[], [(12.0, 21.0), (31.0, 40.0)]])
         ) as choose:
             result = await library.select(Bridge(), 7, scene, project, tmp_path, "key")
         assert choose.await_count == 2
         assert result["asset"]["id"] == second
         assert result["start"] == 12.0
         assert result["end"] == 21.0
+        assert result["alternatives"][0]["start"] == 31.0
         assert result["rights"] == "author_uploaded"
         assert "подтвердите" in result["note"].lower()
     asyncio.run(scenario())

@@ -87,8 +87,8 @@ async def trailer_candidate(
                     "platform": candidate["platform"],
                     "publisher": candidate.get("publisher", ""),
                     "start": 0, "end": round(end - start, 3),
-                    "sourceStart": start, "rights": "unconfirmed",
-                    "note": "Фрагмент трейлера найден и проверен ИИ по двум кадрам. "
+                    "sourceStart": start, "sourceEnd": end, "rights": "unconfirmed",
+                    "note": "Фрагмент трейлера найден и проверен ИИ по трём кадрам. "
                             "Актёра, событие, источник и разрешение на публикацию "
                             "необходимо подтвердить вручную. Кандидат НЕ утверждён."}
         except Exception as exc:  # noqa: BLE001
@@ -125,27 +125,25 @@ async def render_scene(bridge: Any, admin: int, scene: dict[str, Any], work: Pat
     await visual_guard.audit(work, [{"text": scene["text"], "start": 0, "end": total,
         "offset": scene.get("start", 0),
         "clip" if meta["mime"].startswith("video/") else "image": str(media.resolve())}], key)
-    # Text is held in a file rather than interpolated into a shell/filter expression.
-    words, lines, line = scene["text"].split(), [], ""
-    for word in words:
-        if len(line + " " + word) > 33:
-            lines.append(line)
-            line = word
-        else:
-            line += (" " if line else "") + word
-    if line:
-        lines.append(line)
-    # Use ASS subtitles for pagination so no paragraph text disappears off-screen.
+    # Time short captions against the actual voice duration. Without word alignment
+    # this is a proportional estimate, using the length of each spoken group.
+    words = scene["text"].split()
+    groups = [" ".join(words[i:i + 2]) for i in range(0, len(words), 2)]
+    weights = [max(4, len(group)) for group in groups]
+    units = sum(weights)
     ass = work / "captions.ass"
-    def stamp(n: float) -> str:
-        return f"{int(n)//3600}:{int(n)//60%60:02d}:{n%60:05.2f}"
-    pages = [lines[i:i + 4] for i in range(0, len(lines), 4)]
+
+    def stamp(value: float) -> str:
+        cs = round(value * 100)
+        return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
     events = []
-    for i, page in enumerate(pages):
-        # Escape ASS control sequences from user content.
-        text = r"\N".join(page).replace("{", "（").replace("}", "）")
-        text = text.replace("\\", "＼").replace("＼N", r"\N")
-        events.append(f"Dialogue: 0,{stamp(i*total/len(pages))},{stamp((i+1)*total/len(pages))},Default,,0,0,0,,{text}")
+    cursor = 0
+    for group, weight in zip(groups, weights):
+        text = group.replace("{", "（").replace("}", "）").replace("\\", "＼")
+        start, end = voice_duration * cursor / units, voice_duration * (cursor + weight) / units
+        events.append(f"Dialogue: 0,{stamp(start)},{stamp(end)},Default,,0,0,0,,{text}")
+        cursor += weight
     ass.write_text("[Script Info]\nScriptType: v4.00+\nPlayResX: 720\nPlayResY: 1280\n"
                    "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
                    "Style: Default,Montserrat,34,&H00FFFFFF,&H00FFFFFF,&H00111111,&H70000000,-1,0,0,0,100,100,0,0,1,2,1,2,45,45,170,1\n"

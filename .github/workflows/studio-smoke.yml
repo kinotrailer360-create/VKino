@@ -19,6 +19,9 @@ on:
       - 'shorts/studio_adapter.py'
       - 'shorts/imgsearch.py'
       - 'shorts/clips.py'
+      - 'shorts/studio_media_library.py'
+      - 'shorts/studio_media_picker.js'
+      - 'shorts/studio_social_sources.py'
       - 'tests/test_studio*.py'
       - '.github/workflows/studio-smoke.yml'
 
