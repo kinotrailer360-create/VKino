@@ -5,6 +5,7 @@ proposes candidate shots; neither relevance nor publishing rights are approved.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from pathlib import Path
@@ -25,7 +26,8 @@ PLATFORMS = (
 )
 MAX_MEDIA = 20
 MAX_LINKS = 5
-MAX_FRAMES = 4
+MAX_WINDOWS = 5
+LOCAL_VIDEO = ("-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,avi")
 
 
 def allowed_source(url: str) -> bool:
@@ -50,7 +52,7 @@ def required_length(scene: dict[str, Any]) -> float:
 
 
 async def video_duration(path: Path) -> float:
-    raw = await process.run("ffprobe", "-v", "error",
+    raw = await process.run("ffprobe", "-v", "error", *LOCAL_VIDEO,
                             "-show_entries", "format=duration",
                             "-of", "default=noprint_wrappers=1:nokey=1",
                             str(path), timeout=20)
@@ -70,43 +72,55 @@ async def matches(path: Path, scene_text: str, key: str) -> bool:
         with Image.open(path) as im:
             if im.width * im.height > 30_000_000:
                 return False
-            fit, _ = await ai.media_fits(key, im.convert("RGB"), scene_text)
+            with im.convert("RGB") as rgb:
+                fit, _ = await asyncio.wait_for(ai.media_fits(key, rgb, scene_text), 18)
             return fit is True
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TimeoutError) as exc:
         log.info("Candidate rejected: %s", type(exc).__name__)
         return False
 
 
 async def frame_at(source: Path, out: Path, second: float) -> Path:
     await process.run("ffmpeg", "-v", "error", "-y",
-                      "-ss", str(max(0.0, second)), "-i", str(source),
+                      "-ss", str(max(0.0, second)), *LOCAL_VIDEO, "-threads", "1", "-i", str(source),
                       "-frames:v", "1", "-vf", "scale=448:-2",
                       str(out), timeout=25)
     return out
 
 
-async def choose_video(source: Path, scene: dict[str, Any],
-                       folder: Path, key: str) -> tuple[float, float] | None:
-    """Find a continuous shot by checking two frames in each eligible window."""
+async def choose_windows(source: Path, scene: dict[str, Any], folder: Path, key: str,
+                         excluded: tuple[tuple[float, float], ...] = (), limit: int = 2) -> list[tuple[float, float]]:
+    """Seek to bounded candidate windows and check their start, middle and end."""
     length = required_length(scene)
     total = await video_duration(source)
     if total < length:
-        return None
-    samples_dir = folder / "sample"
-    samples_dir.mkdir(parents=True, exist_ok=True)
-    samples = await clips.sample_frames(
-        source, samples_dir, every=max(2.0, total / MAX_FRAMES),
-        duration=total, limit=MAX_FRAMES, whole=True,
-    )
-    for i, (timestamp, preview) in enumerate(samples):
-        start = min(max(0.0, timestamp - 1.0), total - length)
-        if not await matches(preview, scene["text"], key):
+        return []
+    folder.mkdir(parents=True, exist_ok=True)
+    preview = folder / "frame.jpg"
+    last_start = total - length
+    count = min(MAX_WINDOWS, math.ceil(last_start / max(2, length / 2)) + 1)
+    starts = [last_start * i / max(1, count - 1) for i in range(count)]
+    target = (scene.get("visualTarget") or "").strip()
+    text = scene["text"] + ("\nВ кадре обязательно: " + target if target else "")
+    selected: list[tuple[float, float]] = []
+    for start in starts:
+        end = start + length
+        if any(start < right - .05 and end > left + .05 for left, right in [*excluded, *selected]):
             continue
-        second = await frame_at(source, folder / f"check_{i}.jpg",
-                                start + min(length - 0.1, max(1.0, length * 0.7)))
-        if await matches(second, scene["text"], key):
-            return round(start, 3), round(start + length, 3)
-    return None
+        for position in (.5, .12, .88):
+            await frame_at(source, preview, start + length * position)
+            if not await matches(preview, text, key):
+                break
+        else:
+            selected.append((round(start, 3), round(end, 3)))
+            if len(selected) >= limit:
+                break
+    return selected
+
+
+async def choose_video(source: Path, scene: dict[str, Any], folder: Path, key: str) -> tuple[float, float] | None:
+    selected = await choose_windows(source, scene, folder, key, limit=1)
+    return selected[0] if selected else None
 
 
 async def select(bridge: Any, admin: int, scene: dict[str, Any],
@@ -135,28 +149,30 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
     # the first matching shot. A shortlist lets the Site offer alternatives.
     videos = [entry for entry in sources if entry[1].get("mime", "").startswith("video/")]
     images = [entry for entry in sources if entry not in videos]
-    suggestions: list[dict[str, Any]] = []
+    suggested_by_video: list[list[dict[str, Any]]] = []
     for index, (path, meta, label, source_id) in enumerate(videos):
         try:
             location = work / f"video_{index}"
             location.mkdir(parents=True, exist_ok=True)
-            window = await choose_video(path, scene, location, key)
-            if window is None:
+            used = tuple((other["start"], other["end"]) for other in project.get("scenes", [])
+                         if (other.get("asset") or {}).get("hash") == meta.get("hash") and meta.get("hash"))
+            windows = await choose_windows(path, scene, location, key, excluded=used)
+            if not windows:
                 failures.append(f"Нет подходящего фрагмента: {label[:45]}")
                 continue
-            start, end = window
-            suggestions.append({"asset": {"id": source_id, "mime": meta["mime"], "name": label},
-                                "start": start, "end": end, "source": label,
-                                "rights": "author_uploaded"})
+            asset = {**meta, "id": source_id, "name": label}
+            suggested_by_video.append([{"asset": asset, "start": start, "end": end, "source": label,
+                                        "rights": "author_uploaded"} for start, end in windows])
         except Exception as exc:  # noqa: BLE001
             failures.append(f"Ошибка анализа видео: {type(exc).__name__}")
             log.warning("Media candidate error: %s", type(exc).__name__)
+    suggestions = [group[slot] for slot in range(2) for group in suggested_by_video if len(group) > slot]
     if suggestions:
         chosen = dict(suggestions[0])
         chosen["alternatives"] = suggestions[1:4]
         chosen["note"] = (
             f"Проверено {len(videos)} видео; найдено подходящих вариантов: {len(suggestions)}. "
-            "ИИ сверил два кадра каждого предложенного фрагмента. "
+            "ИИ сверил три кадра каждого предложенного фрагмента. "
             "Подтвердите актёра, сцену и права перед монтажом; ничего не утверждено автоматически.")
         chosen["errors"] = failures[:8]
         return chosen
@@ -181,7 +197,7 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
             await clips.cut_clip(downloaded, cut, start, end - start)
             asset = await bridge.store_file(admin, cut, "video/mp4", "source-clip.mp4")
             return {"asset": asset, "start": 0.0, "end": end - start,
-                    "source": url, "sourceStart": start, "rights": "unconfirmed",
+                    "source": url, "sourceStart": start, "sourceEnd": end, "rights": "unconfirmed",
                     "alternatives": [],
                     "note": "Фрагмент найден по предоставленной ссылке. "
                             "Подтвердите его содержание и право использования; "
@@ -196,7 +212,7 @@ async def select(bridge: Any, admin: int, scene: dict[str, Any],
     for path, meta, label, source_id in images:
         try:
             if source_id and await matches(path, scene["text"], key):
-                return {"asset": {"id": source_id, "mime": meta["mime"], "name": label},
+                return {"asset": {**meta, "id": source_id, "name": label},
                         "source": label, "rights": "author_uploaded",
                         "note": "Кадр подобран из файлов автора; проверьте смысл перед утверждением.",
                         "errors": failures[:8]}
