@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import io
 import json
 import logging
@@ -11,12 +12,12 @@ import re
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from . import ai, clips, imgsearch, netsafe, process
+from . import ai, clips, fastnews, imgsearch, netsafe, process
 
 log = logging.getLogger("shorts")
 STUDIO_HANDLES = {"@marvel", "@marvelstudios", "@disney", "@waltdisneystudios"}
@@ -25,6 +26,9 @@ QUANTUMANIA_TRAILERS = ("ZlNFpri-Y40", "5WfTEZJnv_8")
 KANG_PRESS = "https://press.disney.co.uk/gallery/ant-man-and-the-wasp-quantumania-logos-and-key-art"
 KANG_PRESS_IMAGE = ("https://lumiere-a.akamaihd.net/v1/images/pcl3080_mp01_v001_wr_g_r709_1124_13a8a9e5.jpeg"
                     "?region=426%2C0%2C3034%2C1707&width=1400")
+
+KANG_LOGO_PAGE = "https://www.marvel.com/articles/movies/sdcc-2022-marvel-studios-avengers-the-kang-dynasty-announced"
+KANG_LOGO = "https://cdn.marvel.com/content/2x/sdcc_avengerskangdynasty.webp"
 
 SECTION = re.compile(r"(?m)^##\s+\d+\.\s+(.+)$")
 SCENE = re.compile(r"(?m)^###\s+Сцена\s+(\d+)\s*[—–-]\s*(.+)$", re.I)
@@ -319,22 +323,101 @@ async def verify_cut(path: Path, target: str, key: str, seconds: float) -> bool:
             image.close()
 
 
-async def verified_target_still(path: Path, target: str, used: list[dict]) -> dict | None:
-    if not is_quantumania_kang(target) or any(ref["id"] == "quantumania-kang-press" for ref in used):
-        return None
+def studio_still(target: str) -> tuple[str, str] | None:
+    if is_quantumania_kang(target):
+        return KANG_PRESS_IMAGE, KANG_PRESS
+    if re.search(r"логотип|анонс|logo|title reveal", target, re.I) and re.search(
+        r"the kang dynasty|династи[яию] канга", target, re.I
+    ):
+        return KANG_LOGO, KANG_LOGO_PAGE
+    return None
+
+
+def still_ref(image: str, source: str) -> dict:
+    return {"id": "still:" + hashlib.sha256(image.split("?")[0].encode()).hexdigest()[:24],
+            "url": source, "kind": "still"}
+
+
+async def opened_still(session: aiohttp.ClientSession, url: str) -> Image.Image | None:
     try:
-        async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=12), headers=imgsearch.BROWSER) as session:
-            content, _ = await netsafe._get(session, KANG_PRESS_IMAGE, 8 * 1024 * 1024, "")
+        content = await netsafe.fetch(session, url, 8 * 1024 * 1024)
         with Image.open(io.BytesIO(content)) as opened:
-            if opened.width * opened.height > 18_000_000:
+            if opened.width < 480 or opened.height < 360 or opened.width * opened.height > 18_000_000:
                 return None
-            image = opened.convert("RGB")
-        with image:
-            image.thumbnail((1600, 1600))
-            image.save(path, "JPEG", quality=94)
+            return ImageOps.exif_transpose(opened).convert("RGB")
     except (OSError, RuntimeError, TimeoutError, ValueError, aiohttp.ClientError):
         return None
-    return {"id": "quantumania-kang-press", "url": KANG_PRESS, "kind": "still"}
+
+
+async def page_still(session: aiohttp.ClientSession, url: str) -> dict | None:
+    try:
+        page, ctype = await netsafe.fetch_page(session, url)
+        if ctype.startswith("image/"):
+            return {"source": url, "image": url}
+        match = fastnews.OG_IMAGE.search(page)
+        if match:
+            return {"source": url, "image": urljoin(url, html.unescape(match[1] or match[2]))}
+    except (OSError, RuntimeError, TimeoutError, ValueError, aiohttp.ClientError):
+        pass
+    return None
+
+
+async def find_still(scene: dict, target: str, queries: list[str], key: str, used: list[dict]) -> tuple[Image.Image, dict] | None:
+    target = target.replace("**", "")
+    known = studio_still(target)
+    seen = {ref["id"] for ref in used}
+    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=7), headers=imgsearch.BROWSER) as session:
+        if known:
+            ref = still_ref(*known)
+            if ref["id"] not in seen:
+                image = await opened_still(session, known[0])
+                if image:
+                    return image, ref
+
+        urls = [url for url in scene.get("sources", []) if urlsplit(url).path.strip("/") and not youtube_id(url)]
+        portals = await asyncio.gather(imgsearch.broad_search(session, queries),
+                                       *(page_still(session, url) for url in urls[:3]))
+        hits = [hit for hit in portals[1:] if hit] + portals[0]
+        hits.sort(key=lambda hit: not official(hit["source"]))
+        attempts = 0
+        for hit in hits:
+            ref = still_ref(hit["image"], hit["source"])
+            if ref["id"] in seen:
+                continue
+            seen.add(ref["id"])
+            image = await opened_still(session, hit["image"])
+            if image is None:
+                continue
+            attempts += 1
+            keep = False
+            try:
+                verdict, _ = await asyncio.wait_for(ai.media_fits(
+                    key, image, f"Целевой кадр: {target}\nКонтроль: {scene['control']}"), 7)
+                keep = verdict is True
+                if keep:
+                    return image, ref
+            except (OSError, RuntimeError, TimeoutError, ValueError, aiohttp.ClientError):
+                pass
+            finally:
+                if not keep:
+                    image.close()
+            if attempts >= 3:
+                break
+    return None
+
+
+async def target_still(path: Path, scene: dict, target: str, queries: list[str], key: str, used: list[dict]) -> dict | None:
+    try:
+        candidate = await asyncio.wait_for(find_still(scene, target, queries, key, used), 27)
+    except (OSError, RuntimeError, TimeoutError, ValueError, aiohttp.ClientError):
+        return None
+    if not candidate:
+        return None
+    image, ref = candidate
+    with image:
+        image.thumbnail((1600, 1600))
+        image.save(path, "JPEG", quality=94)
+    return ref
 
 
 async def find_motion(path: Path, scene: dict, narration: str, index: int, key: str, used: list[dict]) -> list[dict]:
@@ -342,7 +425,7 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
     layout, targets = motion_targets(scene)
     queries = scene.get("queries") or []
     urls = scene.get("sources") or []
-    if not queries and not any(map(youtube_id, urls)) and not any(map(is_quantumania_kang, targets)):
+    if not queries and not urls and not any(map(studio_still, targets)):
         return []
     seconds = video_duration(scene, narration)
     part_duration = seconds if layout == "split" else math.ceil(seconds / len(targets) * 100) / 100
@@ -354,7 +437,8 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         is_graphic = bool(re.search(r"^(авторская|собственная|чистая авторская)\s", target, re.I))
         specific = queries[j::len(targets)] if len(targets) > 1 else queries
         piece = None
-        if not is_graphic:
+        is_still = bool(re.search(r"логотип|портрет|официальное фото|title reveal", target, re.I))
+        if not is_graphic and not is_still:
             try:
                 piece = await asyncio.wait_for(matching_clip(path.parent, stem, specific, target,
                     scene["control"], key, part_duration, used + refs, urls), timeout=48)
@@ -366,11 +450,15 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
             parts.append(part)
         elif len(targets) > 1:
             still = path.with_name(stem + ".jpg")
-            ref = await verified_target_still(still, target, used + refs)
+            ref = None if is_graphic else await target_still(
+                still, scene, target, list(dict.fromkeys(specific[:2])), key, used + refs)
             if ref:
                 refs.append(ref)
             else:
                 graphic = {**scene, "label": "", "fallback": "", "heading": target.strip(" .")[:95]}
+                if is_graphic and "→" in target:
+                    graphic["steps"] = re.findall(r"`([^`]+)`", target)[:3]
+                    graphic["heading"] = "ИЗНАЧАЛЬНЫЙ ЗАМЫСЕЛ"
                 if re.search(r"доктор\w* дум|doctor doom", target, re.I):
                     graphic.update(heading="ДОКТОР ДУМ", mask=True)
                 await asyncio.to_thread(fallback_card, still, graphic, index + j)
@@ -391,7 +479,8 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         if layout == "split":
             shape = "scale=540:1920:force_original_aspect_ratio=increase,crop=540:1920"
         else:
-            shape = "scale=1080:1920"
+            shape = ("scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                     "pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
         filters.append(f"[{i}:v]{shape},fps=30,setsar=1,format=yuv420p,trim=duration={part_duration},setpts=PTS-STARTPTS[v{i}]")
     inputs = "".join(f"[v{i}]" for i in range(len(parts)))
     filters.append(inputs + ("hstack=inputs=2:shortest=1" if layout == "split" else f"concat=n={len(parts)}:v=1:a=0") + "[v]")
@@ -401,33 +490,6 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
     for part in parts:
         part.unlink(missing_ok=True)
     return refs
-
-
-async def find_still(scene: dict, narration: str, key: str) -> tuple[Image.Image, str] | None:
-    """Only accept a verified still whose landing page belongs to the studio."""
-    if len(scene["targets"]) != 1 or not any(official(url) for url in scene["sources"]):
-        return None
-    target = scene["targets"][0].replace("**", "")
-    if any(word in target.casefold() for word in ("сплит-экран", "затем", "авторская финальная")):
-        return None
-    async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=12), headers=imgsearch.BROWSER) as session:
-        for query in scene["queries"][:2]:
-            hits = await imgsearch.search(query + " (site:marvel.com OR site:disney.com)", 8)
-            official_hits = [hit for hit in hits if official(hit.get("source") or "")]
-            for hit in official_hits[:2]:
-                try:
-                    raw, _ = await netsafe._get(session, hit["image"], 10 * 1024 * 1024, "")
-                    with Image.open(io.BytesIO(raw)) as opened:
-                        if opened.width < 480 or opened.height < 360 or opened.width * opened.height > 18_000_000:
-                            continue
-                        image = opened.convert("RGB")
-                    verdict, _ = await ai.media_fits(key, image, f"{narration}\nЦелевой кадр: {target}\nКонтроль: {scene['control']}")
-                    if verdict is True:
-                        return image, hit["source"]
-                    image.close()
-                except (aiohttp.ClientError, OSError, ValueError, RuntimeError):
-                    continue
-    return None
 
 
 def fallback_card(path: Path, scene: dict, index: int) -> None:
@@ -465,22 +527,31 @@ def fallback_card(path: Path, scene: dict, index: int) -> None:
         draw.multiline_text((540, 1180 if scene.get("mask") else 850), "\n".join(pieces), font=font, anchor="mm",
                             align="center", spacing=16, fill="#f8f1e3")
         draw.text((540, 1300), "АВТОРСКАЯ ГРАФИКА", font=sans, anchor="mm", fill="#e6ba63")
+        steps = scene.get("steps", [])
+        if steps:
+            timeline_font = ImageFont.truetype(str(head), 64)
+            draw.rectangle((90, 720, 990, 1400), fill=palette[(index - 1) % len(palette)])
+            for row, step in enumerate(steps):
+                y = 810 + 180 * row
+                draw.text((540, y), step[:40], font=timeline_font, anchor="mm", fill="#f8f1e3")
+                if row + 1 < len(steps):
+                    draw.line((540, y + 51, 540, y + 121), fill="#e6ba63", width=5)
+                    draw.polygon(((525, y + 110), (555, y + 110), (540, y + 132)), fill="#e6ba63")
+            draw.text((540, 1440), "ВИЗУАЛИЗАЦИЯ • НЕСОСТОЯВШИЙСЯ ПЛАН", font=sans, anchor="mm", fill="#e6ba63")
         image.save(path, quality=93)
 
 
-async def prepare_still(path: Path, scene: dict, narration: str, index: int, key: str) -> str:
-    try:
-        candidate = await asyncio.wait_for(find_still(scene, narration, key), 35)
-    except (TimeoutError, aiohttp.ClientError, OSError, ValueError, RuntimeError):
-        candidate = None
-    if candidate:
-        image, source = candidate
-        with image:
-            image.thumbnail((1600, 1600))
-            image.save(path, quality=93)
-        return source
-    await asyncio.to_thread(fallback_card, path, scene, index)
-    return ""
+async def prepare_still(path: Path, scene: dict, index: int, key: str, used: list[dict],
+                        *, allow_graphic: bool = True) -> dict | None:
+    layout, targets = motion_targets(scene)
+    if layout == "single" and not re.match(r"^(авторская|собственная|чистая авторская)\s", targets[0], re.I):
+        queries = scene.get("queries") or []
+        ref = await target_still(path, scene, targets[0], list(dict.fromkeys(queries[:1] + queries[-1:])), key, used)
+        if ref:
+            return ref
+    if allow_graphic:
+        await asyncio.to_thread(fallback_card, path, scene, index)
+    return None
 
 
 def normalize_photo(path: Path) -> None:

@@ -4,6 +4,7 @@ Google бот превращает в запрос и ищет здесь. Фо�
 
 from __future__ import annotations
 
+import asyncio
 import html
 import io
 import json
@@ -83,6 +84,47 @@ async def search(query: str, limit: int = 12) -> list[dict[str, str]]:
             errors.append(f"{name}: пусто")
     last_error = "; ".join(errors)
     return []
+
+
+def yandex_results(page: str, limit: int) -> list[dict[str, str]]:
+    for match in re.finditer(r'data-state="([^"]+)"', page):
+        if "origUrl" not in match[1]:
+            continue
+        try:
+            items = json.loads(html.unescape(match[1]))["initialState"]["serpList"]["items"]
+            rows = [items["entities"][ident] for ident in items["keys"]]
+        except (KeyError, TypeError, ValueError):
+            continue
+        hits = []
+        for row in rows:
+            image = str(row.get("origUrl") or "")
+            source = str((row.get("snippet") or {}).get("url") or "")
+            width = row.get("origWidth")
+            if source.startswith(("https://", "http://")) and _ok(image + " " + source, width if isinstance(width, int) else 0):
+                hits.append({"image": image, "source": source})
+                if len(hits) >= limit:
+                    break
+        return hits
+    return []
+
+
+async def yandex_images(session: aiohttp.ClientSession, query: str, limit: int) -> list[dict[str, str]]:
+    page, _ = await netsafe.fetch_page(session, "https://yandex.ru/images/search?text=" + quote_plus(query))
+    return yandex_results(page, limit)
+
+
+async def broad_search(session: aiohttp.ClientSession, queries: list[str]) -> list[dict[str, str]]:
+    async def run(engine, query):
+        try:
+            return await asyncio.wait_for(engine(session, query, 6), 8)
+        except (aiohttp.ClientError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+            log.info("shorts: %s did not return images: %s", engine.__name__, type(exc).__name__)
+            return []
+
+    batches = await asyncio.gather(*(run(engine, query) for query in queries
+                                      for engine in (yandex_images, bing, ddg)))
+    # Round-robin so one engine's results do not fill the entire shortlist.
+    return [batch[i] for i in range(6) for batch in batches if len(batch) > i]
 
 
 async def pick(query: str, phrase: str, gemini_key: str) -> bytes | None:
