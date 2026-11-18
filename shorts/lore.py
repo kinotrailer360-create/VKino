@@ -961,7 +961,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "voice": voice.name,
         "music": str(music or musiclib.pick(script.get("title") or "", " ".join(script.get("lines") or []))
                      or ASSETS / "music.mp3"),
-        "music_db": -90 if structured else -17 if voiced else -6,
+        "music_db": -21 if structured else -17 if voiced else -6,
+        "loop_music": structured,
         "logo": str(ASSETS / "logo.png"),
         "fonts": {"head": str(ASSETS / "Oswald.ttf"), "sans": str(ASSETS / "Montserrat.ttf")},
         "slides": slides,

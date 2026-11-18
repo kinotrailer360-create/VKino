@@ -388,7 +388,7 @@ async def verify_cut(path: Path, target: str, key: str, seconds: float) -> bool:
 
 
 def wants_still(target: str) -> bool:
-    if re.search(r"видео\s*(?:[/и]|или)\s*фото|видеофрагмент|трейлер|trailer", target, re.I):
+    if re.search(r"(?:видео\s*(?:/|или|и)\s*фото|фото\s*(?:/|или|и)\s*видео)|видеофрагмент|трейлер|trailer", target, re.I):
         return False
     return bool(re.search(r"логотип|портрет|\bфото\b|промокадр|официальн\w* образ|title reveal|press photo",
                           target, re.I))
@@ -598,7 +598,9 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         if part.suffix == ".jpg":
             dims = "540x1920" if layout == "split" else "1080x1920"
             k = f"min(on/{max(1, int(part_duration * 30) - 1)},1)"
-            shape += (f",zoompan=z='1+0.04*{k}*{k}*(3-2*{k})':"
+            if (index + (i if layout == "sequence" else 0)) % 2 == 0:
+                k = f"(1-{k})"
+            shape += (f",zoompan=z='1+0.06*{k}*{k}*(3-2*{k})':"
                       f"x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={dims}:fps=30")
         filters.append(f"[{i}:v]{shape},fps=30,setsar=1,format=yuv420p,trim=duration={part_duration},setpts=PTS-STARTPTS[v{i}]")
     inputs = "".join(f"[v{i}]" for i in range(len(parts)))

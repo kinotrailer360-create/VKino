@@ -595,12 +595,12 @@ VOICE_CHAIN = ("highpass=f=90,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3200:t=q:
 
 
 def mix_audio(voice: Path, music: Path, total: float, out: Path, music_db: float,
-              sfx: list[tuple[float, Path, float]] | None = None):
+              sfx: list[tuple[float, Path, float]] | None = None, *, loop_music: bool = False):
     """Голос (с обработкой для разборчивости) + музыка (заметно тише голоса и приглушается под него)
     + звуковые эффекты (время, файл, громкость дБ)."""
     fade = max(total - 2.0, 0)
     sfx = [(t, f, db) for t, f, db in sfx or [] if 0 <= t < total and f.exists()]
-    inputs = ["-i", str(voice), "-i", str(music)]
+    inputs = ["-i", str(voice)] + (["-stream_loop", "-1"] if loop_music else []) + ["-i", str(music)]
     filt = (
         f"[1:a]volume={music_db}dB,atrim=0:{total},afade=t=in:d=0.5,afade=t=out:st={fade}:d=2[m];"
         f"[0:a]aresample=48000,{VOICE_CHAIN},apad=whole_dur={total},asplit=2[v][sc];"

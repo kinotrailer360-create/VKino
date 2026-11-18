@@ -157,10 +157,12 @@ class FillSlide:
         return img
 
 
-def gentle_zoom(img: Image.Image, t: float, dur: float) -> Image.Image:
+def gentle_zoom(img: Image.Image, t: float, dur: float, reverse: bool = False) -> Image.Image:
     """Subpixel push-in for static material; keep captions outside this transform."""
     k = min(max(t / max(dur, 0.1), 0.0), 1.0)
-    factor = 1.0 + 0.04 * k * k * (3 - 2 * k)
+    if reverse:
+        k = 1 - k
+    factor = 1.0 + 0.06 * k * k * (3 - 2 * k)
     if factor == 1.0:
         return img.copy()
     w, h = img.size
@@ -169,7 +171,8 @@ def gentle_zoom(img: Image.Image, t: float, dur: float) -> Image.Image:
 
 
 class ApprovedStill:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, reverse: bool = False):
+        self.reverse = reverse
         with Image.open(path) as original:
             still = original.convert("RGB")
         if abs(still.width / still.height - W / H) < 0.015:
@@ -177,19 +180,20 @@ class ApprovedStill:
         else:
             base = ImageOps.fit(still, (W // 8, H // 8), Image.Resampling.LANCZOS)
             self.canvas = ImageEnhance.Brightness(base.filter(ImageFilter.GaussianBlur(6))).enhance(0.48).resize((W, H))
-            fg = ImageOps.contain(still, (round(W * .96), round(H * .96)), Image.Resampling.LANCZOS)
+            fg = ImageOps.contain(still, (round(W / 1.06), round(H / 1.06)), Image.Resampling.LANCZOS)
             self.canvas.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
 
     def frame(self, t: float, dur: float) -> Image.Image:
-        return gentle_zoom(self.canvas, t, dur)
+        return gentle_zoom(self.canvas, t, dur, self.reverse)
 
 
 class ClipSlide:
     """Отрезок трейлера (уже 1080×1920, 30 к/с, без звука): кадры читаются из ffmpeg по ходу монтажа, в памяти —
     только текущий. Кончился отрезок — держим последний кадр (на время перехода к следующей картинке)."""
 
-    def __init__(self, path: Path, animate_stills: bool = False, fit_duration: float | None = None):
+    def __init__(self, path: Path, animate_stills: bool = False, fit_duration: float | None = None, *, reverse: bool = False):
         self.animate_stills = animate_stills
+        self.reverse = reverse
         filters = f"fps={FPS},scale={W}:{H}"
         if fit_duration:
             length = duration(path)
@@ -211,7 +215,7 @@ class ClipSlide:
                 break
             self.last = Image.frombytes("RGB", (W, H), buf)
             self.idx += 1
-        return gentle_zoom(self.last, t, dur) if self.animate_stills else self.last
+        return gentle_zoom(self.last, t, dur, self.reverse) if self.animate_stills else self.last
 
     def close(self) -> None:
         self.proc.kill()
@@ -403,9 +407,10 @@ def render(cfg: dict, base: Path) -> Path:
                     gone.close()
             if slides[k].get("clip"):  # отрезок трейлера
                 loaded[k] = ClipSlide(p(slides[k]["clip"]), animate_stills=bool(slides[k].get("animate_stills")),
-                                      fit_duration=ends[k] - slides[k]["start"] if slides[k].get("fit_clip") else None)
+                                      fit_duration=ends[k] - slides[k]["start"] if slides[k].get("fit_clip") else None,
+                                      reverse=bool(k % 2))
             elif cfg.get("approved_motion"):
-                loaded[k] = ApprovedStill(p(slides[k]["image"]))
+                loaded[k] = ApprovedStill(p(slides[k]["image"]), reverse=bool(k % 2))
             else:
                 path = p(slides[k]["image"])
                 with Image.open(path) as probe:
@@ -428,7 +433,7 @@ def render(cfg: dict, base: Path) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     audio = out.with_suffix(".m4a")
     sfx = [(float(t), p(f), float(db)) for t, f, db in cfg.get("sfx") or []]
-    mix_audio(voice, music, total, audio, cfg.get("music_db", -16), sfx)
+    mix_audio(voice, music, total, audio, cfg.get("music_db", -16), sfx, loop_music=bool(cfg.get("loop_music")))
 
     log_path = out.with_suffix(".ffmpeg.log")
     log = open(log_path, "wb")  # noqa: SIM115 — закрываем вручную после кодировщика
