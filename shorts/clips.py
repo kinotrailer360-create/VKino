@@ -137,7 +137,7 @@ def _age_days(v: dict) -> float | None:
 
 
 async def rutube_trailer(titles: list[str], year: int | None = None, season: int | None = None,
-                         fresh_days: float | None = None) -> dict | None:
+                         fresh_days: float | None = None, *, official_only: bool = False) -> dict | None:
     """Лучший трейлер на Rutube: название фильма + «трейлер», не платный, не 18+, 30–400 с.
     season — нужен трейлер именно этого сезона (в названии ролика есть номер сезона; со 2-го сезона без
     номера не берём — это может быть трейлер первого). fresh_days — ролик выложен не раньше (новость о
@@ -159,17 +159,19 @@ async def rutube_trailer(titles: list[str], year: int | None = None, season: int
             async with session.get(RUTUBE_SEARCH, params={"query": query, "format": "json"},
                                    headers={"accept": "application/json"}) as resp:
                 data = await resp.json(content_type=None)
-        found = _best_trailer(data, names, year, season, fresh_days)
+        found = _best_trailer(data, names, year, season, fresh_days, official_only=official_only)
         if found:
             return found
     return None
 
 
 def _best_trailer(data: dict, names: list[str], year: int | None, season: int | None,
-                  fresh_days: float | None) -> dict | None:
+                  fresh_days: float | None, *, official_only: bool = False) -> dict | None:
     best, best_score = None, 0.0
     for v in (data.get("results") or [])[:30]:
         if not isinstance(v, dict) or v.get("is_paid") or v.get("is_adult") or v.get("is_hidden"):
+            continue
+        if official_only and v.get("is_official") is not True:
             continue
         title, dur = _norm(v.get("title")), float(v.get("duration") or 0)
         if not 30 <= dur <= 400 or not any(n in title for n in names):

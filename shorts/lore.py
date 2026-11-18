@@ -823,7 +823,12 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         for n, line in (user_pins or {}).items():
             path = (user_media or [])[n]
             if path in videos:
-                slides[line - 1] = {"start": starts[line - 1], "clip": path.name, "hard": True}
+                approved = script["structured"][line - 1]
+                refs = approved.get("refs") or []
+                legacy_stills = bool(refs) and all(ref.get("kind") == "still" and not ref.get("animated") for ref in refs)
+                slides[line - 1] = {"start": starts[line - 1], "clip": path.name, "hard": True,
+                                    "animate_stills": legacy_stills,
+                                    "fit_clip": bool(approved.get("sequence")) or legacy_stills}
     clip_notes: list[str] = []
     # библиотека сцен: сцена из проиндексированного видео автора/лицензии/официального трейлера — раньше трейлера
     lib_refs: dict[int, dict[str, Any]] = {}
@@ -964,7 +969,8 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
         "outro_image": pool[order[0]][0],
         # свой сценарий: короткая концовка — долгий статичный финал роняет досмотр шортса;
         # динамичный — без заставки вовсе: ролик обрывается на последней фразе и идёт по кругу
-        "outro_len": 0 if dynamic else 2.0 if script.get("kind_own") else 3.5,
+        "outro_len": 0 if dynamic or structured else 2.0 if script.get("kind_own") else 3.5,
+        "approved_motion": structured,
         "style": "dynamic" if dynamic else "calm",
         "fill": dynamic or bool(script.get("kind_own")),  # кадры на весь экран, без размытых полос
         "words": words,

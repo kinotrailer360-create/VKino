@@ -15633,14 +15633,14 @@ async def structured_find_asset(folder: Path, plan: dict, index: int, used: list
         path.unlink(missing_ok=True)
         refs = []
     if refs:
-        sources = " · ".join(r["url"] if r.get("kind") == "still" else f"{r['url']}&t={int(r['start'])}s"
+        sources = " · ".join(r["url"] if r.get("kind") == "still" else f"{r['url']}{'&' if '?' in r['url'] else '?'}t={int(r['start'])}s"
                              for r in refs)
-        _, targets = shorts_script_task.motion_targets(scene)
+        layout, targets = shorts_script_task.motion_targets(scene)
         if len(refs) < len(targets):
             label = "Фото" if all(r.get("kind") == "still" for r in refs) else "Видеоряд"
             sources = f"{label} + авторская графика\n" + sources
         return {"file": path.name, "revision": revision, "source": sources, "refs": refs,
-                "external": True, "fallback": False}
+                "external": True, "fallback": False, "sequence": layout == "sequence"}
     path = path.with_suffix(".jpg")
     layout, targets = shorts_script_task.motion_targets(scene)
     card = layout == "single" and shorts_script_task.author_graphic(targets[0])

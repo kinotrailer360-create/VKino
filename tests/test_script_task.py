@@ -1,3 +1,4 @@
+from contextlib import aclosing
 from pathlib import Path
 import asyncio
 import json
@@ -169,7 +170,7 @@ def test_sequence_places_official_logo_before_illustrated_timeline(monkeypatch, 
              "heading": "Сцена 3", "label": "", "fallback": ""}
     path = tmp_path / "sequence.mp4"
     result = asyncio.run(script_task.find_motion(path, scene, "Реплика.", 3, "", []))
-    assert result == [script_task.still_ref(script_task.KANG_LOGO, script_task.KANG_LOGO_PAGE)]
+    assert result == [{**script_task.still_ref(script_task.KANG_LOGO, script_task.KANG_LOGO_PAGE), "animated": True}]
     assert path.read_bytes() == b"sequence"
 
 
@@ -199,3 +200,41 @@ def test_storyboard_keeps_planned_card_and_uses_distinct_confirmed_sources():
     assert script_task.motion_targets({"targets": [final]}) == ("single", [final])
     assert script_task.card_text("КАНГ ИЛИ ДУМ? 👇") == "КАНГ ИЛИ ДУМ?"
     assert script_task.card_text("ROBERT DOWNEY JR. → DOCTOR DOOM") == "ROBERT DOWNEY JR. — DOCTOR DOOM"
+
+
+def test_structured_trailer_uses_official_rutube_before_broad_search(monkeypatch):
+    video_id = "abcdef0123456789" * 2
+    url = f"https://rutube.ru/video/{video_id}/"
+
+    async def rutube(titles, *, official_only=False):
+        assert "Квантомания" in titles[0] and official_only
+        return {"url": url}
+
+    monkeypatch.setattr(script_task.clips, "rutube_trailer", rutube)
+
+    async def first_two():
+        async with aclosing(
+            script_task.trailer_sources([], "Канг из «Квантомании»", [])
+        ) as pool:
+            return [await anext(pool), await anext(pool)]
+
+    result = asyncio.run(first_two())
+    assert result[0][0] == script_task.QUANTUMANIA_TRAILERS[0]
+    assert result[1] == ("rutube_" + video_id, url)
+    assert not script_task.wants_still("официальное видео/фото с презентации")
+    assert not script_task.rutube_id(f"https://rutube.ru/video/private/{video_id}/")
+
+
+def test_approved_still_camera_moves_without_changing_size(tmp_path):
+    from PIL import Image, ImageDraw
+    from shorts.make_lore import ApprovedStill
+
+    path = tmp_path / "frame.jpg"
+    with Image.new("RGB", (540, 960), "grey") as source:
+        ImageDraw.Draw(source).rectangle((100, 100, 300, 300), fill="red")
+        source.save(path)
+
+    scene = ApprovedStill(path)
+    with scene.frame(0, 4) as start, scene.frame(4, 4) as end:
+        assert end.size == start.size
+        assert start.tobytes() != end.tobytes()

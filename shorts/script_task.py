@@ -273,19 +273,54 @@ def video_duration(scene: dict, narration: str) -> float:
     return min(24, max(4, planned + 2, math.ceil(len(narration) / 10) + 1))
 
 
+def rutube_id(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.netloc not in {"rutube.ru", "www.rutube.ru"}:
+            return ""
+    except ValueError:
+        return ""
+    match = re.fullmatch(r"/video/([0-9a-f]{32})/?", parts.path)
+    return match[1] if match else ""
+
+
+async def trailer_sources(queries: list[str], target: str, urls: list[str]):
+    # Try a known studio upload and any direct Rutube links first. Then reuse
+    # the older Rutube search before broad YouTube discovery takes the budget.
+    for ident in (QUANTUMANIA_TRAILERS[:1] if is_quantumania_kang(target) else ()):
+        yield ident, f"https://www.youtube.com/watch?v={ident}"
+    seen = set()
+    for ident in list(filter(None, map(rutube_id, urls)))[:2]:
+        if ident not in seen:
+            seen.add(ident)
+            yield "rutube_" + ident, f"https://rutube.ru/video/{ident}/"
+    titles = (["Человек-муравей и Оса: Квантомания", "Ant-Man and the Wasp: Quantumania"]
+              if is_quantumania_kang(target) else re.findall(r"«([^»]{5,100})»", target)[:2])
+    if titles:
+        try:
+            found = await asyncio.wait_for(clips.rutube_trailer(titles, official_only=True), timeout=9)
+            ident = rutube_id(found["url"]) if found else ""
+            if ident and ident not in seen:
+                yield "rutube_" + ident, f"https://rutube.ru/video/{ident}/"
+        except (aiohttp.ClientError, OSError, RuntimeError, TimeoutError, ValueError):
+            log.info("Structured Shorts Rutube search unavailable")
+    async for ident in studio_candidates(queries, target, urls):
+        if not (is_quantumania_kang(target) and ident == QUANTUMANIA_TRAILERS[0]):
+            yield ident, f"https://www.youtube.com/watch?v={ident}"
+
+
 async def matching_clip(folder: Path, stem: str, queries: list[str], target: str, control: str,
                         key: str, seconds: float, used: list[dict], urls: list[str]) -> tuple[Path, dict] | None:
     from . import daily, lore
 
     if not ai.available(key):
         return None
-    async for ident in studio_candidates(queries, target, urls):
-        url = f"https://www.youtube.com/watch?v={ident}"
+    async for ident, url in trailer_sources(queries, target, urls):
         cache = folder / f"studio_{ident}"
         cache.mkdir(exist_ok=True)
         sources = [f for f in cache.glob("trailer_full.*") if f.suffix in lore.VIDEO_EXT]
         try:
-            src = sources[0] if sources else await clips.download_full(url, cache, timeout=28)
+            src = sources[0] if sources else await clips.download_full(url, cache, timeout=17 if ident.startswith("rutube_") else 14)
             total = await daily._duration(src)
             if total < seconds + 2 or total > 245:
                 continue
@@ -353,9 +388,10 @@ async def verify_cut(path: Path, target: str, key: str, seconds: float) -> bool:
 
 
 def wants_still(target: str) -> bool:
+    if re.search(r"видео\s*(?:[/и]|или)\s*фото|видеофрагмент|трейлер|trailer", target, re.I):
+        return False
     return bool(re.search(r"логотип|портрет|\bфото\b|промокадр|официальн\w* образ|title reveal|press photo",
                           target, re.I))
-
 
 def studio_still(target: str) -> tuple[str, str] | None:
     if is_quantumania_kang(target):
@@ -516,7 +552,7 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         if not is_graphic and not is_still:
             try:
                 piece = await asyncio.wait_for(matching_clip(path.parent, stem, specific, target,
-                    scene["control"], key, part_duration, used + refs, urls), timeout=48)
+                    scene["control"], key, part_duration, used + refs, urls), timeout=62)
             except (TimeoutError, OSError, RuntimeError, ValueError):
                 log.info("Shorts studio search unavailable for scene %s", index)
         if piece:
@@ -542,6 +578,8 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         else:
             return []
     if not refs:
+        for part in parts:
+            part.unlink(missing_ok=True)
         return []
     if layout == "single":
         parts[0].replace(path)
@@ -557,14 +595,24 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         else:
             shape = ("scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                      "pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
+        if part.suffix == ".jpg":
+            dims = "540x1920" if layout == "split" else "1080x1920"
+            k = f"min(on/{max(1, int(part_duration * 30) - 1)},1)"
+            shape += (f",zoompan=z='1+0.04*{k}*{k}*(3-2*{k})':"
+                      f"x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={dims}:fps=30")
         filters.append(f"[{i}:v]{shape},fps=30,setsar=1,format=yuv420p,trim=duration={part_duration},setpts=PTS-STARTPTS[v{i}]")
     inputs = "".join(f"[v{i}]" for i in range(len(parts)))
     filters.append(inputs + ("hstack=inputs=2:shortest=1" if layout == "split" else f"concat=n={len(parts)}:v=1:a=0") + "[v]")
-    await process.run(*cmd, "-filter_complex", ";".join(filters), "-map", "[v]", "-t", str(seconds), "-an",
-                      "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-movflags", "+faststart",
-                      str(path), timeout=100)
-    for part in parts:
-        part.unlink(missing_ok=True)
+    try:
+        await process.run(*cmd, "-filter_complex", ";".join(filters), "-map", "[v]", "-t", str(seconds), "-an",
+                          "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-movflags", "+faststart",
+                          str(path), timeout=100)
+    finally:
+        for part in parts:
+            part.unlink(missing_ok=True)
+    for ref in refs:
+        if ref.get("kind") == "still":
+            ref["animated"] = True
     return refs
 
 
