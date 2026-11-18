@@ -36,6 +36,19 @@ FEIGE_PHOTO_PAGE = "https://commons.wikimedia.org/wiki/File:Kevin_Feige_by_Gage_
 FEIGE_PHOTO = "https://upload.wikimedia.org/wikipedia/commons/1/1a/Kevin_Feige_by_Gage_Skidmore.jpg"
 FEIGE_CREDIT = "Фото: Gage Skidmore · CC BY-SA 3.0"
 
+KANG_THRONE = ("https://lumiere-a.akamaihd.net/v1/images/6f21cf8e477ccc5df0413646cab4428e_4096x2717_f2c9ee64.jpeg"
+               "?region=0%2C207%2C4096%2C2304&width=1400")
+DOWNEY_REVEAL = ("https://d23.com/marvel-studios-announces-the-return-of-robert-downey-jr-in-"
+                 "avengers-doomsday-among-other-san-diego-comic-con-highlights/")
+DOWNEY_REVEAL_IMAGE = "https://d23.com/app/uploads/2024/07/1180w_600h_072724_Marvel-Studios-SDCC-Presentation_00.jpg"
+DOOMSDAY_LOGO = "https://lumiere-a.akamaihd.net/v1/images/pp_avengersdoomsday_marvel_logo-1000_bc74dca5.png"
+MAJORS_PORTRAIT_PAGE = "https://commons.wikimedia.org/wiki/File:Jonathan_Majors_(52665026913).jpg"
+MAJORS_PORTRAIT = "https://upload.wikimedia.org/wikipedia/commons/3/35/Jonathan_Majors_%2852665026913%29.jpg"
+PHOTO_CREDITS = {
+    FEIGE_PHOTO_PAGE: (FEIGE_CREDIT, "https://creativecommons.org/licenses/by-sa/3.0/"),
+    MAJORS_PORTRAIT_PAGE: ("Фото: Eva Rinaldi · CC BY-SA 2.0", "https://creativecommons.org/licenses/by-sa/2.0/"),
+}
+
 SECTION = re.compile(r"(?m)^##\s+\d+\.\s+(.+)$")
 SCENE = re.compile(r"(?m)^###\s+Сцена\s+(\d+)\s*[—–-]\s*(.+)$", re.I)
 FIELD = re.compile(r"(?m)^(?:- )?\*\*([^*]+?):\*\*[ \t]*(.*)$")
@@ -233,13 +246,23 @@ async def studio_candidates(queries: list[str], target: str, urls: list[str]):
                 yield ident
 
 
+def author_graphic(target: str) -> bool:
+    return bool(re.match(r"^(?:чистая авторская|авторская|собственная)\s|"
+                         r"^(?:короткий )?переход к (?:авторской|собственной)\s", target.strip(), re.I))
+
+
+def card_text(value: str) -> str:
+    value = value.translate(str.maketrans({"→": "—", "↓": " ", "👇": " ", "\ufe0f": "", "\u200d": ""}))
+    return re.sub(r"[\U0001F000-\U0001FAFF]", "", value).strip()
+
+
 def motion_targets(scene: dict) -> tuple[str, list[str]]:
     targets = [s.replace("**", "") for s in scene["targets"]]
     if len(targets) == 1:
         split = re.search(r"слева\s+(.+?),\s*справа\s+(.+)", targets[0], re.I)
-        if split:
+        if split and not author_graphic(targets[0]):
             return "split", [split[1], re.split(r"\.\s*Если ", split[2])[0]]
-        if "затем" in targets[0].casefold():
+        if not author_graphic(targets[0]) and re.search(r"\bзатем\b", targets[0], re.I):
             targets = re.split(r"[,;]?\s+затем\s+", targets[0], maxsplit=1, flags=re.I)
     return ("sequence" if len(targets) > 1 else "single"), targets[:3]
 
@@ -336,7 +359,16 @@ def wants_still(target: str) -> bool:
 
 def studio_still(target: str) -> tuple[str, str] | None:
     if is_quantumania_kang(target):
+        if re.search(r"трейлер|trailer", target, re.I):
+            return KANG_THRONE, KANG_PRESS
         return KANG_PRESS_IMAGE, KANG_PRESS
+    if re.search(r"логотип|титр|logo", target, re.I) and re.search(r"doomsday|судн\w* день", target, re.I):
+        return DOOMSDAY_LOGO, DOOM_PRESS
+    if (re.search(r"дауни|downey", target, re.I) and re.search(r"дум\w*|doom", target, re.I)
+            and re.search(r"презентаци|comic.con|reveal", target, re.I)):
+        return DOWNEY_REVEAL_IMAGE, DOWNEY_REVEAL
+    if re.search(r"джонатан\w* м[эе]йджорс|jonathan majors", target, re.I) and wants_still(target):
+        return MAJORS_PORTRAIT, MAJORS_PORTRAIT_PAGE
     if re.search(r"логотип|анонс|logo|title reveal", target, re.I) and re.search(
         r"the kang dynasty|династи[яию] канга", target, re.I
     ):
@@ -352,10 +384,12 @@ def studio_still(target: str) -> tuple[str, str] | None:
 def still_ref(image: str, source: str) -> dict:
     ref = {"id": "still:" + hashlib.sha256(image.split("?")[0].encode()).hexdigest()[:24],
            "url": source, "kind": "still"}
-    if source == FEIGE_PHOTO_PAGE:
-        ref["credit"] = FEIGE_CREDIT
-    elif source == DOOM_PRESS:
-        ref["credit"] = "Фото Marvel · проверь право использования перед публикацией"
+    if source in PHOTO_CREDITS:
+        ref["credit"] = PHOTO_CREDITS[source][0]
+    elif source in (DOOM_PRESS, DOWNEY_REVEAL):
+        ref["credit"] = "Материал Marvel · проверь право использования перед публикацией"
+    elif source == KANG_PRESS:
+        ref["credit"] = "Пресс-кадр Disney · только для редакционного использования"
     return ref
 
 
@@ -391,7 +425,7 @@ async def find_still(scene: dict, target: str, queries: list[str], key: str, use
         if known:
             ref = still_ref(*known)
             if ref["id"] not in seen:
-                if known[1] == FEIGE_PHOTO_PAGE:
+                if known[1] in PHOTO_CREDITS:
                     async with netsafe.safe_session(timeout=session.timeout, headers={
                         "User-Agent": "VKino/1.0 (https://github.com/kinotrailer360-create/VKino)"
                     }) as commons_session:
@@ -443,6 +477,20 @@ async def target_still(path: Path, scene: dict, target: str, queries: list[str],
     image, ref = candidate
     with image:
         image.thumbnail((1600, 1600))
+        caption = re.search(r"(?:с подписью|надпись)\s+«([^»]+)»", target, re.I)
+        if caption:
+            from .daily import ASSETS
+
+            text = card_text(caption[1])[:55]
+            draw = ImageDraw.Draw(image)
+            size = max(20, image.width // 25)
+            font = ImageFont.truetype(str(ASSETS / "Oswald.ttf"), size)
+            while size > 14 and draw.textlength(text, font=font) > image.width * .8:
+                size -= 2
+                font = ImageFont.truetype(str(ASSETS / "Oswald.ttf"), size)
+            y = image.height * .86
+            draw.rectangle((0, y - size, image.width, y + size), fill="#15202b")
+            draw.text((image.width // 2, y), text, font=font, anchor="mm", fill="#f8f1e3")
         image.save(path, "JPEG", quality=94)
     return ref
 
@@ -456,12 +504,12 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         return []
     seconds = video_duration(scene, narration)
     part_duration = seconds if layout == "split" else math.ceil(seconds / len(targets) * 100) / 100
-    if len(targets) == 1 and (wants_still(targets[0]) or "карточка" in targets[0].casefold()):
+    if len(targets) == 1 and (wants_still(targets[0]) or author_graphic(targets[0])):
         return []
     refs, parts = [], []
     for j, target in enumerate(targets):
         stem = f"{path.stem}_{j}"
-        is_graphic = bool(re.search(r"^(авторская|собственная|чистая авторская)\s", target, re.I))
+        is_graphic = author_graphic(target)
         specific = queries[j::len(targets)] if len(targets) > 1 else queries
         piece = None
         is_still = wants_still(target)
@@ -482,7 +530,8 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
             if ref:
                 refs.append(ref)
             else:
-                graphic = {**scene, "label": "", "fallback": "", "heading": target.strip(" .")[:95]}
+                graphic = {**scene, "label": "", "fallback": target if is_graphic else "",
+                           "heading": target.strip(" .")[:95]}
                 if is_graphic and "→" in target:
                     graphic["steps"] = re.findall(r"`([^`]+)`", target)[:3]
                     graphic["heading"] = "ИЗНАЧАЛЬНЫЙ ЗАМЫСЕЛ"
@@ -536,7 +585,7 @@ def fallback_card(path: Path, scene: dict, index: int) -> None:
             draw.line([(610, 845), (570, 859)], fill="#172322", width=15)
         fallback = scene["fallback"]
         words = re.findall(r"«([^»]+)»", fallback)
-        title = "  /  ".join(words[:3]) or scene["label"] or scene["heading"].split(" (")[0]
+        title = card_text("  /  ".join(words[:3]) or scene["label"] or scene["heading"].split(" (")[0])
         for size in range(80, 29, -5):
             font = ImageFont.truetype(str(head), size)
             pieces = []
@@ -560,18 +609,34 @@ def fallback_card(path: Path, scene: dict, index: int) -> None:
             draw.rectangle((90, 720, 990, 1400), fill=palette[(index - 1) % len(palette)])
             for row, step in enumerate(steps):
                 y = 810 + 180 * row
-                draw.text((540, y), step[:40], font=timeline_font, anchor="mm", fill="#f8f1e3")
+                draw.text((540, y), card_text(step[:40]), font=timeline_font, anchor="mm", fill="#f8f1e3")
                 if row + 1 < len(steps):
                     draw.line((540, y + 51, 540, y + 121), fill="#e6ba63", width=5)
                     draw.polygon(((525, y + 110), (555, y + 110), (540, y + 132)), fill="#e6ba63")
             draw.text((540, 1440), "ВИЗУАЛИЗАЦИЯ • НЕСОСТОЯВШИЙСЯ ПЛАН", font=sans, anchor="mm", fill="#e6ba63")
+        if scene.get("targets") and author_graphic(scene["targets"][0]):
+            comparison = re.search(r"слева\s+«([^»]+)»,?\s+справа\s+«([^»]+)».*?в центре.*?«([^»]+)»",
+                                   scene["targets"][0], re.I)
+            if comparison:
+                left, right, question = map(card_text, comparison.groups())
+                draw.rectangle((0, 0, 540, 1920), fill="#20264b")
+                draw.rectangle((540, 0, 1080, 1920), fill="#19362c")
+                draw.rectangle((100, 648, 980, 660), fill="#e6ba63")
+                name_font = ImageFont.truetype(str(head), 84)
+                draw.text((300, 785), left[:20], font=name_font, anchor="mm", fill="#f8f1e3")
+                draw.text((780, 785), right[:20], font=name_font, anchor="mm", fill="#f8f1e3")
+                draw.rounded_rectangle((136, 920, 944, 1110), radius=24, fill="#15202b")
+                draw.text((540, 1015), question[:27], font=name_font, anchor="mm", fill="#f8f1e3")
+                draw.line((540, 1190, 540, 1265), fill="#e6ba63", width=9)
+                draw.polygon(((518, 1244), (562, 1244), (540, 1280)), fill="#e6ba63")
+                draw.text((540, 1410), "КИНОМИР 360", font=sans, anchor="mm", fill="#e6ba63")
         image.save(path, quality=93)
 
 
 async def prepare_still(path: Path, scene: dict, index: int, key: str, used: list[dict],
                         *, allow_graphic: bool = True) -> dict | None:
     layout, targets = motion_targets(scene)
-    if layout == "single" and not re.match(r"^(авторская|собственная|чистая авторская)\s", targets[0], re.I):
+    if layout == "single" and not author_graphic(targets[0]):
         queries = scene.get("queries") or []
         ref = await target_still(path, scene, targets[0], list(dict.fromkeys(queries[:1] + queries[-1:])), key, used)
         if ref:

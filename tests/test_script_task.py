@@ -182,3 +182,20 @@ def test_known_doom_and_feige_photos_are_scoped_to_requested_subjects():
     assert script_task.studio_still("драка Доктора Дума в «Мстителях: Судный день»") is None
     assert script_task.studio_still("официальное фото режиссёров Руссо") is None
     assert "Gage Skidmore" in script_task.still_ref(*script_task.studio_still(feige))["credit"]
+
+
+def test_storyboard_keeps_planned_card_and_uses_distinct_confirmed_sources():
+    kang = "официальный трейлер «Квантомании», где виден Канг, затем собственная карточка «Планы»"
+    layout, parts = script_task.motion_targets({"targets": [kang]})
+    assert layout == "sequence"
+    assert script_task.studio_still(parts[0])[0] == script_task.KANG_THRONE
+    assert script_task.author_graphic(parts[1])
+    assert script_task.author_graphic("короткий переход к авторской карточке «Планы»")
+    assert script_task.studio_still("архивный пресс-портрет Джонатана Мэйджорса")[0] == script_task.MAJORS_PORTRAIT
+    assert script_task.studio_still("Роберт Дауни на презентации Marvel в роли Дума")[0] == script_task.DOWNEY_REVEAL_IMAGE
+    assert script_task.studio_still("официальный логотип Avengers: Doomsday")[0] == script_task.DOOMSDAY_LOGO
+
+    final = "чистая авторская финальная карточка: слева «Канг», справа «Дум», в центре «Кто круче?»"
+    assert script_task.motion_targets({"targets": [final]}) == ("single", [final])
+    assert script_task.card_text("КАНГ ИЛИ ДУМ? 👇") == "КАНГ ИЛИ ДУМ?"
+    assert script_task.card_text("ROBERT DOWNEY JR. → DOCTOR DOOM") == "ROBERT DOWNEY JR. — DOCTOR DOOM"

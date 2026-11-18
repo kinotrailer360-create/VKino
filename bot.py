@@ -15642,11 +15642,14 @@ async def structured_find_asset(folder: Path, plan: dict, index: int, used: list
         return {"file": path.name, "revision": revision, "source": sources, "refs": refs,
                 "external": True, "fallback": False}
     path = path.with_suffix(".jpg")
-    ref = await shorts_script_task.prepare_still(path, scene, index, GEMINI_API_KEY, used, allow_graphic=not retry)
-    if retry and not ref:
+    layout, targets = shorts_script_task.motion_targets(scene)
+    card = layout == "single" and shorts_script_task.author_graphic(targets[0])
+    ref = await shorts_script_task.prepare_still(path, scene, index, GEMINI_API_KEY, used, allow_graphic=not retry or card)
+    if retry and not ref and not card:
         return None
-    return {"file": path.name, "revision": revision, "source": ref["url"] if ref else "Резервная авторская графика",
-            "refs": [ref] if ref else [], "external": bool(ref), "fallback": not ref}
+    source = ref["url"] if ref else ("Авторская карточка по сценарию" if card else "Резервная авторская графика")
+    return {"file": path.name, "revision": revision, "source": source,
+            "refs": [ref] if ref else [], "external": bool(ref), "fallback": not ref and not card, "card": card}
 
 
 async def structured_preview(message: Message, plan: dict, draft: str, folder: Path, i: int, asset: dict) -> None:
@@ -15665,6 +15668,8 @@ async def structured_preview(message: Message, plan: dict, draft: str, folder: P
         media_note = f"\nПредпросмотр без озвучки · {kind}"
     elif path.suffix == ".mp4":
         media_note = "\nЗагруженное видео"
+    elif asset.get("card"):
+        media_note = "\nАвторская карточка"
     else:
         media_note = "\nРезервная карточка" if asset.get("fallback") else "\nФото"
     credit = "\n".join(dict.fromkeys(ref["credit"] for ref in refs if ref.get("credit")))
@@ -15679,8 +15684,9 @@ async def structured_preview(message: Message, plan: dict, draft: str, folder: P
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _btn("✅ Утвердить кадр", f"scplan:{draft}:ok:{i}:{asset['revision']}"),
         _btn("📎 Заменить", f"scplan:{draft}:replace:{i}:{asset['revision']}"),
-    ], *([[_btn("🔎 Найти другое фото или видео", f"scplan:{draft}:retry:{i}:{asset['revision']}")]]
-           if scene["queries"] else [])])
+    ], *([[_btn("🔄 Пересобрать карточку" if asset.get("card") else "🔎 Найти другое фото или видео",
+                f"scplan:{draft}:retry:{i}:{asset['revision']}")]]
+           if scene["queries"] or asset.get("card") else [])])
     if path.suffix == ".mp4":
         await message.answer_video(FSInputFile(path), caption=caption, parse_mode=None, reply_markup=kb,
                                    supports_streaming=True)
@@ -15697,13 +15703,17 @@ async def structured_prepare(message: Message, state: FSMContext, draft: str, pl
                     return
                 assets = current["structured_assets"]
                 asset = assets.get(str(index))
-                if asset and (folder / asset["file"]).is_file():
-                    if not asset.get("approved"):
-                        await structured_preview(message, plan, draft, folder, index, asset)
+                previous = asset if asset and (folder / asset["file"]).is_file() else None
+                if previous and previous.get("approved"):
+                    continue
+                if previous and not previous.get("fallback"):
+                    await structured_preview(message, plan, draft, folder, index, previous)
                     continue
                 used = [ref for other in assets.values() for ref in other.get("refs", [])]
-            asset = await structured_find_asset(folder, plan, index, used)
+            asset = await structured_find_asset(folder, plan, index, used, retry=bool(previous))
             if asset is None:
+                if previous:
+                    await structured_preview(message, plan, draft, folder, index, previous)
                 continue
             async with structured_task_lock:
                 current = await state.get_data()
@@ -15780,14 +15790,17 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
             await state.set_state(None)
             await state.update_data(structured_rendering=True)
             status = await message.answer(progress_bar(0, "Собираю по утверждённым сценам"))
+            credited = dict.fromkeys(ref["url"] for asset in assets.values() for ref in asset.get("refs", [])
+                                     if ref.get("url") in shorts_script_task.PHOTO_CREDITS)
             description = plan["description"]
-            if any(ref.get("url") == shorts_script_task.FEIGE_PHOTO_PAGE
-                   for asset in assets.values() for ref in asset.get("refs", [])):
-                description = (f"{description}\n\n{shorts_script_task.FEIGE_CREDIT} · кадрирование\n"
-                               f"{shorts_script_task.FEIGE_PHOTO_PAGE}\nhttps://creativecommons.org/licenses/by-sa/3.0/").strip()
+            if credited:
+                credits = [f"{shorts_script_task.PHOTO_CREDITS[url][0]} · кадрирование\n"
+                           f"{url}\n{shorts_script_task.PHOTO_CREDITS[url][1]}" for url in credited]
+                description = "\n\n".join([description, *credits]).strip()
             script = {"title": plan["title"], "name": plan["title"], "description": description,
                       "hashtags": plan["hashtags"].split(), "lines": plan["lines"], "kind": "news", "kind_own": True,
-                      "screen_labels": [scene["label"] for scene in plan["scenes"]],
+                      "screen_labels": ["" if assets[str(i)].get("card") else shorts_script_task.card_text(scene["label"])
+                                        for i, scene in enumerate(plan["scenes"], 1)],
                       "structured": [assets[str(i)] for i in range(1, len(files) + 1)]}
             job_data = {"lore_script": script, "lore_media": [
                 {"local": str(path), "ext": path.suffix, "line": i} for i, path in enumerate(files, 1)]}
@@ -15817,10 +15830,12 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
                 if draft in structured_searches:
                     await message.answer("Основной подбор ещё идёт. После него можно поискать другое фото или видео.")
                     return
-                wait = await message.answer(f"🔎 Ищу другое фото или видео для сцены {index}.")
+                wait = await message.answer(f"🔄 Пересобираю карточку для сцены {index}." if asset.get("card")
+                                            else f"🔎 Ищу другое фото или видео для сцены {index}.")
                 _, targets = shorts_script_task.motion_targets(plan["scenes"][int(index) - 1])
                 current_refs = asset.get("refs", [])
-                has_missing = 0 < len(current_refs) < len(targets)
+                expected = sum(not shorts_script_task.author_graphic(target) for target in targets)
+                has_missing = 0 < len(current_refs) < expected
                 used = [ref for number, other in assets.items() for ref in other.get("refs", [])
                         if number != index or not has_missing]
                 new_asset = await structured_find_asset(folder, plan, int(index), used, retry=True)
