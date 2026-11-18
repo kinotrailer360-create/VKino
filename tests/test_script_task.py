@@ -93,3 +93,44 @@ def test_motion_keeps_split_and_ab_targets_and_proposed_length():
     assert script_task.motion_targets(scene) == ("split", ["Первый герой", "Второй герой"])
     assert script_task.video_duration(scene, "Реплика") == 8
     assert script_task.motion_targets({"targets": ["Кадр A", "Кадр B"]}) == ("sequence", ["Кадр A", "Кадр B"])
+
+
+def test_verified_studio_trailer_is_tried_before_youtube_search(monkeypatch):
+    async def unavailable(*_):
+        pytest.fail("direct video references must be available without search")
+
+    monkeypatch.setattr(script_task, "official_videos", unavailable)
+
+    async def first():
+        return await anext(script_task.studio_candidates(
+            ["Kang trailer"], "Канг в костюме из «Квантомании»", []))
+
+    assert asyncio.run(first()) == "ZlNFpri-Y40"
+    assert not script_task.is_quantumania_kang("Канг из «Локи»")
+    assert script_task.youtube_id("https://youtu.be/ZlNFpri-Y40") == "ZlNFpri-Y40"
+    assert not script_task.youtube_id("https://youtube.com.example.net/watch?v=ZlNFpri-Y40")
+
+
+def test_split_keeps_verified_image_when_video_is_unavailable(monkeypatch, tmp_path):
+    async def no_video(*args):
+        return None
+
+    async def press(path, target, used):
+        if "Канг" in target:
+            path.write_bytes(b"press-image")
+            return {"id": "studio-press", "url": "https://press.disney.co.uk/gallery/test", "kind": "still"}
+        return None
+
+    async def ffmpeg(*args, **kwargs):
+        assert any(str(arg).endswith("_0.jpg") for arg in args)
+        assert any("hstack=inputs=2" in str(arg) for arg in args)
+        Path(args[-1]).write_bytes(b"split")
+
+    monkeypatch.setattr(script_task, "matching_clip", no_video)
+    monkeypatch.setattr(script_task, "verified_target_still", press)
+    monkeypatch.setattr(script_task.process, "run", ffmpeg)
+    scene = {"targets": ["сплит-экран: слева Канг, справа Доктор Дум."], "queries": ["Канг", "Дум"],
+             "control": "", "heading": "Сцена", "label": "", "fallback": ""}
+    result = asyncio.run(script_task.find_motion(tmp_path / "split.mp4", scene, "Реплика.", 1, "", []))
+    assert result[0]["kind"] == "still"
+    assert (tmp_path / "split.mp4").read_bytes() == b"split"
