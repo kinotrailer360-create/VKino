@@ -15622,7 +15622,7 @@ async def structured_task_edit(message: Message, state: FSMContext) -> None:
 
 
 async def structured_find_asset(folder: Path, plan: dict, index: int, used: list[dict],
-                                video_only: bool = False) -> dict | None:
+                                retry: bool = False) -> dict | None:
     scene = plan["scenes"][index - 1]
     revision = secrets.token_hex(4)
     path = folder / f"scene_{index}_{revision}.mp4"
@@ -15637,16 +15637,16 @@ async def structured_find_asset(folder: Path, plan: dict, index: int, used: list
                              for r in refs)
         _, targets = shorts_script_task.motion_targets(scene)
         if len(refs) < len(targets):
-            label = "Кадр студии" if all(r.get("kind") == "still" for r in refs) else "Видео"
+            label = "Фото" if all(r.get("kind") == "still" for r in refs) else "Видеоряд"
             sources = f"{label} + авторская графика\n" + sources
         return {"file": path.name, "revision": revision, "source": sources, "refs": refs,
                 "external": True, "fallback": False}
-    if video_only:
-        return None
     path = path.with_suffix(".jpg")
-    source = await shorts_script_task.prepare_still(path, scene, plan["lines"][index - 1], index, GEMINI_API_KEY)
-    return {"file": path.name, "revision": revision, "source": source or "Резервная авторская графика",
-            "external": bool(source), "fallback": not source}
+    ref = await shorts_script_task.prepare_still(path, scene, index, GEMINI_API_KEY, used, allow_graphic=not retry)
+    if retry and not ref:
+        return None
+    return {"file": path.name, "revision": revision, "source": ref["url"] if ref else "Резервная авторская графика",
+            "refs": [ref] if ref else [], "external": bool(ref), "fallback": not ref}
 
 
 async def structured_preview(message: Message, plan: dict, draft: str, folder: Path, i: int, asset: dict) -> None:
@@ -15663,7 +15663,7 @@ async def structured_preview(message: Message, plan: dict, draft: str, folder: P
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _btn("✅ Утвердить кадр", f"scplan:{draft}:ok:{i}:{asset['revision']}"),
         _btn("📎 Заменить", f"scplan:{draft}:replace:{i}:{asset['revision']}"),
-    ], *([[_btn("🔎 Найти другой фрагмент", f"scplan:{draft}:retry:{i}:{asset['revision']}")]]
+    ], *([[_btn("🔎 Найти другое фото или видео", f"scplan:{draft}:retry:{i}:{asset['revision']}")]]
            if scene["queries"] else [])])
     path = folder / asset["file"]
     if path.suffix == ".mp4":
@@ -15795,18 +15795,18 @@ async def structured_task_buttons(callback: CallbackQuery, state: FSMContext) ->
                 return
             if action == "retry":
                 if draft in structured_searches:
-                    await message.answer("Основной подбор ещё идёт. После него можно поискать другой фрагмент.")
+                    await message.answer("Основной подбор ещё идёт. После него можно поискать другое фото или видео.")
                     return
-                wait = await message.answer(f"🔎 Ищу новый видеофрагмент для сцены {index}.")
+                wait = await message.answer(f"🔎 Ищу другое фото или видео для сцены {index}.")
                 used = [ref for other in assets.values() for ref in other.get("refs", [])]
-                new_asset = await structured_find_asset(folder, plan, int(index), used, video_only=True)
+                new_asset = await structured_find_asset(folder, plan, int(index), used, retry=True)
                 if new_asset is None:
-                    await _edit_quiet(wait, "Другого подходящего видео не нашёл. Текущий материал сохранён.")
+                    await _edit_quiet(wait, "Подходящего фото или видео не нашёл. Текущий материал сохранён.")
                     return
                 assets[index] = new_asset
                 await state.update_data(structured_assets=assets)
                 await structured_preview(message, plan, draft, folder, int(index), new_asset)
-                await _edit_quiet(wait, "Новый фрагмент готов к согласованию.")
+                await _edit_quiet(wait, "Новый материал готов к согласованию.")
                 return
             if action == "replace":
                 await state.set_state(LoreState.task_media)

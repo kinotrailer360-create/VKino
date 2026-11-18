@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from shorts import script_task
+from shorts import imgsearch, script_task
 
 
 TASK = """# Подборка
@@ -115,7 +115,7 @@ def test_split_keeps_verified_image_when_video_is_unavailable(monkeypatch, tmp_p
     async def no_video(*args):
         return None
 
-    async def press(path, target, used):
+    async def press(path, scene, target, queries, key, used):
         if "Канг" in target:
             path.write_bytes(b"press-image")
             return {"id": "studio-press", "url": "https://press.disney.co.uk/gallery/test", "kind": "still"}
@@ -127,10 +127,47 @@ def test_split_keeps_verified_image_when_video_is_unavailable(monkeypatch, tmp_p
         Path(args[-1]).write_bytes(b"split")
 
     monkeypatch.setattr(script_task, "matching_clip", no_video)
-    monkeypatch.setattr(script_task, "verified_target_still", press)
+    monkeypatch.setattr(script_task, "target_still", press)
     monkeypatch.setattr(script_task.process, "run", ffmpeg)
     scene = {"targets": ["сплит-экран: слева Канг, справа Доктор Дум."], "queries": ["Канг", "Дум"],
              "control": "", "heading": "Сцена", "label": "", "fallback": ""}
     result = asyncio.run(script_task.find_motion(tmp_path / "split.mp4", scene, "Реплика.", 1, "", []))
     assert result[0]["kind"] == "still"
     assert (tmp_path / "split.mp4").read_bytes() == b"split"
+
+
+def test_yandex_image_result_preserves_original_and_source():
+    import html
+
+    result = {"origUrl": script_task.KANG_LOGO, "origWidth": 2000, "snippet": {"url": script_task.KANG_LOGO_PAGE}}
+    state = {"initialState": {"serpList": {"items": {"keys": ["1"], "entities": {"1": result}}}}}
+    page = f'<div data-state="{html.escape(json.dumps(state), quote=True)}"></div>'
+    assert imgsearch.yandex_results(page, 2) == [{"image": script_task.KANG_LOGO, "source": script_task.KANG_LOGO_PAGE}]
+
+
+def test_sequence_places_official_logo_before_illustrated_timeline(monkeypatch, tmp_path):
+    async def no_video(*args):
+        pytest.fail("the logo and original timeline should not trigger trailer searches")
+
+    async def logo(*args):
+        from PIL import Image
+        assert args[1] == script_task.KANG_LOGO
+        return Image.new("RGB", (600, 600))
+
+    async def ffmpeg(*args, **kwargs):
+        assert any("concat=n=2" in str(arg) for arg in args)
+        assert Path(args[args.index("-i") + 1]).is_file()
+        assert Path(args[args.index("-i", args.index("-i") + 1) + 1]).is_file()
+        Path(args[-1]).write_bytes(b"sequence")
+
+    monkeypatch.setattr(script_task, "matching_clip", no_video)
+    monkeypatch.setattr(script_task, "opened_still", logo)
+    monkeypatch.setattr(script_task.process, "run", ffmpeg)
+    scene = {"targets": ["официальный логотип Avengers: The Kang Dynasty",
+                         "авторская инфографика: `ПЛАН` → `СЕРЕДИНА` → `ДУМ`"],
+             "queries": ["Avengers Kang Dynasty", "Династия Канга"], "control": "",
+             "heading": "Сцена 3", "label": "", "fallback": ""}
+    path = tmp_path / "sequence.mp4"
+    result = asyncio.run(script_task.find_motion(path, scene, "Реплика.", 3, "", []))
+    assert result == [script_task.still_ref(script_task.KANG_LOGO, script_task.KANG_LOGO_PAGE)]
+    assert path.read_bytes() == b"sequence"
