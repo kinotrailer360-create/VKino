@@ -14506,8 +14506,7 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             "остаётся.\n\n"
             f"🎨 <b>Картинка ИИ</b> ({'вкл' if art else 'выкл'}) — если ни фото, ни постера не нашлось, ИИ рисует "
             "иллюстрацию (без лиц реальных людей, не постер) с пометкой «Иллюстрация · ИИ». "
-            f"≈{shorts_budget.IMAGE_USD:.3f}$ за картинку, из общего лимита {shorts_budget.LIMITS['ai']:.0f}$ "
-            "в месяц.\n" + "\n".join(await shorts_budget.status_lines()),
+            f"≈{shorts_budget.IMAGE_USD:.3f}$ за картинку.\n" + "\n".join(await shorts_budget.status_lines()),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [_btn(("✅ " if not db else "") + "Из новости", "pt:pmode:live"),
                  _btn(("✅ " if db else "") + "Из базы фильмов", "pt:pmode:db")],
@@ -18251,9 +18250,15 @@ async def weekly_admin_report() -> str:
         f"🔎 Поисков {searches} · ❤️ в избранное {favs} · 📔 в кинодневник {diary_n} · 🧩 ответов в викторине {quiz_n}",
         f"📢 Постов в канал: <b>{int(u.get('tg_posts', 0))}</b> · ▶️ на YouTube: шортсов "
         f"<b>{int(u.get('yt_shorts', 0))}</b>, выпусков <b>{int(u.get('yt_long', 0))}</b>",
-        f"💳 Расходы: ИИ Lumean {int(u.get('llm_calls', 0))} запр., озвучка {int(u.get('tts_chars', 0)):,} симв., "
-        f"музыка {int(u.get('music_tracks', 0))} тр.".replace(",", " "),
     ]
+    try:
+        costs = await shorts_budget.weekly_spending()
+        ai_cost, tts_cost = costs.get("ai", 0.0), costs.get("tts", 0.0)
+        lines.append(f"💳 Расходы за 7 дней ≈<b>${ai_cost + tts_cost:.2f}</b>\n"
+                     f"ИИ, картинки и музыка ≈${ai_cost:.2f} · озвучка ≈${tts_cost:.2f}")
+    except Exception:  # noqa: BLE001
+        logging.exception("Weekly expense totals unavailable")
+        lines.append("💳 Расходы за 7 дней временно недоступны.")
     if top:
         lines.append("🔥 Чаще искали: " + ", ".join(f"{escape(r['q'][:30])} ({r['n']})" for r in top))
     try:

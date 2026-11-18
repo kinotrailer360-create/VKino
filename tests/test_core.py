@@ -282,7 +282,7 @@ def test_netsafe_blocks_internal_addresses():
             asyncio.run(netsafe.check_url(url))
 
 
-def test_budget_reserves_before_call_and_blocks_at_limit():
+def test_budget_tracks_ai_without_cap_and_limits_tts(monkeypatch):
     import asyncio
 
     import pytest
@@ -320,30 +320,49 @@ def test_budget_reserves_before_call_and_blocks_at_limit():
         def acquire(self):
             return self
 
+        async def fetch(self, sql):
+            assert "status = 'settled'" in sql and "INTERVAL '7 days'" in sql
+            totals = {}
+            for row in self.rows.values():
+                if row["status"] == "settled":
+                    value = row["est"] if row["actual"] is None else row["actual"]
+                    totals[row["pool"]] = totals.get(row["pool"], 0) + value
+            return [{"pool": pool, "usd": value} for pool, value in totals.items()]
+
     rows = {}
     pool = Pool(rows)
-    budget.attach(lambda: pool)
-    budget.LIMITS["ai"], budget.LIMITS["tts"] = 1.0, 1.0
-    budget.on_warning = None
+    warnings = []
+
+    async def warn(message):
+        warnings.append(message)
+
+    monkeypatch.setattr(budget, "_pool_getter", lambda: pool)
+    monkeypatch.setattr(budget, "_warned", set())
+    monkeypatch.setitem(budget.LIMITS, "tts", 1.0)
+    monkeypatch.setattr(budget, "on_warning", warn)
 
     async def run():
         async with budget.guard("ai", "gemini", 0.5) as r:
             await r.settle(0.7)  # факт дороже оценки — учитывается факт
-        with pytest.raises(budget.BudgetExceeded):
-            async with budget.guard("ai", "image", 0.45):
-                pass  # 0.7 + 0.45 > 1.0 — запрос не делается
+        async with budget.guard("ai", "image", 10.0):
+            pass
+        assert warnings == []
         async with budget.guard("ai", "free", 0.0):
-            pass  # бесплатное не блокируется
+            pass
         async with budget.guard("tts", "tts", 0.9):
-            pass  # отдельный кошелёк озвучки
+            pass
+        with pytest.raises(budget.BudgetExceeded):
+            async with budget.guard("tts", "tts", 0.2):
+                pytest.fail("Озвучка сверх лимита не должна запускаться")
         with pytest.raises(RuntimeError):
             async with budget.guard("ai", "gemini", 0.1):
-                raise RuntimeError("сбой")  # резерв снят
-        assert await budget.spent("ai") == pytest.approx(0.7)
-    try:
-        asyncio.run(run())
-    finally:
-        budget.attach(None)
+                raise RuntimeError("сбой")
+        await budget.reserve("ai", "pending", 20.0)
+        assert await budget.spent("ai") == pytest.approx(30.7)
+        assert await budget.weekly_spending() == pytest.approx({"ai": 10.7, "tts": 0.9})
+        assert len(warnings) == 1 and "озвучка" in warnings[0]
+
+    asyncio.run(run())
 
 
 def test_safe_resolver_blocks_rebinding():

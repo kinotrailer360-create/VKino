@@ -1,6 +1,6 @@
-"""Единый месячный бюджет платных вызовов: проверка ДО запроса с резервированием, пересчёт ПОСЛЕ ответа.
+"""Учёт платных вызовов с резервированием до запроса и пересчётом после ответа.
 
-Два независимых лимита («кошелька»):
+Два кошелька:
 - "ai"  — всё, кроме озвучки: текст и Vision (Gemini, Lumean LLM), картинки, музыка, платный веб-поиск;
 - "tts" — озвучка (Lumean / ElevenLabs): свой лимит, чтобы шортсы не вставали из-за постов и наоборот.
 
@@ -33,10 +33,8 @@ def _env_float(name: str, default: float | None = None) -> float | None:
         return default
 
 
-# лимиты в месяц, $ — решение владельца канала (ноябрь 2026): посты/ИИ — 10$, озвучка — отдельный кошелёк
-LIMITS = {"ai": _env_float("AI_MONTHLY_BUDGET_USD", 10.0) or 10.0,
-          # озвучка: подписка Lumean Start — 99 ₽ за 100 000 токенов в месяц ≈ 1,2 $; лимит = объём подписки
-          "tts": _env_float("TTS_MONTHLY_BUDGET_USD", 1.2) or 1.2}
+# Озвучка: месячный лимит соответствует объёму подписки Lumean.
+LIMITS = {"tts": _env_float("TTS_MONTHLY_BUDGET_USD", 1.2) or 1.2}
 POOL_NAMES = {"ai": "ИИ, картинки, музыка", "tts": "озвучка"}
 WARN_SHARE = 0.8  # с 80 % — предупреждение автору (раз в месяц на кошелёк)
 
@@ -95,6 +93,17 @@ async def spent(pool: str) -> float:
     return float(await _pool_getter().fetchval(SPENT_SQL, pool))
 
 
+async def weekly_spending() -> dict[str, float]:
+    """Расходы по завершённым вызовам за последние семь дней."""
+    if not _pool_getter:
+        return {}
+    rows = await _pool_getter().fetch(
+        "SELECT pool, SUM(COALESCE(actual_usd, estimate_usd)) AS usd FROM ai_usage "
+        "WHERE status = 'settled' AND COALESCE(settled_at, created_at) >= NOW() - INTERVAL '7 days' "
+        "GROUP BY pool")
+    return {row["pool"]: float(row["usd"]) for row in rows}
+
+
 async def reconcile_interrupted() -> int:
     """Keep the estimate for calls whose worker disappeared; never pretend they were free."""
     if not _pool_getter:
@@ -131,19 +140,21 @@ async def reserve(pool: str, op: str, estimate: float, provider: str = "") -> Re
     """Зарезервировать оценку до запроса; не влезает в лимит — BudgetExceeded (бесплатное — всегда можно)."""
     if not _pool_getter:  # база не подключена (тесты, отдельный процесс монтажа) — без учёта
         return Reservation(None, pool, estimate)
+    limit = LIMITS.get(pool)
+    used = 0.0
     async with _lock:
         conn_pool = _pool_getter()
         async with conn_pool.acquire() as conn, conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock($1)", LOCK_ID)  # и между копиями бота
-            used = float(await conn.fetchval(SPENT_SQL, pool))
-            limit = LIMITS[pool]
-            if estimate > 0 and used + estimate > limit:
-                raise BudgetExceeded(f"месячный лимит «{POOL_NAMES[pool]}» исчерпан: {used:.2f}$ из {limit:g}$")
+            if limit is not None and estimate > 0:
+                used = float(await conn.fetchval(SPENT_SQL, pool))
+                if used + estimate > limit:
+                    raise BudgetExceeded(f"месячный лимит «{POOL_NAMES[pool]}» исчерпан: {used:.2f}$ из {limit:g}$")
             rid = await conn.fetchval(
                 "INSERT INTO ai_usage (pool, op, provider, status, estimate_usd) VALUES ($1, $2, $3, 'reserved', $4) "
                 "RETURNING id", pool, op, provider, estimate)
     month_key = f"{pool}:{__import__('datetime').date.today():%Y-%m}"
-    if estimate > 0 and used + estimate >= limit * WARN_SHARE and month_key not in _warned:
+    if limit is not None and estimate > 0 and used + estimate >= limit * WARN_SHARE and month_key not in _warned:
         _warned.add(month_key)
         text = (f"⚠️ Бюджет «{POOL_NAMES[pool]}»: потрачено {used + estimate:.2f}$ из {limit:g}$ (80 %). "
                 "На 100 % платные вызовы этого кошелька остановятся до следующего месяца.")
@@ -180,8 +191,12 @@ def gemini_cost(tokens_in: int, tokens_out: int) -> float:
 async def status_lines() -> list[str]:
     """Отчёт автору: потрачено по кошелькам за месяц и какие цены ещё не заданы."""
     out = []
-    for pool, limit in LIMITS.items():
+    for pool in POOL_NAMES:
         used = await spent(pool)
+        limit = LIMITS.get(pool)
+        if limit is None:
+            out.append(f"💵 {POOL_NAMES[pool]}: ≈{used:.2f}$ за месяц")
+            continue
         out.append(f"💵 {POOL_NAMES[pool]}: ≈{used:.2f}$ из {limit:g}$ за месяц"
                    + (" — лимит исчерпан" if used >= limit else ""))
     tts_limit = LIMITS["tts"]
