@@ -97,6 +97,43 @@ def table_clock(value: str) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
+def scene_media_links(body: str) -> dict[int, tuple[list[str], dict[str, list[str]]]]:
+    sections = list(re.finditer(r"(?mi)^###[ \t]+([^\n]+)$", body))
+    results = {}
+    for i, section in enumerate(sections):
+        number = re.match(r"Сцена\s+(\d+)\b", section[1], re.I)
+        if not number:
+            continue
+        text = body[section.end():sections[i + 1].start() if i + 1 < len(sections) else len(body)]
+        pages = []
+        queries = {"video": [], "image": []}
+        for url in re.findall(r'https://[^\s<>»;)]+', text):
+            try:
+                parts = urlsplit(url)
+                host = (parts.hostname or "").removeprefix("www.")
+            except ValueError:
+                continue
+            provider = {
+                ("yandex.ru", "/images/search"): ("image", "text"),
+                ("google.com", "/search"): ("image", "q"),
+                ("youtube.com", "/results"): ("video", "search_query"),
+            }.get((host, parts.path.rstrip("/")))
+            if provider:
+                kind, parameter = provider
+                query = (parse_qs(parts.query).get(parameter) or [""])[0].strip()
+                if query:
+                    queries[kind].append(query[:250])
+            else:
+                pages.append(url)
+        results[int(number[1])] = (pages, queries)
+    return results
+
+
+def scene_search(queries: list[str], scene: dict, kind: str, limit: int) -> list[str]:
+    extra = (scene.get("media_queries") or {}).get(kind) or []
+    return list(dict.fromkeys(queries[:1] + extra[:1] + queries[1:] + extra[1:]))[:limit]
+
+
 def table_plan(sections: dict[str, str], storyboard: str) -> dict:
     rows = [row for row in storyboard.splitlines() if "|" in row]
     first = next(i for i, row in enumerate(rows) if table_header(row))
@@ -107,6 +144,7 @@ def table_plan(sections: dict[str, str], storyboard: str) -> dict:
         raise ValueError("В таблице должно быть от 2 до 12 сцен.")
     source_hint = section_body(sections, "где искать")
     urls = re.findall(r'https://[^\s<>»;)]+', source_hint)
+    media_links = scene_media_links(section_body(sections, "прямые ссылки и поиск медиа"))
     rules = section_body(sections, "правила для vkino")
     visual_rules = [row.strip("- ") for row in rules.splitlines()
                     if row.startswith("- ") and re.search(r"кадр|график|промо|сюжет", row, re.I)]
@@ -122,9 +160,11 @@ def table_plan(sections: dict[str, str], storyboard: str) -> dict:
         if not timing or int(timing[1]) != i or not visual or not reply:
             raise ValueError(f"Проверь номер, реплику и видеоряд сцены {i}.")
         heading = f"{table_clock(timing[2])}–{table_clock(timing[3])}" if timing[2] else "Видеоряд"
-        scene_urls = list(dict.fromkeys(re.findall(r'https://[^\s<>»;)]+', visual) + urls))
+        pages, extras = media_links.get(i, ([], {}))
+        scene_urls = list(dict.fromkeys(re.findall(r'https://[^\s<>»;)]+', visual) + pages + urls))
+        queries = re.findall(r"`([^`]+)`", search) or extras.get("image") or extras.get("video") or []
         scenes.append({"heading": heading, "targets": [visual], "label": label.strip("«» "),
-                       "queries": re.findall(r"`([^`]+)`", search), "sources": scene_urls,
+                       "queries": queries, "media_queries": extras, "sources": scene_urls,
                        "source_hint": "\n".join(scene_urls)[:240], "fallback": "", "control": control})
         replies.append(reply.strip("«» "))
 
@@ -652,7 +692,7 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         is_still = wants_still(target)
         if not is_graphic and not is_still:
             try:
-                piece = await asyncio.wait_for(matching_clip(path.parent, stem, specific, target,
+                piece = await asyncio.wait_for(matching_clip(path.parent, stem, scene_search(specific, scene, "video", 2), target,
                     scene["control"], key, part_duration, used + refs, urls), timeout=62)
             except (TimeoutError, OSError, RuntimeError, ValueError):
                 log.info("Shorts studio search unavailable for scene %s", index)
@@ -663,7 +703,7 @@ async def find_motion(path: Path, scene: dict, narration: str, index: int, key: 
         elif len(targets) > 1:
             still = path.with_name(stem + ".jpg")
             ref = None if is_graphic else await target_still(
-                still, scene, target, list(dict.fromkeys(specific[:2])), key, used + refs)
+                still, scene, target, scene_search(specific, scene, "image", 3), key, used + refs)
             if ref:
                 refs.append(ref)
             else:
@@ -789,7 +829,7 @@ async def prepare_still(path: Path, scene: dict, index: int, key: str, used: lis
     layout, targets = motion_targets(scene)
     if layout == "single" and not author_graphic(targets[0]):
         queries = scene.get("queries") or []
-        ref = await target_still(path, scene, targets[0], list(dict.fromkeys(queries[:1] + queries[-1:])), key, used)
+        ref = await target_still(path, scene, targets[0], scene_search(queries[:1] + queries[-1:], scene, "image", 3), key, used)
         if ref:
             return ref
     if allow_graphic:

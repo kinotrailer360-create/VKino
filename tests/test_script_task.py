@@ -286,3 +286,21 @@ def test_markdown_table_preserves_original_voice_and_visual_search():
 def test_markdown_table_rejects_rewritten_voice():
     with pytest.raises(ValueError, match="совпадать с озвучкой"):
         script_task.parse(TABLE_TASK.replace("«Как вам такое решение?»", "«Что думаете?»"))
+
+
+def test_markdown_media_supplement_routes_scene_links_and_queries():
+    task = TABLE_TASK + """
+## ПРЯМЫЕ ССЫЛКИ И ПОИСК МЕДИА ДЛЯ КАЖДОЙ СЦЕНЫ
+### Сцена 2 — Предложение
+- https://yandex.ru/images/search?text=Joe%20Russo
+- https://www.google.com/search?tbm=isch&q=Russo%20portrait
+- https://www.youtube.com/results?search_query=Marvel+interview
+- https://thewaltdisneycompany.com/news/marvel/
+### Дополнительные библиотеки
+- https://www.pexels.com/search/cinematic/
+"""
+    first, second, final = script_task.parse(task)["scenes"]
+    assert not first["media_queries"] and not final["media_queries"]
+    assert second["sources"] == ["https://thewaltdisneycompany.com/news/marvel/", "https://www.marvel.com/"]
+    assert second["media_queries"] == {"image": ["Joe Russo", "Russo portrait"], "video": ["Marvel interview"]}
+    assert script_task.scene_search(second["queries"], second, "video", 2) == ["Джо Руссо", "Marvel interview"]
