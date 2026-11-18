@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from . import ai, clips, daily, imgsearch, linkfetch, process as media_process
+from . import ai, clips, daily, imgsearch, linkfetch, studio_media_library, studio_social_sources, process as media_process
 import re
 import logging
 
@@ -56,59 +56,46 @@ async def trailer_candidate(
     bridge: Any, admin: int, scene: dict[str, Any],
     title: str, work: Path, key: str,
 ) -> dict[str, Any] | None:
-    """Suggest actual moving footage when the script names a film explicitly.
+    """Find a real scene from public trailers, then request author approval.
 
-    Existing Rutube/yt-dlp/FFmpeg services are reused. Never auto-approve a
-    downloaded video or claim its publishing rights are verified.
+    This does not grant permission to publish the downloaded footage. Only
+    explicitly identified film titles are sent to official video search APIs.
     """
     titles = trailer_titles(scene.get("text", ""), title)
     if not titles or not ai.available(key):
         return None
-    try:
-        match = await clips.rutube_trailer(titles)
-        if not match:
-            return None
-        full = await clips.download_full(match["url"], work, timeout=110)
+    candidates = await studio_social_sources.discover(titles)
+    if not candidates:
+        log.info("Studio: no trailer candidates for explicit movie title")
+        return None
+    for index, candidate in enumerate(candidates[:3]):
+        path = work / f"social_candidate_{index}"
+        path.mkdir(parents=True, exist_ok=True)
+        full = None
         try:
-            frame_dir = work / "trailer_frames"
-            frame_dir.mkdir(exist_ok=True)
-            samples = await clips.sample_frames(full, frame_dir, every=12.0,
-                                               duration=float(match["duration"]), limit=10)
-            for timestamp, filename in samples:
-                try:
-                    with Image.open(filename) as im:
-                        fits, _ = await ai.media_fits(key, im.convert("RGB"), scene["text"])
-                    if not fits:
-                        continue
-                    start = max(0.0, timestamp - 1.5)
-                    if start + 4.0 > float(match["duration"]):
-                        continue
-                    # Check a second frame so a brief unrelated shot cannot
-                    # be mistaken for a usable four-second sequence.
-                    check = work / "candidate_check.jpg"
-                    await run("ffmpeg", "-v", "error", "-y", "-ss",
-                              str(start + 2.7), "-i", str(full),
-                              "-frames:v", "1", "-vf", "scale=448:-2", str(check))
-                    with Image.open(check) as im:
-                        fits_second, _ = await ai.media_fits(key, im.convert("RGB"), scene["text"])
-                    if not fits_second:
-                        continue
-                    result = work / "candidate_trailer.mp4"
-                    await clips.cut_clip(full, result, start, 4.0)
-                    if not result.is_file() or result.stat().st_size == 0:
-                        continue
-                    asset = await bridge.store_file(admin, result, "video/mp4", "trailer-candidate.mp4")
-                    return {"asset": asset, "source": match["url"], "start": 0, "end": 4.0,
-                            "sourceStart": round(start, 2),
-                            "note": "Движущийся фрагмент трейлера. ИИ проверил два кадра, "
-                                    "но актёра, контекст и права обязан подтвердить автор. "
-                                    "Кандидат НЕ утверждён."}
-                except (OSError, RuntimeError, ValueError) as exc:
-                    log.info("Studio candidate frame rejected: %s", type(exc).__name__)
+            full = await clips.download_full(candidate["url"], path, timeout=70)
+            window = await studio_media_library.choose_video(full, scene, path, key)
+            if window is None:
+                continue
+            start, end = window
+            output = path / "selected.mp4"
+            await clips.cut_clip(full, output, start, end - start)
+            if not output.is_file() or not output.stat().st_size:
+                continue
+            asset = await bridge.store_file(admin, output, "video/mp4", "trailer-candidate.mp4")
+            return {"asset": asset, "source": candidate["url"],
+                    "platform": candidate["platform"],
+                    "publisher": candidate.get("publisher", ""),
+                    "start": 0, "end": round(end - start, 3),
+                    "sourceStart": start, "rights": "unconfirmed",
+                    "note": "Фрагмент трейлера найден и проверен ИИ по двум кадрам. "
+                            "Актёра, событие, источник и разрешение на публикацию "
+                            "необходимо подтвердить вручную. Кандидат НЕ утверждён."}
+        except Exception as exc:  # noqa: BLE001
+            log.info("Studio trailer candidate failed: %s", type(exc).__name__)
         finally:
-            full.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Studio trailer search failed; falling back to images: %s", type(exc).__name__)
+            if full:
+                full.unlink(missing_ok=True)
     return None
 
 
@@ -240,7 +227,13 @@ async def execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path, 
         return {"script": script, "factCheck": "Требуется проверка автора"}
     if operation == "media":
         scene = p["scenes"][payload["sceneIndex"]]
-        # Reconnect Studio's media search to VKino's existing trailer cutter.
+        # Uploaded media and author-supplied links come before general searching.
+        # Every candidate remains subject to manual approval.
+        library_candidate = await studio_media_library.select(
+            bridge, admin, scene, p, work, key)
+        if library_candidate:
+            return library_candidate
+        # Existing trailer and image discovery remain available as fallbacks.
         # If there is no explicit movie title or verified matching shot,
         # preserve the original image-search behavior.
         moving = await trailer_candidate(bridge, admin, scene, p.get("title", ""), work, key)
