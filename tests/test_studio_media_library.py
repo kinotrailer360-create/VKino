@@ -78,7 +78,7 @@ def test_selects_second_matching_uploaded_video_not_first(tmp_path):
         assert result["start"] == 12.0
         assert result["end"] == 21.0
         assert result["rights"] == "author_uploaded"
-        assert "утверж" in result["note"]
+        assert "подтвердите" in result["note"]
     asyncio.run(scenario())
 
 
