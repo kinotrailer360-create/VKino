@@ -290,6 +290,25 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """, None),
+    (15, "Windows Studio worker tokens and durable remote render jobs", """
+        CREATE TABLE IF NOT EXISTS studio_worker_tokens (
+            token_hash TEXT PRIMARY KEY, admin_id BIGINT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_studio_worker_tokens_owner ON studio_worker_tokens(admin_id);
+        CREATE TABLE IF NOT EXISTS studio_worker_jobs (
+            id TEXT PRIMARY KEY, admin_id BIGINT NOT NULL, payload JSONB NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            worker_hash TEXT, lease_hash TEXT, lease_expires TIMESTAMPTZ,
+            error TEXT, result JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT studio_worker_jobs_valid_status CHECK
+                (status IN ('queued','running','interrupted','failed','cancelled','awaiting_review'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_studio_worker_jobs_queue
+            ON studio_worker_jobs(admin_id,status,created_at);
+    """, None),
 ]
 
 
