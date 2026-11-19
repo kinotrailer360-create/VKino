@@ -138,7 +138,12 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                 if any(fits is False for fits, _ in verdicts):
                     result.update(status='rejected', issue='semantic', reason='; '.join(reason for fits, reason in verdicts if fits is False))
                 elif not verdicts or any(fits is not True for fits, _ in verdicts):
-                    result.update(issue='provider', reason='ИИ не подтвердил соответствие. Повторите проверку или замените материал')
+                    missing = [reason for fits, reason in verdicts if fits is not True]
+                    provider = any(reason.startswith('Проверка ИИ недоступна') for reason in missing)
+                    result.update(
+                        issue='provider' if provider else 'uncertain',
+                        reason='; '.join(dict.fromkeys(reason or 'ИИ не дал заключение' for reason in missing))[:240]
+                        or 'ИИ не дал заключение')
                 else:
                     result.update(status='matched', reason='Проверка ИИ; утверждение автора всё равно требуется')
         except (ValueError, OSError, KeyError, TypeError) as exc:
