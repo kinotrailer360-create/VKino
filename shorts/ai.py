@@ -3158,7 +3158,7 @@ async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | No
     новости, а поиск по каналам и базам фильмов промахивается: к «Дюне 3» пришёл логотип «Мстителей», к смерти
     Тинто Брасса — постер сериала «Trinity». (True/False/None — ИИ не ответил, что увидел на картинке)."""
     if not available(key) and not RESERVE_KEY:
-        return None, ""
+        return None, "Проверка ИИ недоступна: модель не настроена"
     prompt = (
         "Ты бильд-редактор новостного канала о кино. Это картинка, которую бот собирается поставить к посту. "
         "Сначала прочитай ВСЕ надписи на картинке (названия, логотипы) и пойми, кто или что на ней. Потом реши, "
@@ -3188,13 +3188,22 @@ async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | No
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI media_fits failed: %s", exc)
-        return None, ""
+        error = str(exc).lower()
+        if "429" in error or "quota" in error or "resource_exhausted" in error:
+            return None, "Проверка ИИ недоступна: лимит запросов (429)"
+        if "timeout" in error or "timed out" in error or "тайм" in error:
+            return None, "Проверка ИИ недоступна: тайм-аут"
+        if "503" in error or "500" in error or "unavailable" in error:
+            return None, "Проверка ИИ недоступна: ошибка сервиса"
+        return None, "Проверка ИИ недоступна: ошибка модели"
     if not isinstance(data, dict):
-        return None, ""
+        return None, "ИИ не дал заключение: некорректный ответ"
     fits = data.get("fits")
     if isinstance(fits, str):
-        fits = fits.strip().lower() == "true"
+        fits = {"true": True, "false": False}.get(fits.strip().lower())
     seen = re.sub(r"\s+", " ", str(data.get("seen") or "")).strip()[:120]
     log.info("shorts: media check: fits=%s seen=%s", fits, seen)
-    return (fits if isinstance(fits, bool) else None), seen
+    if not isinstance(fits, bool):
+        return None, "ИИ не дал заключение" + (f": {seen}" if seen else "")
+    return fits, seen or ("Кадр соответствует" if fits else "Кадр не соответствует")
 
