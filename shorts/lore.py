@@ -22,7 +22,7 @@ from typing import Any
 import aiohttp
 from PIL import Image, ImageEnhance, ImageOps
 
-from . import ai, clips, daily, library, project, pronounce, tmdb, visual_guard
+from . import ai, clips, daily, library, project, pronounce, tmdb, visual_guard, lore_recovery
 from . import music as musiclib
 from .cards import make_cover
 from .daily import (
@@ -621,6 +621,7 @@ def _source_of(name: str) -> tuple[str, str]:
                              ("lvid", "user_media", "кадр из видео автора"), ("lfix", "web_image_search",
                                                                               "картинка по ссылке из задания"),
                              ("lsearch", "web_image_search", "поиск картинок"),
+                             ("lrecover", "web_image_search", "проверенная замена для фразы"),
                              ("lwiki", "film_frame_pool", "иллюстрация статьи"),
                              ("hclip", "trailer_clip", "трейлер фильма с героем"), ("tclip", "trailer_clip", "трейлер"),
                              ("score", "user_media", "карточка оценки")):
@@ -786,11 +787,9 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 img.thumbnail((480, 480))
                 pool.append((out.name, img))
         general = len(pool)
-    if not pool:
-        raise RuntimeError("нет ни одной картинки: пришли свои (страницы комиксов, кадры) кнопкой «📎»")
-
-        # Каждая сцена получает уникальный материал; при нехватке прекращаем сборку,
-        # чтобы не выдавать повтор за осмысленный монтаж.
+    # No global image-pool requirement: a missing pool may be recovered
+    # individually per phrase below (unless this is author-only/structured).
+    # Do not fabricate approval or silently reuse an unrelated frame.
     free_lines = [i for i in range(len(lines)) if i not in pinned]
     if structured and free_lines:
         raise ValueError("Для каждой сцены нужен утверждённый материал.")
@@ -803,18 +802,49 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
     for i, c in pinned.items():
         choices[i] = c
     used: set[int] = set(pinned.values())
+    verified_hashes = {lore_recovery.fingerprint(pool[j][1]) for j in used}
     order: list[int] = []
+    topic = str(script.get("name") or script.get("title") or script.get("trailer_film") or "")
     for i in range(len(lines)):
         if i in pinned:
             order.append(pinned[i])
             continue
-        c = choices[i] if choices and i < len(choices) else -1
-        if c < 0 or c in used:
+        c = choices[i] if i < len(choices) else -1
+        if c in used or c >= len(pool):
+            c = -1
+        # A batch matcher supplies only a suggested index, not an approval.
+        # Confirm the actually downloaded image against this exact phrase.
+        if c >= 0 and not only_own:
+            if not gemini_key:
+                c = -1
+            else:
+                fits, _ = await ai.media_fits(gemini_key, pool[c][1], lines[i])
+                if fits is not True:
+                    c = -1
+        if c < 0 and only_own:
             free = [j for j in range(len(pool)) if j not in used]
             c = free[0] if free else -1
+        if c < 0 and not structured and not only_own:
+            # The old path only searched when the *entire* pool was empty.
+            # Recover a missing shot even when six of seven images exist.
+            recovered = await lore_recovery.recover(lines[i], topic, gemini_key,
+                                                     verified_hashes)
+            if recovered:
+                image, source_url = recovered
+                out = work / f"lrecover{i}.jpg"
+                image.save(out, "JPEG", quality=91)
+                image.thumbnail((480, 480))
+                c = len(pool)
+                pool.append((out.name, image))
+                log.info("shorts: verified recovered visual for phrase %d from %s",
+                         i + 1, source_url.split("/")[2][:80])
         if c < 0:
-            raise RuntimeError(f"Для абзаца {i + 1} нет отдельного кадра. Добавьте фото/видео или объедините соседние фразы.")
+            raise RuntimeError(
+                f"Для абзаца {i + 1} не нашлось отдельного подтверждённого кадра. "
+                "Поиск по фразе и резервным источникам выполнен. "
+                "Добавьте фото/видео для этой фразы или утвердите другую иллюстрацию.")
         used.add(c)
+        verified_hashes.add(lore_recovery.fingerprint(pool[c][1]))
         order.append(c)
     slides = [{"start": starts[i], "image": pool[order[i]][0]} for i in range(len(lines))]
     durs = [((starts[i + 1] if i + 1 < len(starts) else starts[i] + float(spans[i]["speech"]) + 0.3) - starts[i])
