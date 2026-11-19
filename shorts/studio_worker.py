@@ -205,9 +205,18 @@ class StudioWorker:
                              "VALUES($1,$2,$3::jsonb,'queued')", raw['requestId'], admin, payload)
         return web.json_response({'id': raw['requestId'], 'status': 'queued'}, status=202)
 
+    async def expire_for_owner(self, admin, job_id):
+        await self.studio.pool.execute(
+            "UPDATE studio_worker_jobs SET status='interrupted', "
+            "error='Истёк срок задания; требуется ручная проверка', "
+            "worker_hash=NULL,lease_hash=NULL,lease_expires=NULL,updated_at=NOW() "
+            "WHERE id=$1 AND admin_id=$2 AND status='running' AND lease_expires<NOW()",
+            job_id, admin)
+
     async def status(self, request):
         admin = await self.studio.authenticate(request)
         job_id = is_uuid(request.match_info['id'])
+        await self.expire_for_owner(admin, job_id)
         row = await self.studio.pool.fetchrow(
             'SELECT * FROM studio_worker_jobs WHERE id=$1 AND admin_id=$2', job_id, admin)
         if not row:
@@ -218,15 +227,19 @@ class StudioWorker:
     async def retry(self, request):
         admin = await self.studio.authenticate(request)
         job_id = is_uuid(request.match_info['id'])
-        result = await self.studio.pool.execute(
-            "UPDATE studio_worker_jobs SET status='queued',worker_hash=NULL,lease_hash=NULL,lease_expires=NULL, "
-            "error=NULL,updated_at=NOW() WHERE id=$1 AND admin_id=$2 AND status IN ('failed','interrupted')",
-            job_id, admin)
-        if result != 'UPDATE 1':
-            raise ValueError('Задание нельзя перезапустить без ручной проверки')
-        folder = self._folder(admin, job_id)
-        if folder.exists():
-            await asyncio.to_thread(shutil.rmtree, folder)
+        await self.expire_for_owner(admin, job_id)
+        async with self.studio.pool.acquire() as db, db.transaction():
+            await db.execute('SELECT pg_advisory_xact_lock($1)', admin)
+            row = await db.fetchrow(
+                'SELECT status FROM studio_worker_jobs WHERE id=$1 AND admin_id=$2 FOR UPDATE',
+                job_id, admin)
+            if not row or row['status'] not in ('failed', 'interrupted'):
+                raise ValueError('Задание нельзя перезапустить без ручной проверки')
+            await asyncio.to_thread(shutil.rmtree, self._folder(admin, job_id), True)
+            await db.execute(
+                "UPDATE studio_worker_jobs SET status='queued',worker_hash=NULL,lease_hash=NULL, "
+                "lease_expires=NULL,error=NULL,result=NULL,updated_at=NOW() WHERE id=$1 AND admin_id=$2",
+                job_id, admin)
         return web.json_response({'id': job_id, 'status': 'queued'})
 
     async def claim(self, request):
@@ -234,6 +247,11 @@ class StudioWorker:
         await self.studio.pool.execute(
             "UPDATE studio_worker_jobs SET status='interrupted',error='Истёк срок аренды: проверьте результат', "
             "updated_at=NOW() WHERE admin_id=$1 AND status='running' AND lease_expires<NOW()", admin)
+        active = await self.studio.pool.fetchval(
+            "SELECT 1 FROM studio_worker_jobs WHERE worker_hash=$1 AND status='running' "
+            'AND lease_expires>NOW() LIMIT 1', worker_hash)
+        if active:
+            return web.json_response({'job': None})
         lease = secrets.token_urlsafe(40)
         row = await self.studio.pool.fetchrow(
             "UPDATE studio_worker_jobs SET status='running',worker_hash=$2,lease_hash=$3, "
@@ -335,12 +353,11 @@ class StudioWorker:
             if copied != size or sha.hexdigest() != expected:
                 raise ValueError('Контрольная сумма MP4 не совпала')
             # ffprobe accepts file paths, never URLs or arbitrary command arguments.
-            proc = await asyncio.create_subprocess_exec('ffprobe', '-v', 'error',
+            from . import process
+            stdout = await process.run('ffprobe', '-v', 'error',
                 '-protocol_whitelist', 'file,pipe', '-show_entries', 'stream=codec_type',
-                '-of', 'json', str(temp), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE)
-            stdout, _ = await asyncio.wait_for(proc.communicate(), 30)
-            if proc.returncode or not any(s.get('codec_type') == 'video' for s in json.loads(stdout).get('streams', [])):
+                '-of', 'json', str(temp), timeout=30)
+            if not any(s.get('codec_type') == 'video' for s in json.loads(stdout).get('streams', [])):
                 raise ValueError('Результат не содержит видеопотока')
             os.replace(temp, out)
             await self.studio.pool.execute(
