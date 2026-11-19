@@ -15472,6 +15472,15 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
             lost: list[str] = []
             lost_pinned = False
+            task_lines = (data.get("lore_script") or {}).get("lines") or []
+            for item in data.get("lore_media") or []:
+                if item.get("line"):
+                    number = int(item["line"])
+                    if not 1 <= number <= len(task_lines):
+                        raise RuntimeError(
+                            f"Материал отмечен как фраза {number}, но в озвучке "
+                            f"только {len(task_lines)} фраз. Перепроверьте привязку "
+                            "кадров к точным фразам, а не к номерам сцен.")
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
