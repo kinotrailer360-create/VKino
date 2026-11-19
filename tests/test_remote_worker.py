@@ -1,7 +1,5 @@
 """Pure contract tests and a synthetic end-to-end local agent run."""
 import hashlib
-import json
-from pathlib import Path
 import shutil
 import subprocess
 from uuid import uuid4
@@ -10,7 +8,7 @@ import pytest
 from PIL import Image
 
 from shorts.studio_worker import validate_remote_spec, canonical_path, CHUNK
-from vkino_studio.remote import Client, origin, run_once
+from vkino_studio.remote import origin, run_once
 
 
 def make_spec(tmp_path):
