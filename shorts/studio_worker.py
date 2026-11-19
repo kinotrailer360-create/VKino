@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 import re
 import secrets
 import shutil
