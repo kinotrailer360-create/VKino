@@ -12,11 +12,10 @@ import math
 import os
 from pathlib import Path
 import ssl
-import sys
 import tempfile
 import threading
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 from uuid import UUID
