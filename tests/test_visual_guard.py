@@ -100,3 +100,52 @@ def test_all_assembly_pipelines_call_shared_guard():
     root = Path(__file__).resolve().parents[1] / 'shorts'
     for module in ['daily', 'lore', 'review', 'weekly', 'studio_adapter']:
         assert 'await visual_guard.audit(' in (root / (module+'.py')).read_text()
+
+
+@pytest.mark.parametrize('verdict,reason,expected_issue', [
+    (None, 'Проверка ИИ недоступна: лимит запросов (429)', 'provider'),
+    (None, 'Проверка ИИ недоступна: тайм-аут', 'provider'),
+    (None, 'ИИ не дал заключение', 'uncertain'),
+    (False, 'На изображении другой фильм', 'semantic'),
+])
+def test_news_visual_review_preserves_actual_reason(tmp_path, monkeypatch, verdict, reason, expected_issue):
+    Image.new('RGB', (40, 40)).save(tmp_path / 'frame.jpg')
+
+    async def check(key, image, text):
+        return verdict, reason
+
+    monkeypatch.setattr(ai, 'media_fits', check)
+    with pytest.raises(guard.VisualReviewRequired):
+        asyncio.run(guard.audit(tmp_path, [
+            dict(image='frame.jpg', text='Доктор Дум', start=0, end=3)
+        ]))
+    row = json.loads((tmp_path / 'visual_review.json').read_text())[0]
+    assert row['issue'] == expected_issue
+    assert row['reason'] == reason
+    assert row['status'] == ('rejected' if verdict is False else 'unverified')
+
+
+@pytest.mark.parametrize('raw,expected', [
+    ('true', True), ('false', False), ('unknown', None), ('null', None),
+])
+def test_media_fits_parses_only_explicit_boolean_verdict(tmp_path, monkeypatch, raw, expected):
+    async def fake_model(*args, **kwargs):
+        return {'fits': raw, 'seen': 'Персонаж в маске'}
+
+    monkeypatch.setattr(ai, '_with_reserve', fake_model)
+    monkeypatch.setattr(ai, 'available', lambda key: True)
+    result, reason = asyncio.run(ai.media_fits('test', Image.new('RGB', (40, 40)), 'Доктор Дум'))
+    assert result is expected
+    assert reason
+
+
+def test_media_fits_classifies_model_quota_without_claiming_mismatch(monkeypatch):
+    async def outage(*args, **kwargs):
+        raise RuntimeError('HTTP 429 RESOURCE_EXHAUSTED')
+
+    monkeypatch.setattr(ai, '_with_reserve', outage)
+    monkeypatch.setattr(ai, 'available', lambda key: True)
+    result, reason = asyncio.run(ai.media_fits('test', Image.new('RGB', (40, 40)), 'Доктор Дум'))
+    assert result is None
+    assert '429' in reason
+    assert reason.startswith('Проверка ИИ недоступна')
