@@ -44,7 +44,66 @@ def canonical_path(value: object) -> str:
     return str(path)
 
 
+def validate_assembly_spec(raw: object) -> dict:
+    """Strict, author-approved contract for final assembly of approved scene MP4s."""
+    if not isinstance(raw, dict) or raw.get('mode') != 'assemble_clips' or raw.get('authorApproved') is not True:
+        raise ValueError('Автор должен утвердить все сцены перед ПК-монтажом')
+    is_uuid(raw.get('requestId'))
+    revision = raw.get('revision')
+    if type(revision) is not int or revision < 1:
+        raise ValueError('Недопустимая версия проекта')
+    p = raw.get('project')
+    if not isinstance(p, dict) or p.get('version') != 1:
+        raise ValueError('Неправильный формат проекта')
+    if p.get('width') != 720 or p.get('height') != 1280 or p.get('fps') != 30:
+        raise ValueError('Текущая сборка поддерживает только 720x1280 30fps')
+    if not isinstance(p.get('title'), str) or not 1 <= len(p['title']) <= 180:
+        raise ValueError('Неверное название проекта')
+    clips = p.get('clips')
+    if not isinstance(clips, list) or not 1 <= len(clips) <= 30:
+        raise ValueError('Для сборки нужно от 1 до 30 утверждённых MP4')
+    total = 0.0
+    expected_paths = []
+    for clip in clips:
+        if not isinstance(clip, dict) or clip.get('approved') is not True:
+            raise ValueError('Все фрагменты должны быть утверждены автором')
+        if clip.get('rights') not in ('author', 'licensed', 'unconfirmed'):
+            raise ValueError('Статус прав не указан')
+        name = canonical_path(clip.get('source'))
+        if not name.endswith('.mp4'):
+            raise ValueError('Для итогового монтажа допустимы только MP4')
+        expected_paths.append(name)
+        dur = clip.get('duration')
+        if type(dur) not in (int, float) or not math.isfinite(dur) or not 1 <= dur <= 30:
+            raise ValueError('Длительность клипа: 1–30 секунд')
+        total += float(dur)
+    if total > 180 or len(set(expected_paths)) != len(expected_paths):
+        raise ValueError('Повторы фрагментов или итог длиннее 180 секунд')
+    assets = raw.get('assets')
+    if not isinstance(assets, list) or len(assets) != len(clips):
+        raise ValueError('Нужен один проверенный исходник на каждый фрагмент')
+    asset_paths, asset_ids = set(), set()
+    for item in assets:
+        if not isinstance(item, dict):
+            raise ValueError('Некорректный исходник')
+        name = canonical_path(item.get('path'))
+        identifier = is_uuid(item.get('fileId'))
+        sha = item.get('sha256')
+        size = item.get('size')
+        if (name not in expected_paths or name in asset_paths or identifier in asset_ids
+                or not isinstance(sha, str) or not re.fullmatch(r'[a-f0-9]{64}', sha)
+                or type(size) is not int or not 0 < size <= 50 * 1024 * 1024):
+            raise ValueError('Некорректный исходник или контрольная сумма')
+        asset_paths.add(name)
+        asset_ids.add(identifier)
+    if asset_paths != set(expected_paths):
+        raise ValueError('Файлы и утверждённые фрагменты не совпадают')
+    return raw
+
+
 def validate_remote_spec(raw: object) -> dict:
+    if isinstance(raw, dict) and raw.get('mode') == 'assemble_clips':
+        return validate_assembly_spec(raw)
     if not isinstance(raw, dict) or raw.get('authorApproved') is not True:
         raise ValueError('Требуется явное утверждение автора')
     identifier = is_uuid(raw.get('requestId'))
@@ -366,6 +425,15 @@ class StudioWorker:
                 row['id'], json.dumps({'sha256': expected, 'size': size, 'published': False}))
             for p in folder.glob('*.chunk'):
                 p.unlink(missing_ok=True)
+            if self.studio.bot:
+                try:
+                    await self.studio.bot.send_message(
+                        row['admin_id'], '🖥 VKino Studio: сборка на компьютере готова!\n'
+                        'Это черновик, публикации не было. Для проверки откройте /studio_pc.',
+                        parse_mode=None)
+                except Exception:
+                    # Telegram may be unavailable; the durable result still remains.
+                    pass
             return web.json_response({'id': row['id'], 'status': 'awaiting_review', 'published': False})
         finally:
             temp.unlink(missing_ok=True)
