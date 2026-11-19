@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 from typing import Callable
@@ -181,8 +182,13 @@ def render(manifest: Path, destination: Path, encoder: str = "libx264",
                  timeout=180)
         if not staged.is_file() or staged.stat().st_size < 1000:
             raise RuntimeError("Итоговое видео не создано")
-        # Preserve older preview on failure; replace only on success.
-        os.replace(staged, target)
+        # Copy to destination volume first: os.replace cannot cross Windows drives.
+        partial = destination / "vkino_studio_preview.partial.mp4"
+        try:
+            shutil.copyfile(staged, partial)
+            os.replace(partial, target)
+        finally:
+            partial.unlink(missing_ok=True)
     status = {"title": project.title, "scenes": len(project.scenes),
               "duration_planned": round(sum(s.duration for s in project.scenes), 3),
               "output": target.name, "captions_timing": "estimated" if project.captions else "off",
