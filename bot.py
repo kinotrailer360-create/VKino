@@ -56,6 +56,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from shorts import studio as shorts_studio
 from shorts import studio_adapter as shorts_studio_adapter
+from shorts import studio_pc_handlers as shorts_studio_pc_handlers
 from shorts import ai as shorts_ai
 from shorts import budget as shorts_budget
 from shorts import migrations as shorts_migrations
@@ -3000,6 +3001,9 @@ async def api_progress(request: web.Request) -> web.Response:
 
 studio_bridge: shorts_studio.Studio | None = None
 
+# Register private Windows assembly UI; actual server/worker remains opt-in.
+shorts_studio_pc_handlers.register(router, lambda: studio_bridge, ADMIN_IDS)
+
 
 async def _studio_execute(bridge: Any, admin: int, payload: dict[str, Any], work: Path) -> dict[str, Any]:
     if payload["operation"] in {"render", "assemble"}:
@@ -3025,7 +3029,9 @@ async def studio_command(message: Message) -> None:
         + "Адрес сервера: " + escape(WEBAPP_URL.rstrip("/")) + "\nОдноразовый код (10 минут):\n<code>"
         + code + "</code>\n\nКод даёт доступ к заданиям студии на 30 дней. Не публикуйте его. "
         "Отозвать доступ: /studio revoke. Токен Telegram-бота не нужен.\n"
-        "Чтобы перенести текст на сайт, ответьте на сообщение командой /studio_export."
+        "Чтобы перенести текст на сайт, ответьте на сообщение командой /studio_export.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🖥 Монтаж на ПК", callback_data="studio_pc:menu")]]),
     )
 
 
@@ -19758,6 +19764,7 @@ async def set_admin_commands(bot: Bot) -> None:
         BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
         BotCommand(command="studio", description="🌐 Подключить KinoMir360 Studio"),
         BotCommand(command="studio_export", description="📁 Перенести текст в студию (ответом на сообщение)"),
+        BotCommand(command="studio_pc", description="🖥 Монтаж утверждённых сцен на ПК"),
         BotCommand(command="report", description="📊 Отчёт за неделю и план"),
         BotCommand(command="plan", description="📅 Контент-план на неделю"),
         BotCommand(command="planimport", description="📥 Загрузить контент-план из Word"),
