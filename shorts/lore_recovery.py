@@ -10,7 +10,6 @@ import hashlib
 import io
 import logging
 import re
-from typing import Any
 
 import aiohttp
 from PIL import Image, UnidentifiedImageError
