@@ -15471,6 +15471,16 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             files: list[Path] = []
             pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
             lost: list[str] = []
+            lost_pinned = False
+            task_lines = (data.get("lore_script") or {}).get("lines") or []
+            for item in data.get("lore_media") or []:
+                if item.get("line"):
+                    number = int(item["line"])
+                    if not 1 <= number <= len(task_lines):
+                        raise RuntimeError(
+                            f"Материал отмечен как фраза {number}, но в озвучке "
+                            f"только {len(task_lines)} фраз. Перепроверьте привязку "
+                            "кадров к точным фразам, а не к номерам сцен.")
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
@@ -15487,14 +15497,26 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     files.append(path)
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
+                    lost_pinned = lost_pinned or bool(item.get("line"))
                     lost.append((f"к фразе {item['line']}: " if item.get("line") else "")
                                 + (str(exc)[:160] if item.get("url") else str(k)))
-            if lost and (data.get("lore_script") or {}).get("structured"):
-                raise RuntimeError("Утверждённый материал недоступен. Открой сцену и прикрепи его заново.")
             if lost:
-                await bot.send_message(chat_id, "⚠️ Не скачались картинки (ссылка не открылась или это не картинка):\n"
-                                       + "\n".join(f"• {escape(x)}" for x in lost[:10])
-                                       + "\nНа этих фразах будут другие кадры.")
+                # Missing author-pinned media must NOT silently become an
+                # unrelated replacement. A linked 404 can be CDN-specific;
+                # the failed URL is not evidence that a different picture fits.
+                if lost_pinned or (data.get("lore_script") or {}).get("structured"):
+                    detail = "\n".join("• " + x[:180] for x in lost[:8])
+                    raise RuntimeError(
+                        "Не удалось получить материалы, привязанные к фразам. "
+                        "Сборка остановлена до проверки, чтобы не подменить кадры.\n"
+                        + detail
+                        + "\nПрикрепите фото/видео файлом или замените ссылку, "
+                          "проверенную на сервере VKino.")
+                await bot.send_message(chat_id,
+                    "⚠️ Некоторые дополнительные картинки не скачались:\n"
+                    + "\n".join(f"• {escape(x)}" for x in lost[:10])
+                    + "\nДругие кадры будут использованы только при наличии "
+                      "достаточного количества подходящих материалов.")
             progress = progress_updater(status)
             shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
             script = dict(data["lore_script"])
