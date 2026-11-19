@@ -28,7 +28,9 @@ MAX_FILE = 50 * 1024 * 1024
 MIMES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
          "image/gif": ".gif", "image/bmp": ".bmp", "image/tiff": ".tiff",
          "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
-         "video/x-matroska": ".mkv", "video/x-msvideo": ".avi", "video/x-m4v": ".m4v"}
+         "video/x-matroska": ".mkv", "video/x-msvideo": ".avi", "video/x-m4v": ".m4v",
+         "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/mpeg": ".mp3",
+         "audio/mp4": ".m4a", "audio/ogg": ".ogg"}
 OPERATIONS = {"source", "script", "media", "check", "render", "assemble", "notify"}
 
 
@@ -119,6 +121,7 @@ class Studio:
         self.bot: Any = None
         self.task: asyncio.Task | None = None
         self.last_cleanup = 0.0
+        self.worker_api = None
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def issue_pair(self, admin: int) -> str:
@@ -135,6 +138,10 @@ class Studio:
         await self.pool.execute("DELETE FROM studio_tokens WHERE admin_id=$1", admin)
         await self.pool.execute("UPDATE studio_jobs SET status='cancelled',error='Подключение отозвано' "
                                 "WHERE admin_id=$1 AND status='queued'", admin)
+        await self.pool.execute("DELETE FROM studio_worker_tokens WHERE admin_id=$1", admin)
+        await self.pool.execute("UPDATE studio_worker_jobs SET status='cancelled',error='Доступ отозван', "
+                                "worker_hash=NULL,lease_hash=NULL,lease_expires=NULL,updated_at=NOW() "
+                                "WHERE admin_id=$1 AND status IN ('queued','running')", admin)
 
     async def authenticate(self, request: web.Request) -> int:
         auth = request.headers.get("Authorization", "")
@@ -166,6 +173,9 @@ class Studio:
                     log.exception("Studio API failed")
                     return web.json_response({"error": "Ошибка сервера VKino. Проверьте журнал бота."}, status=500)
             app.router.add_route(method, PREFIX + path, route)
+        from .studio_worker import StudioWorker
+        self.worker_api = StudioWorker(self)
+        self.worker_api.register(app)
 
     async def pair(self, request: web.Request) -> web.Response:
         data = await request.json()
@@ -418,6 +428,8 @@ class Studio:
         for path in self.root.glob("*/jobs/*"):
             if path.is_dir() and path.stat().st_mtime < cutoff:
                 shutil.rmtree(path, ignore_errors=True)
+        if self.worker_api is not None:
+            await self.worker_api.cleanup()
         self.last_cleanup = time.monotonic()
 
     async def start(self, bot: Any) -> None:
