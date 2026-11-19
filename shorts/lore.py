@@ -821,6 +821,16 @@ async def make_lore(work: Path, script: dict[str, Any], music: Path | None = Non
                 fits, _ = await ai.media_fits(gemini_key, pool[c][1], lines[i])
                 if fits is not True:
                     c = -1
+        if c < 0 and not only_own and not structured and gemini_key:
+            # Search already downloaded candidates first, before any network
+            # requests. No automatic "first unused" fallback for unrelated art.
+            for j, (_, thumbnail) in enumerate(pool):
+                if j in used or lore_recovery.fingerprint(thumbnail) in verified_hashes:
+                    continue
+                fit, _ = await ai.media_fits(gemini_key, thumbnail, lines[i])
+                if fit is True:
+                    c = j
+                    break
         if c < 0 and only_own:
             free = [j for j in range(len(pool)) if j not in used]
             c = free[0] if free else -1
