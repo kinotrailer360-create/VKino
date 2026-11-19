@@ -166,8 +166,12 @@ def run_once(client: Client, *, encoder: str, temp_root: Path) -> bool:
                 client.fetch_asset(job_id, lease, item, folder)
             manifest = folder / 'project.json'
             manifest.write_text(json.dumps(job['project'], ensure_ascii=False), encoding='utf-8')
-            load_project(manifest)  # enforce the same author approval, file and timeline rules
-            result = render(manifest, folder / 'output', encoder, print)
+            if job.get('mode') == 'assemble_clips':
+                from .assembly import assemble_approved_clips
+                result = assemble_approved_clips(manifest, folder / 'output', print)
+            else:
+                load_project(manifest)  # enforce approval and local path/voice/timing rules
+                result = render(manifest, folder / 'output', encoder, print)
             if errors:
                 raise RuntimeError('Соединение с VKino прервалось во время рендера')
             uploaded = client.upload(job_id, lease, result)
