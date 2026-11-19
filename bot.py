@@ -15471,6 +15471,7 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
             files: list[Path] = []
             pins: dict[int, int] = {}  # своя картинка -> номер фразы из подписи
             lost: list[str] = []
+            lost_pinned = False
             for k, item in enumerate(data.get("lore_media") or []):
                 path = work / f"user{k}{item['ext']}"
                 try:
@@ -15487,14 +15488,14 @@ async def run_lore(bot: Bot, chat_id: int, data: dict[str, Any], status: Message
                     files.append(path)
                 except Exception as exc:  # noqa: BLE001
                     logging.info("Lore: user file %s failed: %s", item.get("url") or k, exc)
+                    lost_pinned = lost_pinned or bool(item.get("line"))
                     lost.append((f"к фразе {item['line']}: " if item.get("line") else "")
                                 + (str(exc)[:160] if item.get("url") else str(k)))
             if lost:
                 # Missing author-pinned media must NOT silently become an
                 # unrelated replacement. A linked 404 can be CDN-specific;
                 # the failed URL is not evidence that a different picture fits.
-                pinned_failure = any(item.get("line") for item in data.get("lore_media") or [])
-                if pinned_failure or (data.get("lore_script") or {}).get("structured"):
+                if lost_pinned or (data.get("lore_script") or {}).get("structured"):
                     detail = "\n".join("• " + x[:180] for x in lost[:8])
                     raise RuntimeError(
                         "Не удалось получить материалы, привязанные к фразам. "
