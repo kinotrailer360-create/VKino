@@ -1,0 +1,98 @@
+"""Lumean per-call price guard: never approve unknown or expensive paid calls."""
+import asyncio
+
+import pytest
+
+from shorts import lumean_pricing
+
+
+def catalog(input_rate=2000000, output_rate=3000000, *, model="gpt-4.1-mini"):
+    # Precision 6, so 2_000_000 minor / 10**6 = 2 LUMC / 1m input tokens.
+    return {
+        "data": {
+            "asset": {"code": "LUMC", "precision": 6},
+            "models": [{
+                "key": model, "kind": "chat", "billing_available": True,
+                "price": {
+                    "input": {"per_mtok_minor": input_rate},
+                    "output": {"per_mtok_minor": output_rate},
+                },
+            }],
+        },
+    }
+
+
+def test_catalog_estimate_in_lumc_not_usd():
+    cost = lumean_pricing.estimate_lumc(catalog(), 1000, 4000)
+    assert cost == pytest.approx(0.0146)
+
+
+@pytest.mark.parametrize("corruption", [
+    {},
+    {"data": {"models": [], "asset": {"code": "LUMC", "precision": 6}}},
+    {"data": {"models": [{
+        "kind": "chat", "billing_available": False, "price": {}
+    }], "asset": {"code": "LUMC", "precision": 6}}},
+    {"data": {"models": [{
+        "kind": "chat", "billing_available": True,
+        "price": {"input": {"per_mtok_minor": 100}}
+    }], "asset": {"code": "LUMC", "precision": 6}}},
+])
+def test_incomplete_or_unavailable_price_fails_closed(corruption):
+    with pytest.raises(lumean_pricing.PriceCheckUnavailable):
+        lumean_pricing.estimate_lumc(corruption, 1000, 4000)
+
+
+def test_expensive_model_blocked_before_chat_purchase(monkeypatch):
+    monkeypatch.setenv("LUMEAN_MAX_REQUEST_LUMC", "0.02")
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def json(self, content_type=None):
+            return catalog()
+
+    class Session:
+        def get(self, url, headers):
+            assert url.endswith("/gpt-4.1-mini")
+            assert headers["X-API-KEY"] == "test"
+            return Response()
+
+    async def scenario():
+        with pytest.raises(lumean_pricing.PriceCheckUnavailable, match="превышает лимит"):
+            await lumean_pricing.preflight(Session(), "test", "gpt-4.1-mini", 1500, 7000)
+    asyncio.run(scenario())
+
+
+def test_affordable_model_passes_price_gate(monkeypatch):
+    monkeypatch.setenv("LUMEAN_MAX_REQUEST_LUMC", "0.02")
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def json(self, content_type=None):
+            return catalog()
+
+    class Session:
+        def get(self, url, headers):
+            return Response()
+
+    cost = asyncio.run(lumean_pricing.preflight(
+        Session(), "test", "gpt-4.1-mini", 1000, 4000))
+    assert cost == pytest.approx(0.0146)
+
+
+def test_user_invalid_limit_cannot_disable_safety(monkeypatch):
+    for text in ("0", "-1", "nan", "NaN", "500000", "abc"):
+        monkeypatch.setenv("LUMEAN_MAX_REQUEST_LUMC", text)
+        assert lumean_pricing.max_request_lumc() == 0.5

@@ -8693,6 +8693,10 @@ async def ai_status_action(message: Message) -> None:
     modes = {"important": "только важное (сценарий выпуска, пост по ссылке) + запасной", "all": "всё подряд",
              "off": "выключен для текстов"}
     rows.append(f"\n💳 <b>Lumean для текстов</b>: {modes.get(shorts_ai.LUMEAN_MODE, shorts_ai.LUMEAN_MODE)}")
+    rows.append("🛡 Платные запросы ограничены: месяц — "
+                f"{shorts_budget.LIMITS['ai']:.2f}$ (внутренний расчёт), "
+                "один запрос — по текущему прайсу Lumean. "
+                "Дополнительно задайте месячный AI-лимит самому API-ключу в кабинете Lumean.")
     if u["date"] == date.today().isoformat() and u["calls"]:
         top = ", ".join(f"{escape(t)} — {n}" for t, n in sorted(u["tasks"].items(), key=lambda kv: -kv[1])[:6])
         tin, tout = f"{u['tokens_in']:,}".replace(",", " "), f"{u['tokens_out']:,}".replace(",", " ")
@@ -8715,6 +8719,13 @@ async def ai_status_action(message: Message) -> None:
 
 
 async def load_ai_mode() -> None:
+    # Previous releases persisted "all"/"important". Changing the default
+    # alone would not stop those expensive saved settings on the live VPS.
+    # Force economy mode ONCE during the new deployment; subsequent explicit
+    # choices in /ai persist normally.
+    if await shorts_setting("ai_economy_guard_v2") != "1":
+        await set_shorts_setting("lumean_mode", "off")
+        await set_shorts_setting("ai_economy_guard_v2", "1")
     mode = await shorts_setting("lumean_mode") or "off"
     shorts_ai.LUMEAN_MODE = mode if mode in ("important", "all", "off") else "off"
 
