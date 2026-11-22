@@ -824,6 +824,9 @@ def test_lumean_retries_truncated_script_once(monkeypatch):
     monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
     monkeypatch.setattr(ai, "LUMEAN_ALLOW_PAID_RETRY", True)
     monkeypatch.setattr(ai, "_count_lumean", lambda data: None)
+    async def free_price_check(*args, **kwargs):
+        return 0.01
+    monkeypatch.setattr(ai.lumean_pricing, "preflight", free_price_check)
     monkeypatch.setattr(ai.aiohttp, "ClientSession", _fake_session([(200, truncated, {}), (200, complete, {})], calls))
     assert asyncio.run(ai._with_reserve("", [{"text": "script"}], "script", premium=True)) == {"complete": True}
     assert [call["max_tokens"] for call in calls] == [12000, 24000]
