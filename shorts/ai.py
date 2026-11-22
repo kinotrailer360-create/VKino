@@ -24,6 +24,7 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from . import budget
+from . import lumean_pricing
 from . import luna
 from . import usage as usage_log
 from . import websearch
@@ -66,7 +67,7 @@ LUMEAN_LLM_URL = os.getenv("LUMEAN_LLM_URL", "https://api.lumean.app/v1").rstrip
 LUMEAN_LLM_MODEL = os.getenv("LUMEAN_LLM_MODEL", "").strip()  # пусто — бот выберет сам из /v1/models
 LLM_PRIMARY = os.getenv("LLM_PRIMARY", "lumean").strip().lower()
 # какие модели брать, если LUMEAN_LLM_MODEL не задан: по порядку, первая доступная
-LUMEAN_PREFER = ("claude-sonnet", "claude-opus", "gpt-5", "gpt-4.1", "claude", "gpt-4o", "gemini-2.5-pro", "gemini")
+LUMEAN_PREFER = ("gemini-3.8-flash", "gemini-2.5-flash", "gpt-4.1-mini", "gpt-4o-mini", "claude-haiku", "gpt-5-mini", "gpt-4.1", "claude-sonnet")
 
 
 def available(key: str) -> bool:
@@ -121,7 +122,7 @@ async def _lumean_pick_model(session: aiohttp.ClientSession) -> str:
             raise AIError(f"Lumean ИИ: список моделей HTTP {resp.status}: {str(data)[:200]}")
     ids = [str(m.get("id")) for m in data.get("data") or [] if m.get("kind", "chat") == "chat" and m.get("id")]
     for want in LUMEAN_PREFER:
-        match = sorted((i for i in ids if want in i.lower() and "mini" not in i.lower() and "image" not in i.lower()),
+        match = sorted((i for i in ids if want in i.lower() and "image" not in i.lower()),
                        key=lambda i: _version(i), reverse=True)
         if match:
             _lumean_model = match[0]
@@ -155,7 +156,14 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
         body = {"model": model, "temperature": 0.3, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": "Отвечай только валидным JSON, без пояснений."},
                              {"role": "user", "content": content}]}
-        # платный вызов — через бюджет (цена за вызов из .env; не задана — считается, но по 0$)
+        # Check the *live* LUMC rates of this model before any paid request.
+        # Unlike the internal USD ledger, this prevents outdated price guesses
+        # from triggering a costly Claude/Opus request without warning.
+        await lumean_pricing.preflight(
+            session, LUMEAN_LLM_KEY, model,
+            max(1, len(json.dumps(body, ensure_ascii=False)) // 3), max_tokens,
+        )
+        # Платный вызов — через внутренний бюджет (оценка в USD).
         if is_factcheck:
             body.pop("temperature")
         cost = luna.cost if model == luna.MODEL else budget.lumean_cost
