@@ -108,6 +108,9 @@ def test_luna_uses_existing_lumean_gateway_without_changing_author_model(monkeyp
     monkeypatch.setattr(ai, "LUMEAN_LLM_URL", "https://api.lumean.app/v1")
     monkeypatch.setattr(ai, "LUMEAN_LLM_MODEL", "claude-sonnet-5-5")
     monkeypatch.setattr(ai, "_count_lumean", lambda data: None)
+    async def free_price_check(*args, **kwargs):
+        return 0.01
+    monkeypatch.setattr(ai.lumean_pricing, "preflight", free_price_check)
     monkeypatch.setattr(ai.aiohttp, "ClientSession", Session)
     monkeypatch.setattr(luna, "MODE", "active")
     monkeypatch.setattr(ai, "_cool", {})
