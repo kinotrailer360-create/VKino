@@ -52,9 +52,19 @@ def estimate_lumc(payload: dict, input_tokens: int, output_tokens: int) -> float
             raise PriceCheckUnavailable("Lumean: нет тарифа входных или выходных токенов")
         numbers.append(float(n))
     factor = 10 ** precision
-    # Reserve at least a 30% margin for input tokenization overhead.
+    # Some reasoning models bill reasoning separately from visible output.
+    # Budget for that class too when published; unknown rates fail closed.
+    reasoning = rate.get("reasoning")
+    thinking = 0.0
+    if reasoning is not None:
+        n = reasoning.get("per_mtok_minor") if isinstance(reasoning, dict) else None
+        if type(n) not in (int, float) or not math.isfinite(n) or n < 0:
+            raise PriceCheckUnavailable("Lumean: неизвестный тариф reasoning-токенов")
+        thinking = float(n)
+    # Reserve 30% for input tokenization overhead and one full output-window
+    # allowance for separately billed reasoning tokens.
     return (max(input_tokens, 1) * 1.3 * numbers[0]
-            + max(output_tokens, 1) * numbers[1]) / (1_000_000 * factor)
+            + max(output_tokens, 1) * (numbers[1] + thinking)) / (1_000_000 * factor)
 
 
 async def preflight(session: aiohttp.ClientSession, key: str, model: str,
