@@ -68,3 +68,22 @@ def test_ai_status_never_pays_for_probes(monkeypatch):
 
     rows = asyncio.run(ai.probe(""))
     assert any("платная проба не запускалась" in reason for _, _, reason in rows)
+
+
+def test_truncated_premium_response_is_not_retried_automatically(monkeypatch):
+    monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
+    monkeypatch.setattr(ai, "LUMEAN_ALLOW_PAID_RETRY", False)
+    monkeypatch.setattr(ai, "RESERVE_KEY", "")
+    monkeypatch.setattr(ai, "BEAT_KEY", "")
+    calls = []
+
+    async def truncated(*args, **kwargs):
+        calls.append(kwargs.get("max_tokens", args[2] if len(args) > 2 else None))
+        raise ai.OutputTruncated("paid output truncated")
+
+    monkeypatch.setattr(ai, "_ask_lumean", truncated)
+    with pytest.raises(ai.AllBusy):
+        asyncio.run(ai._with_reserve("", [{"text": "script"}], "script", premium=True))
+    assert len(calls) == 1
