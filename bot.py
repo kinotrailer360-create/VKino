@@ -8690,7 +8690,8 @@ async def ai_status_action(message: Message) -> None:
         await wait.delete()
     await load_ai_mode()
     u = shorts_ai.lumean_usage
-    modes = {"important": "только важное (сценарий выпуска, пост по ссылке) + запасной", "all": "всё подряд",
+    modes = {"balanced": "⚖️ Умный баланс — сначала бесплатные, платные для сложных задач",
+             "important": "только важное (платный Lumean первым)", "all": "всё подряд (дороже)",
              "off": "выключен для текстов"}
     rows.append(f"\n💳 <b>Lumean для текстов</b>: {modes.get(shorts_ai.LUMEAN_MODE, shorts_ai.LUMEAN_MODE)}")
     rows.append("🛡 Платные запросы ограничены: месяц — "
@@ -8713,6 +8714,8 @@ async def ai_status_action(message: Message) -> None:
                     + "\n".join(escape(x) for x in stats + [f"⏸ {w}" for w in paused]))
     rows += await expenses_rows()
     await message.answer("\n".join(rows), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "balanced" else "")
+              + "⚖️ Умный баланс (рекомендуется)", "aim:balanced")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "important" else "") + "💳 Lumean: только важное", "aim:important")],
         [_btn(("✅ " if shorts_ai.LUMEAN_MODE == "all" else "") + "💎 Lumean: всё (дороже)", "aim:all"),
          _btn(("✅ " if shorts_ai.LUMEAN_MODE == "off" else "") + "🆓 Lumean: выкл", "aim:off")]]))
@@ -8727,7 +8730,7 @@ async def load_ai_mode() -> None:
         await set_shorts_setting("lumean_mode", "off")
         await set_shorts_setting("ai_economy_guard_v2", "1")
     mode = await shorts_setting("lumean_mode") or "off"
-    shorts_ai.LUMEAN_MODE = mode if mode in ("important", "all", "off") else "off"
+    shorts_ai.LUMEAN_MODE = mode if mode in ("balanced", "important", "all", "off") else "off"
 
 
 @router.callback_query(F.data.startswith("aim:"))
@@ -8736,12 +8739,13 @@ async def ai_mode_button(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     mode = (callback.data or "")[4:]
-    if mode not in ("important", "all", "off"):
+    if mode not in ("balanced", "important", "all", "off"):
         await callback.answer()
         return
     await set_shorts_setting("lumean_mode", mode)
     shorts_ai.LUMEAN_MODE = mode
-    await callback.answer({"important": "Lumean — только для важного", "all": "Lumean — для всех текстов",
+    await callback.answer({"balanced": "Умный баланс: бесплатно сначала, платный ИИ только для сложного",
+                           "important": "Lumean — только для важного", "all": "Lumean — для всех текстов",
                            "off": "Lumean для текстов выключен — экономия"}[mode], show_alert=True)
 
 
