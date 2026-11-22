@@ -22,6 +22,8 @@ def test_evidence_must_come_from_correct_source_and_claim():
 
 def test_active_check_uses_luna_without_legacy_credentials(monkeypatch):
     monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
     monkeypatch.setattr(luna, "MODE", "active")
     monkeypatch.setattr(ai, "_cool", {})
 
@@ -40,6 +42,8 @@ def test_active_check_uses_luna_without_legacy_credentials(monkeypatch):
 
 def test_active_outage_is_visible_and_skips_repeat(monkeypatch):
     monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
     monkeypatch.setattr(luna, "MODE", "active")
     monkeypatch.setattr(ai, "_cool", {})
     attempts = []
@@ -58,6 +62,8 @@ def test_active_outage_is_visible_and_skips_repeat(monkeypatch):
 
 def test_shadow_compares_but_returns_current_verdict(monkeypatch, caplog):
     monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
     monkeypatch.setattr(luna, "MODE", "shadow")
     monkeypatch.setattr(ai, "_cool", {})
 
@@ -105,6 +111,8 @@ def test_luna_uses_existing_lumean_gateway_without_changing_author_model(monkeyp
             return Response()
 
     monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
     monkeypatch.setattr(ai, "LUMEAN_LLM_URL", "https://api.lumean.app/v1")
     monkeypatch.setattr(ai, "LUMEAN_LLM_MODEL", "claude-sonnet-5-5")
     monkeypatch.setattr(ai, "_count_lumean", lambda data: None)
@@ -117,3 +125,24 @@ def test_luna_uses_existing_lumean_gateway_without_changing_author_model(monkeyp
     [result] = asyncio.run(ai.check_facts("", ["факт"], {"студия": "официальный текст"}))
     assert result["evidence"] == "официальный текст"
     assert ai.LUMEAN_LLM_MODEL == "claude-sonnet-5-5"
+
+
+def test_economy_off_skips_paid_luna_and_uses_free_factcheck(monkeypatch):
+    monkeypatch.setattr(ai, "LUMEAN_LLM_KEY", "test")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "off")
+    monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
+    monkeypatch.setattr(luna, "MODE", "active")
+    monkeypatch.setattr(ai, "_cool", {})
+
+    async def no_paid(*args, **kwargs):
+        raise AssertionError("Luna must never charge while economy mode is off")
+
+    async def free(*args, **kwargs):
+        return {"checks": [{"n": 1, "status": "confirmed",
+                           "source": "Студия", "note": ""}]}
+
+    monkeypatch.setattr(ai, "_ask_lumean", no_paid)
+    monkeypatch.setattr(ai, "_with_reserve", free)
+    result = asyncio.run(ai.check_facts("gemini", ["Вышел тизер"],
+                                       {"Студия": "Вышел тизер."}))
+    assert result[0]["status"] == "confirmed"
