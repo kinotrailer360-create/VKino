@@ -8658,7 +8658,7 @@ async def ai_status_action(message: Message) -> None:
         "🤖 <b>ИИ бота</b>",
         "Посты: свой поиск (Groq/DuckDuckGo/Tavily/Яндекс) → Gemini с поиском Google → пишет сильная модель Lumean → "
         "второй проход-фактчекер.",
-        f"0. Lumean ИИ (Claude/GPT): {'включён ✅' if shorts_ai.lumean_llm_on() else 'выключен ❌ (нужен LUMEAN_API_KEY)'}"
+        f"0. Lumean ИИ (Claude/GPT): {'включён ✅' if shorts_ai.lumean_llm_on() else 'выключен 🆓 (экономный режим /ai или нет ключа)'}"
         f"; поиск: Tavily {'✅' if shorts_websearch.TAVILY_KEY else '— нет TAVILY_API_KEY'}, Яндекс "
         f"{'✅' if shorts_websearch.YANDEX_KEY and shorts_websearch.YANDEX_FOLDER else '— нет YANDEX_SEARCH_API_KEY/YANDEX_FOLDER_ID'}"
         f", DuckDuckGo {'✅' if shorts_websearch.DDG_ON else '— выключен'}"
@@ -8715,8 +8715,8 @@ async def ai_status_action(message: Message) -> None:
 
 
 async def load_ai_mode() -> None:
-    mode = await shorts_setting("lumean_mode") or "important"
-    shorts_ai.LUMEAN_MODE = mode if mode in ("important", "all", "off") else "important"
+    mode = await shorts_setting("lumean_mode") or "off"
+    shorts_ai.LUMEAN_MODE = mode if mode in ("important", "all", "off") else "off"
 
 
 @router.callback_query(F.data.startswith("aim:"))
@@ -8728,10 +8728,10 @@ async def ai_mode_button(callback: CallbackQuery) -> None:
     if mode not in ("important", "all", "off"):
         await callback.answer()
         return
-    await set_shorts_setting("lumean_mode", None if mode == "important" else mode)
+    await set_shorts_setting("lumean_mode", mode)
     shorts_ai.LUMEAN_MODE = mode
     await callback.answer({"important": "Lumean — только для важного", "all": "Lumean — для всех текстов",
-                           "off": "Lumean для текстов выключен"}[mode], show_alert=True)
+                           "off": "Lumean для текстов выключен — экономия"}[mode], show_alert=True)
 
 
 @router.message(Command("ai"))
