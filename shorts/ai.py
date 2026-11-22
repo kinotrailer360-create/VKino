@@ -2835,7 +2835,7 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
     if not facts or not body:
         return blank
     comparison = None
-    if LUMEAN_LLM_KEY and luna.MODE in {"shadow", "active"} and not cooling("luna"):
+    if lumean_llm_on() and luna.MODE in {"shadow", "active"} and not cooling("luna"):
         try:
             prompt, sources = luna.prepare(facts, material)
             data = await _ask_lumean(prompt, max_tokens=min(6000, 800 + 220 * len(facts)), model_override=luna.MODEL)
@@ -2843,7 +2843,7 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Luna fact check unavailable (%s)", type(exc).__name__)
             cooldown("luna", 120, "проверка недоступна")
-    if luna.MODE == "active":
+    if luna.MODE == "active" and lumean_llm_on():
         return comparison if comparison is not None else [
             {**row, "note": "Проверка источников временно недоступна."} for row in blank
         ]
