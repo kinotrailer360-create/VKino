@@ -282,7 +282,7 @@ def test_netsafe_blocks_internal_addresses():
             asyncio.run(netsafe.check_url(url))
 
 
-def test_budget_tracks_ai_without_cap_and_limits_tts(monkeypatch):
+def test_budget_caps_paid_ai_and_limits_tts(monkeypatch):
     import asyncio
 
     import pytest
@@ -339,14 +339,18 @@ def test_budget_tracks_ai_without_cap_and_limits_tts(monkeypatch):
     monkeypatch.setattr(budget, "_pool_getter", lambda: pool)
     monkeypatch.setattr(budget, "_warned", set())
     monkeypatch.setitem(budget.LIMITS, "tts", 1.0)
+    monkeypatch.setitem(budget.LIMITS, "ai", 3.0)
     monkeypatch.setattr(budget, "on_warning", warn)
 
     async def run():
         async with budget.guard("ai", "gemini", 0.5) as r:
             await r.settle(0.7)  # факт дороже оценки — учитывается факт
-        async with budget.guard("ai", "image", 10.0):
+        async with budget.guard("ai", "image", 1.8):
             pass
-        assert warnings == []
+        assert len(warnings) == 1 and "ИИ" in warnings[0]
+        with pytest.raises(budget.BudgetExceeded):
+            async with budget.guard("ai", "image", 10.0):
+                pytest.fail("Платный ИИ сверх лимита не должен вызываться")
         async with budget.guard("ai", "free", 0.0):
             pass
         async with budget.guard("tts", "tts", 0.9):
@@ -357,10 +361,11 @@ def test_budget_tracks_ai_without_cap_and_limits_tts(monkeypatch):
         with pytest.raises(RuntimeError):
             async with budget.guard("ai", "gemini", 0.1):
                 raise RuntimeError("сбой")
-        await budget.reserve("ai", "pending", 20.0)
-        assert await budget.spent("ai") == pytest.approx(30.7)
-        assert await budget.weekly_spending() == pytest.approx({"ai": 10.7, "tts": 0.9})
-        assert len(warnings) == 1 and "озвучка" in warnings[0]
+        with pytest.raises(budget.BudgetExceeded):
+            await budget.reserve("ai", "pending", 20.0)
+        assert await budget.spent("ai") == pytest.approx(2.5)
+        assert await budget.weekly_spending() == pytest.approx({"ai": 2.5, "tts": 0.9})
+        assert len(warnings) == 2 and any("озвучка" in w for w in warnings)
 
     asyncio.run(run())
 
@@ -817,6 +822,7 @@ def test_lumean_retries_truncated_script_once(monkeypatch):
     monkeypatch.setattr(ai, "LUMEAN_LLM_MODEL", "claude-sonnet-5-5")
     monkeypatch.setattr(ai, "LLM_PRIMARY", "lumean")
     monkeypatch.setattr(ai, "LUMEAN_MODE", "important")
+    monkeypatch.setattr(ai, "LUMEAN_ALLOW_PAID_RETRY", True)
     monkeypatch.setattr(ai, "_count_lumean", lambda data: None)
     monkeypatch.setattr(ai.aiohttp, "ClientSession", _fake_session([(200, truncated, {}), (200, complete, {})], calls))
     assert asyncio.run(ai._with_reserve("", [{"text": "script"}], "script", premium=True)) == {"complete": True}
