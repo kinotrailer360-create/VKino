@@ -71,7 +71,7 @@ LUMEAN_PREFER = ("claude-sonnet", "claude-opus", "gpt-5", "gpt-4.1", "claude", "
 
 def available(key: str) -> bool:
     """Есть ли хоть один ИИ: ключ Gemini или резервный."""
-    return bool(key or RESERVE_KEY or BEAT_KEY or LUMEAN_LLM_KEY)
+    return bool(key or RESERVE_KEY or BEAT_KEY or lumean_llm_on())
 
 
 def lumean_llm_on() -> bool:
@@ -82,7 +82,7 @@ def lumean_llm_on() -> bool:
 #   important — первым только для важного (сценарий выпуска, пост по ссылке), остальное — бесплатный Gemini и Groq,
 #               Lumean — запасной, если они не ответили (по умолчанию);
 #   all — Lumean первым для всего (лучше тексты, дороже); off — Lumean для текстов не используется вовсе.
-LUMEAN_MODE = "important"
+LUMEAN_MODE = "off"  # economy default; explicit opt-in via /ai
 # расход Lumean за сутки: {"date", "calls", "tokens_in", "tokens_out", "tasks": {задача: запросов}}
 lumean_usage: dict[str, Any] = {"date": "", "calls": 0, "tokens_in": 0, "tokens_out": 0, "tasks": {}}
 
@@ -666,7 +666,8 @@ LUMEAN_RETRY_TOKENS = 24000
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
                         image: Image.Image | None = None, premium: bool = False,
                         reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS,
-                        paid_first: bool = False, paid_max_tokens: int = 4000) -> Any:
+                        paid_first: bool = False, paid_max_tokens: int = 4000,
+                        allow_paid: bool = True) -> Any:
     """Порядок ИИ. Важное (premium) или режим «all» — сначала сильная модель Lumean (платно), потом Gemini и
     резервные. Остальное — бесплатные Gemini и Groq, а Lumean — только если они не ответили.
     Ошибка — с причинами всех."""
@@ -687,7 +688,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         if pictures:
             image = pictures[0] if len(pictures) == 1 else _sheet(pictures)
     blind = image is None and any("inline_data" in p for p in gemini_parts)
-    lumean_first = lumean_llm_on() and not blind and (premium or paid_first or LUMEAN_MODE == "all")
+    lumean_first = allow_paid and lumean_llm_on() and not blind and (premium or paid_first or LUMEAN_MODE == "all")
 
     attempted: set[str] = set()
     global last_engine
@@ -755,7 +756,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             return result
         except Exception as exc:  # noqa: BLE001
             failed("reserve", exc, f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
-    if not lumean_first and lumean_llm_on() and not blind:  # бесплатные не ответили — платный запасной
+    if allow_paid and not lumean_first and lumean_llm_on() and not blind:  # explicit opt-in fallback
         result = await ask_lumean()
         if result is not None:
             return result
@@ -833,13 +834,12 @@ async def probe(key: str) -> list[tuple[str, bool, str]]:
     if RESERVE_KEY:
         await run("Groq", _ask_reserve(ask), lambda r: "отвечает")
     if LUMEAN_LLM_KEY:
-        await run("ИИ Lumean (главный автор текстов)" + ("" if lumean_llm_on() else " — выключен: LLM_PRIMARY=gemini"),
-                  _ask_lumean(ask, max_tokens=50), lambda r: f"отвечает, модель {LUMEAN_LLM_MODEL or _lumean_model}")
-        if luna.MODE in {"shadow", "active"}:
-            await run(f"Фактчек Lumean ({luna.MODE})", _ask_lumean(ask, max_tokens=256, model_override=luna.MODEL),
-                      lambda r: f"отвечает, модель {luna.MODEL}")
-        else:
-            out.append(("Фактчек Lumean", False, "пилот выключен (VKINO_LUNA_FACTCHECK)"))
+        # Viewing /ai must never incur a paid model request.
+        state = "включён" if lumean_llm_on() else "выключен"
+        out.append(("ИИ Lumean", lumean_llm_on(),
+                    f"{state}; платная проба не запускалась"))
+        out.append(("Фактчек Lumean", False,
+                    f"режим {luna.MODE}; платная проба не запускалась"))
     out += await websearch.probe()
     return out
 
@@ -1129,7 +1129,7 @@ async def match_images(key: str, texts: list[str], images: list[Image.Image],
     try:
         data = await _with_reserve(
             key, parts, prompt, _sheet(images),
-            reserve_max_tokens=128, paid_first=True, paid_max_tokens=256,
+            reserve_max_tokens=128, paid_max_tokens=256, allow_paid=False,
         )
         raw = list(data["choices"])[: len(texts)]
     except Exception as exc:  # noqa: BLE001
@@ -1162,7 +1162,7 @@ async def remix_headlines(key: str, texts: list[str]) -> list[str]:
     )
     try:
         data = await _with_reserve(key, [{"text": prompt}], prompt,
-                                   paid_first=True, paid_max_tokens=512, reserve_max_tokens=512)
+                                   paid_max_tokens=512, reserve_max_tokens=512, allow_paid=False)
         raw = data.get("headlines") or []
         return [str(raw[i]).strip().upper() if i < len(raw) and isinstance(raw[i], str)
                 and 1 < len(raw[i].strip()) <= 48 else default
@@ -1189,7 +1189,7 @@ async def remix_media_fits(key: str, images: list[Image.Image], text: str) -> tu
     try:
         data = await _with_reserve(
             key, [{"text": prompt}] + [_thumb(image) for image in images], prompt,
-            _sheet(images, cols=3), paid_first=True, paid_max_tokens=256, reserve_max_tokens=256,
+            _sheet(images, cols=3), paid_max_tokens=256, reserve_max_tokens=256, allow_paid=False,
         )
         value = data.get("fits")
         if isinstance(value, str):
@@ -3184,7 +3184,7 @@ async def media_fits(key: str, image: Image.Image, post: str) -> tuple[bool | No
         # сильная модель первой: слабая запасная пропускала чужие постеры («Мстители» к новости о «Рокки»)
         data = await _with_reserve(
             key, [{"text": prompt}, _thumb(image, 768)], prompt, image,
-            paid_first=True, paid_max_tokens=512, reserve_max_tokens=256,
+            paid_max_tokens=512, reserve_max_tokens=256, allow_paid=False,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: AI media_fits failed: %s", exc)
