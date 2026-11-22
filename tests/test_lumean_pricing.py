@@ -96,3 +96,31 @@ def test_user_invalid_limit_cannot_disable_safety(monkeypatch):
     for text in ("0", "-1", "nan", "NaN", "500000", "abc"):
         monkeypatch.setenv("LUMEAN_MAX_REQUEST_LUMC", text)
         assert lumean_pricing.max_request_lumc() == 0.5
+
+
+def test_balanced_request_has_stricter_per_call_cap(monkeypatch):
+    monkeypatch.setenv("LUMEAN_MAX_REQUEST_LUMC", "0.50")
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def json(self, content_type=None):
+            return catalog(input_rate=2_000_000, output_rate=3_000_000)
+
+    class Session:
+        def get(self, url, headers):
+            return Response()
+
+    # 0.30 LUMC is within the global 0.50 cap but above balanced's 0.20.
+    async def run():
+        with pytest.raises(lumean_pricing.PriceCheckUnavailable, match="0.20 LUMC"):
+            await lumean_pricing.preflight(
+                Session(), "key", "gpt-4.1-mini", 0, 100_000, limit_lumc=0.20
+            )
+    asyncio.run(run())
