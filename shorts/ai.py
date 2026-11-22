@@ -162,6 +162,7 @@ async def _ask_lumean(prompt: str, image: Image.Image | None = None, max_tokens:
         await lumean_pricing.preflight(
             session, LUMEAN_LLM_KEY, model,
             max(1, len(json.dumps(body, ensure_ascii=False)) // 3), max_tokens,
+            limit_lumc=0.20 if LUMEAN_MODE == "balanced" else None,
         )
         # Платный вызов — через внутренний бюджет (оценка в USD).
         if is_factcheck:
@@ -677,9 +678,9 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
                         reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS,
                         paid_first: bool = False, paid_max_tokens: int = 4000,
                         allow_paid: bool = True) -> Any:
-    """Порядок ИИ. Важное (premium) или режим «all» — сначала сильная модель Lumean (платно), потом Gemini и
-    резервные. Остальное — бесплатные Gemini и Groq, а Lumean — только если они не ответили.
-    Ошибка — с причинами всех."""
+    """В balanced сначала все бесплатные модели; платный Lumean только для premium
+    при отказе бесплатных. Остальные режимы сохраняют прежний порядок провайдеров.
+    Нет ответа или лимита — отказ, а не автоматическое платное одобрение."""
     errors = []
     # картинки в запросе, а листа для резервных моделей нет — сильной модели нечего показать, сразу Gemini
     if image is None:
@@ -697,7 +698,11 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         if pictures:
             image = pictures[0] if len(pictures) == 1 else _sheet(pictures)
     blind = image is None and any("inline_data" in p for p in gemini_parts)
-    lumean_first = allow_paid and lumean_llm_on() and not blind and (premium or paid_first or LUMEAN_MODE == "all")
+    eligible_paid = allow_paid and lumean_llm_on() and not blind and (
+        LUMEAN_MODE != "balanced" or premium
+    )
+    lumean_first = (eligible_paid and LUMEAN_MODE != "balanced"
+                    and (premium or paid_first or LUMEAN_MODE == "all"))
 
     attempted: set[str] = set()
     global last_engine
@@ -724,7 +729,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         # платная модель: длинное задание урезаем (середина), чтобы один запрос не стоил как десять; важному —
         # длинный ответ (сценарий выпуска из 7 новостей в 4000 токенов не влезал)
         text = _fit(prompt, LUMEAN_MAX_CHARS)
-        long_answer = premium and paid_max_tokens == 4000
+        long_answer = premium and paid_max_tokens == 4000 and LUMEAN_MODE != "balanced"
         attempts = ((LUMEAN_LONG_TOKENS, LUMEAN_RETRY_TOKENS)
                     if long_answer and LUMEAN_ALLOW_PAID_RETRY else
                     (LUMEAN_LONG_TOKENS,) if long_answer else (paid_max_tokens,))
@@ -767,7 +772,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             return result
         except Exception as exc:  # noqa: BLE001
             failed("reserve", exc, f"резервный ИИ не ответил за {RESERVE_BUDGET} с")
-    if allow_paid and not lumean_first and lumean_llm_on() and not blind:  # explicit opt-in fallback
+    if eligible_paid and not lumean_first and LUMEAN_MODE != "balanced":  # legacy paid fallback
         result = await ask_lumean()
         if result is not None:
             return result
@@ -783,6 +788,10 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             return result
         except Exception as exc:  # noqa: BLE001
             failed("beat", exc, f"BeatAPI не ответил за {wait} с")
+    if eligible_paid and LUMEAN_MODE == "balanced":  # only premium tasks, after ALL free alternatives
+        result = await ask_lumean()
+        if result is not None:
+            return result
     if not RESERVE_KEY and not BEAT_KEY:
         errors.append("резервный ИИ не подключён: бот не видит переменную RESERVE_AI_KEY")
     raise AllBusy("; ".join(errors), retry_in(attempted, key))
@@ -997,7 +1006,7 @@ async def proofread(key: str, texts: list[str]) -> list[str]:
     attempts = []
     if key:
         attempts.append(("Gemini", lambda: _ask(key, [{"text": prompt}])))
-    if lumean_llm_on():  # Gemini на лимите — сильная модель: слабые запасные пишут по-русски коряво (на озвучку)
+    if lumean_llm_on() and LUMEAN_MODE != "balanced":  # proofread should not spend in balanced
         attempts.append(("Lumean", lambda: _ask_lumean(prompt)))
     if BEAT_KEY:
         async def beat_gemini() -> Any:
@@ -2835,7 +2844,7 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
     if not facts or not body:
         return blank
     comparison = None
-    if lumean_llm_on() and luna.MODE in {"shadow", "active"} and not cooling("luna"):
+    if lumean_llm_on() and LUMEAN_MODE != "balanced" and luna.MODE in {"shadow", "active"} and not cooling("luna"):
         try:
             prompt, sources = luna.prepare(facts, material)
             data = await _ask_lumean(prompt, max_tokens=min(6000, 800 + 220 * len(facts)), model_override=luna.MODEL)
@@ -2843,7 +2852,7 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Luna fact check unavailable (%s)", type(exc).__name__)
             cooldown("luna", 120, "проверка недоступна")
-    if luna.MODE == "active" and lumean_llm_on():
+    if luna.MODE == "active" and lumean_llm_on() and LUMEAN_MODE != "balanced":
         return comparison if comparison is not None else [
             {**row, "note": "Проверка источников временно недоступна."} for row in blank
         ]
