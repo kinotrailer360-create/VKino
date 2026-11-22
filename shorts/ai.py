@@ -677,10 +677,10 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
                         image: Image.Image | None = None, premium: bool = False,
                         reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS,
                         paid_first: bool = False, paid_max_tokens: int = 4000,
-                        allow_paid: bool = True) -> Any:
-    """В balanced сначала все бесплатные модели; платный Lumean только для premium
-    при отказе бесплатных. Остальные режимы сохраняют прежний порядок провайдеров.
-    Нет ответа или лимита — отказ, а не автоматическое платное одобрение."""
+                        allow_paid: bool = True, essential: bool = False) -> Any:
+    """В balanced сначала все бесплатные модели; Lumean только для premium/essential
+    при их недоступности. Vision/optional проверки НЕ получают платный fallback.
+    Другие режимы сохраняют прежний порядок провайдеров."""
     errors = []
     # картинки в запросе, а листа для резервных моделей нет — сильной модели нечего показать, сразу Gemini
     if image is None:
@@ -699,7 +699,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             image = pictures[0] if len(pictures) == 1 else _sheet(pictures)
     blind = image is None and any("inline_data" in p for p in gemini_parts)
     eligible_paid = allow_paid and lumean_llm_on() and not blind and (
-        LUMEAN_MODE != "balanced" or premium
+        LUMEAN_MODE != "balanced" or premium or essential
     )
     lumean_first = (eligible_paid and LUMEAN_MODE != "balanced"
                     and (premium or paid_first or LUMEAN_MODE == "all"))
@@ -782,17 +782,18 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             tokens = min(tokens, reserve_max_tokens)
         wait = BEAT_LONG_BUDGET if tokens > 4000 else BEAT_BUDGET
         try:
-            result = await asyncio.wait_for(_ask_beat(prompt, image, max_tokens=tokens, timeout=wait), wait)
+            result = await asyncio.wait_for(_ask_beat(prompt, image, max_tokens=tokens, timeout=wait),
+                                            wait + BEAT_QUEUE_WAIT + BEAT_GAP + 10)
             log.info("shorts: BeatAPI (%s) answered", _beat_model or BEAT_MODEL)
             last_engine = "beat"
             return result
         except Exception as exc:  # noqa: BLE001
             failed("beat", exc, f"BeatAPI не ответил за {wait} с")
-    if eligible_paid and LUMEAN_MODE == "balanced":  # only premium tasks, after ALL free alternatives
+    if eligible_paid and LUMEAN_MODE == "balanced":  # only premium/essential, after free alternatives
         result = await ask_lumean()
         if result is not None:
             return result
-    if not RESERVE_KEY and not BEAT_KEY:
+    if not RESERVE_KEY and not BEAT_KEY and not eligible_paid:
         errors.append("резервный ИИ не подключён: бот не видит переменную RESERVE_AI_KEY")
     raise AllBusy("; ".join(errors), retry_in(attempted, key))
 
@@ -899,9 +900,9 @@ async def extract_plan(key: str, text: str, max_films: int = 10,
         parts: list[dict[str, Any]] = [{"text": prompt}]
         for i, img in enumerate(images, 1):
             parts += [{"text": f"Картинка {i}:"}, _thumb(img, 1024)]
-        data = await _with_reserve(key, parts, prompt, _sheet(images, 640, 640, 3))
+        data = await _with_reserve(key, parts, prompt, _sheet(images, 640, 640, 3), essential=True)
     else:
-        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
     films = []
     for f in (data.get("films") if isinstance(data, dict) else None) or []:
         if isinstance(f, dict) and str(f.get("ru") or f.get("en") or "").strip():
@@ -1072,9 +1073,9 @@ async def _beat_stream(resp: aiohttp.ClientResponse, model: str) -> Any:
     return _json_from("".join(chunks))
 
 
-async def _ask_beat(prompt: str, image: Image.Image | None = None, model: str | None = None,
-                    max_tokens: int = 4000, timeout: int = BEAT_BUDGET) -> Any:
-    """Потоковый запрос к BeatAPI. Короткий лимит ждём один раз."""
+async def _ask_beat_unlocked(prompt: str, image: Image.Image | None = None, model: str | None = None,
+                             max_tokens: int = 4000, timeout: int = BEAT_BUDGET) -> Any:
+    """Внутренний потоковый запрос BeatAPI; вызывается только из _ask_beat с очередью."""
     if why := cooling("beat"):
         raise AIError(why)
     model = model or BEAT_MODEL or await _pick_beat_model()
@@ -1105,7 +1106,9 @@ async def _ask_beat(prompt: str, image: Image.Image | None = None, model: str | 
                 await asyncio.sleep(wait)
                 continue
             if status == 429:
-                cooldown("beat", wait or 60, "лимит")
+                # Beat free model permits one successful request/minute/account.
+                # Missing Retry-After must not trigger a burst of new 429s.
+                cooldown("beat", max(wait, BEAT_GAP), "лимит (1 запрос в минуту)")
             elif status >= 500:
                 cooldown("beat", wait or PROVIDER_TIMEOUT_PAUSE, f"HTTP {status}")
             break
@@ -1118,6 +1121,40 @@ async def _ask_beat(prompt: str, image: Image.Image | None = None, model: str | 
         return _json_from(choice["message"]["content"])
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise AIError(f"BeatAPI: неожиданный ответ ({exc})") from exc
+
+
+# BeatAPI free tier: only one successful request per minute across bot tasks.
+# Serialise requests and enforce a gap after the previous attempt, not only after
+# HTTP 429. A bounded queue avoids blocking the whole Telegram bot indefinitely.
+BEAT_GAP = 65.0
+BEAT_QUEUE_WAIT = 130.0
+_beat_gate = asyncio.Lock()
+_beat_next_at = 0.0
+
+
+async def _ask_beat(prompt: str, image: Image.Image | None = None, model: str | None = None,
+                    max_tokens: int = 4000, timeout: int = BEAT_BUDGET) -> Any:
+    global _beat_next_at
+    if why := cooling("beat"):
+        raise AIError(why)
+    try:
+        await asyncio.wait_for(_beat_gate.acquire(), timeout=BEAT_QUEUE_WAIT)
+    except asyncio.TimeoutError as exc:
+        raise AIError("BeatAPI: очередь занята; попробуй позже или используй резерв") from exc
+    try:
+        pause = max(0.0, _beat_next_at - time.monotonic())
+        if pause:
+            await asyncio.sleep(pause)
+        if why := cooling("beat"):
+            raise AIError(why)
+        try:
+            return await _ask_beat_unlocked(prompt, image, model, max_tokens, timeout)
+        finally:
+            # Also throttle HTTP 200 with malformed JSON: the provider may count
+            # that response as a successful request even if the bot rejected it.
+            _beat_next_at = max(_beat_next_at, time.monotonic() + BEAT_GAP)
+    finally:
+        _beat_gate.release()
 
 
 async def match_images(key: str, texts: list[str], images: list[Image.Image],
@@ -2466,7 +2503,7 @@ async def write_review(key: str, brief: str, notes: str = "") -> dict[str, Any]:
         "\"sections\": [{\"heading\": \"...\", \"text\": \"...\"}, ...]}.\n\n"
         "ДАННЫЕ О ФИЛЬМЕ:\n" + brief + author
     )
-    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
     sections = [{"heading": str(s.get("heading") or "").strip()[:40], "text": str(s.get("text") or "").strip()}
                 for s in (data.get("sections") if isinstance(data, dict) else None) or [] if isinstance(s, dict)]
     sections = [s for s in sections if s["text"]]
@@ -2613,7 +2650,7 @@ async def write_lore(key: str, name: str, article: str, hook: str = "") -> dict[
         "Ответь JSON: {\"title\": \"название шортса до 70 символов\", \"en\": \"имя персонажа по-английски\", "
         "\"lines\": [\"фраза\", ...]}.\n\nСТАТЬЯ:\n" + article[:12000]
     )
-    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
     lines = [str(x).strip() for x in (data.get("lines") if isinstance(data, dict) else None) or [] if str(x).strip()]
     if len(lines) < 4:
         raise AIError("ИИ вернул слишком короткий сценарий — попробуй ещё раз")
@@ -2649,7 +2686,7 @@ async def write_news_story(key: str, text: str) -> dict[str, Any]:
         'Ответь только JSON: {"title": "", "person": "", "person_en": "", "films": [""], '
         '"hashtags": ["#..."], "lines": ["фраза", ...], "visuals": []}.\n\nТЕКСТ АВТОРА:\n' + text[:6000]
     )
-    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
     if not isinstance(data, dict):
         raise AIError("ИИ ответил не в том формате — попробуй ещё раз")
     lines = [str(x).strip() for x in data.get("lines") or [] if str(x).strip()]
@@ -2744,7 +2781,7 @@ async def condense_facts(key: str, title: str, text: str, n: int = 5) -> list[st
         "Убери ссылки и названия сайтов-источников. Названия фильмов — в «ёлочках». "
         "Ответь JSON: {\"facts\": [\"...\", ...]}.\n\nТЕКСТ:\n" + text.strip()[:8000]
     )
-    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
     facts = [re.sub(r"\s+", " ", str(f)).strip() for f in (data.get("facts") if isinstance(data, dict) else None) or []]
     facts = [f for f in facts if len(f) >= 20][:n]
     if len(facts) < 3:
@@ -2823,7 +2860,7 @@ async def web_facts(key: str, title: str, en: str = "", year: int | None = None,
     if not extra:
         raise AIError("; ".join(errors) or "нет материала для фактов")
     prompt = rules + " Бери факты ТОЛЬКО из текстов ниже, ничего не добавляй от себя." + extra + tail
-    data = await _with_reserve(key, [{"text": prompt}], prompt)
+    data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
     facts = _clean_facts(data, n)
     if len(facts) < 3:
         raise AIError("ИИ не нашёл хотя бы 3 факта" + (f" ({'; '.join(errors)})" if errors else ""))
@@ -3038,7 +3075,7 @@ async def write_weekly_bookends(key: str, headlines: list[str], next_day: str) -
               "канала — KinoMir360." + GRAMMAR + '\n\nОтветь только JSON: {"intro": ["…"], "outro": ["…"]}\n\n'
               "НОВОСТИ ВЫПУСКА:\n" + "\n".join(f"{i}. {h}" for i, h in enumerate(headlines, 1)))
     try:
-        data = await _with_reserve(key, [{"text": prompt}], prompt)
+        data = await _with_reserve(key, [{"text": prompt}], prompt, essential=True)
         out = {k: [strip_citations(re.sub(r"\s+", " ", str(x))).strip() for x in data.get(k) or [] if str(x).strip()][:4]
                for k in ("intro", "outro")}
     except AllBusy:
