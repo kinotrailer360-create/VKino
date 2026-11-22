@@ -33,8 +33,10 @@ def _env_float(name: str, default: float | None = None) -> float | None:
         return default
 
 
-# Озвучка: месячный лимит соответствует объёму подписки Lumean.
-LIMITS = {"tts": _env_float("TTS_MONTHLY_BUDGET_USD", 1.2) or 1.2}
+# По умолчанию ограничиваем платные AI-вызовы ≈$3/мес (оценка, не тариф провайдера).
+# Озвучка: отдельный месячный лимит соответствует объёму подписки Lumean.
+LIMITS = {"ai": _env_float("AI_MONTHLY_BUDGET_USD", 3.0) or 3.0,
+          "tts": _env_float("TTS_MONTHLY_BUDGET_USD", 1.2) or 1.2}
 POOL_NAMES = {"ai": "ИИ, картинки, музыка", "tts": "озвучка"}
 WARN_SHARE = 0.8  # с 80 % — предупреждение автору (раз в месяц на кошелёк)
 
