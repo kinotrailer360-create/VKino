@@ -68,7 +68,8 @@ def estimate_lumc(payload: dict, input_tokens: int, output_tokens: int) -> float
 
 
 async def preflight(session: aiohttp.ClientSession, key: str, model: str,
-                    estimated_input_tokens: int, max_output_tokens: int) -> float:
+                    estimated_input_tokens: int, max_output_tokens: int,
+                    limit_lumc: float | None = None) -> float:
     """Fail closed if catalog is down or estimated request exceeds author's cap.
 
     Read-only call: no paid generation. This preflight does not replace the
@@ -91,6 +92,10 @@ async def preflight(session: aiohttp.ClientSession, key: str, model: str,
     except (TypeError, OverflowError, ZeroDivisionError) as exc:
         raise PriceCheckUnavailable("Lumean: не удалось рассчитать цену") from exc
     ceiling = max_request_lumc()
+    if limit_lumc is not None:
+        if not math.isfinite(limit_lumc) or limit_lumc <= 0:
+            raise PriceCheckUnavailable("Lumean: некорректный лимит запроса")
+        ceiling = min(ceiling, limit_lumc)
     if estimate > ceiling:
         raise PriceCheckUnavailable(
             f"Lumean: оценка {estimate:.3f} LUMC за запрос превышает лимит {ceiling:.2f} LUMC; "
