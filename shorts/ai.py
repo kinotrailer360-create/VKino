@@ -660,7 +660,6 @@ BEAT_BUDGET = 120
 BEAT_LONG_BUDGET = 180
 PROVIDER_TIMEOUT_PAUSE = 120
 LUMEAN_LONG_TOKENS = 12000
-LUMEAN_RETRY_TOKENS = 24000
 
 
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
@@ -716,7 +715,7 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
         # длинный ответ (сценарий выпуска из 7 новостей в 4000 токенов не влезал)
         text = _fit(prompt, LUMEAN_MAX_CHARS)
         long_answer = premium and paid_max_tokens == 4000
-        attempts = (LUMEAN_LONG_TOKENS, LUMEAN_RETRY_TOKENS) if long_answer else (paid_max_tokens,)
+        attempts = (LUMEAN_LONG_TOKENS,) if long_answer else (paid_max_tokens,)  # never retry paid truncations automatically
         for tokens in attempts:
             wait = lumean_timeout(text, tokens) + 10
             try:
@@ -2824,7 +2823,7 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
     if not facts or not body:
         return blank
     comparison = None
-    if LUMEAN_LLM_KEY and luna.MODE in {"shadow", "active"} and not cooling("luna"):
+    if lumean_llm_on() and luna.MODE in {"shadow", "active"} and not cooling("luna"):
         try:
             prompt, sources = luna.prepare(facts, material)
             data = await _ask_lumean(prompt, max_tokens=min(6000, 800 + 220 * len(facts)), model_override=luna.MODEL)
@@ -2832,7 +2831,7 @@ async def check_facts(key: str, facts: list[str], material: dict[str, str]) -> l
         except Exception as exc:  # noqa: BLE001
             log.warning("shorts: Luna fact check unavailable (%s)", type(exc).__name__)
             cooldown("luna", 120, "проверка недоступна")
-    if luna.MODE == "active":
+    if luna.MODE == "active" and lumean_llm_on():
         return comparison if comparison is not None else [
             {**row, "note": "Проверка источников временно недоступна."} for row in blank
         ]
