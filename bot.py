@@ -7381,7 +7381,11 @@ async def fast_feeds() -> list[str]:
         feeds = json.loads(raw) if raw else None
     except ValueError:
         feeds = None
-    return feeds if isinstance(feeds, list) else list(shorts_fast.DEFAULT_FEEDS)  # [] — автор удалил все
+    if not isinstance(feeds, list):
+        return list(shorts_fast.DEFAULT_FEEDS)
+    if any(entry in shorts_fast.LEGACY_REDDIT_FEEDS for entry in feeds):
+        return shorts_fast.with_reddit_pack(feeds)
+    return feeds  # [] — автор удалил все
 
 
 async def send_qc(bot: Bot, chat_id: int, video: Path, vertical: bool | None = None) -> None:
@@ -8264,6 +8268,13 @@ async def fast_command(message: Message) -> None:
     action, _, arg = (message.text or "").partition(" ")[2].strip().partition(" ")
     arg = arg.strip()
     feeds = await fast_feeds()
+    if action == "reddit":
+        await set_shorts_setting("fast_feeds", json.dumps(shorts_fast.with_reddit_pack(feeds)))
+        names = ", ".join(f"r/{sub}" for sub in shorts_fast.REDDIT_COMMUNITIES)
+        setup = ("\nДля чтения нужен <code>REDLISTEN_API_KEY</code> на сервере."
+                 if not os.getenv("REDLISTEN_API_KEY", "").strip() else "\nСостояние ленты можно проверить через /fast.")
+        await message.answer(f"🎬 <b>{shorts_fast.REDDIT_PACK_LABEL}:</b>\n{names}\n" + setup)
+        return
     if action == "add" and not arg.startswith(("http://", "https://", "x:", "@")):
         await message.answer("Напиши ссылку через пробел после команды, например:\n"
                              "<code>/fast add https://rss.app/feeds/xxxxx.xml</code>\n"
@@ -8293,6 +8304,7 @@ async def fast_command(message: Message) -> None:
     lines.append(
         "\n<code>/fast add URL</code> — добавить RSS (в том числе X через rss.app)\n"
         "<code>/fast add @Имя</code> — аккаунт X через свой RSSHub (COMPOSE_PROFILES=x в .env)\n"
+        "<code>/fast reddit</code> — добавить подборку кино и сериалов с Reddit\n"
         "<code>/fast del N</code> — удалить\n<code>/fast default</code> — стандартный список")
     await wait.edit_text("\n".join(lines), disable_web_page_preview=True)
 

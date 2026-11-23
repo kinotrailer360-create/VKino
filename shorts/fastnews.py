@@ -27,9 +27,22 @@ from . import netsafe
 
 log = logging.getLogger("shorts")
 
-DEFAULT_FEEDS = [
+LEGACY_REDDIT_FEEDS = (
     "https://www.reddit.com/r/movies/search.rss?q=flair%3ANews&restrict_sr=1&sort=new",
     "https://www.reddit.com/r/boxoffice/new/.rss?limit=25",
+)
+REDDIT_COMMUNITIES = (
+    "movies", "television", "boxoffice", "horror", "netflix", "hbo", "DisneyPlus", "Oscars", "Documentaries",
+    "marvelstudios", "MarvelStudiosSpoilers", "DCULeaks", "StarWars", "StarWarsLeaks", "gameofthrones",
+    "HouseOfTheDragon", "StrangerThings", "TheBoys", "breakingbad", "thewalkingdead", "dune", "GODZILLA",
+    "MovieDetails", "MovieSuggestions", "NetflixBestOf", "televisionsuggestions",
+)
+REDDIT_PACK = "reddit:cinema"
+REDDIT_PACK_LABEL = f"Reddit — кино и сериалы ({len(REDDIT_COMMUNITIES)})"
+REDDIT_COMMUNITY_NAMES = frozenset(name.casefold() for name in REDDIT_COMMUNITIES)
+REDDIT_RSS_URL = "https://api.redlisten.com/r/" + "+".join(REDDIT_COMMUNITIES) + "/new.rss?limit=50"
+DEFAULT_FEEDS = [
+    REDDIT_PACK,
     "https://deadline.com/feed/",
     "https://variety.com/v/film/feed/",
     "https://www.hollywoodreporter.com/c/movies/movie-news/feed/",
@@ -45,7 +58,7 @@ HOURS = 12
 PER_FEED = 6
 TEXT_MAX = 900
 REDDIT_SKIP = re.compile(r"\b(?:thread|discussion|megathread|predictions?|projections?|update)\b|\?\s*$", re.I)
-REDDIT_EVERY = 600  # Reddit без входа режет частые запросы (429): одну ленту — не чаще раза в 10 минут
+REDDIT_EVERY = 3600  # Пауза после успешной загрузки общей ленты.
 REDDIT_STALE = 6 * 3600  # при отказе берём последнюю сохранённую ленту, если ей меньше 6 часов
 _reddit_cache: dict[str, tuple[float, bytes]] = {}
 _reddit_retry: dict[str, float] = {}
@@ -55,6 +68,24 @@ REDDIT_BACKOFF = 6 * 3600
 class RedditRateLimited(RuntimeError):
     """Temporary upstream throttle, distinct from a broken source."""
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://t.me/KinoMir360)"}
+
+
+def with_reddit_pack(feeds: list[str]) -> list[str]:
+    """Add the pack once; replace the two retired defaults while preserving other sources."""
+    return list(dict.fromkeys(REDDIT_PACK if entry in LEGACY_REDDIT_FEEDS else entry
+                              for entry in [*feeds, REDDIT_PACK]))
+
+
+def _reddit_name(url: str) -> str:
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return ""
+    host = parts.hostname or ""
+    match = re.match(r"/r/([A-Za-z0-9_]+)(?:/|$)", parts.path, re.I)
+    if match and parts.scheme in {"https", "http"} and (host == "reddit.com" or host.endswith(".reddit.com")):
+        return match[1]
+    return ""
 
 
 def nitter() -> str:
@@ -79,13 +110,15 @@ def feed_url(entry: str) -> str | None:
         if rsshub():
             return f"{rsshub()}/twitter/user/{m.group(1)}"
         return f"{nitter()}/{m.group(1)}/rss" if nitter() else None
-    if "/r/boxoffice/search.rss" in entry:  # в RSS Reddit нет флеров — поиск по флеру пуст, берём свежие посты
-        return "https://www.reddit.com/r/boxoffice/new/.rss?limit=25"
+    if entry == REDDIT_PACK:
+        return REDDIT_RSS_URL
     return entry if entry.startswith("http") else None
 
 
 def label(entry: str) -> str:
     """Короткое имя источника для ИИ и автора: r/movies, Deadline, X @DanielRPK."""
+    if entry == REDDIT_PACK:
+        return REDDIT_PACK_LABEL
     m = re.fullmatch(r"(?:x:|@|https?://(?:www\.)?(?:x|twitter)\.com/)@?(\w{1,30})/?", entry.strip(), re.I)
     if m:
         return f"X @{m.group(1)}"
@@ -155,6 +188,12 @@ def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> li
             continue
         if source.startswith("Reddit") and REDDIT_SKIP.search(title):
             continue
+        entry_source = source
+        if source == REDDIT_PACK_LABEL:
+            subreddit = _reddit_name(link)
+            if subreddit.casefold() not in REDDIT_COMMUNITY_NAMES:
+                continue
+            entry_source = f"Reddit r/{subreddit}"
         body = ""
         for part in entry.get("content") or []:
             body = _text(part.get("value"))
@@ -166,7 +205,7 @@ def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> li
         article = _article(entry)
         text = (f"{title}\n{body}".strip() + (f"\nИсточник статьи: {urlparse(article).netloc}" if article else ""))
         image = _image(entry)
-        out.append({"channel": source, "label": source, "url": link, "article_url": article, "title": title,
+        out.append({"channel": entry_source, "label": entry_source, "url": link, "article_url": article, "title": title,
                     "text": text[:TEXT_MAX], "time": published,
                     "image": image, "video": None, "media": [{"image": image}] if image else [], "lang": "en"})
         if len(out) >= per_feed:
@@ -183,6 +222,25 @@ async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
         return await netsafe.fetch(session, url, 5 * 1024 * 1024, trusted)
     async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=20)) as safe:  # чужой адрес — только публичные IP
         return await netsafe.fetch(safe, url, 5 * 1024 * 1024)
+
+
+async def _download_reddit(session: aiohttp.ClientSession) -> bytes:
+    key = os.getenv("REDLISTEN_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Reddit не подключён: нужен REDLISTEN_API_KEY на сервере")
+    async with session.get(REDDIT_RSS_URL, headers={"Authorization": f"Bearer {key}"},
+                           allow_redirects=False, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        resp.raise_for_status()
+        if resp.status != 200:
+            raise RuntimeError(f"Неожиданный ответ Redlisten: HTTP {resp.status}")
+        raw = bytearray()
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            raw.extend(chunk)
+            if len(raw) > 5 * 1024 * 1024:
+                raise ValueError("Лента Redlisten больше 5 МБ")
+        if not is_feed(raw):
+            raise ValueError("Redlisten не вернул RSS или Atom")
+        return bytes(raw)
 
 
 _found_feed: dict[str, str] = {}  # адрес сайта → его RSS, найденный на главной (чтобы не искать каждый раз)
@@ -248,7 +306,7 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
     url = feed_url(entry)
     if not url:
         return []
-    if "reddit.com" in url:  # Reddit режет частые запросы (429): по одному, с паузой, не чаще раза в 10 минут
+    if entry == REDDIT_PACK:
         _reddit = _reddit or asyncio.Lock()
         async with _reddit:
             cached = _reddit_cache.get(url)
@@ -259,9 +317,8 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
             elif cached and time.time() - cached[0] < REDDIT_EVERY:
                 raw = cached[1]
             else:
-                await asyncio.sleep(2)  # пауза между запросами к Reddit (чаще — 429)
                 try:
-                    raw = await _download(session, url)
+                    raw = await _download_reddit(session)
                     _reddit_cache[url] = (time.time(), raw)
                     _reddit_retry.pop(url, None)
                 except aiohttp.ClientResponseError as exc:
@@ -272,19 +329,22 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
                         seconds = float(retry)
                     except ValueError:
                         seconds = REDDIT_BACKOFF
-                    _reddit_retry[url] = time.time() + max(3600, min(seconds, 24 * 3600))
+                    _reddit_retry[url] = time.time() + max(REDDIT_EVERY, min(seconds, 31 * 86400))
                     if not cached or time.time() - cached[0] > REDDIT_STALE:
                         raise RedditRateLimited("Лимит Reddit: ждём следующей попытки") from None
                     log.info("shorts: reddit 429, using cached %s", url)
                     raw = cached[1]
+    elif _reddit_name(url) and ".rss" in urlparse(url).path:
+        raise RuntimeError("Reddit отключил RSS. Добавь новую подборку командой /fast reddit")
     else:
         known = _found_feed.get(url)
         raw = await _download(session, known or url)
         if not known and not is_feed(raw):  # страница сайта — ищем его ленту
             feed, raw = await _site_feed(session, url, raw)
             _found_feed[url] = feed
-    posts = await asyncio.to_thread(parse, raw, label(entry), since, per_feed)
-    if per_feed <= PER_FEED and not entry.startswith("x:") and "reddit.com" not in url:
+    limit = min(50, 4 * per_feed) if entry == REDDIT_PACK else per_feed
+    posts = await asyncio.to_thread(parse, raw, label(entry), since, limit)
+    if per_feed <= PER_FEED and not entry.startswith("x:") and entry != REDDIT_PACK and not _reddit_name(url):
         await _add_images(posts)
     return posts
 
@@ -298,8 +358,7 @@ async def latest(feeds: list[str], hours: float = HOURS, per_feed: int = PER_FEE
 
     async def one(session: aiohttp.ClientSession, entry: str) -> list[dict[str, Any]]:
         try:
-            if "reddit.com" in (feed_url(entry) or ""):
-                # Reddit идёт по одному со своим замком и паузой — общие слоты при этом не занимает
+            if entry == REDDIT_PACK:
                 return await _fetch(session, entry, since, per_feed)
             async with sem:
                 return await _fetch(session, entry, since, per_feed)
@@ -339,7 +398,7 @@ async def check(feeds: list[str]) -> list[tuple[str, int | str, str]]:
         try:
             posts = await _fetch(session, entry, 0, 200)
             url = feed_url(entry) or ""
-            if "reddit.com" in url and time.time() < _reddit_retry.get(url, 0):
+            if entry == REDDIT_PACK and time.time() < _reddit_retry.get(url, 0):
                 return entry, "Лимит Reddit: ждём следующей попытки", name
             fresh = [p for p in posts if p["time"] >= since]
             return entry, len(fresh), name or (posts[0]["label"] if posts else "RSS")
