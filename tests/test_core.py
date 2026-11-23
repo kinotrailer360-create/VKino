@@ -587,6 +587,25 @@ def test_spoken_form_is_cached(tmp_path, monkeypatch):
     assert calls == [["Привет", "Пока"], ["Новая"]]
 
 
+def test_spoken_lines_keep_question_and_exclamation_from_cached_text(tmp_path, monkeypatch):
+    import asyncio
+    from shorts import ai, daily
+
+    monkeypatch.setattr(daily, "SPOKEN_CACHE", tmp_path / "spoken.json")
+
+    async def simplify(texts, **kwargs):
+        return ["Вы это видели.", "Вот это поворот", "«Кто там!»"]
+
+    async def no_accent(texts):
+        return texts
+
+    monkeypatch.setattr(ai, "spoken_form", simplify)
+    monkeypatch.setattr(daily, "_accent", no_accent)
+    lines = ["Вы это видели?", "Вот это поворот!", "«Кто там?»"]
+    assert asyncio.run(daily.spoken_lines(lines)) == lines
+    assert asyncio.run(daily.spoken_lines(lines)) == lines
+
+
 def test_project_revoice_only_fixed_phrase(tmp_path, monkeypatch):
     """«🎙 Только звук»: исправленная фраза встаёт на своё место, остальные и длина ролика — как были."""
     import asyncio
