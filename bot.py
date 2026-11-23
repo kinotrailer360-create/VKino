@@ -14077,7 +14077,7 @@ async def hype_scan() -> list[dict[str, Any]]:
 
 
 async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> None:
-    """«🔥 Инфоповод» автору: о чём, сколько источников, кнопки «Пост», «Тизер», «Текст для рекламы»."""
+    """Карточка для редактора, материалы и кнопки подготовки черновиков."""
     hid = secrets.token_hex(4)
     hype_cache[hid] = g
     for old in list(hype_cache)[:-40]:
@@ -14085,20 +14085,27 @@ async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> None:
     hist = await _posts_history()
     stories = [st for st in hist["stories"] if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
     posted = _repeats(set(g["tokens"]), stories)
-    head = f"🔥 <b>Инфоповод</b> — пишут {g['sources']} источника(ов)"
+    card = shorts_hype.card(g)
+    head = f"🔥 <b>{escape(card['headline'])}</b>"
     if g["franchise"]:
         head += f" · громкое имя: <b>{escape(g['franchise'])}</b>"
-    lines = [head, ""]
-    for p in g["posts"][:3]:
-        lines.append("— " + escape(re.sub(r"\s+", " ", p.get("text") or "")[:180]) + "…")
-    links = " · ".join(
-        f'<a href="{escape(p["url"])}">{escape(str(p.get("channel") or p.get("label") or "источник"))[:24]}</a>'
-        for p in g["posts"][:6] if p.get("url"))
-    lines.append("\nИсточники: " + links)
-    lines.append("\n✅ Пост об этом в канале уже был — сделай тизер и рекламу." if posted else
-                 "\n⚡ Хайп держится 3–5 дней — лучше выйти с постом сегодня.")
+    lines = [head, f"<b>{escape(card['status'])}</b>"]
+    posts = sorted(g["posts"], key=shorts_hype.source_rank, reverse=True)
+    for p in posts[:2]:
+        excerpt = re.sub(r"\s+", " ", p.get("text") or "")
+        lines.append("— " + escape(excerpt[:180]) + ("…" if len(excerpt) > 180 else ""))
+
+    def links(items: list[tuple[str, str]]) -> str:
+        return " · ".join(f'<a href="{escape(url)}">{escape(label[:36])}</a>' for url, label in items)
+
+    if card["links"]:
+        lines.append("\nИсточники: " + links(card["links"]))
+    if card["media"]:
+        lines.append("Кандидаты для видеоряда: " + links(card["media"]))
+    if posted:
+        lines.append("\n✅ Пост об этом в канале уже был.")
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("📝 Пост в канал сейчас", f"hy:p:{hid}")],
+        [_btn("📝 Черновик поста", f"hy:p:{hid}"), _btn("🎬 Сценарий Shorts", f"hy:s:{hid}")],
         [_btn("🎬 Тизер-ролик (Telegram и MAX)", f"hy:t:{hid}")],
         [_btn("📣 Текст для посева и Директа", f"hy:a:{hid}")]])
     for chat_id in chat_ids:
@@ -14160,7 +14167,7 @@ async def hype_command(message: Message) -> None:
         return
     if not groups:
         auto = "выключена — /hype on" if await shorts_setting("hype") == "off" else "каждые 20 минут"
-        await wait.edit_text("Сейчас громких инфоповодов нет (нужно от 3 источников, для больших франшиз — от 2). "
+        await wait.edit_text("Сейчас новых инфоповодов нет. "
                              f"Автопроверка: {auto}.")
         return
     await wait.delete()
@@ -14183,7 +14190,7 @@ async def _hype_teaser_job(bot: Bot, chat_id: int, g: dict[str, Any]) -> None:
 
 
 @router.callback_query(F.data.startswith("hy:"))
-async def hype_buttons(callback: CallbackQuery) -> None:
+async def hype_buttons(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user.id not in ADMIN_IDS or not callback.message:
         await callback.answer()
         return
@@ -14204,6 +14211,30 @@ async def hype_buttons(callback: CallbackQuery) -> None:
             except Exception as exc:  # noqa: BLE001
                 await bot.send_message(chat_id, f"❌ <code>{escape(_safe_err(exc)[:400])}</code>")
         _run_job(post_job)
+    elif kind == "s":
+        message = callback.message
+        if message.chat.type != "private":
+            await message.answer("Открой карточку в личном чате с ботом для согласования сценария.")
+            return
+        plan = g.get("short_plan")
+        if not plan:
+            if g.get("short_plan_pending"):
+                await message.answer("Сценарий по этой теме уже готовится.")
+                return
+            g["short_plan_pending"] = True
+            try:
+                wait = await message.answer("🎬 Пишу сценарий и подбираю запросы для поиска кадров…")
+                try:
+                    plan = await shorts_hype.short_plan(GEMINI_API_KEY, g)
+                except Exception as exc:  # noqa: BLE001
+                    logging.info("Hype Shorts script failed: %s", _safe_err(exc))
+                    await _edit_quiet(wait, "Сценарий не готов. Можно повторить кнопкой Shorts.")
+                    return
+                g["short_plan"] = plan
+                await _edit_quiet(wait, "Сценарий готов к согласованию.")
+            finally:
+                g.pop("short_plan_pending", None)
+        await show_structured_plan(message, state, copy.deepcopy(plan))
     elif kind == "t":
         await bot.send_message(chat_id, "🎬 Собираю тизер-ролики (Telegram и MAX), пара минут…")
 
@@ -15671,6 +15702,10 @@ async def structured_task_start(message: Message, state: FSMContext, text: str) 
     except ValueError as exc:
         await message.answer(f"⚠️ {escape(str(exc))}")
         return
+    await show_structured_plan(message, state, plan)
+
+
+async def show_structured_plan(message: Message, state: FSMContext, plan: dict) -> None:
     async with structured_task_lock:
         draft = secrets.token_hex(8)
         await state.set_state(None)

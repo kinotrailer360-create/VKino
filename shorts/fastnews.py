@@ -166,7 +166,8 @@ def parse(raw: bytes, source: str, since: float, per_feed: int = PER_FEED) -> li
         article = _article(entry)
         text = (f"{title}\n{body}".strip() + (f"\nИсточник статьи: {urlparse(article).netloc}" if article else ""))
         image = _image(entry)
-        out.append({"channel": source, "label": source, "url": link, "text": text[:TEXT_MAX], "time": published,
+        out.append({"channel": source, "label": source, "url": link, "article_url": article, "title": title,
+                    "text": text[:TEXT_MAX], "time": published,
                     "image": image, "video": None, "media": [{"image": image}] if image else [], "lang": "en"})
         if len(out) >= per_feed:
             break
