@@ -14177,22 +14177,33 @@ async def hype_scan() -> list[dict[str, Any]]:
     """Громкие истории за 8 часов, о которых ещё не было уведомления (за 3 дня)."""
     own = POST_CHANNEL.lstrip("@").lower()
     channels = [c for c in await fact_channels() if c.lower() != own]
-    posts = await shorts_tgsearch.latest(channels, hours=8, per_channel=6)
-    try:
-        posts += await shorts_fast.latest(await fast_feeds(), timeout=50)
-    except Exception as exc:  # noqa: BLE001
-        logging.info("Hype: fast sources failed: %s", exc)
+    feeds = await fast_feeds()
+    results = await asyncio.gather(shorts_tgsearch.latest(channels, hours=8, per_channel=6),
+                                   shorts_fast.latest(feeds, timeout=50), return_exceptions=True)
+    posts = []
+    for component in results:
+        if isinstance(component, list):
+            posts.extend(component)
+        else:
+            logging.info("Hype: source scan failed: %s", component)
     seen = json.loads(await shorts_setting("hype_seen") or "[]")
     out = []
-    for g in shorts_hype.hot(shorts_hype.clusters(posts, _key_tokens, _shared)):
+    groups = shorts_hype.clusters(posts, _key_tokens, _shared)
+    links_seen = {url for entry in seen if time.time() - entry.get("at", 0) < STORY_HOURS * 3600
+                  for url in entry.get("links", [])}
+    for g in shorts_hype.hot(groups):
         toks = set(g["tokens"])
-        if _repeats(toks, seen) or _repeats(toks, seen, english=True):
+        if (any(p.get("url") in links_seen for p in g["posts"]) or _repeats(toks, seen)
+                or _repeats(toks, seen, english=True)):
             continue
         out.append(g)
+    await set_shorts_setting("hype_scan_status", json.dumps({"at": time.time(), "posts": len(posts),
+        "x": sum(str(p.get("channel") or "").startswith("X @") for p in posts), "groups": len(groups),
+        "eligible": len(out), "failed": sum(isinstance(x, BaseException) for x in results)}))
     return out
 
 
-async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> None:
+async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> bool:
     """Карточка для редактора, материалы и кнопки подготовки черновиков."""
     hid = secrets.token_hex(4)
     hype_cache[hid] = g
@@ -14224,24 +14235,31 @@ async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> None:
         [_btn("📝 Черновик поста", f"hy:p:{hid}"), _btn("🎬 Сценарий Shorts", f"hy:s:{hid}")],
         [_btn("🎬 Тизер-ролик (Telegram и MAX)", f"hy:t:{hid}")],
         [_btn("📣 Текст для посева и Директа", f"hy:a:{hid}")]])
+    delivered = False
     for chat_id in chat_ids:
         try:
             await bot.send_message(chat_id, "\n".join(lines), reply_markup=markup, disable_web_page_preview=True)
+            delivered = True
         except Exception:  # noqa: BLE001
             logging.exception("Hype alert failed")
+    return delivered
 
 
 async def _hype_remember(g: dict[str, Any]) -> None:
     seen = [st for st in json.loads(await shorts_setting("hype_seen") or "[]")
             if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
-    seen.append({"at": int(time.time()), "tokens": g["tokens"][:120]})
+    seen.append({"at": int(time.time()), "tokens": g["tokens"][:120],
+                 "links": [url for p in g["posts"][:12] if (url := shorts_hype.public_link(p.get("url")))]})
     await set_shorts_setting("hype_seen", json.dumps(seen[-80:], ensure_ascii=False))
 
 
 async def hype_loop(bot: Bot) -> None:
     """Раз в 20 минут (кроме ночи): громкие инфоповоды — уведомление автору, не больше HYPE_MAX_DAY в день."""
+    first = True
     while True:
-        await asyncio.sleep(HYPE_EVERY)
+        if not first:
+            await asyncio.sleep(HYPE_EVERY)
+        first = False
         try:
             if await shorts_setting("hype") == "off":
                 continue
@@ -14254,10 +14272,10 @@ async def hype_loop(bot: Bot) -> None:
             if day["n"] >= HYPE_MAX_DAY:
                 continue
             for g in (await hype_scan())[:HYPE_MAX_DAY - day["n"]]:
-                await hype_alert(bot, g, sorted(ADMIN_IDS))
-                await _hype_remember(g)
-                day["n"] += 1
-            await set_shorts_setting("hype_day", json.dumps(day))
+                if await hype_alert(bot, g, sorted(ADMIN_IDS)):
+                    day["n"] += 1
+                    await set_shorts_setting("hype_day", json.dumps(day))
+                    await _hype_remember(g)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -14270,6 +14288,22 @@ async def hype_command(message: Message) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         return
     arg = (message.text or "").partition(" ")[2].strip().lower()
+    if arg == "status":
+        auto = await shorts_setting("hype") != "off"
+        now = datetime.now(POST_TZ)
+        day = json.loads(await shorts_setting("hype_day") or "{}")
+        sent = day.get("n", 0) if day.get("d") == now.date().isoformat() else 0
+        scan = json.loads(await shorts_setting("hype_scan_status") or "{}")
+        text = ("🔥 Автопроверка " + ("включена" if auto else "выключена")
+                + f". Отправлено сегодня: {sent}/{HYPE_MAX_DAY}.")
+        if scan.get("at"):
+            at = datetime.fromtimestamp(scan["at"], POST_TZ)
+            text += (f"\nПоследняя проверка {at:%d.%m %H:%M}. Прочитано постов: {scan['posts']} (из X: {scan['x']})."
+                     f"\nСгруппировано тем: {scan['groups']}. Подходят для карточки: {scan['eligible']}.")
+            if scan["failed"]:
+                text += " Часть источников недоступна."
+        await message.answer(text + "\nПроверить сейчас — /hype. Состояние лент — /fast.")
+        return
     if arg in ("on", "off"):
         await set_shorts_setting("hype", arg)
         await message.answer("🔥 Уведомления об инфоповодах " + (
@@ -14288,8 +14322,8 @@ async def hype_command(message: Message) -> None:
         return
     await wait.delete()
     for g in groups[:3]:
-        await hype_alert(message.bot, g, [message.chat.id])
-        await _hype_remember(g)
+        if await hype_alert(message.bot, g, [message.chat.id]):
+            await _hype_remember(g)
 
 
 async def _hype_teaser_job(bot: Bot, chat_id: int, g: dict[str, Any]) -> None:

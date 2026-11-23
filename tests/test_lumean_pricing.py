@@ -6,6 +6,35 @@ import pytest
 from shorts import lumean_pricing
 
 
+def test_elevenlabs_template_updates_when_delivery_settings_change(monkeypatch):
+    from shorts import lumean
+
+    created = []
+
+    async def call(session, method, route, **kwargs):
+        if method == 'GET':
+            return {'items': [{'name': 'KinoMir360 TTS', 'id': 'old-template'}]}
+        created.append(kwargs['json'])
+        return {'id': str(len(created))}
+
+    monkeypatch.setattr(lumean, '_call', call)
+    monkeypatch.setattr(lumean, '_templates', {})
+    monkeypatch.setattr(lumean, 'SPEED', 1.15)
+    assert asyncio.run(lumean._template_id(None, 'elevenlabs', 'voice')) == '1'
+    assert asyncio.run(lumean._template_id(None, 'elevenlabs', 'voice')) == '1'
+    monkeypatch.setattr(lumean, 'SPEED', 1.1)
+    assert asyncio.run(lumean._template_id(None, 'elevenlabs', 'voice')) == '2'
+    assert created[0]['name'] != created[1]['name']
+    assert created[1]['config']['tts_settings']['voice_settings']['speed'] == 1.1
+
+
+def test_narration_gaps_follow_punctuation():
+    from shorts.daily import narration_gap
+
+    assert narration_gap('Он открывает дверь') < narration_gap('и вдруг,') < narration_gap('Всё стихло.')
+    assert narration_gap('«И кто там?»') > narration_gap('Всё стихло.')
+
+
 def catalog(input_rate=2000000, output_rate=3000000, *, model="gpt-4.1-mini"):
     # Precision 6, so 2_000_000 minor / 10**6 = 2 LUMC / 1m input tokens.
     return {
