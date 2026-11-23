@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from typing import Any, AsyncIterator, Callable
 
 log = logging.getLogger("shorts")
@@ -37,6 +38,8 @@ def _env_float(name: str, default: float | None = None) -> float | None:
 # Озвучка: отдельный месячный лимит соответствует объёму подписки Lumean.
 LIMITS = {"ai": _env_float("AI_MONTHLY_BUDGET_USD", 3.0) or 3.0,
           "tts": _env_float("TTS_MONTHLY_BUDGET_USD", 1.2) or 1.2}
+# Одобренное повышение на ноябрь. Месяц в журнале Docker/PostgreSQL отсчитывается по UTC.
+_AI_LIMIT_NOVEMBER_2026 = 15.0
 POOL_NAMES = {"ai": "ИИ, картинки, музыка", "tts": "озвучка"}
 WARN_SHARE = 0.8  # с 80 % — предупреждение автору (раз в месяц на кошелёк)
 
@@ -75,6 +78,12 @@ class BudgetExceeded(RuntimeError):
 def attach(pool_getter: Callable[[], Any]) -> None:
     global _pool_getter
     _pool_getter = pool_getter
+
+
+def monthly_limit(pool: str, today: date | None = None) -> float | None:
+    if pool == "ai" and date(2026, 11, 1) <= (today or datetime.now(UTC).date()) < date(2026, 12, 1):
+        return _AI_LIMIT_NOVEMBER_2026
+    return LIMITS.get(pool)
 
 
 def price(name: str) -> float:
@@ -142,7 +151,7 @@ async def reserve(pool: str, op: str, estimate: float, provider: str = "") -> Re
     """Зарезервировать оценку до запроса; не влезает в лимит — BudgetExceeded (бесплатное — всегда можно)."""
     if not _pool_getter:  # база не подключена (тесты, отдельный процесс монтажа) — без учёта
         return Reservation(None, pool, estimate)
-    limit = LIMITS.get(pool)
+    limit = monthly_limit(pool)
     used = 0.0
     async with _lock:
         conn_pool = _pool_getter()
@@ -155,7 +164,7 @@ async def reserve(pool: str, op: str, estimate: float, provider: str = "") -> Re
             rid = await conn.fetchval(
                 "INSERT INTO ai_usage (pool, op, provider, status, estimate_usd) VALUES ($1, $2, $3, 'reserved', $4) "
                 "RETURNING id", pool, op, provider, estimate)
-    month_key = f"{pool}:{__import__('datetime').date.today():%Y-%m}"
+    month_key = f"{pool}:{datetime.now(UTC):%Y-%m}"
     if limit is not None and estimate > 0 and used + estimate >= limit * WARN_SHARE and month_key not in _warned:
         _warned.add(month_key)
         text = (f"⚠️ Бюджет «{POOL_NAMES[pool]}»: потрачено {used + estimate:.2f}$ из {limit:g}$ (80 %). "
@@ -195,7 +204,7 @@ async def status_lines() -> list[str]:
     out = []
     for pool in POOL_NAMES:
         used = await spent(pool)
-        limit = LIMITS.get(pool)
+        limit = monthly_limit(pool)
         if limit is None:
             out.append(f"💵 {POOL_NAMES[pool]}: ≈{used:.2f}$ за месяц")
             continue

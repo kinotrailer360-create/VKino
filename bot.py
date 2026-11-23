@@ -8823,7 +8823,7 @@ async def ai_status_action(message: Message) -> None:
              "off": "выключен для текстов"}
     rows.append(f"\n💳 <b>Lumean для текстов</b>: {modes.get(shorts_ai.LUMEAN_MODE, shorts_ai.LUMEAN_MODE)}")
     rows.append("🛡 Платные запросы ограничены: месяц — "
-                f"{shorts_budget.LIMITS['ai']:.2f}$ (внутренний расчёт), "
+                f"{shorts_budget.monthly_limit('ai'):.2f}$ (внутренний расчёт), "
                 "один запрос — по текущему прайсу Lumean. "
                 "Дополнительно задайте месячный AI-лимит самому API-ключу в кабинете Lumean.")
     if u["date"] == date.today().isoformat() and u["calls"]:
