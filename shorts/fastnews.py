@@ -42,13 +42,14 @@ REDDIT_PACK = "reddit:cinema"
 REDDIT_PACK_LABEL = f"Reddit — кино и сериалы ({len(REDDIT_COMMUNITIES)})"
 REDDIT_COMMUNITY_NAMES = frozenset(name.casefold() for name in REDDIT_COMMUNITIES)
 REDDIT_RSS_URL = "https://api.redlisten.com/r/" + "+".join(REDDIT_COMMUNITIES) + "/new.rss?limit=50"
+WORLD_OF_REEL_RSS = "https://www.worldofreel.com/blog?format=rss"
 DEFAULT_FEEDS = [
     REDDIT_PACK,
     "https://deadline.com/feed/",
     "https://variety.com/v/film/feed/",
     "https://www.hollywoodreporter.com/c/movies/movie-news/feed/",
     "https://www.theinsneider.com/feed",
-    "https://www.worldofreel.com/blog?format=rss",
+    WORLD_OF_REEL_RSS,
     "https://bloody-disgusting.com/feed/",
     "x:DiscussingFilm",
     "x:DanielRPK",
@@ -291,6 +292,11 @@ ALT = re.compile(r'<link[^>]+type=["\']application/(?:rss|atom)\+xml["\'][^>]*>'
 OG_IMAGE = re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)'
                       r'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)',
                       re.I)
+FIRECRAWL_SCRAPE = "https://api.firecrawl.dev/v2/scrape"
+FIRECRAWL_INTERVAL = 2 * 3600
+_firecrawl_lock = asyncio.Lock()
+_firecrawl_next = 0.0
+_firecrawl_rss: bytes | None = None
 OG_EVERY = 4  # у скольких новостей сайта без картинки в ленте искать её на странице статьи
 
 
@@ -303,6 +309,33 @@ def google_news(host: str) -> str:
 def is_feed(raw: bytes) -> bool:
     head = raw[:600].lstrip().lower()
     return head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head
+
+
+async def _worldofreel_via_firecrawl(session: aiohttp.ClientSession, key: str) -> bytes:
+    global _firecrawl_next, _firecrawl_rss
+    async with _firecrawl_lock:
+        if time.monotonic() < _firecrawl_next:
+            if _firecrawl_rss is not None:
+                return _firecrawl_rss
+            raise ValueError("Firecrawl: ждём следующей попытки")
+        _firecrawl_next = time.monotonic() + FIRECRAWL_INTERVAL
+        _firecrawl_rss = None
+        body = {"url": WORLD_OF_REEL_RSS, "formats": ["rawHtml"], "onlyMainContent": False,
+                "maxAge": 0, "proxy": "basic", "timeout": 8000}
+        async with session.post(FIRECRAWL_SCRAPE, json=body, headers={"Authorization": f"Bearer {key}"},
+                                allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"Firecrawl HTTP {resp.status}")
+            payload = await resp.json()
+        data = payload.get("data") if isinstance(payload, dict) and payload.get("success") is True else None
+        xml = data.get("rawHtml") if isinstance(data, dict) else None
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        raw = xml.encode("utf-8") if isinstance(xml, str) else b""
+        if (not isinstance(metadata, dict) or metadata.get("statusCode") != 200
+                or len(raw) > 5 * 1024 * 1024 or not is_feed(raw)):
+            raise ValueError("Firecrawl не вернул RSS World of Reel")
+        _firecrawl_rss = raw
+        return raw
 
 
 async def _site_feed(session: aiohttp.ClientSession, url: str, raw: bytes) -> tuple[str, bytes]:
@@ -384,23 +417,30 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
         host = (parts.hostname or "").removeprefix("www.")
         empire_home = host == "empireonline.com" and parts.path in ("", "/") and not parts.query
         known = EMPIRE_RSS if empire_home else _found_feed.get(url)
+        worldofreel_rss = host == "worldofreel.com" and parts.path == "/blog" and parts.query == "format=rss"
         try:
             raw = await _download(session, known or url)
-            if empire_home and not is_feed(raw):
-                raise ValueError("RSS Empire вернул ответ без ленты")
+            if (empire_home or worldofreel_rss) and not is_feed(raw):
+                raise ValueError(f"{host} не вернул RSS или Atom")
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             mirror = FX_FEED_MIRRORS.get(host)
             forbidden = isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403
             if (mirror and FX_FEED_PATH.fullmatch(parts.path)
                     and isinstance(exc, aiohttp.ClientResponseError) and exc.status == 404):
                 fallback = parts._replace(netloc=mirror).geturl()
-            elif empire_home or (forbidden and host in GOOGLE_NEWS_ON_FORBIDDEN):
+            elif worldofreel_rss or empire_home or (forbidden and host in GOOGLE_NEWS_ON_FORBIDDEN):
                 fallback = google_news(host)
             else:
                 raise
-            raw = await _download(session, fallback)
-            if not is_feed(raw):
-                raise ValueError(f"{urlparse(fallback).hostname} не вернул RSS или Atom")
+            try:
+                raw = await _download(session, fallback)
+                if not is_feed(raw):
+                    raise ValueError(f"{urlparse(fallback).hostname} не вернул RSS или Atom")
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                key = os.getenv("FIRECRAWL_API_KEY", "").strip() if worldofreel_rss else ""
+                if not key:
+                    raise
+                raw = await _worldofreel_via_firecrawl(session, key)
         else:
             if not known and not is_feed(raw):  # страница сайта — ищем его ленту
                 feed, raw = await _site_feed(session, url, raw)

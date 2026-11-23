@@ -11,6 +11,7 @@ on:
       - 'shorts/studio_media_picker.js'
       - 'shorts/studio_social_sources.py'
       - 'tests/test_studio*.py'
+      - 'tests/browser/**'
       - '.github/workflows/studio-smoke.yml'
   push:
     branches: [main]
@@ -23,6 +24,7 @@ on:
       - 'shorts/studio_media_picker.js'
       - 'shorts/studio_social_sources.py'
       - 'tests/test_studio*.py'
+      - 'tests/browser/**'
       - '.github/workflows/studio-smoke.yml'
 
 permissions:
@@ -50,3 +52,9 @@ jobs:
         run: node --check shorts/studio_media_picker.js
       - name: Studio regression tests
         run: python -m pytest -q tests/test_studio.py tests/test_studio_trailer_candidates.py tests/test_studio_batch_media.py tests/test_studio_media_library.py tests/test_studio_social_sources.py
+      - name: Install Playwright and Chromium
+        run: |
+          python -m pip install playwright==1.62.0
+          python -m playwright install --with-deps chromium
+      - name: Studio browser smoke test
+        run: python -m pytest -q tests/browser
