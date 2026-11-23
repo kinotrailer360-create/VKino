@@ -65,6 +65,83 @@ def test_cache_is_bound_to_text(tmp_path, monkeypatch):
     assert all('approved' not in s for s in scenes)
 
 
+class ReviewStore:
+    """In-memory stand-in for the two queries against the review table."""
+
+    def __init__(self):
+        self.rows = {}
+
+    async def fetchval(self, sql, key):
+        return self.rows.get(key)
+
+    async def execute(self, sql, key, reason):
+        self.rows[key] = reason
+
+
+@pytest.mark.parametrize('context', ['', 'remix'])
+def test_confirmed_review_is_reused_across_assemblies(tmp_path, monkeypatch, context):
+    image = tmp_path / 'frame.jpg'
+    Image.new('RGB', (40, 40), 'blue').save(image)
+    calls = []
+
+    async def check(key, frames, text):
+        calls.append(text)
+        return True, 'Подходит'
+
+    monkeypatch.setattr(guard, '_review_pool', ReviewStore(), raising=False)
+    monkeypatch.setattr(ai, 'media_fits', check)
+    monkeypatch.setattr(ai, 'remix_media_fits', check)
+    scene = dict(image=image.name, text='Доктор Дум', start=0, end=3)
+    asyncio.run(guard.audit(tmp_path, [scene], context=context))
+    asyncio.run(guard.audit(tmp_path, [scene], context=context))
+    asyncio.run(guard.audit(tmp_path, [dict(scene, text='Тони Старк')], context=context))
+    Image.new('RGB', (40, 40), 'green').save(image)
+    asyncio.run(guard.audit(tmp_path, [scene], context=context))
+
+    assert calls == ['Доктор Дум', 'Тони Старк', 'Доктор Дум']
+    assert 'approved' not in scene
+
+
+def test_provider_outage_is_retried_on_next_assembly(tmp_path, monkeypatch):
+    Image.new('RGB', (40, 40)).save(tmp_path / 'photo.jpg')
+    answers = iter([(None, 'Проверка ИИ недоступна: HTTP 429'), (True, 'Подходит')])
+
+    async def check(*args):
+        return next(answers)
+
+    monkeypatch.setattr(guard, '_review_pool', ReviewStore(), raising=False)
+    monkeypatch.setattr(ai, 'media_fits', check)
+    scene = dict(image='photo.jpg', text='Доктор Дум', start=0, end=3)
+    with pytest.raises(guard.VisualReviewRequired):
+        asyncio.run(guard.audit(tmp_path, [scene]))
+    asyncio.run(guard.audit(tmp_path, [scene]))
+    asyncio.run(guard.audit(tmp_path, [scene]))
+
+
+def test_visual_review_is_invalidated_when_clip_offset_changes(tmp_path, monkeypatch):
+    (tmp_path / 'clip.mp4').write_bytes(b'video')
+    calls = []
+
+    async def command(*args):
+        if args[0] == 'ffprobe':
+            return '{"format":{"duration":10}}'
+        Image.new('RGB', (40, 40)).save(args[-1])
+        return ''
+
+    async def check(key, images, text):
+        calls.append(text)
+        return True, 'Подходит'
+
+    monkeypatch.setattr(guard, '_review_pool', ReviewStore())
+    monkeypatch.setattr(guard, 'command', command)
+    monkeypatch.setattr(ai, 'remix_media_fits', check)
+    scene = dict(clip='clip.mp4', text='Доктор Дум', start=0, end=3, offset=1)
+    for offset in (1, 1, 2):
+        asyncio.run(guard.audit(tmp_path, [dict(scene, offset=offset)], context='remix'))
+
+    assert len(calls) == 2
+
+
 def test_short_clip_rejected_before_model(tmp_path, monkeypatch):
     (tmp_path / 'clip.mp4').write_bytes(b'test')
     async def command(*args):

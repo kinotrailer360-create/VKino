@@ -1,14 +1,55 @@
 """Shared pre-render visual check. A model failure never counts as approval."""
 from __future__ import annotations
+import asyncio
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
 from typing import Any
+import asyncpg
 from PIL import Image
 from . import process as media_process
+
+log = logging.getLogger('shorts')
+_review_pool: asyncpg.Pool | None = None
+# Bump when the criteria for a positive visual verdict or frame sampling change.
+_REVIEW_POLICY_VERSION = 1
+
+
+def attach(pool: asyncpg.Pool) -> None:
+    global _review_pool
+    _review_pool = pool
+
+
+async def cleanup() -> None:
+    if _review_pool is not None:
+        await _review_pool.execute('DELETE FROM visual_review_cache WHERE expires_at <= NOW()', timeout=5)
+
+
+async def _cached_review(pool: asyncpg.Pool, key: str) -> str | None:
+    try:
+        async with asyncio.timeout(1):
+            return await pool.fetchval(
+                'SELECT reason FROM visual_review_cache WHERE key = $1 AND expires_at > NOW()', key,
+            )
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as exc:
+        log.warning('Visual review cache read failed (%s)', type(exc).__name__)
+        return None
+
+
+async def _remember_review(pool: asyncpg.Pool, key: str, reason: str) -> None:
+    try:
+        async with asyncio.timeout(1):
+            await pool.execute(
+                "INSERT INTO visual_review_cache (key, reason, expires_at) VALUES ($1, $2, NOW() + INTERVAL '7 days') "
+                'ON CONFLICT (key) DO UPDATE SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at',
+                key, reason,
+            )
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as exc:
+        log.warning('Visual review cache write failed (%s)', type(exc).__name__)
 
 
 class VisualReviewRequired(RuntimeError):
@@ -76,6 +117,7 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
         samples: list[Image.Image] = []
         scratch: list[Path] = []
         try:
+            interval = None
             start, end = float(scene['start']), float(scene['end'])
             if not all(math.isfinite(t) for t in (start, end)) or start < 0 or end <= start:
                 raise ValueError('Некорректные границы сцены')
@@ -107,6 +149,15 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                     sample = im.convert('RGB')
                     sample.thumbnail((768, 768))
                     samples.append(sample)
+            pool = _review_pool
+            review_key = None
+            cached_reason = None
+            if pool is not None and scene.get('match_source') not in ('author_approved', 'semantic'):
+                frame_ids = [(sample.size, hashlib.sha256(sample.tobytes()).hexdigest()) for sample in samples]
+                review_input = (_REVIEW_POLICY_VERSION, context, text, interval, frame_ids,
+                                ai.MODEL, ai.RESERVE_MODEL, ai.BEAT_MODEL)
+                review_key = hashlib.sha256(json.dumps(review_input, ensure_ascii=False).encode()).hexdigest()
+                cached_reason = await _cached_review(pool, review_key)
             if scene.get('match_source') == 'author_approved':
                 result.update(status='matched', reason='Материал утверждён автором до сборки')
             elif scene.get('match_source') == 'semantic':
@@ -116,6 +167,9 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                     status='matched',
                     reason='Сцена выбрана семантическим подборщиком ИИ; дополнительная проверка пропущена',
                 )
+            elif cached_reason is not None:
+                result.update(status='matched', reason=cached_reason)
+                log.info('Visual review cache hit')
             elif context == 'remix':
                 # Review the shot jointly as an illustration, not as three news photos.
                 fits, reason = await ai.remix_media_fits(key, samples, text)
@@ -146,6 +200,8 @@ async def audit(work: Path, scenes: list[dict[str, Any]], key: str = '', name: s
                         or 'ИИ не дал заключение')
                 else:
                     result.update(status='matched', reason='Проверка ИИ; утверждение автора всё равно требуется')
+            if pool is not None and review_key is not None and cached_reason is None and result['status'] == 'matched':
+                await _remember_review(pool, review_key, result['reason'])
         except (ValueError, OSError, KeyError, TypeError) as exc:
             result.update(status='rejected', issue='media', reason=str(exc)[:240])
         finally:
