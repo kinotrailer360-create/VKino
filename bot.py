@@ -245,6 +245,7 @@ async def quiet_not_modified(event: Any) -> bool | None:
         return True
     return None
 contact_router = Router()  # ответы в переписке «написать админу» — раньше всех остальных обработчиков
+daily_short_router = Router()
 
 MAIN_MENU_LABELS = {
     "🔎 Найти фильм или сериал",
@@ -7507,6 +7508,8 @@ async def run_short(
     chat_ids: list[int],
     theme_key: str | None = None,
     status: Message | None = None,
+    *,
+    strict_theme: bool = False,
 ) -> None:
     async with shorts_lock:
         rows = await db().fetch(
@@ -7548,6 +7551,7 @@ async def run_short(
                     result = await make_daily_short(
                         kp._get, work, theme_key, exclude, music, now.date(), TMDB_API_KEY, feeds,
                         manual=theme_key is not None, gemini_key=GEMINI_API_KEY, trailer_clips=trailer_clips,
+                        strict_theme=strict_theme,
                     )
             except TimeoutError:
                 if not deadline.expired():
@@ -7924,6 +7928,118 @@ async def sources_command(message: Message) -> None:
     await wait.edit_text(text[:4000], disable_web_page_preview=True)
 
 
+DAILY_SHORT_QUESTION = "🎬 Ежедневный Shorts"
+DAILY_SHORT_BUILD = re.compile(r"^собери\s+(?:мне\s+)?(?:(?:shorts|шортс)\s+)?по\s+теме\b", re.I)
+
+
+async def offer_daily_short(bot: Bot, now: datetime) -> None:
+    day = now.date().isoformat()
+    if now.hour < SHORTS_HOUR or await shorts_setting("daily_last_run") == day or not ADMIN_IDS:
+        return
+    theme = shorts_daily.SCHEDULE[now.weekday()]
+    name = (shorts_daily.theme_for(theme, now.date()).header.capitalize() if theme.startswith("genre:")
+            else SHORT_THEMES[theme])
+    offer = await shorts_setting("daily_short_offer") or ""
+    if offer == f"{day}|":  # решение уже принято, даже если перезапуск прервал запись daily_last_run
+        return
+    if not offer.startswith(f"{day}|"):
+        await set_shorts_setting("daily_short_offer", f"{day}|{theme}")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Да, собрать", f"dshort:yes:{day}"), _btn("❌ Нет, пропустить", f"dshort:no:{day}")],
+    ])
+    sent = False
+    for admin in sorted(ADMIN_IDS):
+        try:
+            await bot.send_message(
+                admin, f"{DAILY_SHORT_QUESTION}\n\nСобрать ролик на тему <b>«{escape(name)}»</b>?\n\n"
+                "Можешь ответить «да», «нет» или написать свою тему. Например:\n"
+                "<code>Собери Shorts по теме: Кто такой Доктор Дум?\nНазвание: Почему все боятся Дума?</code>",
+                reply_markup=keyboard,
+            )
+            sent = True
+        except Exception:  # noqa: BLE001
+            logging.exception("Daily Shorts offer not delivered to %s", admin)
+    if sent:
+        await set_shorts_setting("daily_last_run", day)
+
+
+async def claim_daily_short(day: str, *, required: bool = True) -> str | None:
+    if day != datetime.now(MSK).date().isoformat():
+        return None
+    offer = await shorts_setting("daily_short_offer")
+    if not offer or not offer.startswith(f"{day}|") or offer == f"{day}|":
+        return None if required else ""
+    claimed = await db().fetchval("UPDATE shorts_settings SET value = $2 "
+                                  "WHERE key = 'daily_short_offer' AND value = $1 RETURNING value",
+                                  offer, f"{day}|")
+    return offer.partition("|")[2] if claimed else None
+
+
+async def daily_short_choice(message: Message, day: str, approve: bool) -> None:
+    theme = await claim_daily_short(day)
+    if not theme:
+        await message.answer("Этот запрос уже обработан или срок ответа истёк.")
+    elif approve:
+        await start_short(message, theme, strict_theme=True)
+    else:
+        await message.answer("Хорошо, сегодня пропускаю шортс по расписанию.")
+
+
+@daily_short_router.callback_query(F.data.startswith("dshort:"))
+async def daily_short_button(callback: CallbackQuery) -> None:
+    if (callback.from_user.id not in ADMIN_IDS or not isinstance(callback.message, Message)
+            or callback.message.chat.type != "private"):
+        await callback.answer()
+        return
+    match = re.fullmatch(r"dshort:(yes|no):(\d{4}-\d{2}-\d{2})", callback.data or "")
+    await callback.answer()
+    if not match:
+        return
+    choice, day = match.groups()
+    await daily_short_choice(callback.message, day, choice == "yes")
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+
+def daily_short_reply(message: Message) -> bool:
+    reply = message.reply_to_message
+    return bool(reply and reply.from_user and reply.from_user.id == message.bot.id
+                and (reply.text or "").startswith(DAILY_SHORT_QUESTION))
+
+
+@daily_short_router.message(F.chat.type == "private", F.from_user.id.in_(ADMIN_IDS), F.text, ~F.text.startswith("/"),
+                            F.text.regexp(DAILY_SHORT_BUILD) | F.func(daily_short_reply))
+async def daily_short_topic(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    reply = message.reply_to_message if daily_short_reply(message) else None
+    day = (reply.date if reply else datetime.now(MSK)).astimezone(MSK).date().isoformat()
+    if reply and text.casefold().rstrip(".! ") in {"да", "нет"}:
+        await daily_short_choice(message, day, text.casefold().startswith("да"))
+        return
+    parts = re.split(r"\n\s*название\s*:\s*", text, maxsplit=1, flags=re.I)
+    topic = DAILY_SHORT_BUILD.sub("", parts[0], count=1).strip(" :—–-\t\n")
+    title = " ".join(parts[1].split()) if len(parts) > 1 else ""
+    if not 2 <= len(topic) <= 300 or len(title) > 95:
+        await message.answer("Укажи тему от 2 до 300 символов. Название, если нужно, укажи отдельной строкой до 95 символов.")
+        return
+    if (await state.get_data()).get("structured_rendering"):
+        await message.answer("Предыдущий шортс ещё собирается. Напиши тему, когда он будет готов.")
+        return
+    if await claim_daily_short(day, required=bool(reply)) is None:
+        await message.answer("Этот запрос уже обработан или срок ответа истёк. Новую тему можно прислать отдельно.")
+        return
+    wait = await message.answer(f"✍️ Ищу источники и готовлю сценарий по теме «{escape(topic)}»…")
+    try:
+        plan = await asyncio.wait_for(shorts_hype.topic_short_plan(GEMINI_API_KEY, topic, title), timeout=180)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Shorts topic script failed")
+        await wait.edit_text("❌ Сценарий не готов. Напиши тему отдельным сообщением, чтобы повторить.\n"
+                             f"<code>{escape(_safe_err(exc)[:300])}</code>")
+        return
+    await wait.edit_text("Сценарий готов к согласованию.")
+    await show_structured_plan(message, state, plan)
+
+
 async def shorts_daily_loop(
     bot: Bot,
 ) -> None:
@@ -7942,27 +8058,7 @@ async def shorts_daily_loop(
         except Exception:  # noqa: BLE001
             logging.exception("Source health check failed")
         try:
-            now = datetime.now(MSK)
-            today = now.date().isoformat()
-            if (
-                now.hour >= SHORTS_HOUR
-                and await shorts_setting("daily_last_run") != today
-            ):
-                await set_shorts_setting("daily_last_run", today)
-                try:
-                    await run_short(bot, sorted(ADMIN_IDS))
-                except Exception as exc:
-                    logging.exception("Daily short failed")
-                    for admin_id in ADMIN_IDS:
-                        try:
-                            await bot.send_message(
-                                admin_id,
-                                "❌ Ежедневный шортс не собрался:\n"
-                                f"<code>{escape(_safe_err(exc)[-700:])}</code>\n\n"
-                                "Попробуй вручную: /short",
-                            )
-                        except Exception:
-                            pass
+            await offer_daily_short(bot, datetime.now(MSK))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -8040,7 +8136,7 @@ async def short_command(
     await start_short(message, (message.text or "").partition(" ")[2].strip())
 
 
-async def start_short(message: Message, theme: str) -> None:
+async def start_short(message: Message, theme: str, *, strict_theme: bool = False) -> None:
     """Собрать шортс по теме (как в /short) и прислать в этот чат — для команды и кнопок."""
     if theme.lower() in ("facts_new", "facts_old"):
         theme = theme.lower()
@@ -8063,15 +8159,17 @@ async def start_short(message: Message, theme: str) -> None:
             "Без темы — тема дня по расписанию."
         )
         return
-    if shorts_lock.locked():
+    busy = shorts_lock.locked()
+    if busy and not strict_theme:
         await message.answer("⏳ Шортс уже собирается, подожди пару минут.")
         return
 
-    status = await message.answer(progress_bar(0, "Начинаю, обычно это 2–5 минут"))
+    stage = "В очереди после текущей сборки" if busy else "Начинаю, обычно это 2–5 минут"
+    status = await message.answer(progress_bar(0, stage))
 
     async def job() -> None:
         try:
-            await run_short(message.bot, [message.chat.id], theme or None, status)
+            await run_short(message.bot, [message.chat.id], theme or None, status, strict_theme=strict_theme)
         except Exception as exc:
             logging.exception("Manual short failed")
             try:
@@ -19963,6 +20061,7 @@ async def main() -> None:
     dp.message.outer_middleware(subscription_gate)
     dp.callback_query.outer_middleware(subscription_gate)
     dp.include_router(contact_router)
+    dp.include_router(daily_short_router)
     dp.include_router(router)
     commands_task = asyncio.create_task(set_admin_commands(bot))  # не задерживает запуск
 

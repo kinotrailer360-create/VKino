@@ -2764,10 +2764,10 @@ async def make_daily_short(fetch: Fetch, work: Path, theme_key: str | None = Non
                            exclude: set[int] | None = None, music: Path | None = None,
                            today: date | None = None, tmdb_key: str = "",
                            news_feeds: list[str] | None = None, manual: bool = False,
-                           gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
+                           gemini_key: str = "", trailer_clips: bool = True, *, strict_theme: bool = False) -> ShortResult:
     """fetch(path, **params) -> dict — запрос к API Кинопоиска (PoiskKino._get)."""
     result = await _make_short(fetch, work, theme_key, exclude, music, today, tmdb_key, news_feeds, manual,
-                               gemini_key, trailer_clips)
+                               gemini_key, trailer_clips, strict_theme=strict_theme)
     add_english_seo(result)
     return result
 
@@ -2776,7 +2776,7 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
                       exclude: set[int] | None = None, music: Path | None = None,
                       today: date | None = None, tmdb_key: str = "",
                       news_feeds: list[str] | None = None, manual: bool = False,
-                      gemini_key: str = "", trailer_clips: bool = True) -> ShortResult:
+                      gemini_key: str = "", trailer_clips: bool = True, *, strict_theme: bool = False) -> ShortResult:
     today = today or date.today()
     work.mkdir(parents=True, exist_ok=True)
     theme_key = theme_key or SCHEDULE[today.weekday()]
@@ -2786,7 +2786,7 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
         try:
             return await make_birthday_short(work, today, exclude, music, tmdb_key, trailer_clips, fetch, pick)
         except Exception:
-            if manual:
+            if manual or strict_theme:
                 raise
             log.exception("shorts: birthday failed, falling back to genre")
             theme_key = "genre"
@@ -2795,7 +2795,7 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
             return await make_news_short(fetch, work, news_feeds or news.DEFAULT_FEEDS, exclude, music,
                                          tmdb_key, today, gemini_key)
         except RuntimeError:
-            if manual:
+            if manual or strict_theme:
                 raise
             log.exception("shorts: news failed, falling back to genre")
             theme_key = "genre"
@@ -2806,7 +2806,7 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
             return await make_facts_short(fetch, work, query, exclude, music, tmdb_key, gemini_key,
                                           trailer_clips, era=era)
         except RuntimeError:
-            if query:
+            if query or strict_theme:
                 raise
             log.exception("shorts: facts failed, falling back to genre")
             theme_key = "genre"
@@ -2815,7 +2815,7 @@ async def _make_short(fetch: Fetch, work: Path, theme_key: str | None = None,
     # если тема их не набрала — берём жанровую подборку
     await _progress(5, "Подбираю фильмы")
     films = await pick_films(fetch, theme, today, exclude or set())
-    for _ in range(3):
+    for _ in range(0 if strict_theme else 3):
         if len(films) >= FILMS:
             break
         log.info("shorts: theme %s gave %d films, falling back to genre", theme.key, len(films))
