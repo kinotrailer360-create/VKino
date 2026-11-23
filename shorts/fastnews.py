@@ -73,7 +73,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://
 
 def with_reddit_pack(feeds: list[str]) -> list[str]:
     """Add the pack once and replace retired URLs while preserving other sources."""
-    return list(dict.fromkeys(REDDIT_PACK if entry in LEGACY_REDDIT_FEEDS else entry
+    return list(dict.fromkeys(REDDIT_PACK if is_retired_reddit_feed(entry) else entry
                               for entry in [*feeds, REDDIT_PACK]))
 
 
@@ -87,6 +87,14 @@ def _reddit_name(url: str) -> str:
     if match and parts.scheme in {"https", "http"} and (host == "reddit.com" or host.endswith(".reddit.com")):
         return match[1]
     return ""
+
+
+def is_retired_reddit_feed(entry: str) -> bool:
+    url = entry.strip()
+    if url in LEGACY_REDDIT_FEEDS:
+        return True
+    # The curated pack already includes r/boxoffice. Reddit's old RSS no longer works with any query parameters.
+    return _reddit_name(url).casefold() == "boxoffice" and ".rss" in urlparse(url).path.casefold()
 
 
 def nitter() -> str:

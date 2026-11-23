@@ -18,6 +18,27 @@ def test_bot_imports() -> None:
     import bot  # noqa: F401
 
 
+def test_fast_feeds_migrates_boxoffice_url_with_extra_query_parameters(monkeypatch) -> None:
+    import asyncio
+    import json
+
+    import bot
+
+    legacy = "https://www.reddit.com/r/boxoffice/search.rss?q=flair%3A%22Industry+News%22&restrict_sr=1&sort=new"
+    custom = "https://example.org/r/boxoffice/search.rss"
+    feeds = ["reddit:cinema", legacy, custom]
+
+    async def setting(key):
+        assert key == "fast_feeds"
+        return json.dumps(feeds)
+
+    monkeypatch.setattr(bot, "shorts_setting", setting)
+    assert asyncio.run(bot.fast_feeds()) == ["reddit:cinema", custom]
+
+    feeds.clear()
+    assert asyncio.run(bot.fast_feeds()) == []
+
+
 def test_every_button_prefix_has_handler() -> None:
     used = set(re.findall(r'_btn\([^\n]*?,\s*f?"([a-z]+):', SRC))
     used |= set(re.findall(r'callback_data=f?"([a-z]+):', SRC))
