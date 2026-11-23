@@ -7334,7 +7334,15 @@ async def load_pronunciations() -> dict[str, str]:
 
 async def load_voice() -> None:
     """Свой голос (клон, команда /clone) — поверх голоса по умолчанию."""
-    shorts_lumean.use_voice(await shorts_setting("lumean_service"), await shorts_setting("lumean_voice"))
+    rows = await db().fetch("SELECT key, value FROM shorts_settings WHERE key = ANY($1::text[])",
+                            ["lumean_service", "lumean_voice", "lumean_voice_config"])
+    settings = {row["key"]: row["value"] for row in rows}
+    try:
+        config = json.loads(settings.get("lumean_voice_config") or "null")
+    except ValueError:
+        config = None
+    shorts_lumean.use_voice(settings.get("lumean_service"), settings.get("lumean_voice"),
+                            config if isinstance(config, dict) else None)
 
 
 async def fact_channels() -> list[str]:
@@ -8888,34 +8896,37 @@ CLONE_POLL_SECONDS = 20
 CLONE_WAIT_SECONDS = 40 * 60
 
 
-async def set_voice(service: str | None, voice: str | None, name: str | None) -> None:
-    await set_shorts_setting("lumean_service", service)
-    await set_shorts_setting("lumean_voice", voice)
-    await set_shorts_setting("lumean_voice_name", name)
+async def set_voice(service: str | None, voice: str | None, name: str | None,
+                    config: dict | None = None) -> None:
+    settings = {"lumean_service": service, "lumean_voice": voice, "lumean_voice_name": name,
+                "lumean_voice_config": json.dumps(config, ensure_ascii=False) if config else None}
+    async with db().acquire() as conn, conn.transaction():
+        await conn.execute("DELETE FROM shorts_settings WHERE key = ANY($1::text[])",
+                           list(settings))
+        await conn.executemany("INSERT INTO shorts_settings (key, value) VALUES ($1, $2)",
+                               [(key, value) for key, value in settings.items() if value is not None])
 
 
 @router.message(Command("voice_restore"))
 async def voice_restore_command(message: Message) -> None:
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         return
-    order_id = (message.text or "").partition(" ")[2].strip()
-    if not order_id:
+    order = (message.text or "").partition(" ")[2].strip()
+    if not order:
         await message.answer("Открой удачный заказ озвучки в Lumean и отправь "
-                             "<code>/voice_restore ID_заказа</code>.")
+                             "<code>/voice_restore ссылка_на_заказ</code>.")
         return
     try:
-        voice = await shorts_lumean.elevenlabs_voice_from_order(order_id)
+        config = await shorts_lumean.elevenlabs_config_from_order(order)
     except (shorts_lumean.LumeanError, aiohttp.ClientError, TimeoutError) as exc:
-        await message.answer(f"❌ Не удалось найти голос заказа: <code>{escape(_safe_err(exc)[:250])}</code>")
+        await message.answer(f"❌ Не удалось восстановить настройки заказа — <code>{escape(_safe_err(exc)[:250])}</code>")
         return
+    voice = config["tts_settings"]["voice_id"]
     await load_voice()
-    if shorts_lumean.SERVICE == "elevenlabs" and shorts_lumean.VOICE_ID == voice:
-        await message.answer("Голос из этого заказа уже выбран. ID совпадает. "
-                             "Если звук изменился, проверь модель и настройки озвучки.")
-        return
-    await set_voice("elevenlabs", voice, "голос ElevenLabs из удачного заказа")
-    await message.answer("✅ Выбран тот же ID голоса ElevenLabs, что в старом заказе. "
-                         "Пробную озвучку не запускал.")
+    same_voice = shorts_lumean.SERVICE == "elevenlabs" and shorts_lumean.VOICE_ID == voice
+    name = await current_voice_name() if same_voice else "голос ElevenLabs из удачного заказа"
+    await set_voice("elevenlabs", voice, name, config)
+    await message.answer("✅ Восстановил голос, модель и настройки озвучки из старого заказа.")
 
 
 async def clone_off(message: Message) -> None:
