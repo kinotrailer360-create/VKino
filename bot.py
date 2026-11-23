@@ -8894,6 +8894,30 @@ async def set_voice(service: str | None, voice: str | None, name: str | None) ->
     await set_shorts_setting("lumean_voice_name", name)
 
 
+@router.message(Command("voice_restore"))
+async def voice_restore_command(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    order_id = (message.text or "").partition(" ")[2].strip()
+    if not order_id:
+        await message.answer("Открой удачный заказ озвучки в Lumean и отправь "
+                             "<code>/voice_restore ID_заказа</code>.")
+        return
+    try:
+        voice = await shorts_lumean.elevenlabs_voice_from_order(order_id)
+    except (shorts_lumean.LumeanError, aiohttp.ClientError, TimeoutError) as exc:
+        await message.answer(f"❌ Не удалось найти голос заказа: <code>{escape(_safe_err(exc)[:250])}</code>")
+        return
+    await load_voice()
+    if shorts_lumean.SERVICE == "elevenlabs" and shorts_lumean.VOICE_ID == voice:
+        await message.answer("Голос из этого заказа уже выбран. ID совпадает. "
+                             "Если звук изменился, проверь модель и настройки озвучки.")
+        return
+    await set_voice("elevenlabs", voice, "голос ElevenLabs из удачного заказа")
+    await message.answer("✅ Выбран тот же ID голоса ElevenLabs, что в старом заказе. "
+                         "Пробную озвучку не запускал.")
+
+
 async def clone_off(message: Message) -> None:
     await set_voice(None, None, None)
     await message.answer("✅ Вернул стандартный голос ElevenLabs.")

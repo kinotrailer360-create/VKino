@@ -177,3 +177,28 @@ def test_balanced_request_has_stricter_per_call_cap(monkeypatch):
                 Session(), "key", "gpt-4.1-mini", 0, 100_000, limit_lumc=0.20
             )
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("service, status, voice", [
+    ("elevenlabs", "completed", "voice-from-old-order"),
+    ("fishaudio", "completed", None),
+    ("elevenlabs", "failed", None),
+])
+def test_restore_elevenlabs_voice_reads_only_completed_orders(monkeypatch, service, status, voice):
+    from shorts import lumean
+
+    order_id = "9f8b2c1a-4d3e-4f5a-8b9c-0d1e2f3a4b5c"
+
+    async def call(session, method, route):
+        assert method == "GET"
+        assert route == f"/orders/{order_id}"
+        return {"status": status, "template": {"service_key": service,
+                "config": {"tts_settings": {"voice_id": "voice-from-old-order"}}}}
+
+    monkeypatch.setattr(lumean, "KEY", "test-key")
+    monkeypatch.setattr(lumean, "_call", call)
+    if voice:
+        assert asyncio.run(lumean.elevenlabs_voice_from_order(order_id)) == voice
+    else:
+        with pytest.raises(lumean.LumeanError):
+            asyncio.run(lumean.elevenlabs_voice_from_order(order_id))
