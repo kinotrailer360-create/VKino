@@ -47,10 +47,14 @@ STUDIOS = ("marvel.com", "disney.com", "thewaltdisneycompany.com", "d23.com", "n
 TRADE_PRESS = ("deadline.com", "variety.com", "hollywoodreporter.com", "empireonline.com")
 SOURCE_LABELS = ("Нужна сверка с первоисточником", "Сообщает профильное издание", "Есть публикация студии")
 INSIDER_ACCOUNTS = {"trailertrack", "cryptic4kqual", "danielrpk", "mytimetoshineh", "alexfromcc"}
+X_NEWS_ACCOUNTS = INSIDER_ACCOUNTS | {"discussingfilm", "filmupdates", "empiremagazine"}
+X_HOSTS = {"x.com", "twitter.com", "www.x.com", "www.twitter.com"}
 TRAILER_REPORT = re.compile(r"\b(?:trailer|teaser)\b", re.I)
 TRAILER_DETAIL = re.compile(r"\b(?:will (?:drop|release|premiere)|(?:drops|lands|premieres)(?:\s+on)?|"
-                            r"release date|runtime|\d+\s*(?:minutes?|seconds?)|scheduled|now online)\b", re.I)
-CAST_REPORT = re.compile(r"\b(?:cast as|has been cast|in talks to|will play|reportedly joins)\b", re.I)
+                            r"expected to (?:drop|release)|release date|runtime|\d+\s*(?:minutes?|seconds?)|"
+                            r"scheduled|now online|out now|has been released)\b", re.I)
+CAST_REPORT = re.compile(r"\b(?:cast as|has been cast|joins the cast|in talks to|will play|will return as|"
+                         r"reportedly joins)\b", re.I)
 
 
 def public_link(value: Any) -> str:
@@ -74,24 +78,55 @@ def source_rank(post: dict[str, Any]) -> int:
     return 0
 
 
+def original_x_account(post: dict[str, Any]) -> str:
+    name = str(post.get("channel") or "").casefold()
+    if not name.startswith("x @"):
+        return ""
+    url = urlsplit(public_link(post.get("url")))
+    match = re.fullmatch(r"/(\w{1,30})/status/\d+/?", url.path, re.I)
+    if url.hostname in X_HOSTS and match and match[1].casefold() == name[3:]:
+        return match[1].casefold()
+    return ""
+
+
+def has_original_x(group: dict[str, Any]) -> bool:
+    return any(original_x_account(post) for post in group["posts"])
+
+
+def select_cards(groups: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Keep one slot for an eligible original from X when other stories fill the batch."""
+    selected = groups[:max(0, limit)]
+    if selected and not any(has_original_x(group) for group in selected):
+        original = next((group for group in groups[limit:] if has_original_x(group)), None)
+        if original:
+            selected[-1] = original
+    return selected
+
+
 def card(group: dict[str, Any]) -> dict[str, Any]:
     posts = sorted(group["posts"], key=source_rank, reverse=True)
     lead = posts[0]
     links: dict[str, str] = {}
+    x_links: dict[str, str] = {}
     media: dict[str, str] = {}
     for post in posts:
         if url := public_link(post.get("url")):
-            links.setdefault(url, str(post.get("channel") or post.get("label") or urlsplit(url).hostname))
+            label = str(post.get("channel") or post.get("label") or urlsplit(url).hostname)
+            links.setdefault(url, label)
+            if original_x_account(post):
+                x_links.setdefault(url, label)
         if url := public_link(post.get("article_url")):
             links.setdefault(url, "Ссылка из обсуждения")
         for kind, label in (("video", "Видео"), ("image", "Фото")):
             if url := public_link(post.get(kind)):
                 media.setdefault(url, label)
     headline = str(lead.get("title") or lead.get("text") or "Инфоповод").strip().split("\n", 1)[0]
-    status = ("Инсайд из X · один источник, требует проверки" if group.get("single_insider")
+    status = ("Публикация в X · один источник, требует проверки" if group.get("single_insider")
               else SOURCE_LABELS[source_rank(lead)])
-    return {"headline": headline[:140], "status": status,
-            "links": list(links.items())[:5], "media": list(media.items())[:4]}
+    visible_x = list(x_links.items())[:2]
+    visible = [(url, label) for url, label in links.items() if url not in x_links][:5 - len(visible_x)]
+    return {"headline": headline[:140], "status": status, "links": visible + visible_x,
+            "x_links": visible_x, "media": list(media.items())[:4]}
 
 
 def franchise(text: str) -> str:
@@ -151,11 +186,7 @@ def clusters(posts: list[dict[str, Any]], key_tokens: Callable[[str], set[str]],
 
 
 def _insider_report(post: dict[str, Any]) -> bool:
-    name = str(post.get("channel") or "").casefold().removeprefix("x @")
-    url = urlsplit(public_link(post.get("url")))
-    if name not in INSIDER_ACCOUNTS or url.hostname not in {"x.com", "twitter.com", "www.x.com", "www.twitter.com"}:
-        return False
-    if not re.fullmatch(rf"/{name}/status/\d+/?", url.path, re.I):
+    if original_x_account(post) not in X_NEWS_ACCOUNTS:
         return False
     text = str(post.get("text") or "")
     return bool(CAST_REPORT.search(text) or (TRAILER_REPORT.search(text) and TRAILER_DETAIL.search(text)))

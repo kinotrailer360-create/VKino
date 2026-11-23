@@ -41,6 +41,22 @@ def test_single_insider_trailer_report_requires_details_and_original_post():
     assert not hype.hot([{**group, 'posts': [{**original, 'url': 'https://x.com/someone/status/123'}]}])
 
 
+def test_hype_keeps_x_report_in_card_batch_and_visible_links():
+    telegram = [dict(url=f'https://t.me/cinema/{i}', channel='Telegram', text='Marvel') for i in range(1, 8)]
+    original = dict(url='https://x.com/DiscussingFilm/status/123', channel='X @DiscussingFilm',
+                    text="The Avengers: Doomsday countdown played Steve and Peggy's theme. "
+                         'Trailer expected to release tomorrow.')
+    tg_topics = [dict(posts=[post], sources=1, franchise='Marvel') for post in telegram[:4]]
+    x_topic, = hype.hot([dict(posts=[original], sources=1, franchise='Marvel')])
+    assert hype.select_cards([*tg_topics, x_topic], 3) == [*tg_topics[:2], x_topic]
+    assert hype.select_cards(tg_topics, 3) == tg_topics[:3]
+    assert hype.select_cards([x_topic], 0) == []
+    mixed = hype.card(dict(posts=[*telegram, original]))
+    assert mixed['x_links'] == [(original['url'], original['channel'])]
+    assert mixed['x_links'][0] in mixed['links']
+    assert len(mixed['links']) == 5
+
+
 def test_shorts_plan_keeps_sources_from_the_card(monkeypatch):
     row = dict(line='В интервью режиссёр рассказал, что к съёмкам команда приступит уже этой зимой.',
                visual='Режиссёр рассказывает о съёмках', query='film director interview', label='Съёмки зимой')

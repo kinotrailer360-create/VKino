@@ -14199,6 +14199,7 @@ async def hype_scan() -> list[dict[str, Any]]:
         out.append(g)
     await set_shorts_setting("hype_scan_status", json.dumps({"at": time.time(), "posts": len(posts),
         "x": sum(str(p.get("channel") or "").startswith("X @") for p in posts), "groups": len(groups),
+        "eligible_x": sum(shorts_hype.has_original_x(g) for g in out),
         "eligible": len(out), "failed": sum(isinstance(x, BaseException) for x in results)}))
     return out
 
@@ -14225,8 +14226,11 @@ async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> bool:
     def links(items: list[tuple[str, str]]) -> str:
         return " · ".join(f'<a href="{escape(url)}">{escape(label[:36])}</a>' for url, label in items)
 
-    if card["links"]:
-        lines.append("\nИсточники: " + links(card["links"]))
+    other_links = [item for item in card["links"] if item not in card["x_links"]]
+    if other_links:
+        lines.append("\nИсточники: " + links(other_links))
+    if card["x_links"]:
+        lines.append("\nПубликации в X: " + links(card["x_links"]))
     if card["media"]:
         lines.append("Кандидаты для видеоряда: " + links(card["media"]))
     if posted:
@@ -14271,7 +14275,7 @@ async def hype_loop(bot: Bot) -> None:
                 day = {"d": now.date().isoformat(), "n": 0}
             if day["n"] >= HYPE_MAX_DAY:
                 continue
-            for g in (await hype_scan())[:HYPE_MAX_DAY - day["n"]]:
+            for g in shorts_hype.select_cards(await hype_scan(), HYPE_MAX_DAY - day["n"]):
                 if await hype_alert(bot, g, sorted(ADMIN_IDS)):
                     day["n"] += 1
                     await set_shorts_setting("hype_day", json.dumps(day))
@@ -14300,6 +14304,8 @@ async def hype_command(message: Message) -> None:
             at = datetime.fromtimestamp(scan["at"], POST_TZ)
             text += (f"\nПоследняя проверка {at:%d.%m %H:%M}. Прочитано постов: {scan['posts']} (из X: {scan['x']})."
                      f"\nСгруппировано тем: {scan['groups']}. Подходят для карточки: {scan['eligible']}.")
+            if "eligible_x" in scan:
+                text += f" Из них с оригинальными публикациями в X: {scan['eligible_x']}."
             if scan["failed"]:
                 text += " Часть источников недоступна."
         await message.answer(text + "\nПроверить сейчас — /hype. Состояние лент — /fast.")
@@ -14321,7 +14327,7 @@ async def hype_command(message: Message) -> None:
                              f"Автопроверка: {auto}.")
         return
     await wait.delete()
-    for g in groups[:3]:
+    for g in shorts_hype.select_cards(groups, 3):
         if await hype_alert(message.bot, g, [message.chat.id]):
             await _hype_remember(g)
 
