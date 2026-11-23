@@ -19,6 +19,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import aiohttp
 
@@ -80,6 +81,29 @@ async def _call(session: aiohttp.ClientSession, method: str, path: str, **kw: An
                                           for k, v in body["errors"].items())
         raise LumeanError(f"Lumean HTTP {resp.status}{f' {reason}' if reason else ''}: {str(msg)[:200]}")
     return body.get("data") if isinstance(body, dict) and "data" in body else body
+
+
+async def elevenlabs_voice_from_order(order_id: str) -> str:
+    """Read the voice ID recorded when a completed order was created."""
+    try:
+        order_id = str(UUID(order_id))
+    except ValueError as exc:
+        raise LumeanError("Нужен ID старого заказа в Lumean (UUID).") from exc
+    if not enabled():
+        raise LumeanError("Ключ Lumean не подключён.")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        order = await _call(session, "GET", f"/orders/{order_id}")
+    if not isinstance(order, dict) or order.get("status") not in DONE:
+        raise LumeanError("Нужен завершённый заказ с удачной озвучкой.")
+    template = order.get("template")
+    if not isinstance(template, dict) or template.get("service_key") != "elevenlabs":
+        raise LumeanError("В этом заказе не найден шаблон ElevenLabs.")
+    config = template.get("config")
+    settings = config.get("tts_settings") if isinstance(config, dict) else None
+    voice = settings.get("voice_id") if isinstance(settings, dict) else None
+    if not isinstance(voice, str) or not voice.strip():
+        raise LumeanError("В настройках заказа не найден ID голоса.")
+    return voice.strip()
 
 
 async def _pick_voice(session: aiohttp.ClientSession) -> str:
