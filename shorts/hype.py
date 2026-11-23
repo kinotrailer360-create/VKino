@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable
 from typing import Any
@@ -155,11 +156,25 @@ def material(group: dict[str, Any], limit: int = 6) -> str:
     )
 
 
-async def short_plan(key: str, group: dict[str, Any]) -> dict[str, Any]:
+async def topic_short_plan(key: str, topic: str, title: str = "") -> dict[str, Any]:
+    results = await asyncio.wait_for(ai.websearch.search(f"{topic} кино фильмы сериалы", n=6), timeout=50)
+    posts = [{"url": url, "title": item["title"], "text": f"{item['title']}\n{item['text']}",
+              "channel": urlsplit(url).hostname}
+             for item in results if (url := public_link(item.get("url"))) and item.get("text")]
+    if not posts:
+        raise ValueError("Нет материалов по теме. Уточни название фильма или события.")
+    return await short_plan(key, {"posts": posts}, topic=topic, title=title)
+
+
+async def short_plan(key: str, group: dict[str, Any], *, topic: str = "", title: str = "") -> dict[str, Any]:
     """One request for narration and scene searches, reviewed in the normal Shorts workflow."""
+    subject = (f"Тема автора: «{topic}». Бери из материалов только относящееся к этой теме. "
+               "Если фактов по теме недостаточно, верни пустой список сцен. " if topic else "")
+    title_rule = f"Название от автора: «{title}». Сохрани его. " if title else ""
     prompt = (
         ai.UNTRUSTED
         + "Сделай русскоязычный киношортс KinoMir360 на 30–45 секунд об одном инфоповоде. "
+        + subject + title_rule +
         "5–8 коротких реплик, по одной на сцену, вместе 420–690 знаков. В первой реплике конкретный факт "
         "или честный вопрос, во второй что зритель увидит или почему это важно. Сохрани оговорки и ссылки "
         "на издателя в формулировках. Обсуждение и пересказы сами по себе не подтверждают факт. "
@@ -179,7 +194,7 @@ async def short_plan(key: str, group: dict[str, Any]) -> dict[str, Any]:
         value = row.get(name)
         return " ".join(value.split())[:limit] if isinstance(value, str) else ""
 
-    title = field(data, "title", 95)
+    title = title or field(data, "title", 95)
     lines, scenes = [], []
     for row in data["scenes"]:
         if not isinstance(row, dict):
