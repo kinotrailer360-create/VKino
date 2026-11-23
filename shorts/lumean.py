@@ -30,11 +30,11 @@ KEY = _env_key("LUMEAN_API_KEY")  # находит и имя, набранное
 SERVICE = os.getenv("LUMEAN_SERVICE", "elevenlabs").strip() or "elevenlabs"  # elevenlabs | fishaudio | cartesia
 VOICE_ID = os.getenv("LUMEAN_VOICE_ID", "").strip()
 MODEL = os.getenv("LUMEAN_MODEL", "eleven_multilingual_v2").strip()
-SPEED = float(os.getenv("LUMEAN_SPEED", "1.15"))  # 0.7..1.2 (ElevenLabs)
+SPEED = float(os.getenv("LUMEAN_SPEED", "1.2"))  # 0.7..1.2 (ElevenLabs)
 # живость голоса: ниже stability — больше интонаций и эмоций (0.5 звучало ровно, «эмоций мало»); style —
 # насколько ярко передаётся манера голоса
 STABILITY = float(os.getenv("LUMEAN_STABILITY", "0.35"))
-STYLE = float(os.getenv("LUMEAN_STYLE", "0.18"))
+STYLE = float(os.getenv("LUMEAN_STYLE", "0.3"))
 TEMPLATE_NAME = "KinoMir360 TTS"
 CLONE_SERVICES = ("fishaudio", "cartesia")
 PAUSE = 1.0  # сек тишины между фразами — по ним режем дорожку
