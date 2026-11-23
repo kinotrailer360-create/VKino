@@ -7279,7 +7279,8 @@ SHORT_THEMES = {
     "news": "новости кино",
     "birthday": "день рождения звезды",
 }
-SHORTS_TIMEOUT = 15 * 60  # сборка дольше — что-то зависло, прерываем и сообщаем
+SHORTS_TIMEOUT = 15 * 60
+SHORTS_RENDER_TIMEOUT = 15 * 60
 shorts_lock = asyncio.Lock()
 shorts_jobs: set[asyncio.Task] = set()
 
@@ -7519,20 +7520,36 @@ async def run_short(
             # если бот перезапустится посреди сборки (обновление), после старта скажем об этом
             await set_shorts_setting("running", json.dumps({"chats": chat_ids, "theme": theme_key or ""}))
             progress = progress_updater(status)
-            shorts_daily.on_progress, shorts_daily.last_stage = progress, ""
-            result = await asyncio.wait_for(make_daily_short(
-                kp._get,
-                work,
-                theme_key,
-                exclude,
-                music,
-                now.date(),
-                TMDB_API_KEY,
-                await news_feeds(),
-                manual=theme_key is not None,
-                gemini_key=GEMINI_API_KEY,
-                trailer_clips=await shorts_setting("clips") != "off",
-            ), timeout=SHORTS_TIMEOUT)
+            feeds = await news_feeds()
+            trailer_clips = await shorts_setting("clips") != "off"
+            loop = asyncio.get_running_loop()
+            deadline = asyncio.timeout(SHORTS_TIMEOUT)
+            rendering_started = False
+
+            async def report_progress(pct: int, stage: str) -> None:
+                nonlocal rendering_started
+                if stage == shorts_daily.RENDER_STAGE and not rendering_started:
+                    # Даже при повторном рендере действует тот же дедлайн монтажа.
+                    rendering_started = True
+                    deadline.reschedule(loop.time() + SHORTS_RENDER_TIMEOUT)
+                await progress(pct, stage)
+
+            shorts_daily.on_progress, shorts_daily.last_stage = report_progress, ""
+            try:
+                async with deadline:
+                    result = await make_daily_short(
+                        kp._get, work, theme_key, exclude, music, now.date(), TMDB_API_KEY, feeds,
+                        manual=theme_key is not None, gemini_key=GEMINI_API_KEY, trailer_clips=trailer_clips,
+                    )
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+                phase = "Монтаж превысил" if rendering_started else "Подготовка превысила"
+                limit = SHORTS_RENDER_TIMEOUT if rendering_started else SHORTS_TIMEOUT
+                raise RuntimeError(
+                    f"{phase} лимит ({limit // 60} мин). "
+                    f"Последний этап: {shorts_daily.last_stage or 'начало'}. Попробуй ещё раз."
+                ) from None
             from shorts.visual_guard import daily_review_notice
             note = daily_review_notice(work)
             if note:
@@ -7549,11 +7566,6 @@ async def run_short(
             await progress(100, "Готово — отправляю ролик")
             for chat_id in chat_ids:
                 await send_short(bot, chat_id, result)
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"сборка шла дольше {SHORTS_TIMEOUT // 60} минут и была прервана — "
-                f"застряла на этапе: {shorts_daily.last_stage or 'начало'}. Попробуй ещё раз."
-            ) from None
         finally:
             shorts_daily.on_progress = None
             await clear_running()

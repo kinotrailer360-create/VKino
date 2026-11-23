@@ -1931,6 +1931,9 @@ def add_english_seo(result: ShortResult) -> None:
 
 # ---------------------------------------------------------------- сборка
 
+RENDER_STAGE = "Монтаж видео"
+
+
 async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lines: list[str],
                   tag: str, header: str, question: str, music: Path | None,
                   boom_slide: int | None = None, scene_plan: bool = False,
@@ -1999,7 +2002,7 @@ async def _render(work: Path, cover_path: Path, cards: list[dict[str, Any]], lin
     }
     cfg_path = work / "short.json"
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    await _progress(50, "Монтаж видео")
+    await _progress(50, RENDER_STAGE)
     try:
         await _run_render(cfg_path)
     except RenderStalled:
@@ -2033,7 +2036,7 @@ class RenderStalled(RuntimeError):
     pass
 
 
-async def _run_render(cfg_path: Path, stage: str = "Монтаж видео") -> None:
+async def _run_render(cfg_path: Path, stage: str = RENDER_STAGE) -> None:
     """Рендер — отдельным процессом, чтобы не блокировать бота; его строки PROGRESS двигают полоску.
     Нет новой строки RENDER_STALL секунд — процесс убиваем (RenderStalled)."""
     proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "shorts.make_short", str(cfg_path),
