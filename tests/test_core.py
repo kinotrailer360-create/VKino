@@ -1112,7 +1112,7 @@ def test_fast_site_page_finds_its_feed_and_article_images(monkeypatch):
             f'<link>https://www.empireonline.com/movies/news/doomsday-poster/</link><pubDate>{now}</pubDate>'
             '<description>Exclusive first look</description></item></channel></rss>').encode()
     home = b'<html><head><link rel="alternate" type="application/rss+xml" href="/feed/rss"></head></html>'
-    pages = {"https://www.empireonline.com/": home, "https://www.empireonline.com/feed/rss": feed}
+    pages = {"https://example.com/": home, "https://example.com/feed/rss": feed}
 
     async def fake_download(session, url):
         return pages[url]
@@ -1123,12 +1123,52 @@ def test_fast_site_page_finds_its_feed_and_article_images(monkeypatch):
     monkeypatch.setattr(fastnews, "_download", fake_download)
     monkeypatch.setattr(netsafe, "fetch_page", fake_page)
     fastnews._found_feed.clear()
-    posts = asyncio.run(fastnews.latest(["https://www.empireonline.com/"]))
+    posts = asyncio.run(fastnews.latest(["https://example.com/"]))
     assert posts and posts[0]["text"].startswith("Avengers: Doomsday poster")
     assert posts[0]["image"] == "https://img.example/poster.jpg"
-    assert fastnews._found_feed["https://www.empireonline.com/"] == "https://www.empireonline.com/feed/rss"
+    assert fastnews._found_feed["https://example.com/"] == "https://example.com/feed/rss"
     assert "site%3Aempireonline.com" in fastnews.google_news("empireonline.com")
 
+
+
+def test_fast_uses_publisher_fallback_and_reports_rss_app_payment(monkeypatch):
+    import asyncio
+    from email.utils import formatdate
+
+    import aiohttp
+    from shorts import fastnews
+
+    empire = "https://www.empireonline.com"
+    world = "https://www.worldofreel.com/blog?format=rss"
+    rss_app = "https://rss.app/feeds/example.xml"
+    fallback_hosts = {fastnews.google_news(host): host for host in ("empireonline.com", "worldofreel.com")}
+    requested = []
+    empire_blocked = False
+
+    async def download(session, url):
+        requested.append(url)
+        if url in fallback_hosts or (url == fastnews.EMPIRE_RSS and not empire_blocked):
+            host = fallback_hosts.get(url, "empireonline.com")
+            return (f'<rss version="2.0"><channel><title>{host}</title><item><title>Film news</title>'
+                    f'<link>https://news.google.com/rss/articles/example</link><pubDate>{formatdate(usegmt=True)}</pubDate>'
+                    '</item></channel></rss>').encode()
+        assert url in {fastnews.EMPIRE_RSS, world, rss_app}
+        raise aiohttp.ClientResponseError(None, (), status=402 if url == rss_app else 403)
+
+    monkeypatch.setattr(fastnews, "_download", download)
+    monkeypatch.setattr(fastnews, "_found_feed", {})
+    rows = asyncio.run(fastnews.check([empire, world, rss_app]))
+    assert rows[:2] == [(empire, 1, "Empireonline"), (world, 1, "Worldofreel")]
+    assert rows[2][0] == rss_app
+    assert "HTTP 402" in rows[2][1]
+    assert rows[2][2] == "RSS.app"
+    assert fastnews.EMPIRE_RSS in requested
+    assert fastnews.google_news("empireonline.com") not in requested
+
+    empire_blocked = True
+    requested.clear()
+    assert asyncio.run(fastnews.check([empire])) == [(empire, 1, "Empireonline")]
+    assert requested == [fastnews.EMPIRE_RSS, fastnews.google_news("empireonline.com")]
 
 
 def test_list_hook_is_short() -> None:
