@@ -198,7 +198,23 @@ def test_restore_elevenlabs_voice_reads_only_completed_orders(monkeypatch, servi
     monkeypatch.setattr(lumean, "KEY", "test-key")
     monkeypatch.setattr(lumean, "_call", call)
     if voice:
-        assert asyncio.run(lumean.elevenlabs_voice_from_order(order_id)) == voice
+        config = asyncio.run(lumean.elevenlabs_config_from_order(f"https://lumean.app/orders/{order_id}"))
+        assert config["tts_settings"]["voice_id"] == voice
     else:
         with pytest.raises(lumean.LumeanError):
-            asyncio.run(lumean.elevenlabs_voice_from_order(order_id))
+            asyncio.run(lumean.elevenlabs_config_from_order(order_id))
+
+
+def test_restored_elevenlabs_config_applies_only_to_selected_voice(monkeypatch):
+    from shorts import lumean
+
+    for attr in ("SERVICE", "VOICE_ID", "_restored_config"):
+        monkeypatch.setattr(lumean, attr, getattr(lumean, attr))
+    config = {"tts_settings": {"voice_id": "saved", "model_id": "eleven_multilingual_v2",
+                              "voice_settings": {"speed": 1.12, "stability": 0.5}}}
+    lumean.use_voice("elevenlabs", "saved", config)
+    assert lumean._config("elevenlabs", "saved") == config
+    assert lumean.restored_config_key()
+    assert lumean._config("elevenlabs", "different")["tts_settings"]["voice_id"] == "different"
+    lumean.use_voice("elevenlabs", "different", config)
+    assert not lumean.restored_config_key()

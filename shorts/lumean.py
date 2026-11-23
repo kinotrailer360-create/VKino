@@ -19,6 +19,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import aiohttp
@@ -46,6 +47,7 @@ FAILED = {"failed", "compensated", "cancelled"}
 log = logging.getLogger("shorts")
 _templates: dict[tuple[str, str, str], str] = {}  # сервис, полный голос, имя с отпечатком -> id шаблона
 _library: dict[str, list[dict[str, Any]]] = {}  # пол -> голоса библиотеки
+_restored_config: dict[str, Any] = {}
 voice_name = ""  # какой голос выбран — для подписи в /voice
 
 
@@ -57,11 +59,21 @@ def enabled() -> bool:
     return bool(KEY)
 
 
-def use_voice(service: str | None, voice_id: str | None) -> None:
+def use_voice(service: str | None, voice_id: str | None, config: dict[str, Any] | None = None) -> None:
     """Голос из настроек бота (например, свой клон) — поверх переменных окружения."""
-    global SERVICE, VOICE_ID
+    global SERVICE, VOICE_ID, _restored_config
     SERVICE = service or os.getenv("LUMEAN_SERVICE", "elevenlabs").strip() or "elevenlabs"
     VOICE_ID = voice_id or os.getenv("LUMEAN_VOICE_ID", "").strip()
+    settings = (config or {}).get("tts_settings")
+    _restored_config = (config or {}) if (service == "elevenlabs" and voice_id
+                                            and isinstance(settings, dict)
+                                            and settings.get("voice_id") == voice_id) else {}
+
+
+def restored_config_key() -> str:
+    if not _restored_config:
+        return ""
+    return hashlib.sha256(json.dumps(_restored_config, sort_keys=True).encode()).hexdigest()
 
 
 async def _call(session: aiohttp.ClientSession, method: str, path: str, **kw: Any) -> Any:
@@ -83,9 +95,14 @@ async def _call(session: aiohttp.ClientSession, method: str, path: str, **kw: An
     return body.get("data") if isinstance(body, dict) and "data" in body else body
 
 
-async def elevenlabs_voice_from_order(order_id: str) -> str:
-    """Read the voice ID recorded when a completed order was created."""
+async def elevenlabs_config_from_order(order_id: str) -> dict[str, Any]:
+    """Read the ElevenLabs configuration snapshot of a completed order."""
     try:
+        url = urlsplit(order_id)
+        if url.scheme == "https" and url.netloc in ("lumean.app", "www.lumean.app"):
+            path = re.fullmatch(r"/orders/([^/]+)/?", url.path)
+            if path:
+                order_id = path[1]
         order_id = str(UUID(order_id))
     except ValueError as exc:
         raise LumeanError("Нужен ID старого заказа в Lumean (UUID).") from exc
@@ -103,7 +120,7 @@ async def elevenlabs_voice_from_order(order_id: str) -> str:
     voice = settings.get("voice_id") if isinstance(settings, dict) else None
     if not isinstance(voice, str) or not voice.strip():
         raise LumeanError("В настройках заказа не найден ID голоса.")
-    return voice.strip()
+    return config
 
 
 async def _pick_voice(session: aiohttp.ClientSession) -> str:
@@ -144,6 +161,8 @@ async def preview(url: str) -> bytes:
 
 
 def _config(service: str, voice: str) -> dict[str, Any]:
+    if service == "elevenlabs" and voice == VOICE_ID and _restored_config:
+        return _restored_config
     if service == "cartesia":
         speed = min(max(SPEED, 0.6), 1.5)
         return {"tts_settings": {"voice_id": voice, "model_id": "sonic-3", "language_code": "ru",

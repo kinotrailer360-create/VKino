@@ -1275,6 +1275,8 @@ def _voice_key(text: str, pause: float) -> Path:
     # настройки голоса тоже в ключе: сменили скорость или живость — фраза озвучивается заново
     raw = (f"v3|{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
            f"{lumean.STYLE:g}|{pause:g}|{text}")
+    if restored := lumean.restored_config_key():
+        raw += f"|restored:{restored}"
     return VOICE_CACHE / (hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".mp3")
 
 
