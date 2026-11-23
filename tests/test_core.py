@@ -455,6 +455,43 @@ def test_migrations_numbered_and_checked():
         migrations.pending(applied)
 
 
+def test_add_fast_insiders_extends_only_configured_x_sources():
+    import asyncio
+    import json
+
+    from shorts import migrations
+
+    original = [f"https://fxtwitter.com/{handle}/feed.xml" for handle in
+                ("DanielRPK", "MyTimeToShineH", "FilmUpdates", "DiscussingFilm", "empiremagazine")]
+    previous = ["https://deadline.com/feed/", "\n/fast add ".join(original),
+                "https://fixupx.com/AlexFromCC/feed.atom.xml?count=30"]
+
+    class Connection:
+        def __init__(self, feeds):
+            self.feeds = feeds
+            self.writes = 0
+
+        async def fetchval(self, query):
+            assert "key = 'fast_feeds' FOR UPDATE" in query
+            return json.dumps(self.feeds)
+
+        async def execute(self, query, value):
+            assert "WHERE key = 'fast_feeds'" in query
+            self.feeds = json.loads(value)
+            self.writes += 1
+
+    configured = Connection(previous)
+    asyncio.run(migrations._add_fast_insiders(configured))
+    assert configured.feeds == [*previous, "https://fxtwitter.com/Cryptic4KQual/feed.xml",
+                                "https://nexuspointnews.com/feed/"]
+    asyncio.run(migrations._add_fast_insiders(configured))
+    assert configured.writes == 1
+
+    other = Connection(original[:-1])
+    asyncio.run(migrations._add_fast_insiders(other))
+    assert other.writes == 0
+
+
 def test_fsm_storage_rejects_non_json():
     import asyncio
 
