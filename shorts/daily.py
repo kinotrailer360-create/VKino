@@ -13,6 +13,8 @@ import random
 import re
 import shutil
 import sys
+import tempfile
+import wave
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -34,7 +36,6 @@ VOICE_RATE = "+22%"
 # запасной голос — Piper, работает прямо на сервере без интернета (модель кладёт Dockerfile)
 PIPER_MODEL = Path(os.getenv("PIPER_MODEL", "/opt/piper/voice.onnx"))
 PIPER_SPEED = 0.8  # length_scale: меньше — быстрее, ~как +22% у основного голоса
-GAP = 0.2  # пауза между фразами, сек
 MIN_RATING = 6.0  # ниже — рейтинг не показываем, он только отпугнёт
 SKIP_RATING = 5.5  # ниже — фильм в подборку не берём
 
@@ -1272,7 +1273,7 @@ def _save_spoken_cache(cache: dict[str, str]) -> None:
 
 def _voice_key(text: str, pause: float) -> Path:
     # настройки голоса тоже в ключе: сменили скорость или живость — фраза озвучивается заново
-    raw = (f"v2|{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
+    raw = (f"v3|{lumean.SERVICE}|{lumean.VOICE_ID}|{lumean.MODEL}|{lumean.SPEED:g}|{lumean.STABILITY:g}|"
            f"{lumean.STYLE:g}|{pause:g}|{text}")
     return VOICE_CACHE / (hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".mp3")
 
@@ -1423,6 +1424,17 @@ async def _edge_pieces(text: str, path: Path, stem: Path) -> tuple[list[float], 
     return words, lost
 
 
+def narration_gap(text: str) -> float:
+    ending = text.rstrip().rstrip('»”"').rstrip()
+    if ending.endswith(("?", "!", "…", "...")):
+        return 0.26
+    if ending.endswith("."):
+        return 0.20
+    if ending.endswith((",", ":", ";", "—")):
+        return 0.14
+    return 0.09
+
+
 async def synthesize(lines: list[str], work: Path, pause: float | None = None, careful: bool = False,
                      prepared: bool = False) -> tuple[Path, list[float], bool, list[dict[str, Any]]]:
     """Озвучка по фразам: файл, начало каждой фразы, есть ли голос, и по фразе {длительность, время слов}."""
@@ -1450,20 +1462,27 @@ async def synthesize(lines: list[str], work: Path, pause: float | None = None, c
         tts_note = ("🗣 Голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
                     + "; ".join(f"«{d[:60]}»" for d in dropped[:3]))
 
+    voice = work / "voice.wav"
     starts, spans, t = [], [], 0.0
     inputs, chains = [], []
-    for i, part in enumerate(parts):
-        starts.append(round(t, 3))
-        dur = await _duration(part)
-        spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]],
-                      "text": speak[i].replace(pronounce.STRESS, "")})
-        t += dur + GAP
-        inputs += ["-i", str(part)]
-        chains.append(f"[{i}:a]aresample=48000,apad=pad_dur={GAP}[a{i}]")
-    filt = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(parts))) + \
-        f"concat=n={len(parts)}:v=0:a=1[out]"
-    voice = work / "voice.wav"
-    await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
+    with tempfile.TemporaryDirectory(dir=work) as decoded_folder:
+        for i, part in enumerate(parts):
+            decoded = Path(decoded_folder) / f"{i}.wav"
+            await _run("ffmpeg", "-v", "error", "-y", "-i", str(part), "-ar", "48000", "-ac", "1", str(decoded))
+            # MP3 duration includes encoder padding which FFmpeg drops while decoding.
+            with wave.open(str(decoded)) as pcm:
+                dur = pcm.getnframes() / pcm.getframerate()
+            starts.append(round(t, 3))
+            spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]],
+                          "text": speak[i].replace(pronounce.STRESS, "")})
+            gap = narration_gap(speak[i]) if i < len(parts) - 1 else 0.0
+            t += dur + gap
+            inputs += ["-i", str(decoded)]
+            padding = f"apad=pad_dur={gap}" if gap else "anull"
+            chains.append(f"[{i}:a]{padding}[a{i}]")
+        filt = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(parts))) + \
+            f"concat=n={len(parts)}:v=0:a=1[out]"
+        await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
     global last_voice
     # разметка озвучки — для «🎙 Переозвучить только звук»: какие фразы, где начинаются и сколько звучат
     last_voice = {"file": voice.name, "lines": list(lines), "prepared": prepared, "careful": careful,

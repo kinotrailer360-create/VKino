@@ -31,6 +31,16 @@ def test_clustering_does_not_merge_two_stories_just_for_franchise():
     assert [group['posts'] for group in hype.hot(groups)] == [[trailer, discussion]]
 
 
+def test_single_insider_trailer_report_requires_details_and_original_post():
+    original = dict(url='https://x.com/trailertrack/status/123', channel='X @trailertrack',
+                    text='The new Avengers trailer drops on Monday.')
+    group = dict(posts=[original], sources=1, franchise='Marvel')
+    selected, = hype.hot([group])
+    assert 'один источник' in hype.card(selected)['status']
+    assert not hype.hot([{**group, 'posts': [{**original, 'text': 'Ready for an epic Monday? #AvengersDoomsday'}]}])
+    assert not hype.hot([{**group, 'posts': [{**original, 'url': 'https://x.com/someone/status/123'}]}])
+
+
 def test_shorts_plan_keeps_sources_from_the_card(monkeypatch):
     row = dict(line='В интервью режиссёр рассказал, что к съёмкам команда приступит уже этой зимой.',
                visual='Режиссёр рассказывает о съёмках', query='film director interview', label='Съёмки зимой')
@@ -64,3 +74,5 @@ def test_card_delivery_shows_draft_buttons_without_generating(monkeypatch):
     row = kwargs['reply_markup'].inline_keyboard[0]
     assert [button.text for button in row] == ['📝 Черновик поста', '🎬 Сценарий Shorts']
     script.assert_not_awaited()
+    sender.send_message.side_effect = RuntimeError('Telegram unavailable')
+    assert asyncio.run(bot.hype_alert(sender, group, [10])) is False

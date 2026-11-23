@@ -12,6 +12,8 @@ LUMEAN_SERVICE / LUMEAN_VOICE_ID, иначе ElevenLabs и первый мужс
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -28,11 +30,11 @@ KEY = _env_key("LUMEAN_API_KEY")  # находит и имя, набранное
 SERVICE = os.getenv("LUMEAN_SERVICE", "elevenlabs").strip() or "elevenlabs"  # elevenlabs | fishaudio | cartesia
 VOICE_ID = os.getenv("LUMEAN_VOICE_ID", "").strip()
 MODEL = os.getenv("LUMEAN_MODEL", "eleven_multilingual_v2").strip()
-SPEED = float(os.getenv("LUMEAN_SPEED", "1.2"))  # 0.7..1.2 (потолок ElevenLabs); автор просил на 5–10% быстрее 1.12
+SPEED = float(os.getenv("LUMEAN_SPEED", "1.15"))  # 0.7..1.2 (ElevenLabs)
 # живость голоса: ниже stability — больше интонаций и эмоций (0.5 звучало ровно, «эмоций мало»); style —
 # насколько ярко передаётся манера голоса
 STABILITY = float(os.getenv("LUMEAN_STABILITY", "0.35"))
-STYLE = float(os.getenv("LUMEAN_STYLE", "0.3"))
+STYLE = float(os.getenv("LUMEAN_STYLE", "0.18"))
 TEMPLATE_NAME = "KinoMir360 TTS"
 CLONE_SERVICES = ("fishaudio", "cartesia")
 PAUSE = 1.0  # сек тишины между фразами — по ним режем дорожку
@@ -41,7 +43,7 @@ DONE = {"completed", "result_delivered"}
 FAILED = {"failed", "compensated", "cancelled"}
 
 log = logging.getLogger("shorts")
-_templates: dict[tuple[str, str], str] = {}  # (сервис, голос) -> id шаблона
+_templates: dict[tuple[str, str, str], str] = {}  # сервис, полный голос, имя с отпечатком -> id шаблона
 _library: dict[str, list[dict[str, Any]]] = {}  # пол -> голоса библиотеки
 voice_name = ""  # какой голос выбран — для подписи в /voice
 
@@ -124,10 +126,13 @@ def _config(service: str, voice: str) -> dict[str, Any]:
                                  "voice_settings": {"speed": speed}}}
     if service == "fishaudio":
         return {"tts_settings": {"voice_id": voice}}  # язык Fish определяет сам
+    stability = min(max(STABILITY, 0.0), 1.0)
+    v3_family = MODEL in {"eleven_v3", "eleven_v3_beta"}
     return {"tts_settings": {
         "mode": "mode_v1", "model_id": MODEL, "voice_id": voice, "language_code": "ru",
         "advanced_voice_settings": True,
-        "voice_settings": {"stability": min(max(STABILITY, 0.0), 1.0), "similarity_boost": 0.75,
+        "prev_next_text": not v3_family,
+        "voice_settings": {"stability": round(stability * 2) / 2 if v3_family else stability, "similarity_boost": 0.75,
                            "style": min(max(STYLE, 0.0), 1.0), "use_speaker_boost": True,
                            "speed": min(max(SPEED, 0.7), 1.2)},
         "output_settings": {"audio_format": "mp3"},
@@ -159,23 +164,27 @@ async def _template_id(session: aiohttp.ClientSession, service: str | None = Non
     voice = voice or (VOICE_ID if (VOICE_ID or service != "elevenlabs") else await _pick_voice(session))
     if not voice:
         raise LumeanError(f"для сервиса {service} не задан голос (LUMEAN_VOICE_ID или /clone)")
-    if (service, voice) in _templates:
-        return _templates[(service, voice)]
     default = service == "elevenlabs" and not VOICE_ID and not explicit
     name = TEMPLATE_NAME if default else f"{TEMPLATE_NAME} {service} {voice[:8]}"
+    config = _config(service, voice)
+    if service == "elevenlabs":
+        signature = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
+        name = f"{name} {signature}"
+    cache_key = (service, voice, name)
+    if cache_key in _templates:
+        return _templates[cache_key]
     data = await _call(session, "GET", "/templates", params={"page": 1, "search": name, "service": service})
     for t in (data or {}).get("items") or []:
         if t.get("name") == name and t.get("id"):
-            _templates[(service, voice)] = str(t["id"])
-            return _templates[(service, voice)]
-    config = _config(service, voice)
+            _templates[cache_key] = str(t["id"])
+            return _templates[cache_key]
     if service == "fishaudio":  # модели Fish в Lumean меняются — берём ту, что предлагает сам сервис
         config["tts_settings"]["model_id"] = await _default_model(session, service)
     created = await _call(session, "POST", "/templates",
                           json={"service_key": service, "name": name, "config": config})
-    _templates[(service, voice)] = str(created["id"])
+    _templates[cache_key] = str(created["id"])
     log.info("shorts: Lumean template %s (%s) created", created["id"], name)
-    return _templates[(service, voice)]
+    return _templates[cache_key]
 
 
 async def create_clone(audio: bytes, name: str, service: str = "fishaudio") -> dict[str, Any]:

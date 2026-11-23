@@ -46,6 +46,11 @@ STUDIOS = ("marvel.com", "disney.com", "thewaltdisneycompany.com", "d23.com", "n
            "dc.com", "warnerbros.com", "sonypictures.com", "universalpictures.com", "paramount.com")
 TRADE_PRESS = ("deadline.com", "variety.com", "hollywoodreporter.com", "empireonline.com")
 SOURCE_LABELS = ("Нужна сверка с первоисточником", "Сообщает профильное издание", "Есть публикация студии")
+INSIDER_ACCOUNTS = {"trailertrack", "cryptic4kqual", "danielrpk", "mytimetoshineh", "alexfromcc"}
+TRAILER_REPORT = re.compile(r"\b(?:trailer|teaser)\b", re.I)
+TRAILER_DETAIL = re.compile(r"\b(?:will (?:drop|release|premiere)|(?:drops|lands|premieres)(?:\s+on)?|"
+                            r"release date|runtime|\d+\s*(?:minutes?|seconds?)|scheduled|now online)\b", re.I)
+CAST_REPORT = re.compile(r"\b(?:cast as|has been cast|in talks to|will play|reportedly joins)\b", re.I)
 
 
 def public_link(value: Any) -> str:
@@ -83,7 +88,9 @@ def card(group: dict[str, Any]) -> dict[str, Any]:
             if url := public_link(post.get(kind)):
                 media.setdefault(url, label)
     headline = str(lead.get("title") or lead.get("text") or "Инфоповод").strip().split("\n", 1)[0]
-    return {"headline": headline[:140], "status": SOURCE_LABELS[source_rank(lead)],
+    status = ("Инсайд из X · один источник, требует проверки" if group.get("single_insider")
+              else SOURCE_LABELS[source_rank(lead)])
+    return {"headline": headline[:140], "status": status,
             "links": list(links.items())[:5], "media": list(media.items())[:4]}
 
 
@@ -143,9 +150,27 @@ def clusters(posts: list[dict[str, Any]], key_tokens: Callable[[str], set[str]],
     return sorted(out, key=lambda g: g["score"], reverse=True)
 
 
+def _insider_report(post: dict[str, Any]) -> bool:
+    name = str(post.get("channel") or "").casefold().removeprefix("x @")
+    url = urlsplit(public_link(post.get("url")))
+    if name not in INSIDER_ACCOUNTS or url.hostname not in {"x.com", "twitter.com", "www.x.com", "www.twitter.com"}:
+        return False
+    if not re.fullmatch(rf"/{name}/status/\d+/?", url.path, re.I):
+        return False
+    text = str(post.get("text") or "")
+    return bool(CAST_REPORT.search(text) or (TRAILER_REPORT.search(text) and TRAILER_DETAIL.search(text)))
+
+
 def hot(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [g for g in groups if g["sources"] >= HOT_SOURCES or (g["sources"] >= 2 and g["franchise"])
-            or any(source_rank(post) == 2 for post in g["posts"])]
+    confirmed, insider = [], []
+    for g in groups:
+        if g["sources"] >= HOT_SOURCES or (g["sources"] >= 2 and g["franchise"]) or any(
+            source_rank(post) == 2 for post in g["posts"]
+        ):
+            confirmed.append(g)
+        elif g["sources"] == 1 and g["franchise"] and any(_insider_report(post) for post in g["posts"]):
+            insider.append({**g, "single_insider": True})
+    return confirmed + insider
 
 
 def material(group: dict[str, Any], limit: int = 6) -> str:

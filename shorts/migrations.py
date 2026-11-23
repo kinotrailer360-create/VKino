@@ -93,6 +93,14 @@ def history_value(item: Any) -> str:
 
 
 async def _add_fast_insiders(conn: Any) -> None:
+    await _extend_fast_insiders(conn, ("AlexFromCC", "Cryptic4KQual"), include_nexus=True)
+
+
+async def _add_trailertrack(conn: Any) -> None:
+    await _extend_fast_insiders(conn, ("trailertrack",))
+
+
+async def _extend_fast_insiders(conn: Any, accounts: tuple[str, ...], *, include_nexus: bool = False) -> None:
     from .fastnews import parse_add_sources
 
     raw = await conn.fetchval("SELECT value FROM shorts_settings WHERE key = 'fast_feeds' FOR UPDATE")
@@ -112,11 +120,11 @@ async def _add_fast_insiders(conn: Any) -> None:
         return
 
     additions = []
-    for account in ("AlexFromCC", "Cryptic4KQual"):
+    for account in accounts:
         if not any(f"{host}/{account.casefold()}/feed{suffix}.xml" in sources
                    for host in fx_hosts for suffix in ("", ".atom")):
             additions.append(f"https://fxtwitter.com/{account}/feed.xml")
-    if "https://nexuspointnews.com/feed" not in sources:
+    if include_nexus and "https://nexuspointnews.com/feed" not in sources:
         additions.append("https://nexuspointnews.com/feed/")
 
     if additions:
@@ -322,6 +330,7 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
         );
     """, None),
     (15, "extend configured X sources with insider feeds", "", _add_fast_insiders),
+    (16, "add TrailerTrack to configured X sources", "", _add_trailertrack),
 ]
 
 

@@ -486,6 +486,10 @@ def test_add_fast_insiders_extends_only_configured_x_sources():
                                 "https://nexuspointnews.com/feed/"]
     asyncio.run(migrations._add_fast_insiders(configured))
     assert configured.writes == 1
+    asyncio.run(migrations._add_trailertrack(configured))
+    assert configured.feeds[-1] == "https://fxtwitter.com/trailertrack/feed.xml"
+    asyncio.run(migrations._add_trailertrack(configured))
+    assert configured.writes == 2
 
     other = Connection(original[:-1])
     asyncio.run(migrations._add_fast_insiders(other))

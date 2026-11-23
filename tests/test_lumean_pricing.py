@@ -1,9 +1,62 @@
 """Lumean per-call price guard: never approve unknown or expensive paid calls."""
 import asyncio
+import shutil
 
 import pytest
 
 from shorts import lumean_pricing
+
+
+def test_elevenlabs_template_updates_when_delivery_settings_change(monkeypatch):
+    from shorts import lumean
+
+    created = []
+
+    async def call(session, method, route, **kwargs):
+        if method == 'GET':
+            return {'items': [{'name': 'KinoMir360 TTS', 'id': 'old-template'}]}
+        created.append(kwargs['json'])
+        return {'id': str(len(created))}
+
+    monkeypatch.setattr(lumean, '_call', call)
+    monkeypatch.setattr(lumean, '_templates', {})
+    monkeypatch.setattr(lumean, 'SPEED', 1.15)
+    assert asyncio.run(lumean._template_id(None, 'elevenlabs', 'voice')) == '1'
+    assert asyncio.run(lumean._template_id(None, 'elevenlabs', 'voice')) == '1'
+    monkeypatch.setattr(lumean, 'SPEED', 1.1)
+    assert asyncio.run(lumean._template_id(None, 'elevenlabs', 'voice')) == '2'
+    assert created[0]['name'] != created[1]['name']
+    assert created[1]['config']['tts_settings']['voice_settings']['speed'] == 1.1
+
+
+def test_narration_gaps_follow_punctuation():
+    from shorts.daily import narration_gap
+
+    assert narration_gap('Он открывает дверь') < narration_gap('и вдруг,') < narration_gap('Всё стихло.')
+    assert narration_gap('«И кто там?»') > narration_gap('Всё стихло.')
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'), reason='FFmpeg is required')
+def test_narration_uses_decoded_timing(tmp_path, monkeypatch):
+    from shorts import daily
+
+    async def fake_voice(speak, parts, work, pause):
+        for part in parts:
+            await daily._run('ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                             'sine=frequency=440:duration=0.5', str(part))
+
+    monkeypatch.setattr(daily, '_lumean_cached', fake_voice)
+    monkeypatch.setattr(daily.lumean, 'enabled', lambda: True)
+
+    async def check():
+        path, starts, _, spans = await daily.synthesize(['Он входит', 'Что он увидел?', 'Всё ясно.'],
+                                                        tmp_path, prepared=True)
+        duration = await daily._duration(path)
+        assert starts == pytest.approx([0, 0.59, 1.35], abs=0.003)
+        assert [entry['speech'] for entry in spans] == pytest.approx([0.5, 0.5, 0.5], abs=0.003)
+        assert duration == pytest.approx(1.85, abs=0.003)
+
+    asyncio.run(check())
 
 
 def catalog(input_rate=2000000, output_rate=3000000, *, model="gpt-4.1-mini"):
