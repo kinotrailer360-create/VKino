@@ -39,6 +39,49 @@ def test_fast_feeds_migrates_boxoffice_url_with_extra_query_parameters(monkeypat
     assert asyncio.run(bot.fast_feeds()) == []
 
 
+def test_fast_add_reads_and_repairs_pasted_command_blocks(monkeypatch) -> None:
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    import bot
+
+    daniel = "https://fxtwitter.com/DanielRPK/feed.xml"
+    shine = "https://fxtwitter.com/MyTimeToShineH/feed.xml"
+    films = "https://fxtwitter.com/FilmUpdates/feed.xml"
+    saved = [f"{daniel}\n/fast add {shine}", shine]
+
+    async def setting(key):
+        assert key == "fast_feeds"
+        return json.dumps(saved)
+
+    async def set_setting(key, value):
+        assert key == "fast_feeds"
+        saved[:] = json.loads(value)
+
+    async def answer(text):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "shorts_setting", setting)
+    monkeypatch.setattr(bot, "set_shorts_setting", set_setting)
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    replies = []
+
+    assert asyncio.run(bot.fast_feeds()) == [daniel, shine]
+    assert bot.shorts_fast.label(daniel) == "X @DanielRPK"
+
+    message = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=answer,
+                              text=f"/fast add {shine}\n/fast add {films}")
+    asyncio.run(bot.fast_command(message))
+    assert saved == [daniel, shine, films]
+    assert "Добавлено источников: 1" in replies[-1]
+
+    message.text = f"/fast add {films}\n/fast default"
+    asyncio.run(bot.fast_command(message))
+    assert saved == [daniel, shine, films]
+    assert "Укажи ссылку" in replies[-1]
+
+
 def test_every_button_prefix_has_handler() -> None:
     used = set(re.findall(r'_btn\([^\n]*?,\s*f?"([a-z]+):', SRC))
     used |= set(re.findall(r'callback_data=f?"([a-z]+):', SRC))
