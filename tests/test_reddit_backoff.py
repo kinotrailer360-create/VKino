@@ -72,6 +72,8 @@ def test_pack_migrates_retired_defaults_preserving_custom_sources():
     from shorts import fastnews
 
     custom = 'https://example.org/film/rss.xml'
-    feeds = [fastnews.LEGACY_REDDIT_FEEDS[0], custom, fastnews.LEGACY_REDDIT_FEEDS[1]]
+    boxoffice = 'https://www.reddit.com/r/boxoffice/search.rss?q=flair%3A%22Industry+News%22&restrict_sr=1&'
+    assert boxoffice in fastnews.LEGACY_REDDIT_FEEDS
+    feeds = [*fastnews.LEGACY_REDDIT_FEEDS[:2], custom, fastnews.REDDIT_PACK, boxoffice]
     assert fastnews.with_reddit_pack(feeds) == [fastnews.REDDIT_PACK, custom]
     assert fastnews.with_reddit_pack([custom, fastnews.REDDIT_PACK]) == [custom, fastnews.REDDIT_PACK]

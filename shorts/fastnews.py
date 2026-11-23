@@ -30,6 +30,7 @@ log = logging.getLogger("shorts")
 LEGACY_REDDIT_FEEDS = (
     "https://www.reddit.com/r/movies/search.rss?q=flair%3ANews&restrict_sr=1&sort=new",
     "https://www.reddit.com/r/boxoffice/new/.rss?limit=25",
+    "https://www.reddit.com/r/boxoffice/search.rss?q=flair%3A%22Industry+News%22&restrict_sr=1&",
 )
 REDDIT_COMMUNITIES = (
     "movies", "television", "boxoffice", "horror", "netflix", "hbo", "DisneyPlus", "Oscars", "Documentaries",
@@ -71,7 +72,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://
 
 
 def with_reddit_pack(feeds: list[str]) -> list[str]:
-    """Add the pack once; replace the two retired defaults while preserving other sources."""
+    """Add the pack once and replace retired URLs while preserving other sources."""
     return list(dict.fromkeys(REDDIT_PACK if entry in LEGACY_REDDIT_FEEDS else entry
                               for entry in [*feeds, REDDIT_PACK]))
 
@@ -244,6 +245,8 @@ async def _download_reddit(session: aiohttp.ClientSession) -> bytes:
 
 
 _found_feed: dict[str, str] = {}  # адрес сайта → его RSS, найденный на главной (чтобы не искать каждый раз)
+EMPIRE_RSS = "https://rss.onebauer.media/api/feed-aggregator?hostname=https://www.empireonline.com"
+GOOGLE_NEWS_ON_FORBIDDEN = frozenset({"empireonline.com", "worldofreel.com"})
 ALT = re.compile(r'<link[^>]+type=["\']application/(?:rss|atom)\+xml["\'][^>]*>', re.I)
 OG_IMAGE = re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)'
                       r'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)',
@@ -337,11 +340,25 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
     elif _reddit_name(url) and ".rss" in urlparse(url).path:
         raise RuntimeError("Reddit отключил RSS. Добавь новую подборку командой /fast reddit")
     else:
-        known = _found_feed.get(url)
-        raw = await _download(session, known or url)
-        if not known and not is_feed(raw):  # страница сайта — ищем его ленту
-            feed, raw = await _site_feed(session, url, raw)
-            _found_feed[url] = feed
+        parts = urlparse(url)
+        host = (parts.hostname or "").removeprefix("www.")
+        empire_home = host == "empireonline.com" and parts.path in ("", "/") and not parts.query
+        known = EMPIRE_RSS if empire_home else _found_feed.get(url)
+        try:
+            raw = await _download(session, known or url)
+            if empire_home and not is_feed(raw):
+                raise ValueError("RSS Empire вернул ответ без ленты")
+        except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+            forbidden = isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403
+            if not empire_home and not (forbidden and host in GOOGLE_NEWS_ON_FORBIDDEN):
+                raise
+            raw = await _download(session, google_news(host))
+            if not is_feed(raw):
+                raise ValueError("Google Новости не вернули RSS или Atom")
+        else:
+            if not known and not is_feed(raw):  # страница сайта — ищем его ленту
+                feed, raw = await _site_feed(session, url, raw)
+                _found_feed[url] = feed
     limit = min(50, 4 * per_feed) if entry == REDDIT_PACK else per_feed
     posts = await asyncio.to_thread(parse, raw, label(entry), since, limit)
     if per_feed <= PER_FEED and not entry.startswith("x:") and entry != REDDIT_PACK and not _reddit_name(url):
@@ -405,6 +422,9 @@ async def check(feeds: list[str]) -> list[tuple[str, int | str, str]]:
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, RedditRateLimited):
                 return entry, str(exc), name
+            if (isinstance(exc, aiohttp.ClientResponseError) and exc.status == 402
+                    and urlparse(entry).hostname == "rss.app"):
+                return entry, "RSS.app требует оплату (HTTP 402). Проверь подписку или замени ссылку.", "RSS.app"
             hint = (" — RSSHub не запущен или нет TWITTER_AUTH_TOKEN" if rsshub() and
                     str(feed_url(entry)).startswith(rsshub()) else "")
             return entry, f"{type(exc).__name__}: {str(exc)[:80]}{hint}", name or "RSS"
