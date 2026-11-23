@@ -1,5 +1,6 @@
 """Lumean per-call price guard: never approve unknown or expensive paid calls."""
 import asyncio
+import shutil
 
 import pytest
 
@@ -33,6 +34,29 @@ def test_narration_gaps_follow_punctuation():
 
     assert narration_gap('Он открывает дверь') < narration_gap('и вдруг,') < narration_gap('Всё стихло.')
     assert narration_gap('«И кто там?»') > narration_gap('Всё стихло.')
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'), reason='FFmpeg is required')
+def test_narration_uses_decoded_timing(tmp_path, monkeypatch):
+    from shorts import daily
+
+    async def fake_voice(speak, parts, work, pause):
+        for part in parts:
+            await daily._run('ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                             'sine=frequency=440:duration=0.5', str(part))
+
+    monkeypatch.setattr(daily, '_lumean_cached', fake_voice)
+    monkeypatch.setattr(daily.lumean, 'enabled', lambda: True)
+
+    async def check():
+        path, starts, _, spans = await daily.synthesize(['Он входит', 'Что он увидел?', 'Всё ясно.'],
+                                                        tmp_path, prepared=True)
+        duration = await daily._duration(path)
+        assert starts == pytest.approx([0, 0.59, 1.35], abs=0.003)
+        assert [entry['speech'] for entry in spans] == pytest.approx([0.5, 0.5, 0.5], abs=0.003)
+        assert duration == pytest.approx(1.85, abs=0.003)
+
+    asyncio.run(check())
 
 
 def catalog(input_rate=2000000, output_rate=3000000, *, model="gpt-4.1-mini"):

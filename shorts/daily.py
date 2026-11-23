@@ -13,6 +13,8 @@ import random
 import re
 import shutil
 import sys
+import tempfile
+import wave
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -1460,22 +1462,27 @@ async def synthesize(lines: list[str], work: Path, pause: float | None = None, c
         tts_note = ("🗣 Голос не смог озвучить кусок текста — в ролике он без голоса (на экране есть): "
                     + "; ".join(f"«{d[:60]}»" for d in dropped[:3]))
 
+    voice = work / "voice.wav"
     starts, spans, t = [], [], 0.0
     inputs, chains = [], []
-    for i, part in enumerate(parts):
-        starts.append(round(t, 3))
-        dur = await _duration(part)
-        spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]],
-                      "text": speak[i].replace(pronounce.STRESS, "")})
-        gap = narration_gap(speak[i]) if i < len(parts) - 1 else 0.0
-        t += dur + gap
-        inputs += ["-i", str(part)]
-        padding = f",apad=pad_dur={gap}" if gap else ""
-        chains.append(f"[{i}:a]aresample=48000{padding}[a{i}]")
-    filt = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(parts))) + \
-        f"concat=n={len(parts)}:v=0:a=1[out]"
-    voice = work / "voice.wav"
-    await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
+    with tempfile.TemporaryDirectory(dir=work) as decoded_folder:
+        for i, part in enumerate(parts):
+            decoded = Path(decoded_folder) / f"{i}.wav"
+            await _run("ffmpeg", "-v", "error", "-y", "-i", str(part), "-ar", "48000", "-ac", "1", str(decoded))
+            # MP3 duration includes encoder padding which FFmpeg drops while decoding.
+            with wave.open(str(decoded)) as pcm:
+                dur = pcm.getnframes() / pcm.getframerate()
+            starts.append(round(t, 3))
+            spans.append({"speech": round(dur, 3), "words": [round(w, 3) for w in words[i]],
+                          "text": speak[i].replace(pronounce.STRESS, "")})
+            gap = narration_gap(speak[i]) if i < len(parts) - 1 else 0.0
+            t += dur + gap
+            inputs += ["-i", str(decoded)]
+            padding = f"apad=pad_dur={gap}" if gap else "anull"
+            chains.append(f"[{i}:a]{padding}[a{i}]")
+        filt = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(parts))) + \
+            f"concat=n={len(parts)}:v=0:a=1[out]"
+        await _run("ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", filt, "-map", "[out]", str(voice))
     global last_voice
     # разметка озвучки — для «🎙 Переозвучить только звук»: какие фразы, где начинаются и сколько звучат
     last_voice = {"file": voice.name, "lines": list(lines), "prepared": prepared, "careful": careful,
