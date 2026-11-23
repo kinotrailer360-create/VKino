@@ -282,6 +282,18 @@ def test_netsafe_blocks_internal_addresses():
             asyncio.run(netsafe.check_url(url))
 
 
+def test_budget_november_override_expires():
+    from datetime import date
+
+    from shorts import budget
+
+    assert budget.monthly_limit("ai", date(2026, 10, 31)) == budget.LIMITS["ai"]
+    assert budget.monthly_limit("ai", date(2026, 11, 1)) == 15
+    assert budget.monthly_limit("ai", date(2026, 11, 30)) == 15
+    assert budget.monthly_limit("ai", date(2026, 12, 1)) == budget.LIMITS["ai"]
+    assert budget.monthly_limit("tts", date(2026, 11, 23)) == budget.LIMITS["tts"]
+
+
 def test_budget_caps_paid_ai_and_limits_tts(monkeypatch):
     import asyncio
 
@@ -340,6 +352,7 @@ def test_budget_caps_paid_ai_and_limits_tts(monkeypatch):
     monkeypatch.setattr(budget, "_warned", set())
     monkeypatch.setitem(budget.LIMITS, "tts", 1.0)
     monkeypatch.setitem(budget.LIMITS, "ai", 3.0)
+    monkeypatch.setattr(budget, "monthly_limit", budget.LIMITS.get)
     monkeypatch.setattr(budget, "on_warning", warn)
 
     async def run():
