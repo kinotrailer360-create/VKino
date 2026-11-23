@@ -124,6 +124,32 @@ def feed_url(entry: str) -> str | None:
     return entry if entry.startswith("http") else None
 
 
+def parse_add_sources(args: str) -> list[str]:
+    """Parse the first /fast add argument and any additional /fast add lines."""
+    sources = []
+    for index, line in enumerate(args.strip().splitlines()):
+        entry = line.strip()
+        if not entry:
+            continue
+        if index:
+            command = re.fullmatch(r"/fast(?:@\w+)?\s+add\s+(\S+)", entry)
+            if not command:
+                return []
+            entry = command[1]
+        if re.fullmatch(r"(?:x:|@)\w{1,30}", entry):
+            sources.append(f"x:{entry[1:]}" if entry.startswith("@") else entry)
+            continue
+        try:
+            url = urlparse(entry)
+            if url.scheme in {"https", "http"} and url.hostname and not re.search(r"\s", entry):
+                sources.append(entry)
+                continue
+        except ValueError:
+            pass
+        return []
+    return sources
+
+
 def label(entry: str) -> str:
     """Короткое имя источника для ИИ и автора: r/movies, Deadline, X @DanielRPK."""
     if entry == REDDIT_PACK:
@@ -136,6 +162,10 @@ def label(entry: str) -> str:
     if "reddit.com" in url.netloc and sub:
         return f"Reddit r/{sub.group(1)}"
     host = url.netloc.removeprefix("www.")
+    if host in {"fxtwitter.com", "fixupx.com"}:
+        profile = re.fullmatch(r"/(\w{1,30})/(?:feed|media)(?:\.atom)?\.xml", url.path)
+        if profile:
+            return f"X @{profile[1]}"
     if host == "rss.app":  # имя ленты rss.app — из самой ленты (аккаунт X и т. п.)
         return ""
     if "/twitter/user/" in url.path:

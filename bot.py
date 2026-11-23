@@ -7383,6 +7383,10 @@ async def fast_feeds() -> list[str]:
         feeds = None
     if not isinstance(feeds, list):
         return list(shorts_fast.DEFAULT_FEEDS)
+    # Older versions saved a pasted block of /fast add commands as one source.
+    if any("\n" in entry or "\r" in entry for entry in feeds):
+        feeds = list(dict.fromkeys(source for entry in feeds for source in
+                                  (shorts_fast.parse_add_sources(entry) or [entry])))
     if any(shorts_fast.is_retired_reddit_feed(entry) for entry in feeds):
         return shorts_fast.with_reddit_pack(feeds)
     return feeds  # [] — автор удалил все
@@ -8275,17 +8279,19 @@ async def fast_command(message: Message) -> None:
                  if not os.getenv("REDLISTEN_API_KEY", "").strip() else "\nСостояние ленты можно проверить через /fast.")
         await message.answer(f"🎬 <b>{shorts_fast.REDDIT_PACK_LABEL}:</b>\n{names}\n" + setup)
         return
-    if action == "add" and not arg.startswith(("http://", "https://", "x:", "@")):
-        await message.answer("Напиши ссылку через пробел после команды, например:\n"
-                             "<code>/fast add https://rss.app/feeds/xxxxx.xml</code>\n"
-                             "или аккаунт X (если настроен RSSHub): <code>/fast add @DanielRPK</code>")
-        return
     if action == "add":
-        entry = f"x:{arg.lstrip('@')}" if arg.startswith("@") else arg
-        if entry not in feeds:
-            feeds.append(entry)
-        await set_shorts_setting("fast_feeds", json.dumps(feeds))
-        await message.answer(f"✅ Добавил: <code>{escape(entry[:90])}</code>")
+        entries = shorts_fast.parse_add_sources(arg)
+        if not entries:
+            await message.answer("Укажи ссылку после команды, например:\n"
+                                 "<code>/fast add https://rss.app/feeds/xxxxx.xml</code>\n"
+                                 "При добавлении нескольких источников ставь каждую команду на отдельной строке.")
+            return
+        updated = list(dict.fromkeys([*feeds, *entries]))
+        await set_shorts_setting("fast_feeds", json.dumps(updated))
+        if len(entries) == 1:
+            await message.answer(f"✅ Источник в списке: <code>{escape(entries[0][:90])}</code>")
+        else:
+            await message.answer(f"✅ Добавлено источников: {len(updated) - len(feeds)}. Проверка — /fast.")
         return
     if action == "del" and arg.isdigit() and 1 <= int(arg) <= len(feeds):
         removed = feeds.pop(int(arg) - 1)
