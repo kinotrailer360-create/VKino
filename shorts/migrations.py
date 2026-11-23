@@ -290,6 +290,14 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """, None),
+    (15, "reuse confirmed visual reviews", """
+        CREATE TABLE IF NOT EXISTS visual_review_cache (
+            key TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_visual_review_cache_expiry ON visual_review_cache(expires_at);
+    """, None),
 ]
 
 

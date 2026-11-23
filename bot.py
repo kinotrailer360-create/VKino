@@ -86,6 +86,7 @@ from shorts import pronounce as shorts_pronounce
 from shorts.clips import download_clip as shorts_download_clip
 from shorts import daily as shorts_daily
 from shorts import scene_planner as shorts_scene_planner
+from shorts import visual_guard as shorts_visual_guard
 from shorts import script_task as shorts_script_task
 from shorts import qc as shorts_qc
 from shorts import health as shorts_health
@@ -1072,6 +1073,7 @@ async def init_db() -> None:
         logging.info("Migrations applied: %s", ", ".join(f"{v:03d}" for v in applied))
     shorts_budget.attach(db)  # учёт и лимиты платных вызовов — в таблице ai_usage (миграция 006)
     shorts_library.attach(pool)  # библиотека сцен (миграция 009)
+    shorts_visual_guard.attach(pool)
     logging.info("PostgreSQL connected")
 
 
@@ -18828,6 +18830,7 @@ async def heartbeat() -> None:
                 await shorts_fsm.PgStorage(db).cleanup()
                 if render_jobs:
                     await render_jobs.cleanup(SHORTS_DIR)
+                await shorts_visual_guard.cleanup()
             except Exception:  # noqa: BLE001
                 logging.exception("FSM cleanup failed")
         await asyncio.sleep(30)
