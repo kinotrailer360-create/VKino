@@ -69,6 +69,8 @@ REDDIT_BACKOFF = 6 * 3600
 class RedditRateLimited(RuntimeError):
     """Temporary upstream throttle, distinct from a broken source."""
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KinoMir360-bot/1.0; +https://t.me/KinoMir360)"}
+FX_FEED_PATH = re.compile(r"/(\w{1,30})/(?:feed|media)(?:\.atom)?\.xml")
+FX_FEED_MIRRORS = {"fxtwitter.com": "fixupx.com", "fixupx.com": "fxtwitter.com"}
 
 
 def with_reddit_pack(feeds: list[str]) -> list[str]:
@@ -162,8 +164,8 @@ def label(entry: str) -> str:
     if "reddit.com" in url.netloc and sub:
         return f"Reddit r/{sub.group(1)}"
     host = url.netloc.removeprefix("www.")
-    if host in {"fxtwitter.com", "fixupx.com"}:
-        profile = re.fullmatch(r"/(\w{1,30})/(?:feed|media)(?:\.atom)?\.xml", url.path)
+    if host in FX_FEED_MIRRORS:
+        profile = FX_FEED_PATH.fullmatch(url.path)
         if profile:
             return f"X @{profile[1]}"
     if host == "rss.app":  # имя ленты rss.app — из самой ленты (аккаунт X и т. п.)
@@ -387,12 +389,18 @@ async def _fetch(session: aiohttp.ClientSession, entry: str, since: float, per_f
             if empire_home and not is_feed(raw):
                 raise ValueError("RSS Empire вернул ответ без ленты")
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+            mirror = FX_FEED_MIRRORS.get(host)
             forbidden = isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403
-            if not empire_home and not (forbidden and host in GOOGLE_NEWS_ON_FORBIDDEN):
+            if (mirror and FX_FEED_PATH.fullmatch(parts.path)
+                    and isinstance(exc, aiohttp.ClientResponseError) and exc.status == 404):
+                fallback = parts._replace(netloc=mirror).geturl()
+            elif empire_home or (forbidden and host in GOOGLE_NEWS_ON_FORBIDDEN):
+                fallback = google_news(host)
+            else:
                 raise
-            raw = await _download(session, google_news(host))
+            raw = await _download(session, fallback)
             if not is_feed(raw):
-                raise ValueError("Google Новости не вернули RSS или Atom")
+                raise ValueError(f"{urlparse(fallback).hostname} не вернул RSS или Atom")
         else:
             if not known and not is_feed(raw):  # страница сайта — ищем его ленту
                 feed, raw = await _site_feed(session, url, raw)
