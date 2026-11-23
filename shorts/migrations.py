@@ -5,8 +5,7 @@
 - при старте бота: общая блокировка (pg_advisory_xact_lock) — две копии бота не применят миграции одновременно;
 - применённая миграция записывается в schema_version с контрольной суммой; изменили её текст — бот не стартует
   миграции (MigrationError) и сообщает админу;
-- все миграции только ДОБАВЛЯЮТ таблицы: старые таблицы и JSON-ключи в shorts_settings не трогаются — откат на
-  прошлую версию бота работает (на переходный период бот пишет и в старое место);
+- миграции сохраняют совместимость старых таблиц и JSON-настроек, чтобы можно было откатить версию бота;
 - перенос данных проверяется: сколько записей было в JSON — столько в таблице, иначе вся миграция откатывается.
 - копию базы перед обновлением делает deploy/update.sh (pg_dump), если есть неприменённые миграции.
 """
@@ -91,6 +90,38 @@ async def _copy_history(conn: Any) -> None:
 def history_value(item: Any) -> str:
     """Элемент истории постов как строка: ссылки и id — как есть, сюжеты (словари) — JSON с сортировкой ключей."""
     return item if isinstance(item, str) else json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+
+async def _add_fast_insiders(conn: Any) -> None:
+    from .fastnews import parse_add_sources
+
+    raw = await conn.fetchval("SELECT value FROM shorts_settings WHERE key = 'fast_feeds' FOR UPDATE")
+    try:
+        feeds = json.loads(raw) if raw else None
+    except ValueError:
+        return
+    if not isinstance(feeds, list) or not all(isinstance(entry, str) for entry in feeds):
+        return
+
+    # Only extend the configured five-account X list. Older settings may contain a pasted block of commands.
+    sources = {source.split("?", 1)[0].casefold().rstrip("/")
+               for entry in feeds for source in (parse_add_sources(entry) or [entry])}
+    fx_hosts = ("https://fxtwitter.com", "https://fixupx.com")
+    current = ("DanielRPK", "MyTimeToShineH", "FilmUpdates", "DiscussingFilm", "empiremagazine")
+    if not all(any(f"{host}/{account.casefold()}/feed.xml" in sources for host in fx_hosts) for account in current):
+        return
+
+    additions = []
+    for account in ("AlexFromCC", "Cryptic4KQual"):
+        if not any(f"{host}/{account.casefold()}/feed{suffix}.xml" in sources
+                   for host in fx_hosts for suffix in ("", ".atom")):
+            additions.append(f"https://fxtwitter.com/{account}/feed.xml")
+    if "https://nexuspointnews.com/feed" not in sources:
+        additions.append("https://nexuspointnews.com/feed/")
+
+    if additions:
+        await conn.execute("UPDATE shorts_settings SET value = $1 WHERE key = 'fast_feeds'",
+                           json.dumps([*feeds, *additions]))
 
 
 # ---------------------------------------------------------------- список миграций
@@ -290,6 +321,7 @@ MIGRATIONS: list[tuple[int, str, str, Step | None]] = [
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """, None),
+    (15, "extend configured X sources with insider feeds", "", _add_fast_insiders),
 ]
 
 
