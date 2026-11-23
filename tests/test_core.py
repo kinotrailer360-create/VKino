@@ -1171,6 +1171,32 @@ def test_fast_uses_publisher_fallback_and_reports_rss_app_payment(monkeypatch):
     assert requested == [fastnews.EMPIRE_RSS, fastnews.google_news("empireonline.com")]
 
 
+def test_fast_uses_fixupx_when_fxtwitter_returns_not_found(monkeypatch):
+    import asyncio
+    from email.utils import formatdate
+
+    import aiohttp
+    from shorts import fastnews
+
+    source = "https://fxtwitter.com/FilmUpdates/feed.xml?count=30"
+    mirror = "https://fixupx.com/FilmUpdates/feed.xml?count=30"
+    link = "https://x.com/FilmUpdates/status/123"
+    requests = []
+
+    async def download(session, url):
+        requests.append(url)
+        if url == source:
+            raise aiohttp.ClientResponseError(None, (), status=404)
+        assert url == mirror
+        return (f'<rss version="2.0"><channel><title>Film Updates</title><item><title>Film news</title>'
+                f'<link>{link}</link><pubDate>{formatdate(usegmt=True)}</pubDate>'
+                '</item></channel></rss>').encode()
+
+    monkeypatch.setattr(fastnews, "_download", download)
+    assert asyncio.run(fastnews.check([source])) == [(source, 1, "X @FilmUpdates")]
+    assert requests == [source, mirror]
+
+
 def test_list_hook_is_short() -> None:
     # подборки теряли зрителей на 4,5–6-й секунде: первая фраза кончалась, а фильм ещё не начался
     from datetime import date
