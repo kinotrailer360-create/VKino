@@ -1204,6 +1204,21 @@ async def say_to_file(text: str, path: Path) -> list[float]:
 stressed: dict[str, int] = {}  # слова со знаком ударения в последней озвучке (выпуск шлёт их автору на проверку)
 
 
+_SPOKEN_ENDING = re.compile(r'([.!?…]+)([»”"’\)\]]*)$')
+
+
+def _keep_spoken_emphasis(source: str, spoken: str) -> str:
+    ending = _SPOKEN_ENDING.search(source.rstrip())
+    if not ending or not any(mark in ending[1] for mark in "!?"):
+        return spoken
+    spoken = spoken.rstrip()
+    match = _SPOKEN_ENDING.search(spoken)
+    if match:
+        return spoken[:match.start()] + ending[1] + match[2]
+    stem = spoken.rstrip('»”"’)]')
+    return stem + ending[1] + spoken[len(stem):]
+
+
 async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
     """Текст для голоса: словарь произношения, затем ИИ пишет числа словами в нужном падеже и латиницу
     русскими буквами; что ИИ не исправил (или он недоступен) — простая замена без ИИ."""
@@ -1235,7 +1250,8 @@ async def spoken_lines(lines: list[str], careful: bool = False) -> list[str]:
     for text in out:
         for word in re.findall(rf"[\w{pronounce.STRESS}-]*{pronounce.STRESS}[\w{pronounce.STRESS}-]*", text):
             stressed[word] = stressed.get(word, 0) + 1
-    return await _accent(out)
+    accented = await _accent(out)
+    return [_keep_spoken_emphasis(source, spoken) for source, spoken in zip(lines, accented)]
 
 
 DATA_DIR = Path(os.getenv("VKINO_DATA", "/tmp/kinomir_data"))  # в Docker — том, переживает обновления бота
