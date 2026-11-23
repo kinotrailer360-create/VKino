@@ -7383,7 +7383,7 @@ async def fast_feeds() -> list[str]:
         feeds = None
     if not isinstance(feeds, list):
         return list(shorts_fast.DEFAULT_FEEDS)
-    if any(entry in shorts_fast.LEGACY_REDDIT_FEEDS for entry in feeds):
+    if any(shorts_fast.is_retired_reddit_feed(entry) for entry in feeds):
         return shorts_fast.with_reddit_pack(feeds)
     return feeds  # [] — автор удалил все
 
