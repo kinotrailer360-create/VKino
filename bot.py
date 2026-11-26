@@ -11488,6 +11488,21 @@ async def offer_post(bot: Bot, chat_id: int, ids: list[int], kind: str, more: st
                            disable_web_page_preview=True)
 
 
+async def studio_news_preview(message: Message, text: str) -> Message:
+    """Clean copyable Telegram post with the existing linked channel signature."""
+    return await message.answer(escape(text) + SIGNATURE, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def studio_news_handoff(message: Message, first: int) -> None:
+    """Register the exact preview once in the existing native approval workflow."""
+    chat_id = message.chat.id
+    if await db().fetchval("SELECT 1 FROM ai_drafts WHERE chat_id=$1 AND first_id=$2", chat_id, first):
+        await message.answer("Черновик уже сохранён. Используй обычное меню публикации.",
+                             reply_markup=post_keyboard(first), parse_mode=None)
+        return
+    await offer_post(message.bot, chat_id, [first], "text", what="Пост ИИ-студии сохранён как черновик")
+
+
 async def _queue_json_remove(pairs: set[tuple[int, int]]) -> None:
     """Двойная запись очереди в старый JSON (переходный период)."""
     queue = await _json_setting("posts_queue", [])
@@ -20142,6 +20157,7 @@ async def main() -> None:
     dp.include_router(build_ai_studio_router(
         ADMIN_IDS, Path(os.getenv("VKINO_DATA", "/data")),
         shorts_script_task.parse, show_structured_plan, shorts_lock.locked,
+        news_preview=studio_news_preview, news_handoff=studio_news_handoff,
     ))
     dp.include_router(contact_router)
     dp.include_router(daily_short_router)
