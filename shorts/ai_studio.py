@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import os
 import secrets
 import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiogram import F, Router
@@ -161,6 +163,65 @@ class StudioStore:
             c.execute("DELETE FROM drafts WHERE owner=?", (owner,))
 
 
+
+# Source URLs are data returned by Open WebUI, not text invented by the model.
+_SOURCE_HEADING = re.compile(r"(?im)^\s*(?:#{1,6}[ \t]+)?(?:\*\*)?(?:источники(?:\s+(?:информации|для проверки))?|ссылки на источники|проверенные источники|sources)\s*(?:\*\*)?\s*:?\s*(?:\*\*)?[ \t]*$")
+_CITATION = re.compile(r"\[(\d{1,4})\](?!\()")
+_MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
+_BARE_URL = re.compile(r"https?://[^\s<>\]\[()]+")
+_VERIFY = re.compile(r"\b(?:проверь|проверить|проверка|фактчек|достоверно|правда ли)\b", re.I)
+
+
+def grounded_news_answer(answer: str, data: dict, question: str) -> str:
+    """Use exact retrieved web URLs; never treat citation markers as URLs."""
+    records = []
+    for item in data.get("sources", []) or []:
+        if not isinstance(item, dict) or (item.get("source") or {}).get("type") != "web_search":
+            continue
+        ids = item.get("citation_ids") or []
+        for i, meta in enumerate(item.get("metadata") or []):
+            if not isinstance(meta, dict):
+                continue
+            url = meta.get("source") or meta.get("url")
+            if not isinstance(url, str) or len(url) > 2000 or any(ch.isspace() for ch in url):
+                continue
+            try:
+                parsed = urlsplit(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                    continue
+            except ValueError:
+                continue
+            title = str(meta.get("title") or parsed.hostname).replace("\n", " ")[:200]
+            cid = str(ids[i]) if i < len(ids) else ""
+            records.append((cid, title, url))
+    match = _SOURCE_HEADING.search(answer)
+    body = answer[:match.start()] if match else answer
+    cited = set(_CITATION.findall(body)) or set(_CITATION.findall(answer))
+    needs_sources = bool(match or cited or _VERIFY.search(question))
+    allowed = {r[2] for r in records}
+    # Keep exact retrieved links in prose, but do not expose made-up links.
+    body = _MARKDOWN_LINK.sub(lambda m: m[0] if m[2] in allowed else m[1], body)
+    body = _BARE_URL.sub(lambda m: m[0] if m[0].rstrip(".,;:!?") in allowed else "", body)
+    body = _CITATION.sub("", body)
+    body = re.sub(r"[ \t]+([.,;:!?])", r"\1", body).strip()
+    if not needs_sources:
+        return body
+    selected = [r for r in records if r[0] in cited] if cited else []
+    if not selected:
+        selected = records
+    seen = set()
+    links = []
+    for _, title, url in selected:
+        if url not in seen:
+            links.append(f"• {title}\n{url}")
+            seen.add(url)
+        if len(links) >= 4:
+            break
+    if links:
+        return body + "\n\nИсточники из поиска (отдельная проверка доступности ссылок не выполнялась):\n" + "\n\n".join(links)
+    return ("⚠️ Поиск не вернул ссылки на веб-источники; достоверность не подтверждена.\n\n" + body).strip()
+
+
 class StudioClient:
     def __init__(self, data_dir):
         self.data_dir = data_dir
@@ -201,6 +262,9 @@ class StudioClient:
             raise StudioError("Модель вернула пустой ответ.", True)
         if len(answer) > 30000:
             raise StudioError("Слишком длинный ответ. Раздели задачу на части.")
+        if mode == "news":
+            question = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+            return grounded_news_answer(answer, data, question)
         return answer.strip()
 
     async def ask(self, mode, provider, history, question):

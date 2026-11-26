@@ -67,3 +67,29 @@ class StudioClientTests(unittest.IsolatedAsyncioTestCase):
             await c.ask("shorts", "gemini", [], "Сценарий")
             self.assertIn("## Карта видеоряда", request.await_args.args[1][-1]["content"])
             self.assertIn("Сценарий", request.await_args.args[1][-1]["content"])
+
+
+class GroundedNewsTests(unittest.TestCase):
+    def test_real_metadata_not_generated_url(self):
+        from shorts.ai_studio import grounded_news_answer
+        url = "https://kino.mail.ru/news/145878-real-article/"
+        data = {"sources": [{"source": {"type": "collection"}, "citation_ids": [1],
+                             "metadata": [{"source": "KinoMir360.md"}]},
+                            {"source": {"type": "web_search"}, "citation_ids": [2],
+                             "metadata": [{"source": url, "title": "Кино Mail"}]}]}
+        raw = "Подтверждено [2].\n\n**Источники:**\n[Кино Mail](https://kino.mail.ru/news/fake/) [2]"
+        result = grounded_news_answer(raw, data, "Проверь")
+        self.assertIn(url, result)
+        self.assertNotIn("/fake/", result)
+        self.assertNotIn("[2]", result)
+        self.assertNotIn("KinoMir360.md", result)
+
+    def test_no_sources_is_explicit(self):
+        from shorts.ai_studio import grounded_news_answer
+        result = grounded_news_answer("Подтверждено [1].", {}, "Проверь")
+        self.assertIn("достоверность не подтверждена", result)
+        self.assertNotIn("[1]", result)
+
+    def test_adaptation_without_sources(self):
+        from shorts.ai_studio import grounded_news_answer
+        self.assertEqual(grounded_news_answer("Готовый пост.", {}, "Для Threads"), "Готовый пост.")
