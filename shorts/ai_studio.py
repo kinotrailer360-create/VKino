@@ -18,7 +18,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from . import netsafe, studio_voice
+from . import netsafe, studio_voice, studio_news
 
 log = logging.getLogger(__name__)
 BUTTON = "🧠 ИИ-студия"
@@ -152,6 +152,7 @@ class StudioStore:
             conn.execute("CREATE TABLE IF NOT EXISTS preferences(owner INTEGER PRIMARY KEY, provider TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS drafts(owner INTEGER PRIMARY KEY, token TEXT NOT NULL, content TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS studio_rules(id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, UNIQUE(owner,scope,content))")
+            conn.execute("CREATE TABLE IF NOT EXISTS studio_news_cards(token TEXT PRIMARY KEY, owner INTEGER NOT NULL, preview INTEGER NOT NULL, content TEXT NOT NULL, transferred INTEGER NOT NULL DEFAULT 0)")
             yield conn
 
 
@@ -185,6 +186,26 @@ class StudioStore:
     def preferences_for(self, owner, mode):
         scope = MODE_SCOPE[mode]
         return [content for name in ("all", scope) for _, content in self.rules(owner, name)]
+
+    def news_card(self, owner, preview, card):
+        token = secrets.token_hex(8)
+        with self.connect() as c:
+            c.execute("INSERT INTO studio_news_cards(token,owner,preview,content) VALUES(?,?,?,?)", (token, owner, preview, json.dumps(card, ensure_ascii=False)))
+            c.execute("DELETE FROM studio_news_cards WHERE owner=? AND rowid NOT IN (SELECT rowid FROM studio_news_cards WHERE owner=? ORDER BY rowid DESC LIMIT 100)", (owner, owner))
+        return token
+
+    def get_news_card(self, owner, token):
+        with self.connect() as c:
+            row = c.execute("SELECT preview,content,transferred FROM studio_news_cards WHERE owner=? AND token=?", (owner, token)).fetchone()
+        return (row[0], json.loads(row[1]), bool(row[2])) if row else None
+
+    def mark_news_transferred(self, owner, token):
+        with self.connect() as c:
+            c.execute("UPDATE studio_news_cards SET transferred=1 WHERE owner=? AND token=?", (owner, token))
+
+    def remove_news_card(self, owner, token):
+        with self.connect() as c:
+            c.execute("DELETE FROM studio_news_cards WHERE owner=? AND token=? AND transferred=0", (owner, token))
 
     def history(self, owner, mode):
         with self.connect() as c:
@@ -346,6 +367,27 @@ async def verify_news_links(answer: str) -> str:
             + "\n".join(lines))
 
 
+async def check_news_cards(result):
+    cards = result["cards"]
+    if not cards:
+        return result
+    urls = list(dict.fromkeys(s["url"] for card in cards for s in card["sources"]))
+    sem = asyncio.Semaphore(4)
+    try:
+        async with netsafe.safe_session(timeout=aiohttp.ClientTimeout(total=7, connect=3), trust_env=False,
+                                        headers={"User-Agent": "Mozilla/5.0"}) as session:
+            async def checked(url):
+                async with sem:
+                    return await _source_status(session, url)
+            statuses = dict(zip(urls, await asyncio.gather(*(checked(u) for u in urls))))
+    except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
+        statuses = dict.fromkeys(urls, "не удалось проверить доступность")
+    for card in cards:
+        for source in card["sources"]:
+            source["availability"] = statuses[source["url"]]
+    return result
+
+
 class StudioClient:
     def __init__(self, data_dir):
         self.data_dir = data_dir
@@ -354,7 +396,9 @@ class StudioClient:
         key = read_key(self.data_dir)
         if not key:
             raise StudioError("Нужно подключить API-ключ Open WebUI на VPS.")
-        _, _, _, search, skill, tools = MODES[mode]
+        _, _, _, search, skill, tools = MODES["news" if mode in {"news_cards", "news_threads"} else mode]
+        if mode == "news_threads":
+            search = False
         payload = {
             "model": model, "messages": messages, "stream": False,
             "features": {"web_search": search, "memory": True},
@@ -386,12 +430,45 @@ class StudioClient:
             raise StudioError("Модель вернула пустой ответ.", True)
         if len(answer) > 30000:
             raise StudioError("Слишком длинный ответ. Раздели задачу на части.")
+        if mode == "news_cards":
+            try:
+                question = next(m["content"] for m in reversed(messages) if m.get("role") == "user")
+                question = question.rsplit(MEMORY_TASK, 1)[-1].split("\n\nЗАДАНИЕ В РЕЖИМЕ КАРТОЧЕК НОВОСТЕЙ.", 1)[0]
+                result = studio_news.parse_cards(answer, data, question)
+            except (ValueError, TypeError, KeyError, StopIteration):
+                raise StudioError("ИИ не вернул корректный формат новостных карточек.", True) from None
+            return await check_news_cards(result)
+        if mode == "news_threads":
+            text = re.sub(r"\[\d{1,4}\]", "", answer).replace("**", "").strip()
+            if not text or len(text) > 500 or re.search(r"https?://|t\.me/|max\.ru/", text, re.I):
+                raise StudioError("ИИ не соблюдал формат Threads до 500 символов.", True)
+            return text
         if mode == "news":
             question = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
             if MEMORY_TASK in question:
                 question = question.rsplit(MEMORY_TASK, 1)[-1]
             return await verify_news_links(grounded_news_answer(answer, data, question))
         return answer.strip()
+
+    async def _news_action(self, provider, question, mode, rules=()):
+        messages = [{"role": "user", "content": memory_prompt(question, rules)}]
+        sequence = model_sequence("news", provider)
+        for i, (label, model) in enumerate(sequence):
+            try:
+                return await self._request(model, messages, mode), label
+            except StudioError as exc:
+                if not exc.retryable or i == len(sequence) - 1:
+                    raise
+        raise StudioError("Нет доступной модели.")
+
+    async def discover(self, provider, question, *, rules=()):
+        return await self._news_action(provider, studio_news.prompt(question), "news_cards", rules)
+
+    async def threads(self, provider, post, *, rules=()):
+        task = ("Адаптируй только данный готовый пост для Threads. До 500 символов, живой текст, "
+                "вопрос по смыслу и тематические хэштеги. Без ссылок, рекламы Telegram/MAX, "
+                "без новых фактов и служебных заголовков. Ответ только текстом для публикации.\n\n" + post)
+        return await self._news_action(provider, task, "news_threads", rules)
 
     async def ask(self, mode, provider, history, question, *, rules=()):
         messages = bounded(history + [{"role": "user", "content": question}])
@@ -434,7 +511,7 @@ def chunks(text):
         text = text[end:].lstrip("\n")
 
 
-def build_router(admin_ids, data_dir, validate_script, handoff, busy):
+def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_preview=None, news_handoff=None):
     router = Router(name="openwebui_ai_studio")
     owner = sole_owner(admin_ids, os.getenv("OPEN_WEBUI_TELEGRAM_OWNER_ID", "").strip())
     store = StudioStore(data_dir / "ai_studio.sqlite3")
@@ -474,7 +551,27 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                              reply_markup=keyboard([[("🧠 Правила проекта", "ais:mem:" + scope)], [("⬅️ ИИ-студия", "ais:home")]]),
                              parse_mode=None)
 
-    async def run_question(message, mode, question="", *, voice=False):
+    async def preview_news(message, text):
+        if news_preview is not None:
+            return await news_preview(message, text)
+        return await message.answer(text + "\n\n" + studio_news.SIGNATURE, parse_mode=None, disable_web_page_preview=True)
+
+    async def send_news_card(message, card):
+        preview = await preview_news(message, card["post"])
+        token = store.news_card(owner, preview.message_id, card)
+        rows = [[("📋 Текст для копирования", "ais:ncopy:" + token)],
+                [("✏️ Редактировать", "ais:nedit:" + token)],
+                [("🎬 Сделать Shorts", "ais:nshort:" + token), ("🧵 Для Threads", "ais:nthread:" + token)]]
+        if news_handoff is not None:
+            rows.append([("📢 Подготовить публикацию", "ais:npub:" + token)])
+        note = studio_news.source_note(card)
+        parts = list(chunks(note))
+        for part in parts[:-1]:
+            await message.answer(part, parse_mode=None, disable_web_page_preview=True)
+        await message.answer(parts[-1], reply_markup=keyboard(rows), parse_mode=None, disable_web_page_preview=True)
+        return token
+
+    async def run_question(message, mode, question="", *, voice=False, fresh=False):
         question = question.strip()
         if not voice and (not question or len(question) > 10000):
             await message.answer("Пришли текст от 1 до 10 000 символов.", parse_mode=None)
@@ -501,7 +598,22 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                         await status.edit_text("Для постоянной памяти подтверди распознанное правило текстом через меню «Память и правила».", parse_mode=None)
                         return
                     await status.edit_text("⏳ ИИ-студия обрабатывает запрос…", parse_mode=None)
-                history = store.history(owner, mode)
+                history = [] if fresh else store.history(owner, mode)
+                if mode == "news" and not fresh and studio_news.is_discovery(question):
+                    result, label = await client.discover(store.provider(owner), question, rules=store.preferences_for(owner, mode))
+                    cards = result["cards"]
+                    if not cards:
+                        await status.edit_text("Не удалось собрать готовые посты с привязанными датированными источниками. Попробуй уточнить запрос.", parse_mode=None)
+                        return
+                    await status.edit_text(f"✅ Подготовлено постов: {len(cards)} · {label}", parse_mode=None)
+                    if result["omitted"]:
+                        await message.answer("Часть вариантов не прошла проверку формата, даты или привязки к источникам и не показана.", parse_mode=None)
+                    for card in cards:
+                        await send_news_card(message, card)
+                    summary = "\n\n".join(c["post"] for c in cards)
+                    store.save(owner, mode, history + [{"role": "user", "content": question}, {"role": "assistant", "content": summary}])
+                    await message.answer("Выбери действие под нужным постом.", reply_markup=keyboard([[("💬 Продолжить", "ais:m:news"), ("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
+                    return
                 if mode == "shorts":
                     store.invalidate_draft(owner)
                 answer, label = await client.ask(mode, store.provider(owner), history, question, rules=store.preferences_for(owner, mode))
@@ -585,6 +697,31 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                 return
             await save_rule(message, scope, message.text or "")
 
+    @router.message(F.text, ~F.text.startswith("/"), F.reply_to_message.text.startswith(studio_news.EDIT_PREFIX))
+    async def news_edit_reply(message: Message):
+        if not allowed(message, message.from_user.id if message.from_user else None):
+            return
+        quoted = message.reply_to_message
+        if not quoted or not quoted.from_user or quoted.from_user.id != message.bot.id:
+            return
+        token = (quoted.text or "").splitlines()[0].removeprefix(studio_news.EDIT_PREFIX)
+        if lock.locked():
+            await message.answer("Дождись ответа ИИ.", parse_mode=None)
+            return
+        async with lock:
+            record = store.get_news_card(owner, token)
+            if not record or record[2]:
+                await message.answer("Черновик уже заменён или передан в обычный редактор.", parse_mode=None)
+                return
+            try:
+                text = studio_news.clean_post(message.text or "")
+            except ValueError as exc:
+                await message.answer(str(exc), parse_mode=None)
+                return
+            card = dict(record[1], post=text, edited=True)
+            await send_news_card(message, card)
+            store.remove_news_card(owner, token)
+
     @router.callback_query(F.data.startswith("ais:"))
     async def callback(query: CallbackQuery, state: FSMContext):
         message = query.message
@@ -620,6 +757,43 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
             removed = store.forget(owner, value, int(data[3]))
             await message.answer("Правило удалено из памяти ИИ-студии." if removed else "Правило уже отсутствует.", parse_mode=None)
             await show_memory(message, value)
+        elif action in {"ncopy", "nedit", "nshort", "nthread", "npub"} and re.fullmatch(r"[a-f0-9]{16}", value):
+            record = store.get_news_card(owner, value)
+            if not record:
+                await message.answer("Карточка устарела. Выбери новый пост.", parse_mode=None)
+                return
+            first, card, transferred = record
+            if transferred and action != "npub":
+                await message.answer("Этот пост уже передан в обычный редактор. Используй его актуальный текст.", parse_mode=None)
+                return
+            if action == "nshort":
+                task = ("Создай Shorts только по этой новости, не добавляй неподтверждённые детали. "
+                        "Используй источники для перепроверки фактов.\n\n" + card["post"] + "\n\n"
+                        + "\n".join(s["url"] for s in card["sources"]))
+                await run_question(message, "shorts", task, fresh=True)
+                return
+            async with lock:
+                if action == "ncopy":
+                    await preview_news(message, card["post"])
+                elif action == "nedit":
+                    await message.answer(studio_news.EDIT_PREFIX + value + "\nПришли полный исправленный текст поста (до 1500 символов). Подпись добавится автоматически.",
+                                         reply_markup=ForceReply(selective=False, input_field_placeholder="Исправленный пост"), parse_mode=None)
+                elif action == "nthread":
+                    status = await message.answer("⏳ Готовлю текст для Threads…", parse_mode=None)
+                    try:
+                        answer, label = await client.threads(store.provider(owner), card["post"], rules=store.preferences_for(owner, "news"))
+                        await status.edit_text("✅ Threads · " + label, parse_mode=None)
+                        await message.answer(answer, parse_mode=None, disable_web_page_preview=True)
+                    except StudioError as exc:
+                        await status.edit_text("⚠️ " + str(exc), parse_mode=None)
+                elif action == "npub" and news_handoff is not None:
+                    # Only create/open an existing native draft, never publish here.
+                    try:
+                        await news_handoff(message, first)
+                        store.mark_news_transferred(owner, value)
+                    except Exception:
+                        log.warning("AI Studio: native post handoff failed")
+                        await message.answer("Не удалось открыть редактор публикации. Пост не отправлен в канал.", parse_mode=None)
         elif action == "providers":
             await message.answer("Авто: Gemini, при временном сбое — Groq.",
                                  reply_markup=keyboard([[(label, "ais:p:" + k)] for k, label in PROVIDERS.items()]), parse_mode=None)
