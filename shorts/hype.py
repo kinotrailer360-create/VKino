@@ -313,7 +313,7 @@ def hot(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             source_rank(post) == 2 for post in g["posts"]
         ):
             confirmed.append(g)
-        elif g["franchise"] and any(source_rank(post) >= 1 and editorial_rank(g)["event"] != "Другая киноновость" for post in g["posts"]):
+        elif g["franchise"] and draft_eligible(g) and editorial_rank(g)["hours"] <= 8:
             confirmed.append(g)
         elif g["sources"] == 1 and g["franchise"] and any(_insider_report(post) for post in g["posts"]):
             insider.append({**g, "single_insider": True})
