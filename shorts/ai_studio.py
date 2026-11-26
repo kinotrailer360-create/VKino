@@ -575,6 +575,24 @@ def chunks(text):
         text = text[end:].lstrip("\n")
 
 
+async def deliver_news_card(send, preview, store, owner, card, *, allow_handoff=True):
+    """Shared delivery for owner-only studio and scheduled editorial drafts."""
+    message = await preview(card["post"])
+    token = store.news_card(owner, message.message_id, card)
+    rows = [[("📋 Текст для копирования", "ais:ncopy:" + token)],
+            [("✏️ Редактировать", "ais:nedit:" + token)],
+            [("🎬 Сделать Shorts", "ais:nshort:" + token), ("🧵 Для Threads", "ais:nthread:" + token)]]
+    if allow_handoff:
+        rows.append([("📢 Подготовить публикацию", "ais:npub:" + token)])
+    review = store.feedback_item(owner, "news", "Готовый Telegram-пост", card["post"], token)
+    rows.append([("👍 Хорошо", "ais:fup:" + review), ("👎 Исправить", "ais:fdown:" + review)])
+    parts = list(chunks(studio_news.source_note(card)))
+    for part in parts[:-1]:
+        await send(part, parse_mode=None, disable_web_page_preview=True)
+    await send(parts[-1], reply_markup=keyboard(rows), parse_mode=None, disable_web_page_preview=True)
+    return token
+
+
 def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_preview=None, news_handoff=None):
     router = Router(name="openwebui_ai_studio")
     owner = sole_owner(admin_ids, os.getenv("OPEN_WEBUI_TELEGRAM_OWNER_ID", "").strip())
@@ -624,21 +642,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
         return [("👍 Хорошо", "ais:fup:" + token), ("👎 Исправить", "ais:fdown:" + token)]
 
     async def send_news_card(message, card):
-        preview = await preview_news(message, card["post"])
-        token = store.news_card(owner, preview.message_id, card)
-        rows = [[("📋 Текст для копирования", "ais:ncopy:" + token)],
-                [("✏️ Редактировать", "ais:nedit:" + token)],
-                [("🎬 Сделать Shorts", "ais:nshort:" + token), ("🧵 Для Threads", "ais:nthread:" + token)]]
-        if news_handoff is not None:
-            rows.append([("📢 Подготовить публикацию", "ais:npub:" + token)])
-        review = store.feedback_item(owner, "news", "Готовый Telegram-пост", card["post"], token)
-        rows.append(feedback_buttons(review))
-        note = studio_news.source_note(card)
-        parts = list(chunks(note))
-        for part in parts[:-1]:
-            await message.answer(part, parse_mode=None, disable_web_page_preview=True)
-        await message.answer(parts[-1], reply_markup=keyboard(rows), parse_mode=None, disable_web_page_preview=True)
-        return token
+        async def preview(text):
+            return await preview_news(message, text)
+        return await deliver_news_card(message.answer, preview, store, owner, card, allow_handoff=news_handoff is not None)
 
     async def run_question(message, mode, question="", *, voice=False, fresh=False):
         question = question.strip()

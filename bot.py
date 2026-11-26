@@ -14222,6 +14222,9 @@ def _run_job(coro_fn: Any) -> None:
 HYPE_EVERY = 20 * 60
 HYPE_MAX_DAY = int(os.getenv("HYPE_MAX_DAY", "4"))  # не больше уведомлений в день, чтобы не заспамить
 hype_cache: dict[str, dict[str, Any]] = {}
+hype_scan_lock = asyncio.Lock()
+hype_draft_lock = asyncio.Lock()
+HYPE_DRAFT_MAX_DAY = 2
 
 
 async def hype_scan() -> list[dict[str, Any]]:
@@ -14238,21 +14241,30 @@ async def hype_scan() -> list[dict[str, Any]]:
         else:
             logging.info("Hype: source scan failed: %s", component)
     seen = json.loads(await shorts_setting("hype_seen") or "[]")
+    hist = await _posts_history()
+    recent_stories = [st for st in hist["stories"] if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
+    published_links = {shorts_hype.canonical_link(url) for url in hist["urls"]}
+    published_links.discard("")
     out = []
     groups = shorts_hype.clusters(posts, _key_tokens, _shared)
-    links_seen = {url for entry in seen if time.time() - entry.get("at", 0) < STORY_HOURS * 3600
+    links_seen = {shorts_hype.canonical_link(url) for entry in seen if time.time() - entry.get("at", 0) < STORY_HOURS * 3600
                   for url in entry.get("links", [])}
+    links_seen.discard("")
+    skipped_posted = 0
     for g in shorts_hype.hot(groups):
         toks = set(g["tokens"])
-        if (any(p.get("url") in links_seen for p in g["posts"]) or _repeats(toks, seen)
-                or _repeats(toks, seen, english=True)):
+        links = shorts_hype.group_links(g)
+        if links & published_links or _repeats(toks, recent_stories) or _repeats(toks, recent_stories, english=True):
+            skipped_posted += 1
+            continue
+        if links & links_seen or _repeats(toks, seen) or _repeats(toks, seen, english=True):
             continue
         out.append(g)
     await set_shorts_setting("hype_scan_status", json.dumps({"at": time.time(), "posts": len(posts),
         "x": sum(str(p.get("channel") or "").startswith("X @") for p in posts), "groups": len(groups),
         "eligible_x": sum(shorts_hype.has_original_x(g) for g in out),
-        "eligible": len(out), "failed": sum(isinstance(x, BaseException) for x in results)}))
-    return out
+        "eligible": len(out), "skipped_posted": skipped_posted, "failed": sum(isinstance(x, BaseException) for x in results)}))
+    return shorts_hype.prioritize(out)
 
 
 async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> bool:
@@ -14268,7 +14280,10 @@ async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> bool:
     head = f"🔥 <b>{escape(card['headline'])}</b>"
     if g["franchise"]:
         head += f" · громкое имя: <b>{escape(g['franchise'])}</b>"
-    lines = [head, f"<b>{escape(card['status'])}</b>"]
+    rank = g.get("editorial") or shorts_hype.editorial_rank(g)
+    lines = [head, f"<b>{escape(card['status'])}</b>",
+             f"Редакторский приоритет: {rank['score']}/20 · {escape(', '.join(rank['reasons']))}\n"
+             f"Источников с учётом дублей: {rank['independent']}. Это оценка интереса, не прогноз просмотров."]
     posts = sorted(g["posts"], key=shorts_hype.source_rank, reverse=True)
     for p in posts[:2]:
         excerpt = re.sub(r"\s+", " ", p.get("text") or "")
@@ -14288,6 +14303,7 @@ async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> bool:
         lines.append("\n✅ Пост об этом в канале уже был.")
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [_btn("📝 Черновик поста", f"hy:p:{hid}"), _btn("🎬 Сценарий Shorts", f"hy:s:{hid}")],
+        [_btn("🧠 Проверить и оформить в ИИ-студии", f"hy:i:{hid}")],
         [_btn("🎬 Тизер-ролик (Telegram и MAX)", f"hy:t:{hid}")],
         [_btn("📣 Текст для посева и Директа", f"hy:a:{hid}")]])
     delivered = False
@@ -14304,8 +14320,86 @@ async def _hype_remember(g: dict[str, Any]) -> None:
     seen = [st for st in json.loads(await shorts_setting("hype_seen") or "[]")
             if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
     seen.append({"at": int(time.time()), "tokens": g["tokens"][:120],
-                 "links": [url for p in g["posts"][:12] if (url := shorts_hype.public_link(p.get("url")))]})
+                 "links": sorted(shorts_hype.group_links(g))[:24]})
     await set_shorts_setting("hype_seen", json.dumps(seen[-80:], ensure_ascii=False))
+
+
+async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automatic: bool = False) -> bool:
+    """Prepare a text draft for the sole studio owner; never publish or render."""
+    from shorts.ai_studio import StudioClient, StudioError, StudioStore, deliver_news_card, read_key, sole_owner
+
+    owner = sole_owner(ADMIN_IDS, os.getenv("OPEN_WEBUI_TELEGRAM_OWNER_ID", "").strip())
+    if owner is None or chat_id != owner:
+        return False
+    data_dir = Path(os.getenv("VKINO_DATA", "/data"))
+    if not read_key(data_dir):
+        return False
+    if hype_draft_lock.locked() or shorts_lock.locked() or post_lock.locked():
+        return False
+    async with hype_draft_lock:
+        if automatic:
+            if await shorts_setting("hype_drafts") != "on" or await shorts_setting("posts_auto") == "on":
+                return False
+            now = datetime.now(POST_TZ)
+            day = json.loads(await shorts_setting("hype_draft_day") or "{}")
+            if day.get("d") != now.date().isoformat():
+                day = {"d": now.date().isoformat(), "n": 0}
+            if now.hour in POSTS_NIGHT or day["n"] >= HYPE_DRAFT_MAX_DAY or not shorts_hype.draft_eligible(g):
+                return False
+            # Count attempts, not just successful drafts, to bound API consumption.
+            day["n"] += 1
+            await set_shorts_setting("hype_draft_day", json.dumps(day))
+        store = StudioStore(data_dir / "ai_studio.sqlite3")
+        try:
+            result, label = await StudioClient(data_dir).discover(store.provider(owner), shorts_hype.monitor_topic(g),
+                                                                 rules=store.preferences_for(owner, "news"))
+            card = next((c for c in result["cards"] if shorts_hype.monitor_match(c, g)), None)
+            if not card:
+                return False
+            # The editor gets a separate source note and existing approval buttons.
+            async def send(text, **kwargs):
+                return await bot.send_message(chat_id, text, **kwargs)
+
+            async def preview(text):
+                return await bot.send_message(chat_id, escape(text) + SIGNATURE, parse_mode="HTML", disable_web_page_preview=True)
+
+            await send("🧠 Черновик по инфоповоду · " + label, parse_mode=None)
+            await deliver_news_card(send, preview, store, owner, card)
+            g["studio_draft_ready"] = True
+            return True
+        except StudioError:
+            logging.info("Hype: studio could not prepare a grounded draft")
+            return False
+        except Exception:
+            logging.warning("Hype: studio draft failed")
+            return False
+
+
+async def hype_cycle(bot: Bot, *, limit: int, automatic: bool = False, chat_id: int | None = None) -> int:
+    """Serialize manual and scheduled scans, then mark only delivered alerts."""
+    if hype_scan_lock.locked():
+        return -1
+    async with hype_scan_lock:
+        groups = shorts_hype.select_cards(await hype_scan(), limit)
+        count = 0
+        recipients = sorted(ADMIN_IDS) if chat_id is None else [chat_id]
+        for g in groups:
+            if not await hype_alert(bot, g, recipients):
+                continue
+            count += 1
+            await _hype_remember(g)
+            if automatic:
+                day = json.loads(await shorts_setting("hype_day") or "{}")
+                today = datetime.now(POST_TZ).date().isoformat()
+                if day.get("d") != today:
+                    day = {"d": today, "n": 0}
+                day["n"] += 1
+                await set_shorts_setting("hype_day", json.dumps(day))
+                if await shorts_setting("hype_drafts") == "on":
+                    for recipient in recipients:
+                        if await hype_studio_draft(bot, g, recipient, automatic=True):
+                            break
+        return count
 
 
 async def hype_loop(bot: Bot) -> None:
@@ -14326,11 +14420,7 @@ async def hype_loop(bot: Bot) -> None:
                 day = {"d": now.date().isoformat(), "n": 0}
             if day["n"] >= HYPE_MAX_DAY:
                 continue
-            for g in shorts_hype.select_cards(await hype_scan(), HYPE_MAX_DAY - day["n"]):
-                if await hype_alert(bot, g, sorted(ADMIN_IDS)):
-                    day["n"] += 1
-                    await set_shorts_setting("hype_day", json.dumps(day))
-                    await _hype_remember(g)
+            await hype_cycle(bot, limit=HYPE_MAX_DAY - day["n"], automatic=True)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -14349,17 +14439,25 @@ async def hype_command(message: Message) -> None:
         day = json.loads(await shorts_setting("hype_day") or "{}")
         sent = day.get("n", 0) if day.get("d") == now.date().isoformat() else 0
         scan = json.loads(await shorts_setting("hype_scan_status") or "{}")
+        drafts = await shorts_setting("hype_drafts") == "on"
         text = ("🔥 Автопроверка " + ("включена" if auto else "выключена")
-                + f". Отправлено сегодня: {sent}/{HYPE_MAX_DAY}.")
+                + f". Отправлено сегодня: {sent}/{HYPE_MAX_DAY}.\nЧерновики ИИ-студии: " + ("включены" if drafts else "выключены")
+                + f" (до {HYPE_DRAFT_MAX_DAY} попыток в день).")
         if scan.get("at"):
             at = datetime.fromtimestamp(scan["at"], POST_TZ)
             text += (f"\nПоследняя проверка {at:%d.%m %H:%M}. Прочитано постов: {scan['posts']} (из X: {scan['x']})."
                      f"\nСгруппировано тем: {scan['groups']}. Подходят для карточки: {scan['eligible']}.")
             if "eligible_x" in scan:
                 text += f" Из них с оригинальными публикациями в X: {scan['eligible_x']}."
+            if scan.get("skipped_posted"):
+                text += f" Уже обработанных тем пропущено: {scan['skipped_posted']}."
             if scan["failed"]:
                 text += " Часть источников недоступна."
-        await message.answer(text + "\nПроверить сейчас — /hype. Состояние лент — /fast.")
+        await message.answer(text + "\nПроверить сейчас — /hype. Черновики — /hype drafts on|off. Состояние лент — /fast.")
+        return
+    if arg in ("drafts on", "drafts off"):
+        await set_shorts_setting("hype_drafts", arg.split()[-1])
+        await message.answer("🧠 Авточерновики ИИ-студии " + ("включены: до двух попыток в день, без автопубликации." if arg.endswith("on") else "выключены."))
         return
     if arg in ("on", "off"):
         await set_shorts_setting("hype", arg)
@@ -14368,19 +14466,19 @@ async def hype_command(message: Message) -> None:
         return
     wait = await message.answer("⏳ Ищу громкие новости: Telegram-каналы и зарубежные источники за 8 часов…")
     try:
-        groups = await hype_scan()
+        count = await hype_cycle(message.bot, limit=3, chat_id=message.chat.id)
     except Exception as exc:  # noqa: BLE001
         await wait.edit_text(f"❌ Не получилось: <code>{escape(_safe_err(exc)[:300])}</code>")
         return
-    if not groups:
+    if count < 0:
+        await wait.edit_text("Проверка уже идёт. Дождись результата.")
+        return
+    if not count:
         auto = "выключена — /hype on" if await shorts_setting("hype") == "off" else "каждые 20 минут"
         await wait.edit_text("Сейчас новых инфоповодов нет. "
                              f"Автопроверка: {auto}.")
         return
     await wait.delete()
-    for g in shorts_hype.select_cards(groups, 3):
-        if await hype_alert(message.bot, g, [message.chat.id]):
-            await _hype_remember(g)
 
 
 async def _hype_teaser_job(bot: Bot, chat_id: int, g: dict[str, Any]) -> None:
@@ -14408,7 +14506,23 @@ async def hype_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer()
     bot, chat_id = callback.bot, callback.message.chat.id
-    if kind == "p":
+    if kind == "i":
+        if callback.message.chat.type != "private":
+            await bot.send_message(chat_id, "Открой ИИ-студию в личном чате с ботом.")
+            return
+        if g.get("studio_draft_pending") or g.get("studio_draft_ready"):
+            await bot.send_message(chat_id, "Черновик уже готовится или был отправлен.")
+            return
+        g["studio_draft_pending"] = True
+        try:
+            await bot.send_message(chat_id, "🧠 Проверяю именно этот инфоповод и готовлю черновик…")
+            if await hype_studio_draft(bot, g, chat_id):
+                g["studio_draft_ready"] = True
+            else:
+                await bot.send_message(chat_id, "Не удалось привязать черновик к исходной статье или ИИ занят. Попробуй позже либо используй обычный черновик поста.")
+        finally:
+            g.pop("studio_draft_pending", None)
+    elif kind == "p":
         await bot.send_message(chat_id, "📝 Пишу пост по этому инфоповоду…")
 
         async def post_job() -> None:
