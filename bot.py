@@ -14233,7 +14233,7 @@ async def hype_scan() -> list[dict[str, Any]]:
     channels = [c for c in await fact_channels() if c.lower() != own]
     feeds = await fast_feeds()
     results = await asyncio.gather(shorts_tgsearch.latest(channels, hours=8, per_channel=6),
-                                   shorts_fast.latest(feeds, timeout=50), return_exceptions=True)
+                                   shorts_fast.latest(feeds, hours=8, timeout=50), return_exceptions=True)
     posts = []
     for component in results:
         if isinstance(component, list):
@@ -14320,7 +14320,8 @@ async def _hype_remember(g: dict[str, Any]) -> None:
     seen = [st for st in json.loads(await shorts_setting("hype_seen") or "[]")
             if time.time() - st.get("at", 0) < STORY_HOURS * 3600]
     seen.append({"at": int(time.time()), "tokens": g["tokens"][:120],
-                 "links": sorted(shorts_hype.group_links(g))[:24]})
+                 "links": sorted({url for p in g["posts"] for u in (p.get("url"), p.get("article_url"))
+                                  if (url := shorts_hype.public_link(u))})[:24]})
     await set_shorts_setting("hype_seen", json.dumps(seen[-80:], ensure_ascii=False))
 
 
@@ -14334,7 +14335,7 @@ async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automa
     data_dir = Path(os.getenv("VKINO_DATA", "/data"))
     if not read_key(data_dir):
         return False
-    if hype_draft_lock.locked() or shorts_lock.locked() or post_lock.locked():
+    if g.get("studio_draft_ready") or hype_draft_lock.locked() or shorts_lock.locked() or post_lock.locked():
         return False
     async with hype_draft_lock:
         if automatic:
