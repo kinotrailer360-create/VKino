@@ -8,6 +8,10 @@ import re
 import os
 import secrets
 import sqlite3
+import time
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 from contextlib import closing, contextmanager
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -101,9 +105,10 @@ def correction_task(question, answer, note):
 
 
 class StudioError(Exception):
-    def __init__(self, text: str, retryable: bool = False):
+    def __init__(self, text: str, retryable: bool = False, *, cooldown: int = 0):
         super().__init__(text)
         self.retryable = retryable
+        self.cooldown = cooldown
 
 
 def sole_owner(admins: set[int], configured: str = "") -> int | None:
@@ -142,10 +147,58 @@ def bounded(messages: list[dict]) -> list[dict]:
     return result
 
 
-def model_sequence(mode: str, provider: str):
+ROUTE_GROUPS = {
+    "kinomir360---": "gemini-lite", "vikon-analyst": "gemini-lite",
+    "vkino-technical": "gemini-lite", "models/gemini-flash-lite-latest": "gemini-lite",
+    "kinomir360-groq": "groq-20b", "openai/gpt-oss-20b": "groq-20b",
+    "vikon-groq": "groq-120b", "vkino-groq": "groq-120b",
+}
+ROUTE_LABELS = {"gemini-lite": "Gemini Flash-Lite", "groq-20b": "Groq GPT-OSS 20B", "groq-120b": "Groq GPT-OSS 120B"}
+HEAVY_TASK = re.compile(r"\b(?:анализ\w*|проанализируй|разбери|разбор\w*|сценар\w*|архитектур\w*|рефактор\w*|аудит\w*|отлад\w*|алгоритм\w*|репозитор\w*|исправ\w*\s+(?:код|ошиб\w*|баг\w*)|напиши\s+код|план\s+разработки|сравни\w*|спроектируй|диагност\w*|тест\w*\s+код\w*)\b", re.I)
+
+
+def model_sequence(mode: str, provider: str, question: str = ""):
     _, primary, reserve, *_ = MODES[mode]
     models = [("Gemini", primary), ("Groq", reserve)]
-    return models[:1] if provider == "gemini" else models[1:] if provider == "groq" else models
+    if provider == "gemini":
+        return models[:1]
+    if provider == "groq":
+        return models[1:]
+    if mode in {"vikon", "vkino"} and HEAVY_TASK.search(question):
+        return list(reversed(models))
+    return models
+
+
+def cooldown_seconds(status, retry_after=None, *, now=None):
+    if status not in {429, 502, 503, 504}:
+        return 0
+    default = 120 if status == 429 else 30
+    if not retry_after:
+        return default
+    now = time.time() if now is None else now
+    try:
+        try:
+            delay = int(retry_after)
+        except (ValueError, TypeError):
+            delay = int(parsedate_to_datetime(retry_after).timestamp() - now) + 1
+        return min(86400, max(default, delay))
+    except (ValueError, TypeError, OverflowError, OSError):
+        return default
+
+
+def reported_usage(data):
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if all(type(v) is int and 0 <= v <= 10000000 for v in (prompt, completion)):
+        return prompt, completion
+    return None
+
+
+def routing_day():
+    return datetime.now(ZoneInfo("Asia/Yekaterinburg")).date().isoformat()
 
 
 class StudioStore:
@@ -168,8 +221,57 @@ class StudioStore:
             conn.execute("CREATE TABLE IF NOT EXISTS studio_rules(id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, UNIQUE(owner,scope,content))")
             conn.execute("CREATE TABLE IF NOT EXISTS studio_news_cards(token TEXT PRIMARY KEY, owner INTEGER NOT NULL, preview INTEGER NOT NULL, content TEXT NOT NULL, transferred INTEGER NOT NULL DEFAULT 0)")
             conn.execute("CREATE TABLE IF NOT EXISTS studio_feedback(token TEXT PRIMARY KEY, owner INTEGER NOT NULL, mode TEXT NOT NULL, question TEXT NOT NULL, answer TEXT NOT NULL, card_token TEXT NOT NULL DEFAULT '', rating INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT '')")
+            conn.execute("CREATE TABLE IF NOT EXISTS studio_route_pause(model_group TEXT PRIMARY KEY, until_at REAL NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS studio_route_daily(day TEXT NOT NULL, model_group TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, usage_reports INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,model_group))")
             yield conn
 
+
+    def route_remaining(self, model, *, now=None):
+        now = time.time() if now is None else now
+        with self.connect() as c:
+            row = c.execute("SELECT until_at FROM studio_route_pause WHERE model_group=?", (ROUTE_GROUPS[model],)).fetchone()
+        return max(0, int(row[0] - now + 0.999)) if row else 0
+
+    def route_pause(self, model, seconds, *, now=None):
+        now = time.time() if now is None else now
+        until = now + min(86400, max(0, seconds))
+        with self.connect() as c:
+            c.execute("INSERT INTO studio_route_pause VALUES(?,?) ON CONFLICT(model_group) DO UPDATE SET until_at=max(until_at,excluded.until_at)", (ROUTE_GROUPS[model], until))
+
+    def route_record(self, model, event, usage=None):
+        if event not in {"attempts", "successes", "failures", "skipped"}:
+            raise ValueError("Invalid routing event")
+        group = ROUTE_GROUPS[model]
+        day = routing_day()
+        cutoff = (datetime.fromisoformat(day) - timedelta(days=31)).date().isoformat()
+        with self.connect() as c:
+            c.execute("INSERT OR IGNORE INTO studio_route_daily(day,model_group) VALUES(?,?)", (day, group))
+            c.execute(f"UPDATE studio_route_daily SET {event}={event}+1 WHERE day=? AND model_group=?", (day, group))
+            if usage is not None:
+                c.execute("UPDATE studio_route_daily SET prompt_tokens=prompt_tokens+?,completion_tokens=completion_tokens+?,usage_reports=usage_reports+1 WHERE day=? AND model_group=?", (*usage, day, group))
+            c.execute("DELETE FROM studio_route_daily WHERE day<?", (cutoff,))
+
+    def route_report(self):
+        day = routing_day()
+        now = time.time()
+        with self.connect() as c:
+            rows = {r[0]: r[1:] for r in c.execute("SELECT model_group,attempts,successes,failures,skipped,prompt_tokens,completion_tokens,usage_reports FROM studio_route_daily WHERE day=?", (day,))}
+            pauses = dict(c.execute("SELECT model_group,until_at FROM studio_route_pause"))
+        lines = ["⚡ Использование ИИ-студии сегодня · " + day]
+        for group, name in ROUTE_LABELS.items():
+            a, ok, fail, skip, inp, out, known = rows.get(group, (0, 0, 0, 0, 0, 0, 0))
+            seconds = max(0, int(pauses.get(group, 0) - now + 0.999))
+            lines.append(f"\n{name}\nЗапросов: {a} · успешно: {ok} · ошибок: {fail} · пропущено по паузе: {skip}")
+            if known:
+                input_display = f"{inp:,}".replace(",", " ")
+                output_display = f"{out:,}".replace(",", " ")
+                lines.append(f"Токены по данным API: вход {input_display}, выход {output_display} (ответов с usage: {known})")
+            else:
+                lines.append("Токены: API пока не вернул статистику.")
+            if seconds:
+                lines.append(f"Пауза: ещё ~{(seconds + 59) // 60} мин.")
+        lines.append("\nСчётчик запросов Open WebUI из ИИ-студии, включая мониторинг. Не включает голос, обычный монтаж, браузер, внутренние запросы Open WebUI и точную стоимость.")
+        return "\n".join(lines)
 
     def rules(self, owner, scope):
         if scope not in MEMORY_SCOPES:
@@ -445,6 +547,8 @@ async def check_news_cards(result):
 class StudioClient:
     def __init__(self, data_dir):
         self.data_dir = data_dir
+        self.routing = StudioStore(data_dir / "ai_studio.sqlite3")
+        self._usage = None
 
     async def _request(self, model, messages, mode):
         key = read_key(self.data_dir)
@@ -468,8 +572,10 @@ class StudioClient:
                     if response.status in (401, 403):
                         raise StudioError("Open WebUI отклонил доступ. Проверь ключ и разрешения.")
                     if response.status != 200:
-                        raise StudioError(f"Open WebUI: HTTP {response.status}.", response.status in RETRYABLE)
+                        raise StudioError(f"Open WebUI: HTTP {response.status}.", response.status in RETRYABLE,
+                                          cooldown=cooldown_seconds(response.status, response.headers.get("Retry-After")))
                     data = await response.json(content_type=None)
+                    self._usage = reported_usage(data)
         except StudioError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -504,24 +610,47 @@ class StudioClient:
             return await verify_news_links(grounded_news_answer(answer, data, question))
         return answer.strip()
 
-    async def _news_action(self, provider, question, mode, rules=()):
-        messages = [{"role": "user", "content": memory_prompt(question, rules)}]
-        sequence = model_sequence("news", provider)
+    async def _dispatch(self, sequence, messages, mode):
         rejected = None
+        last_error = None
+        paused = []
         for i, (label, model) in enumerate(sequence):
+            remaining = self.routing.route_remaining(model)
+            if remaining:
+                self.routing.route_record(model, "skipped")
+                paused.append((label, remaining))
+                continue
+            self.routing.route_record(model, "attempts")
+            self._usage = None
             try:
                 result = await self._request(model, messages, mode)
-                if (mode == "news_cards" and not result["cards"]
-                        and result.get("omitted") and i + 1 < len(sequence)):
-                    rejected = (result, label)
-                    continue
-                return result, label
             except StudioError as exc:
-                if rejected is not None and exc.retryable and i == len(sequence) - 1:
-                    return rejected
-                if not exc.retryable or i == len(sequence) - 1:
+                self.routing.route_record(model, "failures", self._usage)
+                if exc.cooldown:
+                    self.routing.route_pause(model, exc.cooldown)
+                if not exc.retryable:
                     raise
+                last_error = exc
+                continue
+            self.routing.route_record(model, "successes", self._usage)
+            if mode == "news_cards" and not result["cards"] and result.get("omitted") and i + 1 < len(sequence):
+                rejected = (result, label)
+                continue
+            return result, label
+        if rejected is not None:
+            return rejected
+        if paused:
+            wait = ", ".join(f"{name}: ~{(seconds + 59) // 60} мин." for name, seconds in paused)
+            if last_error:
+                raise StudioError(str(last_error) + " Резерв на паузе: " + wait, True)
+            raise StudioError("Модель временно на паузе после ошибки API: " + wait + " Попробуй позже.", True)
+        if last_error:
+            raise last_error
         raise StudioError("Нет доступной модели.")
+
+    async def _news_action(self, provider, question, mode, rules=()):
+        messages = [{"role": "user", "content": memory_prompt(question, rules)}]
+        return await self._dispatch(model_sequence("news", provider), messages, mode)
 
     async def discover(self, provider, question, *, rules=()):
         return await self._news_action(provider, studio_news.prompt(question), "news_cards", rules)
@@ -542,15 +671,7 @@ class StudioClient:
         if mode == "shorts":
             prepared += "\n\n" + SHORTS_FORMAT
         messages[-1] = {"role": "user", "content": prepared}
-        sequence = model_sequence(mode, provider)
-        for i, (label, model) in enumerate(sequence):
-            try:
-                return await self._request(model, messages, mode), label
-            except StudioError as exc:
-                if not exc.retryable or i == len(sequence) - 1:
-                    raise
-                log.info("AI Studio: trying reserve provider")
-        raise StudioError("Нет доступной модели.")
+        return await self._dispatch(model_sequence(mode, provider, question), messages, mode)
 
 
 def keyboard(rows):
@@ -561,7 +682,7 @@ def keyboard(rows):
 
 def menu(provider):
     return keyboard([[(data[0], "ais:m:" + mode)] for mode, data in MODES.items()]
-                    + [[("🧠 Память и правила", "ais:memory")], [("📊 Оценки ответов", "ais:fstats")], [("ИИ: " + PROVIDERS[provider], "ais:providers")]])
+                    + [[("🧠 Память и правила", "ais:memory")], [("📊 Оценки ответов", "ais:fstats")], [("⚡ Использование API", "ais:usage")], [("ИИ: " + PROVIDERS[provider], "ais:providers")]])
 
 
 def chunks(text):
@@ -963,8 +1084,10 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                     except Exception:
                         log.warning("AI Studio: native post handoff failed")
                         await message.answer("Не удалось открыть редактор публикации. Пост не отправлен в канал.", parse_mode=None)
+        elif action == "usage":
+            await message.answer(store.route_report(), reply_markup=keyboard([[("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
         elif action == "providers":
-            await message.answer("Авто: Gemini, при временном сбое — Groq.",
+            await message.answer("Авто: Gemini Flash-Lite для обычных задач; Groq GPT-OSS 120B для сложных сценариев VIKON и технических задач VKino. При временной ошибке — резерв. Ручной выбор не переключает провайдера; паузы после лимитов сохраняются.",
                                  reply_markup=keyboard([[(label, "ais:p:" + k)] for k, label in PROVIDERS.items()]), parse_mode=None)
         elif action == "p" and value in PROVIDERS:
             store.set_provider(owner, value)
