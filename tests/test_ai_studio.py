@@ -6,6 +6,12 @@ from unittest.mock import AsyncMock, patch
 from shorts.ai_studio import StudioClient, StudioError, StudioStore, bounded, build_router, model_sequence, sole_owner
 
 
+def isolated_client(case):
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    return StudioClient(Path(tmp.name))
+
+
 class StudioTests(unittest.TestCase):
     def test_owner(self):
         self.assertEqual(sole_owner({123}), 123)
@@ -49,20 +55,20 @@ class StudioTests(unittest.TestCase):
 
 class StudioClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_fallback(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(side_effect=[StudioError("HTTP 503", True), "готово"])) as request:
             self.assertEqual(await c.ask("news", "auto", [], "Новости"), ("готово", "Groq"))
             self.assertEqual(request.await_count, 2)
 
     async def test_auth_no_fallback(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(side_effect=StudioError("HTTP 401"))) as request:
             with self.assertRaises(StudioError):
                 await c.ask("news", "auto", [], "Новости")
             self.assertEqual(request.await_count, 1)
 
     async def test_short_format(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(return_value="script")) as request:
             await c.ask("shorts", "gemini", [], "Сценарий")
             self.assertIn("## Карта видеоряда", request.await_args.args[1][-1]["content"])
@@ -204,7 +210,7 @@ class MemoryTests(unittest.TestCase):
 
 class MemoryClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_memory_in_request_and_fallback(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(side_effect=[StudioError("HTTP 503", True), "готово"])) as request:
             self.assertEqual(await c.ask("news", "auto", [], "Для Threads", rules=["Кратко"]), ("готово", "Groq"))
             for call in request.await_args_list:
@@ -278,14 +284,14 @@ class NewsCardTests(unittest.TestCase):
 
 class NewsActionTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovery_is_separate_request(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(return_value={"cards": [], "note": "", "omitted": 0})) as request:
             await c.discover("gemini", "Найди новости про X")
             self.assertEqual(request.await_args.args[2], "news_cards")
             self.assertIn("source_ids", request.await_args.args[1][-1]["content"])
 
     async def test_threads_selected_text(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(return_value="Готово")) as request:
             self.assertEqual(await c.threads("groq", "Только выбранный пост"), ("Готово", "Groq"))
             self.assertEqual(request.await_args.args[2], "news_threads")
@@ -307,7 +313,7 @@ class NewsActionTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_news_fallback_after_rejected_candidates(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         first = {"cards": [], "note": "", "omitted": 2}
         second = {"cards": [{"post": "Пост"}], "note": "", "omitted": 0}
         with patch.object(c, "_request", AsyncMock(side_effect=[first, second])) as request:
@@ -380,10 +386,80 @@ class FeedbackTests(unittest.TestCase):
 
 class FeedbackClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_threads_correction_is_passed(self):
-        c = StudioClient(Path("/tmp"))
+        c = isolated_client(self)
         with patch.object(c, "_request", AsyncMock(return_value="Исправлено")) as request:
             await c.threads("gemini", "Выбранный пост", correction="Не добавляй рекламу")
             content = request.await_args.args[1][-1]["content"]
             self.assertIn("Выбранный пост", content)
             self.assertIn("Не добавляй рекламу", content)
             self.assertEqual(request.await_args.args[2], "news_threads")
+
+
+class SmartRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def test_complexity_and_manual_override(self):
+        self.assertEqual(model_sequence("vikon", "auto", "Сделай подробный сценарий")[0], ("Groq", "vikon-groq"))
+        self.assertEqual(model_sequence("vkino", "auto", "Проведи аудит кода")[0], ("Groq", "vkino-groq"))
+        self.assertEqual(model_sequence("vkino", "auto", "Привет")[0], ("Gemini", "vkino-technical"))
+        self.assertEqual(model_sequence("shorts", "auto", "Сделай сценарий")[0][0], "Gemini")
+        self.assertEqual(model_sequence("vikon", "gemini", "Аудит"), [("Gemini", "vikon-analyst")])
+        self.assertEqual(model_sequence("vkino", "groq", "Привет"), [("Groq", "vkino-groq")])
+
+    def test_retry_after_and_usage(self):
+        from shorts.ai_studio import cooldown_seconds, reported_usage
+        self.assertEqual(cooldown_seconds(429, "3600"), 3600)
+        self.assertEqual(cooldown_seconds(429, "9999999"), 86400)
+        self.assertEqual(cooldown_seconds(503, "invalid"), 30)
+        self.assertEqual(cooldown_seconds(401, "600"), 0)
+        self.assertEqual(reported_usage({"usage": {"prompt_tokens": 20, "completion_tokens": 10}}), (20, 10))
+        self.assertIsNone(reported_usage({"usage": {"prompt_tokens": True, "completion_tokens": 10}}))
+
+    async def test_cooldown_shared_across_aliases(self):
+        c = isolated_client(self)
+        with patch.object(c, "_request", AsyncMock(side_effect=[StudioError("HTTP 429", True, cooldown=120), "ok"])) as request:
+            self.assertEqual(await c.ask("news", "auto", [], "Проверь"), ("ok", "Groq"))
+            self.assertEqual(request.await_count, 2)
+        next_client = StudioClient(c.data_dir)
+        with patch.object(next_client, "_request", AsyncMock(return_value="ok")) as request:
+            self.assertEqual(await next_client.ask("vkino", "auto", [], "Привет"), ("ok", "Groq"))
+            self.assertEqual(request.await_count, 1)
+            self.assertEqual(request.await_args.args[0], "vkino-groq")
+            with self.assertRaises(StudioError):
+                await next_client.ask("news", "gemini", [], "Проверь")
+            self.assertEqual(request.await_count, 1)
+        self.assertGreater(next_client.routing.route_remaining("vikon-analyst"), 0)
+        self.assertIn("пропущено по паузе: 2", next_client.routing.route_report())
+
+    def test_pause_expiry_and_independent_groq_groups(self):
+        c = isolated_client(self)
+        c.routing.route_pause("kinomir360-groq", 120, now=1000)
+        self.assertEqual(c.routing.route_remaining("openai/gpt-oss-20b", now=1060), 60)
+        self.assertEqual(c.routing.route_remaining("vkino-groq", now=1060), 0)
+        self.assertEqual(c.routing.route_remaining("kinomir360-groq", now=1121), 0)
+
+    async def test_usage_counts_only_reported_tokens(self):
+        c = isolated_client(self)
+
+        async def fake_request(*args):
+            c._usage = (20, 10)
+            return "ok"
+
+        with patch.object(c, "_request", side_effect=fake_request):
+            await c.ask("personal", "gemini", [], "Привет")
+        self.assertIn("вход 20, выход 10 (ответов с usage: 1)", c.routing.route_report())
+
+    async def test_both_models_paused_no_requests(self):
+        c = isolated_client(self)
+        c.routing.route_pause("kinomir360---", 120)
+        c.routing.route_pause("kinomir360-groq", 120)
+        with patch.object(c, "_request", AsyncMock()) as request:
+            with self.assertRaisesRegex(StudioError, "паузе"):
+                await c.discover("auto", "Найди новости")
+            request.assert_not_awaited()
+
+    async def test_auth_error_does_not_pause_or_fallback(self):
+        c = isolated_client(self)
+        with patch.object(c, "_request", AsyncMock(side_effect=StudioError("HTTP 401"))) as request:
+            with self.assertRaises(StudioError):
+                await c.ask("personal", "auto", [], "Привет")
+            self.assertEqual(request.await_count, 1)
+        self.assertEqual(c.routing.route_remaining("models/gemini-flash-lite-latest"), 0)
