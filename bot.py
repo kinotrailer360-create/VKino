@@ -3569,6 +3569,7 @@ async def premiere_reminder_loop(
 def admin_menu() -> InlineKeyboardMarkup:
     """Админка: Telegram-канал и YouTube — отдельными ветками, чтобы кнопки не смешивались."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧠 ИИ-студия", callback_data="ais:home")],
         [InlineKeyboardButton(text="📢 Telegram-канал: посты ▸", callback_data="pt:menu")],
         [InlineKeyboardButton(text="▶️ YouTube и видео: шортсы, выпуски ▸", callback_data="sh:menu")],
         [InlineKeyboardButton(text="📈 Статистика бота", callback_data="st:home"),
@@ -3612,7 +3613,7 @@ SHORTS_BUTTON = "🎬 Шортсы (админ)"
 
 def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[*([[KeyboardButton(text=SHORTS_BUTTON)]] if admin else []),
+        keyboard=[*([[KeyboardButton(text=SHORTS_BUTTON), KeyboardButton(text="🧠 ИИ-студия")]] if admin else []),
             [KeyboardButton(text="🔎 Найти фильм или сериал")],
             [
                 KeyboardButton(text="🆕 Новинки"),
@@ -20009,6 +20010,7 @@ async def set_admin_commands(bot: Bot) -> None:
     """Подсказки команд в меню «/» — только у админов."""
     commands = [
         BotCommand(command="admin", description="🛠 Админка: Telegram-канал и YouTube"),
+        BotCommand(command="aistudio", description="🧠 ИИ-студия: помощники Open WebUI"),
         BotCommand(command="studio", description="🌐 Подключить KinoMir360 Studio"),
         BotCommand(command="studio_export", description="📁 Перенести текст в студию (ответом на сообщение)"),
         BotCommand(command="report", description="📊 Отчёт за неделю и план"),
@@ -20135,6 +20137,12 @@ async def main() -> None:
     dp.callback_query.outer_middleware(activity_tracker)
     dp.message.outer_middleware(subscription_gate)
     dp.callback_query.outer_middleware(subscription_gate)
+    from shorts.ai_studio import build_router as build_ai_studio_router
+
+    dp.include_router(build_ai_studio_router(
+        ADMIN_IDS, Path(os.getenv("VKINO_DATA", "/data")),
+        shorts_script_task.parse, show_structured_plan, shorts_lock.locked,
+    ))
     dp.include_router(contact_router)
     dp.include_router(daily_short_router)
     dp.include_router(router)
