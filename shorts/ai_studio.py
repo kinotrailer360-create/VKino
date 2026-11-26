@@ -526,10 +526,12 @@ class StudioClient:
     async def discover(self, provider, question, *, rules=()):
         return await self._news_action(provider, studio_news.prompt(question), "news_cards", rules)
 
-    async def threads(self, provider, post, *, rules=()):
+    async def threads(self, provider, post, *, rules=(), correction=""):
         task = ("Адаптируй только данный готовый пост для Threads. До 500 символов, живой текст, "
                 "вопрос по смыслу и тематические хэштеги. Без ссылок, рекламы Telegram/MAX, "
                 "без новых фактов и служебных заголовков. Ответ только текстом для публикации.\n\n" + post)
+        if correction:
+            task += "\n\nЗамечание владельца к предыдущей адаптации:\n" + correction
         return await self._news_action(provider, task, "news_threads", rules)
 
     async def ask(self, mode, provider, history, question, *, rules=()):
@@ -817,7 +819,7 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
             card = store.get_news_card(owner, record["card_token"])
             if card and not card[2]:
                 if record["question"] == "Адаптация для Threads":
-                    rows.append([("🔁 Пересобрать Threads", "ais:nthread:" + record["card_token"])])
+                    rows.append([("🔁 Исправить Threads", f"ais:ffix:{token}:{revision}")])
                 else:
                     rows.append([("✏️ Исправить текст поста", "ais:nedit:" + record["card_token"])])
         else:
@@ -878,6 +880,21 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                     return
                 if action == "fsave":
                     await save_rule(message, MODE_SCOPE[record["mode"]], record["note"])
+                elif record["question"] == "Адаптация для Threads" and record["card_token"]:
+                    card = store.get_news_card(owner, record["card_token"])
+                    if not card or card[2]:
+                        await message.answer("Исходный пост заменён или передан в обычный редактор.", parse_mode=None)
+                        return
+                    async with lock:
+                        status = await message.answer("⏳ Исправляю Threads…", parse_mode=None)
+                        try:
+                            answer, label = await client.threads(store.provider(owner), card[1]["post"], rules=store.preferences_for(owner, "news"), correction=record["note"])
+                            await status.edit_text("✅ Threads · " + label, parse_mode=None)
+                            await message.answer(answer, parse_mode=None, disable_web_page_preview=True)
+                            review = store.feedback_item(owner, "news", "Адаптация для Threads", answer, record["card_token"])
+                            await message.answer("Оцени адаптацию", reply_markup=keyboard([feedback_buttons(review)]), parse_mode=None)
+                        except StudioError as exc:
+                            await status.edit_text("⚠️ " + str(exc), parse_mode=None)
                 elif not record["card_token"]:
                     try:
                         task = correction_task(record["question"], record["answer"], record["note"])
