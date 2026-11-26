@@ -1053,8 +1053,8 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                 await message.answer("Карточка устарела. Выбери новый пост.", parse_mode=None)
                 return
             first, card, transferred = record
-            if transferred and action != "npub":
-                await message.answer("Этот пост уже передан в обычный редактор. Используй его актуальный текст.", parse_mode=None)
+            if transferred:
+                await message.answer("Этот пост уже передан в обычный редактор. Используй сохранённый черновик, чтобы не создавать дубликаты.", parse_mode=None)
                 return
             if action == "nshort":
                 task = ("Создай Shorts только по этой новости, не добавляй неподтверждённые детали. "
