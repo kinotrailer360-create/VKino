@@ -554,12 +554,12 @@ class StudioClient:
         key = read_key(self.data_dir)
         if not key:
             raise StudioError("Нужно подключить API-ключ Open WebUI на VPS.")
-        _, _, _, search, skill, tools = MODES["news" if mode in {"news_cards", "news_threads"} else mode]
+        _, _, _, search, skill, tools = MODES["personal" if mode == "vision" else "news" if mode in {"news_cards", "news_threads"} else mode]
         if mode == "news_threads":
             search = False
         payload = {
             "model": model, "messages": messages, "stream": False,
-            "features": {"web_search": search, "memory": True},
+            "features": {"web_search": search, "memory": mode != "vision"},
             "tool_ids": tools,
         }
         if skill:
@@ -647,6 +647,13 @@ class StudioClient:
         if last_error:
             raise last_error
         raise StudioError("Нет доступной модели.")
+
+    async def vision(self, content):
+        """One verified multimodal alias, no text-model fallback, memory or web search."""
+        return await self._dispatch(
+            [("Gemini", MODES["personal"][1])],
+            [{"role": "user", "content": content}], "vision",
+        )
 
     async def _news_action(self, provider, question, mode, rules=()):
         messages = [{"role": "user", "content": memory_prompt(question, rules)}]
