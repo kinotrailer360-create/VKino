@@ -18,7 +18,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from . import netsafe
+from . import netsafe, studio_voice
 
 log = logging.getLogger(__name__)
 BUTTON = "🧠 ИИ-студия"
@@ -378,13 +378,13 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                              reply_markup=menu(store.provider(owner)), parse_mode=None)
 
     async def prompt(message, mode):
-        await message.answer(PREFIX + MODES[mode][0] + "\nОтветь на это сообщение своим вопросом или заданием.",
+        await message.answer(PREFIX + MODES[mode][0] + "\nОтветь текстом или запиши голосовое сообщение (до 2 минут). Голос распознаётся через Groq или Gemini.",
                              reply_markup=ForceReply(selective=False, input_field_placeholder="Вопрос или задание"),
                              parse_mode=None)
 
-    async def run_question(message, mode, question):
+    async def run_question(message, mode, question="", *, voice=False):
         question = question.strip()
-        if not question or len(question) > 10000:
+        if not voice and (not question or len(question) > 10000):
             await message.answer("Пришли текст от 1 до 10 000 символов.", parse_mode=None)
             return
         if lock.locked():
@@ -394,8 +394,15 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
             if not read_key(data_dir):
                 await message.answer("ИИ-студия установлена, но API-ключ Open WebUI ещё не подключён на VPS.", parse_mode=None)
                 return
-            status = await message.answer("⏳ ИИ-студия обрабатывает запрос…", parse_mode=None)
+            status = await message.answer("🎙 Распознаю голос…" if voice else "⏳ ИИ-студия обрабатывает запрос…", parse_mode=None)
             try:
+                if voice:
+                    raw = await studio_voice.download_voice(message)
+                    question, stt_provider = await studio_voice.transcribe_voice(raw)
+                    del raw
+                    for part in chunks("🎙 Распознано (" + stt_provider + "):\n" + question):
+                        await message.answer(part, parse_mode=None, disable_web_page_preview=True)
+                    await status.edit_text("⏳ ИИ-студия обрабатывает запрос…", parse_mode=None)
                 history = store.history(owner, mode)
                 if mode == "shorts":
                     store.invalidate_draft(owner)
@@ -417,7 +424,7 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                     rows.insert(0, [("🎬 Передать сценарий на согласование", "ais:render:" + token)])
                 rows.append([("⬅️ ИИ-студия", "ais:home")])
                 await message.answer("Что дальше?", reply_markup=keyboard(rows), parse_mode=None)
-            except StudioError as exc:
+            except (StudioError, studio_voice.VoiceError) as exc:
                 await status.edit_text("⚠️ " + str(exc), parse_mode=None)
                 await message.answer("Повтори запрос или выбери помощника.", reply_markup=menu(store.provider(owner)), parse_mode=None)
             except Exception:
@@ -452,6 +459,18 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
         mode = next((k for k, v in MODES.items() if first == PREFIX + v[0]), None)
         if mode:
             await run_question(message, mode, message.text or "")
+
+    @router.message(F.voice, F.reply_to_message.text.startswith(PREFIX))
+    async def voice_reply(message: Message):
+        if not allowed(message, message.from_user.id if message.from_user else None):
+            return
+        quoted = message.reply_to_message
+        if not quoted or not quoted.from_user or quoted.from_user.id != message.bot.id:
+            return
+        first = (quoted.text or "").splitlines()[0]
+        mode = next((k for k, v in MODES.items() if first == PREFIX + v[0]), None)
+        if mode:
+            await run_question(message, mode, voice=True)
 
     @router.callback_query(F.data.startswith("ais:"))
     async def callback(query: CallbackQuery, state: FSMContext):

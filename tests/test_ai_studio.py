@@ -39,7 +39,7 @@ class StudioTests(unittest.TestCase):
 
     def test_registration(self):
         r = build_router({123}, Path("/tmp/unused-ai-studio"), lambda text: {}, AsyncMock(), lambda: False)
-        self.assertEqual(len(r.message.handlers), 3)
+        self.assertEqual(len(r.message.handlers), 4)
         self.assertEqual(len(r.callback_query.handlers), 1)
 
     def test_models(self):
@@ -115,3 +115,49 @@ class SourceAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         from shorts.ai_studio import _source_status
         self.assertEqual(await _source_status(None, "http://user:pass@example.com/"), "небезопасный адрес")
         self.assertEqual(await _source_status(None, "http://example.com:8080/"), "небезопасный адрес")
+
+
+class VoiceCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_voice_limits(self):
+        from types import SimpleNamespace
+        from shorts.studio_voice import voice_limits, VoiceError
+        voice_limits(SimpleNamespace(duration=10, file_size=500))
+        with self.assertRaises(VoiceError):
+            voice_limits(SimpleNamespace(duration=121, file_size=500))
+        with self.assertRaises(VoiceError):
+            voice_limits(SimpleNamespace(duration=10, file_size=5000000))
+
+    def test_buffer_limit(self):
+        from shorts.studio_voice import LimitedBuffer, VoiceError, MAX_VOICE_BYTES
+        with LimitedBuffer() as buf:
+            with self.assertRaises(VoiceError):
+                buf.write(b"x" * (MAX_VOICE_BYTES + 1))
+
+    async def test_groq_first(self):
+        from shorts import studio_voice
+        with patch.object(studio_voice, "convert_voice", AsyncMock(return_value=b"mp3")), \
+                patch.object(studio_voice, "_groq_available", return_value=True), \
+                patch.object(studio_voice.ai, "_groq_whisper", AsyncMock(return_value=[{"text": "Привет мир"}])):
+            self.assertEqual(await studio_voice.transcribe_voice(b"OggS"), ("Привет мир", "Whisper / Groq"))
+
+    async def test_gemini_fallback(self):
+        from shorts import studio_voice
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), \
+                patch.object(studio_voice, "convert_voice", AsyncMock(return_value=b"mp3")), \
+                patch.object(studio_voice, "_groq_available", return_value=True), \
+                patch.object(studio_voice.ai, "_groq_whisper", AsyncMock(side_effect=RuntimeError())), \
+                patch.object(studio_voice.ai, "_ask", AsyncMock(return_value={"text": "Найди новости"})):
+            self.assertEqual(await studio_voice.transcribe_voice(b"OggS"), ("Найди новости", "Gemini"))
+
+    async def test_unavailable_transcription(self):
+        from shorts import studio_voice
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "", "GEMINI_API_KEY_2": ""}), \
+                patch.object(studio_voice, "convert_voice", AsyncMock(return_value=b"mp3")), \
+                patch.object(studio_voice, "_groq_available", return_value=False):
+            with self.assertRaises(studio_voice.VoiceError):
+                await studio_voice.transcribe_voice(b"OggS")
+
+    async def test_reject_non_telegram_voice(self):
+        from shorts import studio_voice
+        with self.assertRaises(studio_voice.VoiceError):
+            await studio_voice.convert_voice(b"not an ogg file")
