@@ -192,6 +192,30 @@ def monitor_match(card, group):
     return bool(direct & {canonical_link(src.get("url")) for src in card.get("sources", [])})
 
 
+def original_material(group: dict[str, Any]) -> dict[str, str] | None:
+    """A bounded feed excerpt and media candidate from one source, without AI."""
+    candidates = [p for p in group.get("posts", []) if public_link(p.get("url"))]
+    if not candidates:
+        return None
+    lead = max(candidates, key=source_rank)
+    url = public_link(lead.get("url"))
+    # Keep a short excerpt, never present it as a rewritten or verified article.
+    title = " ".join(str(lead.get("title") or "").split())
+    text = " ".join(str(lead.get("text") or "").split())
+    title_words = title.split()
+    headline = " ".join(title_words[:16]) or "Материал из ленты"
+    if len(title_words) > 16:
+        headline += "…"
+    excerpt = ""
+    if text and text != title:
+        excerpt = " ".join(text.split()[:max(0, 25 - min(len(title_words), 16))])
+        if excerpt and len(excerpt.split()) < len(text.split()):
+            excerpt += "…"
+    return {"title": headline[:300], "excerpt": excerpt[:400], "url": url,
+            "source": str(lead.get("channel") or lead.get("label") or urlsplit(url).hostname)[:100],
+            "image": public_link(lead.get("image"))}
+
+
 def original_x_account(post: dict[str, Any]) -> str:
     name = str(post.get("channel") or "").casefold()
     if not name.startswith("x @"):
