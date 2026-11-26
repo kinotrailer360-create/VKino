@@ -11,7 +11,7 @@ for name, value in {"BOT_TOKEN": "123456:TEST", "ADMIN_IDS": "1", "KINOPOISK_TOK
     os.environ.setdefault(name, value)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SRC = (ROOT / "bot.py").read_text(encoding="utf-8")
+SRC = "\n".join((ROOT / path).read_text(encoding="utf-8") for path in ("bot.py", "shorts/ai_studio.py"))
 
 
 def test_bot_imports() -> None:
