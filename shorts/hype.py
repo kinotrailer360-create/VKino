@@ -116,7 +116,7 @@ def source_key(post):
     """Syndicated copies of a linked article are not independent sources."""
     direct = canonical_link(post.get("article_url"))
     if direct:
-        return direct
+        return direct.split("/", 1)[0].split("?", 1)[0]
     link = canonical_link(post.get("url"))
     host = urlsplit(public_link(post.get("url"))).hostname or ""
     if host in {"t.me", "telegram.me", "x.com", "twitter.com", "www.x.com", "www.twitter.com", "reddit.com", "www.reddit.com"}:
