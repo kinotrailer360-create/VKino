@@ -214,7 +214,7 @@ class MemoryClientTests(unittest.IsolatedAsyncioTestCase):
 
 class NewsCardTests(unittest.TestCase):
     def fixture(self):
-        return {"sources": [{"source": {"type": "web_search"}, "citation_ids": [2,3,4], "metadata": [
+        return {"sources": [{"source": {"type": "web_search"}, "citation_ids": [2,3,4], "document": ["News article. The studio announced a new film project for next year. More reporting follows here.", "Wikipedia article. The studio announced a new film project for next year. Additional details.", "Tag page. The studio announced a new film project for next year. More stories."], "metadata": [
             {"source": "https://deadline.com/news/article-123/", "title": "Article"},
             {"source": "https://en.wikipedia.org/wiki/Test", "title": "Wiki"},
             {"source": "https://deadline.com/tag/test/", "title": "Tag"}
@@ -233,11 +233,11 @@ class NewsCardTests(unittest.TestCase):
         from datetime import date
         from shorts.studio_news import parse_cards
         raw = {"posts": [
-            {"date": "2026-11-26", "status": "СМИ", "post": "Заголовок\n\nТекст [2]", "source_ids": [2]},
-            {"date": "2026-11-26", "status": "СМИ", "post": "Выдумка", "source_ids": [99]},
-            {"date": "2026-11-26", "status": "СМИ", "post": "Википедия", "source_ids": [3]},
-            {"date": "2026-11-26", "status": "СМИ", "post": "Страница тегов", "source_ids": [4]},
-            {"date": "2026-11-26", "status": "СМИ", "post": "Дубликат", "source_ids": [2]}
+            {"date": "2026-11-26", "status": "СМИ", "post": "Заголовок\n\nТекст [2]", "source_ids": [2], "evidence": {"2": "The studio announced a new film project for next year."}},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Выдумка", "source_ids": [99], "evidence": {"99": "The studio announced a new film project for next year."}},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Википедия", "source_ids": [3], "evidence": {"3": "The studio announced a new film project for next year."}},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Страница тегов", "source_ids": [4], "evidence": {"4": "The studio announced a new film project for next year."}},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Дубликат", "source_ids": [2], "evidence": {"2": "The studio announced a new film project for next year."}}
         ]}
         result = parse_cards(json.dumps(raw), self.fixture(), "Найди новости", current=date(2026,11,26))
         self.assertEqual(len(result["cards"]), 1)
@@ -245,11 +245,20 @@ class NewsCardTests(unittest.TestCase):
         self.assertNotIn("[2]", result["cards"][0]["post"])
         self.assertEqual(result["omitted"], 4)
 
+    def test_fabricated_evidence_is_rejected(self):
+        import json
+        from datetime import date
+        from shorts.studio_news import parse_cards
+        raw = {"posts": [{"date": "2026-11-26", "status": "СМИ", "post": "Заголовок",
+                          "source_ids": [2], "evidence": {"2": "The studio cancelled the film and announced an entirely different project."}}]}
+        result = parse_cards(json.dumps(raw), self.fixture(), "Найди новости", current=date(2026,11,26))
+        self.assertEqual(result["cards"], [])
+
     def test_old_and_future_omitted(self):
         import json
         from datetime import date
         from shorts.studio_news import parse_cards
-        raw = {"posts": [{"date": d, "status": "СМИ", "post": d, "source_ids": [2]} for d in ("2026-10-25","2026-11-27")]}
+        raw = {"posts": [{"date": d, "status": "СМИ", "post": d, "source_ids": [2], "evidence": {"2": "The studio announced a new film project for next year."}} for d in ("2026-10-25","2026-11-27")]}
         result = parse_cards(json.dumps(raw), self.fixture(), "Последние новости", current=date(2026,11,26))
         self.assertEqual(result["cards"], [])
 
