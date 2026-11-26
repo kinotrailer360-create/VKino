@@ -304,3 +304,12 @@ class NewsActionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(offer.await_count, 1)
             self.assertEqual(offer.await_args.args[2], [123])
             publish.assert_not_awaited()
+
+
+    async def test_news_fallback_after_rejected_candidates(self):
+        c = StudioClient(Path("/tmp"))
+        first = {"cards": [], "note": "", "omitted": 2}
+        second = {"cards": [{"post": "Пост"}], "note": "", "omitted": 0}
+        with patch.object(c, "_request", AsyncMock(side_effect=[first, second])) as request:
+            self.assertEqual(await c.discover("auto", "Найди новости"), (second, "Groq"))
+            self.assertEqual(request.await_count, 2)
