@@ -453,10 +453,18 @@ class StudioClient:
     async def _news_action(self, provider, question, mode, rules=()):
         messages = [{"role": "user", "content": memory_prompt(question, rules)}]
         sequence = model_sequence("news", provider)
+        rejected = None
         for i, (label, model) in enumerate(sequence):
             try:
-                return await self._request(model, messages, mode), label
+                result = await self._request(model, messages, mode)
+                if (mode == "news_cards" and not result["cards"]
+                        and result.get("omitted") and i + 1 < len(sequence)):
+                    rejected = (result, label)
+                    continue
+                return result, label
             except StudioError as exc:
+                if rejected is not None and exc.retryable and i == len(sequence) - 1:
+                    return rejected
                 if not exc.retryable or i == len(sequence) - 1:
                     raise
         raise StudioError("Нет доступной модели.")
