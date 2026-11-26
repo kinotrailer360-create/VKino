@@ -93,3 +93,25 @@ class GroundedNewsTests(unittest.TestCase):
     def test_adaptation_without_sources(self):
         from shorts.ai_studio import grounded_news_answer
         self.assertEqual(grounded_news_answer("Готовый пост.", {}, "Для Threads"), "Готовый пост.")
+
+
+class SourceAvailabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unrelated_text_untouched(self):
+        from shorts.ai_studio import verify_news_links
+        self.assertEqual(await verify_news_links("Пост без источников"), "Пост без источников")
+
+    async def test_statuses_follow_real_urls(self):
+        from shorts.ai_studio import _SOURCE_BLOCK, verify_news_links
+        answer = "Проверка" + _SOURCE_BLOCK + "• Один\nhttps://example.com/a\n\n• Два\nhttps://example.com/b"
+        with patch("shorts.ai_studio._source_status", AsyncMock(side_effect=[
+            "открывается (HTTP 200)", "не удалось открыть (HTTP 404)"
+        ])) as check:
+            result = await verify_news_links(answer)
+            self.assertIn("https://example.com/a\nДоступность: открывается (HTTP 200)", result)
+            self.assertIn("https://example.com/b\nДоступность: не удалось открыть (HTTP 404)", result)
+            self.assertEqual(check.await_count, 2)
+
+    async def test_reject_credential_and_internal_port(self):
+        from shorts.ai_studio import _source_status
+        self.assertEqual(await _source_status(None, "http://user:pass@example.com/"), "небезопасный адрес")
+        self.assertEqual(await _source_status(None, "http://example.com:8080/"), "небезопасный адрес")
