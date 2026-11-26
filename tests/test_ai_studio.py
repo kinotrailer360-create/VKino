@@ -369,3 +369,21 @@ class FeedbackTests(unittest.TestCase):
             s.note_feedback(1, token, "Исправь заголовок")
             self.assertEqual(s.get_feedback(1, token)["card_token"], card)
             self.assertEqual(s.get_news_card(1, card)[1]["post"], "Карточка")
+
+
+    def test_revision_prompt_is_not_memory(self):
+        from shorts.ai_studio import correction_task
+        task = correction_task("Для Threads", "Старый ответ", "Убери рекламу")
+        self.assertIn("Убери рекламу", task)
+        self.assertNotIn("Запомни:", task)
+
+
+class FeedbackClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_threads_correction_is_passed(self):
+        c = StudioClient(Path("/tmp"))
+        with patch.object(c, "_request", AsyncMock(return_value="Исправлено")) as request:
+            await c.threads("gemini", "Выбранный пост", correction="Не добавляй рекламу")
+            content = request.await_args.args[1][-1]["content"]
+            self.assertIn("Выбранный пост", content)
+            self.assertIn("Не добавляй рекламу", content)
+            self.assertEqual(request.await_args.args[2], "news_threads")
