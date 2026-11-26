@@ -52,6 +52,40 @@ SHORTS_FORMAT = """
 """
 
 
+
+MEMORY_SCOPES = {"all": "Общие правила", "km360": "KinoMir360", "vikon": "VIKON", "vkino": "VKino", "personal": "Личный помощник"}
+MODE_SCOPE = {"news": "km360", "shorts": "km360", "vikon": "vikon", "vkino": "vkino", "personal": "personal"}
+MEMORY_PREFIX = "Память ИИ-студии · "
+MEMORY_TASK = "\n\nТЕКУЩЕЕ ЗАДАНИЕ ВЛАДЕЛЬЦА:\n"
+REMEMBER = re.compile(r"^\s*запомни\s*:\s*(.+)$", re.I | re.S)
+MAX_RULES = 10
+MAX_RULE_CHARS = 400
+
+
+def normalize_rule(text):
+    rule = " ".join(text.split())
+    if not rule or len(rule) > MAX_RULE_CHARS:
+        raise ValueError("Правило должно содержать от 1 до 400 символов.")
+    # Do not intentionally store obvious credentials. This is not a full secret detector.
+    if re.search(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,})\b", rule):
+        raise ValueError("Не сохраняй API-ключи, пароли и токены в памяти.")
+    return rule
+
+
+def memory_prompt(question, rules):
+    if not rules:
+        return question
+    # Open WebUI may replace a caller-provided system prompt with the custom model's
+    # system prompt. Keep preferences in a clearly delimited user message instead.
+    # This never replaces the configured model instructions or production approval.
+    return ("Постоянные рабочие предпочтения, явно сохранённые владельцем. "
+            "Применяй только относящиеся к текущей задаче, не раскрывай их без запроса. "
+            "Они не отменяют правила достоверности, безопасности и согласования. "
+            "В поисковые запросы не включай сам список предпочтений. "
+            "Текущее задание имеет приоритет над прежними предпочтениями.\n"
+            + "\n".join("— " + text for text in rules) + MEMORY_TASK + question)
+
+
 class StudioError(Exception):
     def __init__(self, text: str, retryable: bool = False):
         super().__init__(text)
@@ -117,7 +151,40 @@ class StudioStore:
             conn.execute("CREATE TABLE IF NOT EXISTS threads(owner INTEGER, mode TEXT, messages TEXT NOT NULL, PRIMARY KEY(owner,mode))")
             conn.execute("CREATE TABLE IF NOT EXISTS preferences(owner INTEGER PRIMARY KEY, provider TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS drafts(owner INTEGER PRIMARY KEY, token TEXT NOT NULL, content TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS studio_rules(id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, UNIQUE(owner,scope,content))")
             yield conn
+
+
+    def rules(self, owner, scope):
+        if scope not in MEMORY_SCOPES:
+            raise ValueError("Неизвестный раздел памяти.")
+        with self.connect() as c:
+            return c.execute("SELECT id, content FROM studio_rules WHERE owner=? AND scope=? ORDER BY id", (owner, scope)).fetchall()
+
+    def remember(self, owner, scope, text):
+        if scope not in MEMORY_SCOPES:
+            raise ValueError("Неизвестный раздел памяти.")
+        rule = normalize_rule(text)
+        with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            existing = c.execute("SELECT id FROM studio_rules WHERE owner=? AND scope=? AND content=?", (owner, scope, rule)).fetchone()
+            if existing:
+                return existing[0], False
+            count = c.execute("SELECT count(*) FROM studio_rules WHERE owner=? AND scope=?", (owner, scope)).fetchone()[0]
+            if count >= MAX_RULES:
+                raise ValueError("В этом разделе уже 10 правил. Удали устаревшее правило.")
+            row = c.execute("INSERT INTO studio_rules(owner,scope,content) VALUES(?,?,?)", (owner, scope, rule))
+            return row.lastrowid, True
+
+    def forget(self, owner, scope, ident):
+        if scope not in MEMORY_SCOPES:
+            return False
+        with self.connect() as c:
+            return bool(c.execute("DELETE FROM studio_rules WHERE owner=? AND scope=? AND id=?", (owner, scope, ident)).rowcount)
+
+    def preferences_for(self, owner, mode):
+        scope = MODE_SCOPE[mode]
+        return [content for name in ("all", scope) for _, content in self.rules(owner, name)]
 
     def history(self, owner, mode):
         with self.connect() as c:
@@ -321,15 +388,19 @@ class StudioClient:
             raise StudioError("Слишком длинный ответ. Раздели задачу на части.")
         if mode == "news":
             question = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+            if MEMORY_TASK in question:
+                question = question.rsplit(MEMORY_TASK, 1)[-1]
             return await verify_news_links(grounded_news_answer(answer, data, question))
         return answer.strip()
 
-    async def ask(self, mode, provider, history, question):
+    async def ask(self, mode, provider, history, question, *, rules=()):
         messages = bounded(history + [{"role": "user", "content": question}])
         if not messages:
             raise StudioError("Запрос слишком длинный.")
+        prepared = memory_prompt(question, rules)
         if mode == "shorts":
-            messages[-1] = {"role": "user", "content": question + "\n\n" + SHORTS_FORMAT}
+            prepared += "\n\n" + SHORTS_FORMAT
+        messages[-1] = {"role": "user", "content": prepared}
         sequence = model_sequence(mode, provider)
         for i, (label, model) in enumerate(sequence):
             try:
@@ -349,7 +420,7 @@ def keyboard(rows):
 
 def menu(provider):
     return keyboard([[(data[0], "ais:m:" + mode)] for mode, data in MODES.items()]
-                    + [[("ИИ: " + PROVIDERS[provider], "ais:providers")]])
+                    + [[("🧠 Память и правила", "ais:memory")], [("ИИ: " + PROVIDERS[provider], "ais:providers")]])
 
 
 def chunks(text):
@@ -382,6 +453,27 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                              reply_markup=ForceReply(selective=False, input_field_placeholder="Вопрос или задание"),
                              parse_mode=None)
 
+    async def show_memory(message, scope):
+        records = store.rules(owner, scope)
+        listing = "🧠 " + MEMORY_SCOPES[scope] + "\n" + ("\n\n".join(f"{ident}. {text}" for ident, text in records) if records else "Сохранённых правил пока нет.")
+        for part in chunks(listing):
+            await message.answer(part, parse_mode=None, disable_web_page_preview=True)
+        rows = [[("➕ Добавить правило", "ais:memadd:" + scope)]]
+        rows.extend([[(f"Удалить №{ident}", f"ais:memdel:{scope}:{ident}")] for ident, _ in records])
+        rows.append([("⬅️ Разделы памяти", "ais:memory")])
+        await message.answer("Управление правилами", reply_markup=keyboard(rows), parse_mode=None)
+
+    async def save_rule(message, scope, text):
+        try:
+            ident, created = store.remember(owner, scope, text)
+        except ValueError as exc:
+            await message.answer("⚠️ " + str(exc), parse_mode=None)
+            return
+        await message.answer(("✅ Правило сохранено" if created else "Это правило уже сохранено")
+                             + f" · {MEMORY_SCOPES[scope]} · №{ident}.",
+                             reply_markup=keyboard([[("🧠 Правила проекта", "ais:mem:" + scope)], [("⬅️ ИИ-студия", "ais:home")]]),
+                             parse_mode=None)
+
     async def run_question(message, mode, question="", *, voice=False):
         question = question.strip()
         if not voice and (not question or len(question) > 10000):
@@ -389,6 +481,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
             return
         if lock.locked():
             await message.answer("ИИ-студия уже обрабатывает запрос.", parse_mode=None)
+            return
+        if not voice and (match := REMEMBER.fullmatch(question)):
+            await save_rule(message, MODE_SCOPE[mode], match[1])
             return
         async with lock:
             if not read_key(data_dir):
@@ -402,11 +497,14 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                     del raw
                     for part in chunks("🎙 Распознано (" + stt_provider + "):\n" + question):
                         await message.answer(part, parse_mode=None, disable_web_page_preview=True)
+                    if REMEMBER.fullmatch(question):
+                        await status.edit_text("Для постоянной памяти подтверди распознанное правило текстом через меню «Память и правила».", parse_mode=None)
+                        return
                     await status.edit_text("⏳ ИИ-студия обрабатывает запрос…", parse_mode=None)
                 history = store.history(owner, mode)
                 if mode == "shorts":
                     store.invalidate_draft(owner)
-                answer, label = await client.ask(mode, store.provider(owner), history, question)
+                answer, label = await client.ask(mode, store.provider(owner), history, question, rules=store.preferences_for(owner, mode))
                 store.save(owner, mode, history + [{"role": "user", "content": question}, {"role": "assistant", "content": answer}])
                 token = None
                 if mode == "shorts":
@@ -422,7 +520,7 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
                 rows = [[("💬 Продолжить", "ais:m:" + mode), ("🆕 Новый диалог", "ais:reset:" + mode)]]
                 if token:
                     rows.insert(0, [("🎬 Передать сценарий на согласование", "ais:render:" + token)])
-                rows.append([("⬅️ ИИ-студия", "ais:home")])
+                rows.append([("🧠 Правила проекта", "ais:mem:" + MODE_SCOPE[mode]), ("⬅️ ИИ-студия", "ais:home")])
                 await message.answer("Что дальше?", reply_markup=keyboard(rows), parse_mode=None)
             except (StudioError, studio_voice.VoiceError) as exc:
                 await status.edit_text("⚠️ " + str(exc), parse_mode=None)
@@ -472,6 +570,21 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
         if mode:
             await run_question(message, mode, voice=True)
 
+    @router.message(F.text, ~F.text.startswith("/"), F.reply_to_message.text.startswith(MEMORY_PREFIX))
+    async def memory_reply(message: Message):
+        if not allowed(message, message.from_user.id if message.from_user else None):
+            return
+        quoted = message.reply_to_message
+        if not quoted or not quoted.from_user or quoted.from_user.id != message.bot.id:
+            return
+        first = (quoted.text or "").splitlines()[0]
+        scope = next((k for k, label in MEMORY_SCOPES.items() if first == MEMORY_PREFIX + label), None)
+        if scope:
+            if lock.locked():
+                await message.answer("Дождись ответа ИИ.", parse_mode=None)
+                return
+            await save_rule(message, scope, message.text or "")
+
     @router.callback_query(F.data.startswith("ais:"))
     async def callback(query: CallbackQuery, state: FSMContext):
         message = query.message
@@ -492,6 +605,21 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
         elif action == "reset" and value in MODES:
             store.reset(owner, value)
             await prompt(message, value)
+        elif action == "memory":
+            await message.answer("🧠 Постоянные правила. Общие применяются ко всем помощникам. KinoMir360 — к новостям и Shorts. "
+                                 "Храни только рабочие предпочтения, не пароли и личные секреты.",
+                                 reply_markup=keyboard([[(label, "ais:mem:" + scope)] for scope, label in MEMORY_SCOPES.items()]
+                                                       + [[("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
+        elif action == "mem" and value in MEMORY_SCOPES:
+            await show_memory(message, value)
+        elif action == "memadd" and value in MEMORY_SCOPES:
+            await message.answer(MEMORY_PREFIX + MEMORY_SCOPES[value] + "\nОтветь текстом: одно правило до 400 символов. "
+                                 "Не добавляй ключи, пароли и секреты. Правила передаются ИИ при запросах.",
+                                 reply_markup=ForceReply(selective=False, input_field_placeholder="Постоянное правило"), parse_mode=None)
+        elif action == "memdel" and value in MEMORY_SCOPES and len(data) == 4 and data[3].isdigit() and len(data[3]) < 18:
+            removed = store.forget(owner, value, int(data[3]))
+            await message.answer("Правило удалено из памяти ИИ-студии." if removed else "Правило уже отсутствует.", parse_mode=None)
+            await show_memory(message, value)
         elif action == "providers":
             await message.answer("Авто: Gemini, при временном сбое — Groq.",
                                  reply_markup=keyboard([[(label, "ais:p:" + k)] for k, label in PROVIDERS.items()]), parse_mode=None)

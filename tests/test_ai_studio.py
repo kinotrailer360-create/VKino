@@ -39,7 +39,7 @@ class StudioTests(unittest.TestCase):
 
     def test_registration(self):
         r = build_router({123}, Path("/tmp/unused-ai-studio"), lambda text: {}, AsyncMock(), lambda: False)
-        self.assertEqual(len(r.message.handlers), 4)
+        self.assertEqual(len(r.message.handlers), 5)
         self.assertEqual(len(r.callback_query.handlers), 1)
 
     def test_models(self):
@@ -161,3 +161,52 @@ class VoiceCommandTests(unittest.IsolatedAsyncioTestCase):
         from shorts import studio_voice
         with self.assertRaises(studio_voice.VoiceError):
             await studio_voice.convert_voice(b"not an ogg file")
+
+
+class MemoryTests(unittest.TestCase):
+    def test_scopes_and_reset(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "memory.db")
+            s.remember(1, "all", "Краткие ответы")
+            ident, new = s.remember(1, "km360", "Только фактчекинг по запросу")
+            self.assertTrue(new)
+            self.assertEqual(s.remember(1, "km360", "Только фактчекинг по запросу"), (ident, False))
+            s.remember(1, "vikon", "Один вопрос")
+            s.reset(1, "news")
+            self.assertEqual(s.preferences_for(1, "news"), ["Краткие ответы", "Только фактчекинг по запросу"])
+            self.assertEqual(s.preferences_for(1, "shorts"), s.preferences_for(1, "news"))
+            self.assertEqual(s.preferences_for(1, "vikon"), ["Краткие ответы", "Один вопрос"])
+            self.assertEqual(s.preferences_for(2, "news"), [])
+            self.assertFalse(s.forget(2, "km360", ident))
+            self.assertTrue(s.forget(1, "km360", ident))
+            self.assertEqual(s.preferences_for(1, "news"), ["Краткие ответы"])
+
+    def test_limits_and_secret_rejection(self):
+        from shorts.ai_studio import normalize_rule, MAX_RULES
+        with self.assertRaises(ValueError):
+            normalize_rule("x" * 401)
+        with self.assertRaises(ValueError):
+            normalize_rule("sk-" + "x" * 30)
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "memory.db")
+            for i in range(MAX_RULES):
+                s.remember(1, "all", f"Правило {i}")
+            with self.assertRaises(ValueError):
+                s.remember(1, "all", "Лишнее правило")
+
+    def test_memory_prompt_preserves_task(self):
+        from shorts.ai_studio import memory_prompt, MEMORY_TASK
+        self.assertEqual(memory_prompt("Для Threads", []), "Для Threads")
+        message = memory_prompt("Для Threads", ["Проверяй даты"])
+        self.assertIn("Проверяй даты", message)
+        self.assertEqual(message.rsplit(MEMORY_TASK, 1)[-1], "Для Threads")
+
+
+class MemoryClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_memory_in_request_and_fallback(self):
+        c = StudioClient(Path("/tmp"))
+        with patch.object(c, "_request", AsyncMock(side_effect=[StudioError("HTTP 503", True), "готово"])) as request:
+            self.assertEqual(await c.ask("news", "auto", [], "Для Threads", rules=["Кратко"]), ("готово", "Groq"))
+            for call in request.await_args_list:
+                self.assertIn("Кратко", call.args[1][-1]["content"])
+                self.assertTrue(call.args[1][-1]["content"].endswith("Для Threads"))
