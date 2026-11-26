@@ -86,7 +86,9 @@ async def review_files(files, text: str, work: Path, key: str, notes=None) -> li
             seen.add(digest)
         fits, reason = None, "Проверка ИИ недоступна или превышен лимит времени"
         remaining = deadline - asyncio.get_running_loop().time()
-        if not stop and remaining > 0 and digest is not None:
+        if digest is None:
+            reason = "Не удалось прочитать файл"
+        elif not stop and remaining > 0:
             try:
                 async with asyncio.timeout(remaining):
                     fits, reason = await review_asset(path, text, work, key)
