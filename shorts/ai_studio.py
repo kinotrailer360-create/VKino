@@ -455,9 +455,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy):
 
     async def show_memory(message, scope):
         records = store.rules(owner, scope)
-        await message.answer("🧠 " + MEMORY_SCOPES[scope] + "\n" +
-                             ("\n\n".join(f"{ident}. {text}" for ident, text in records) if records else "Сохранённых правил пока нет."),
-                             parse_mode=None, disable_web_page_preview=True)
+        listing = "🧠 " + MEMORY_SCOPES[scope] + "\n" + ("\n\n".join(f"{ident}. {text}" for ident, text in records) if records else "Сохранённых правил пока нет.")
+        for part in chunks(listing):
+            await message.answer(part, parse_mode=None, disable_web_page_preview=True)
         rows = [[("➕ Добавить правило", "ais:memadd:" + scope)]]
         rows.extend([[(f"Удалить №{ident}", f"ais:memdel:{scope}:{ident}")] for ident, _ in records])
         rows.append([("⬅️ Разделы памяти", "ais:memory")])
