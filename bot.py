@@ -11503,6 +11503,44 @@ async def studio_news_handoff(message: Message, first: int) -> None:
     await offer_post(message.bot, chat_id, [first], "text", what="Пост ИИ-студии сохранён как черновик")
 
 
+async def studio_news_photo(message: Message, card: dict[str, Any]) -> bool:
+    """Look for the selected article's own OG image, never publish directly."""
+    from shorts import post_visual
+    import tempfile
+
+    text = card["post"]
+    if len((text + "\n\n🎬 KinoMir360 | YouTube | KinoMir360 в MAX").encode("utf-16-le")) // 2 > 1024:
+        await message.answer("Текст слишком длинный для подписи к фотографии. Сократи его или используй обычный редактор.", parse_mode=None)
+        return False
+    if post_lock.locked() or shorts_lock.locked():
+        await message.answer("Сейчас идёт подготовка другого поста или монтаж. Попробуй позже.", parse_mode=None)
+        return False
+    async with post_lock:
+        sources = [{"url": s["url"]} for s in card.get("sources", [])[:2]]
+        notes = []
+        SHORTS_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="studio-news-photo-", dir=SHORTS_DIR) as folder:
+            work = Path(folder)
+            await shorts_fast._add_images(sources)
+            files = await shorts_tgsearch.download_media([{"image": p["image"]} for p in sources if p.get("image")], work, limit=2, prefix="source")
+            keep = await post_visual.review_files(files, text, work, GEMINI_API_KEY, notes)
+            if not keep:
+                await message.answer("Не нашлось проверенной фотографии из этих статей. Текстовый черновик остался доступен.\n"
+                                     + "\n".join(notes), parse_mode=None)
+                return False
+            # One selected source image, exact post body; publication still uses the native approval menu.
+            ids, kind = await _send_media(message.bot, message.chat.id, keep[:1], escape(text) + SIGNATURE)
+            try:
+                await offer_post(message.bot, message.chat.id, ids, kind, what="Пост с проверенной фотографией сохранён как черновик",
+                                 note="\n\n" + escape("\n".join(notes)) + "\nФото из статьи; проверь содержание и права перед публикацией.")
+            except Exception:
+                # If only the editor message failed after saving, do not create a second draft.
+                if not await db().fetchval("SELECT 1 FROM ai_drafts WHERE chat_id=$1 AND first_id=$2", message.chat.id, ids[0]):
+                    raise
+                await message.answer("Черновик сохранён. Открой обычное меню публикации.", reply_markup=post_keyboard(ids[0]), parse_mode=None)
+            return True
+
+
 async def _queue_json_remove(pairs: set[tuple[int, int]]) -> None:
     """Двойная запись очереди в старый JSON (переходный период)."""
     queue = await _json_setting("posts_queue", [])
@@ -11654,60 +11692,29 @@ def _season_of(text: str) -> int | None:
     return min(found)[1]
 
 
-async def _media_frame(path: Path, work: Path) -> Image.Image | None:
-    """Картинка для проверки: само фото или кадр видео на 1-й секунде."""
-    try:
-        if path.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv"):
-            frame = work / f"{path.stem}_check.jpg"
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(path), "-frames:v", "1", str(frame),
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            await asyncio.wait_for(proc.wait(), 60)
-            path = frame
-        return await asyncio.to_thread(lambda: Image.open(path).convert("RGB"))
-    except Exception:  # noqa: BLE001
-        return None
-
-
 async def _check_media(files: list[Path], res: dict[str, Any], work: Path,
-                       notes: list[str] | None = None) -> list[Path]:
-    """Фото и видео поста — только о той же новости: ИИ смотрит на каждое (до 4). Не подошло ничего — постер
-    фильма или портрет человека из базы (TMDB), иначе пост без картинки (её можно добавить кнопкой)."""
-    if not files:
-        return files
-    news = f"{res['post'][:900]}\nФильм/сериал: {res.get('film') or '—'} ({res.get('film_en') or '—'}). " \
-           f"Человек: {res.get('person') or '—'} ({res.get('person_en') or '—'})."
-    keep: list[Path] = []
-    unsure: list[Path] = []  # ИИ не ответил (лимит, сбой) — такой картинке не верим, если есть замена из базы
-    for k, path in enumerate(files):
-        if k >= 2:  # остальные кадры альбома — из того же поста; лимит Gemini на день не тратим
-            (keep if keep else unsure).append(path)
-            continue
-        img = await _media_frame(path, work)
-        fits, seen = await shorts_ai.media_fits(GEMINI_API_KEY, img, news) if img else (None, "")
-        if notes is not None:  # автору под постом: что ИИ увидел на картинке и решил
-            notes.append(f"{'✅' if fits else '❌ убрал' if fits is False else '❔ не проверено'}"
-                         + (f": {seen}" if seen else ""))
-        if fits is False:
-            logging.info("Tg post: media %s rejected for %s", path.name, res.get("topic"))
-            continue
-        (keep if fits else unsure).append(path)
-    if keep:
+                       notes: list[str] | None = None, *, try_database: bool = True) -> list[Path]:
+    """Only attach verified assets; the TMDB fallback is checked too."""
+    from shorts import post_visual
+    news = (f"{res['post'][:900]}\nФильм/сериал: {res.get('film') or '—'} ({res.get('film_en') or '—'}). "
+            f"Человек: {res.get('person') or '—'} ({res.get('person_en') or '—'}).")
+    keep = await post_visual.review_files(files, news, work, GEMINI_API_KEY, notes)
+    if keep or not files:
         return keep
-    # непроверенная картинка часто из сборного поста канала (к новости о «I Play Rocky» пришёл постер
-    # «Мстителей» соседней новости) — надёжнее постер или портрет из базы по названию
-    urls = await _tmdb_media_urls(res)
-    if not urls and unsure:
-        if notes is not None:
-            notes.append("⚠️ ИИ не проверил картинку, замены в базе нет — оставил как есть, проверь глазами")
-        return unsure
-    if notes is not None:
-        notes.append({2: "поставил портрет человека и постер фильма из базы TMDB",
-                      1: "поставил портрет или постер из базы TMDB"}.get(len(urls), "подходящей картинки нет — пост "
-                     "без фото, добавь кнопкой «🖼 Заменить или добавить фото/видео»"))
-    if not urls:
+    # Do not repeat a known provider outage through another candidate source.
+    if notes is not None and any("Проверка ИИ недоступна" in n for n in notes):
+        notes.append("Проверка недоступна — черновик без фото. Добавь материал вручную после проверки.")
         return []
-    return await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
+    if try_database:
+        urls = await _tmdb_media_urls(res)
+        if urls:
+            if notes is not None:
+                notes.append("Проверяю кандидатов из TMDB.")
+            replacements = await shorts_tgsearch.download_media([{"image": u} for u in urls], work, limit=2, prefix="repl")
+            keep = await post_visual.review_files(replacements, news, work, GEMINI_API_KEY, notes)
+    if not keep and notes is not None:
+        notes.append("Подтверждённых фотографий нет — черновик без фото, можно добавить вручную.")
+    return keep
 
 
 async def _illustration(res: dict[str, Any], work: Path, checks: list[str]) -> list[Path]:
@@ -12079,11 +12086,11 @@ async def make_tg_post(bot: Bot, chat_ids: list[int], mode: str = "tg",
                     [{"image": u} for u in db_urls], work, limit=2, prefix="db") if db_urls else []
             if db_files:
                 files = db_files
-                checks.append("режим «фото из базы фильмов»: постер/портрет TMDB")
-            else:
-                files = await _check_media(files, res, work, checks)  # ИИ смотрит, о том ли картинка
+                checks.append("режим «фото из базы фильмов»: проверка постера/портрета TMDB")
+            had_candidates = bool(files)
+            files = await _check_media(files, res, work, checks, try_database=not bool(db_files))
             illustrated = False
-            if not files:  # ни фото из новости, ни постера в базе — картинку рисует ИИ (помечена как иллюстрация)
+            if not files and not had_candidates:  # не увеличиваем платную генерацию из-за более строгой проверки
                 files = await _illustration(res, work, checks)
                 illustrated = bool(files)
             # у нарисованной картинки — видимая подпись в самом посте, а не только плашка на картинке
@@ -14365,7 +14372,7 @@ async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automa
                 return await bot.send_message(chat_id, escape(text) + SIGNATURE, parse_mode="HTML", disable_web_page_preview=True)
 
             await send("🧠 Черновик по инфоповоду · " + label, parse_mode=None)
-            await deliver_news_card(send, preview, store, owner, card)
+            await deliver_news_card(send, preview, store, owner, card, allow_photo=True)
             g["studio_draft_ready"] = True
             return True
         except StudioError:
@@ -15005,10 +15012,9 @@ async def post_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         await message.answer(
             "🖼 <b>Фото к новостям</b>\n\n"
             f"{'⚪️' if db else '🟢'} <b>Из новости</b> — фото и видео из поста-источника (кадры со съёмок, ролики, "
-            "альбомы), если ИИ подтвердил, что они о той же новости; иначе постер из базы фильмов.\n"
-            f"{'🟢' if db else '⚪️'} <b>Из базы фильмов</b> — всегда постер фильма и портрет человека из базы TMDB: "
-            "чужих фото почти не бывает, но меньше живых кадров и видео. Видео трейлера к новости о трейлере "
-            "остаётся.\n\n"
+            "альбомы), только после проверки каждого файла; если не подошло, проверяется постер из базы.\n"
+            f"{'🟢' if db else '⚪️'} <b>Из базы фильмов</b> — кандидаты TMDB тоже проверяются ИИ. "
+            "Неподтверждённое фото или видео не добавляется автоматически.\n\n"
             f"🎨 <b>Картинка ИИ</b> ({'вкл' if art else 'выкл'}) — если ни фото, ни постера не нашлось, ИИ рисует "
             "иллюстрацию (без лиц реальных людей, не постер) с пометкой «Иллюстрация · ИИ». "
             f"≈{shorts_budget.IMAGE_USD:.3f}$ за картинку.\n" + "\n".join(await shorts_budget.status_lines()),
@@ -20272,7 +20278,7 @@ async def main() -> None:
     dp.include_router(build_ai_studio_router(
         ADMIN_IDS, Path(os.getenv("VKINO_DATA", "/data")),
         shorts_script_task.parse, show_structured_plan, shorts_lock.locked,
-        news_preview=studio_news_preview, news_handoff=studio_news_handoff,
+        news_preview=studio_news_preview, news_handoff=studio_news_handoff, news_photo=studio_news_photo,
     ))
     dp.include_router(contact_router)
     dp.include_router(daily_short_router)
