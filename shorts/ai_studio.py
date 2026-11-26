@@ -10,13 +10,15 @@ import secrets
 import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from . import netsafe
 
 log = logging.getLogger(__name__)
 BUTTON = "🧠 ИИ-студия"
@@ -219,7 +221,62 @@ def grounded_news_answer(answer: str, data: dict, question: str) -> str:
             break
     if links:
         return body + "\n\nИсточники из поиска (отдельная проверка доступности ссылок не выполнялась):\n" + "\n\n".join(links)
+    body = re.sub(r"(?im)^(\s*(?:\*\*)?)(?:частично )?подтверждено\b", r"\1Не удалось подтвердить", body, count=1)
     return ("⚠️ Поиск не вернул ссылки на веб-источники; достоверность не подтверждена.\n\n" + body).strip()
+
+
+
+_SOURCE_BLOCK = "\n\nИсточники из поиска (отдельная проверка доступности ссылок не выполнялась):\n"
+
+
+async def _source_status(session: aiohttp.ClientSession, url: str) -> str:
+    """Check only HTTP access, not whether an article supports the claim."""
+    try:
+        # Use the same DNS and redirect protections as existing public media fetches.
+        async with asyncio.timeout(7):
+            for _ in range(4):
+                parts = urlsplit(url)
+                if (parts.scheme not in {"http", "https"} or not parts.hostname
+                        or parts.username or parts.password or parts.port not in (None, 80, 443)):
+                    return "небезопасный адрес"
+                await netsafe.check_url(url)
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status in (301, 302, 303, 307, 308) and response.headers.get("Location"):
+                        url = urljoin(str(response.url), response.headers["Location"])
+                        continue
+                    if 200 <= response.status < 300:
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        if "text/html" in content_type or "application/xhtml+xml" in content_type:
+                            return f"открывается (HTTP {response.status})"
+                        return f"доступен ответ HTTP {response.status}, не HTML-статья"
+                    return f"не удалось открыть (HTTP {response.status})"
+            return "не проверено: слишком много перенаправлений"
+    except (aiohttp.ClientError, OSError, ValueError, TimeoutError, netsafe.UnsafeURL):
+        return "не удалось проверить доступность"
+
+
+async def verify_news_links(answer: str) -> str:
+    """Verify at most four exact URLs in the generated metadata-only source block."""
+    body, separator, block = answer.partition(_SOURCE_BLOCK)
+    if not separator:
+        return answer
+    lines = block.splitlines()
+    indices = [i for i, line in enumerate(lines) if line.startswith(("https://", "http://"))][:4]
+    if not indices:
+        return answer
+    try:
+        async with netsafe.safe_session(
+            timeout=aiohttp.ClientTimeout(total=7, connect=3),
+            trust_env=False,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as session:
+            statuses = await asyncio.gather(*(_source_status(session, lines[i]) for i in indices))
+    except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
+        statuses = ["не удалось проверить доступность"] * len(indices)
+    for i, status in zip(indices, statuses):
+        lines[i] += "\nДоступность: " + status
+    return (body + "\n\nИсточники из поиска (HTTP-проверка с VPS; не доказательство содержания статьи):\n"
+            + "\n".join(lines))
 
 
 class StudioClient:
@@ -264,7 +321,7 @@ class StudioClient:
             raise StudioError("Слишком длинный ответ. Раздели задачу на части.")
         if mode == "news":
             question = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
-            return grounded_news_answer(answer, data, question)
+            return await verify_news_links(grounded_news_answer(answer, data, question))
         return answer.strip()
 
     async def ask(self, mode, provider, history, question):
