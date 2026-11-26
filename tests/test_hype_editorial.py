@@ -28,6 +28,7 @@ class HypeEditorialTests(unittest.TestCase):
              post("https://t.me/b/2", "Marvel trailer", article_url=url + "?utm_campaign=x")]
         self.assertEqual(hype.source_key(p[0]), hype.source_key(p[1]))
         self.assertEqual(hype.editorial_rank(group(p))["independent"], 1)
+        self.assertEqual(hype.source_key(p[0]), hype.source_key(post(url, "Marvel trailer")))
 
     def test_franchise_and_priority(self):
         self.assertEqual(hype.franchise("The Hunger Games: Sunrise on the Reaping"), "Голодные игры")
