@@ -35,11 +35,15 @@ def prompt(question: str) -> str:
           "страницы тегов, общие подборки или главные страницы как источник статьи. "
           "Ссылайся на реальные числовые id из полученного веб-контекста <source id=...>. "
           "Если не нашёл конкретный материал с датой, пропусти инфоповод. Не выдумывай id. "
+          "Для каждого source_id укажи evidence: точную непрерывную цитату на языке оригинала из этого источника, "
+          "8–20 слов, которая подтверждает главный факт карточки, включая его важные ограничения. "
+          "Не переводи цитату, не используй многоточие, не бери общий заголовок о франшизе вместо доказательства. "
+          "Рекорд за праздничный период не означает рекорд за все периоды. Если точного подтверждения нет — убери факт или карточку. "
           "Каждый post — готовый русский текст Telegram, до 900 символов: заголовок, компактные абзацы, "
           "реакции и тематические хэштеги по смыслу. Без служебных ссылок, [N], Markdown, подписи канала "
           "(бот добавит сам) и без обещаний не подтверждённых фактов. Слухи явно маркируй прямо в тексте. "
           "Верни только корректный JSON, без пояснений вне JSON, структура: "
-          '{"posts":[{"date":"YYYY-MM-DD","status":"СМИ","post":"ЗАГОЛОВОК\\n\\nТекст","source_ids":[2,3]}],'
+          '{"posts":[{"date":"YYYY-MM-DD","status":"СМИ","post":"ЗАГОЛОВОК\\n\\nТекст","source_ids":[2],"evidence":{"2":"точная цитата из источника"}}],'
           '"note":"краткое пояснение при нехватке материалов или расширении периода"}. '
           "status: Официально, СМИ, Слух или Аналитика. При отсутствии материалов верни пустой posts."
     )
@@ -71,19 +75,26 @@ def _article_url(url):
         return False
 
 
+def _normalize_evidence(text):
+    return " ".join(text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-"})).casefold().split())
+
+
 def source_records(data):
     records = {}
     for item in data.get("sources", []) or []:
         if not isinstance(item, dict) or (item.get("source") or {}).get("type") != "web_search":
             continue
         ids = item.get("citation_ids") or []
+        docs = item.get("document") or []
         for i, meta in enumerate(item.get("metadata") or []):
             if i >= len(ids) or not isinstance(meta, dict):
                 continue
             url = meta.get("source") or meta.get("url")
             cid = str(ids[i])
-            if cid.isdigit() and _article_url(url):
-                records[cid] = {"url": url, "title": " ".join(str(meta.get("title") or urlsplit(url).hostname).split())[:160]}
+            doc = docs[i] if isinstance(docs, list) and i < len(docs) else None
+            if cid.isdigit() and _article_url(url) and isinstance(doc, str) and len(doc) >= 80:
+                records[cid] = {"url": url, "title": " ".join(str(meta.get("title") or urlsplit(url).hostname).split())[:160],
+                                "document": _normalize_evidence(doc[:100000])}
     return records
 
 
@@ -117,14 +128,18 @@ def parse_cards(answer, data, question, *, current=None):
         if status not in {"Официально", "СМИ", "Слух", "Аналитика"}:
             continue
         ids = item.get("source_ids")
-        if not isinstance(ids, list):
+        evidence = item.get("evidence")
+        if not isinstance(ids, list) or not isinstance(evidence, dict):
             continue
         selected = []
         seen = set()
         for cid in ids[:10]:
             rec = records.get(str(cid))
-            if rec and rec["url"] not in seen:
-                selected.append(rec.copy())
+            quote = evidence.get(str(cid))
+            if (rec and rec["url"] not in seen and isinstance(quote, str)
+                    and 6 <= len(quote.split()) <= 20 and 30 <= len(quote) <= 300
+                    and _normalize_evidence(quote) in rec["document"]):
+                selected.append({"url": rec["url"], "title": rec["title"], "evidence": " ".join(quote.split())})
                 seen.add(rec["url"])
             if len(selected) == 2:
                 break
@@ -152,4 +167,6 @@ def source_note(card):
     note += "\nИсточники для автора (не входят в пост):"
     for src in card["sources"]:
         note += "\n\n" + src["title"] + "\n" + src["url"] + "\n" + src.get("availability", "Доступность не проверена.")
-    return note + "\n\nHTTP-доступность не подтверждает содержание статьи."
+        if src.get("evidence"):
+            note += "\nФрагмент источника: «" + src["evidence"] + "»"
+    return note + "\n\nФрагмент найден в тексте источника; соответствие всех утверждений и даты проверь перед публикацией."
