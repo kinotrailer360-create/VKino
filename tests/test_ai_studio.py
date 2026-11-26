@@ -39,7 +39,7 @@ class StudioTests(unittest.TestCase):
 
     def test_registration(self):
         r = build_router({123}, Path("/tmp/unused-ai-studio"), lambda text: {}, AsyncMock(), lambda: False)
-        self.assertEqual(len(r.message.handlers), 6)
+        self.assertEqual(len(r.message.handlers), 7)
         self.assertEqual(len(r.callback_query.handlers), 1)
 
     def test_models(self):
@@ -313,3 +313,77 @@ class NewsActionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(c, "_request", AsyncMock(side_effect=[first, second])) as request:
             self.assertEqual(await c.discover("auto", "Найди новости"), (second, "Groq"))
             self.assertEqual(request.await_count, 2)
+
+
+class FeedbackTests(unittest.TestCase):
+    def test_owner_isolation_and_rating(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "feedback.db")
+            token = s.feedback_item(1, "news", "Вопрос", "Ответ")
+            self.assertIsNone(s.get_feedback(2, token))
+            self.assertFalse(s.rate_feedback(2, token, 1))
+            self.assertIsNone(s.note_feedback(2, token, "Чужая правка"))
+            self.assertTrue(s.rate_feedback(1, token, 1))
+            self.assertTrue(s.rate_feedback(1, token, 1))
+            self.assertEqual(s.feedback_stats(1), (1, 1, 0, 0))
+            first = s.note_feedback(1, token, "Уточни даты")
+            second = s.note_feedback(1, token, "Уточни кассу")
+            self.assertNotEqual(first, second)
+            self.assertEqual(s.get_feedback(1, token)["note"], "Уточни кассу")
+            self.assertEqual(s.feedback_stats(1), (1, 0, 1, 1))
+            self.assertEqual(s.preferences_for(1, "news"), [])
+            s.remember(1, "km360", s.get_feedback(1, token)["note"])
+            self.assertEqual(s.preferences_for(1, "shorts"), ["Уточни кассу"])
+
+    def test_retention_and_reset(self):
+        from shorts.ai_studio import MAX_FEEDBACK
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "feedback.db")
+            first = s.feedback_item(1, "news", "first", "answer")
+            for i in range(MAX_FEEDBACK):
+                last = s.feedback_item(1, "news", str(i), "answer")
+            self.assertIsNone(s.get_feedback(1, first))
+            s.reset(1, "news")
+            self.assertIsNotNone(s.get_feedback(1, last))
+            self.assertEqual(s.feedback_stats(1)[0], MAX_FEEDBACK)
+
+    def test_note_and_correction_limits(self):
+        from shorts.ai_studio import correction_task
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "feedback.db")
+            token = s.feedback_item(1, "personal", "one", "two")
+            for note in ("", "x" * 1001, "sk-" + "x" * 30):
+                with self.assertRaises(ValueError):
+                    s.note_feedback(1, token, note)
+            task = correction_task("Проверь новость", "Было", "Неверная дата")
+            for part in ("Проверь новость", "Было", "Неверная дата"):
+                self.assertIn(part, task)
+            with self.assertRaises(ValueError):
+                correction_task("one", "x" * 10000, "two")
+
+    def test_card_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "feedback.db")
+            card = s.news_card(1, 123, {"post": "Карточка"})
+            token = s.feedback_item(1, "news", "Готовый Telegram-пост", "Карточка", card)
+            s.note_feedback(1, token, "Исправь заголовок")
+            self.assertEqual(s.get_feedback(1, token)["card_token"], card)
+            self.assertEqual(s.get_news_card(1, card)[1]["post"], "Карточка")
+
+
+    def test_revision_prompt_is_not_memory(self):
+        from shorts.ai_studio import correction_task
+        task = correction_task("Для Threads", "Старый ответ", "Убери рекламу")
+        self.assertIn("Убери рекламу", task)
+        self.assertNotIn("Запомни:", task)
+
+
+class FeedbackClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_threads_correction_is_passed(self):
+        c = StudioClient(Path("/tmp"))
+        with patch.object(c, "_request", AsyncMock(return_value="Исправлено")) as request:
+            await c.threads("gemini", "Выбранный пост", correction="Не добавляй рекламу")
+            content = request.await_args.args[1][-1]["content"]
+            self.assertIn("Выбранный пост", content)
+            self.assertIn("Не добавляй рекламу", content)
+            self.assertEqual(request.await_args.args[2], "news_threads")

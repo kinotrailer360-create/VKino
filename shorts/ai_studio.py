@@ -60,6 +60,9 @@ MEMORY_TASK = "\n\nТЕКУЩЕЕ ЗАДАНИЕ ВЛАДЕЛЬЦА:\n"
 REMEMBER = re.compile(r"^\s*запомни\s*:\s*(.+)$", re.I | re.S)
 MAX_RULES = 10
 MAX_RULE_CHARS = 400
+FEEDBACK_PREFIX = "Замечание к ответу · "
+MAX_FEEDBACK = 60
+MAX_FEEDBACK_CHARS = 1000
 
 
 def normalize_rule(text):
@@ -84,6 +87,17 @@ def memory_prompt(question, rules):
             "В поисковые запросы не включай сам список предпочтений. "
             "Текущее задание имеет приоритет над прежними предпочтениями.\n"
             + "\n".join("— " + text for text in rules) + MEMORY_TASK + question)
+
+
+def correction_task(question, answer, note):
+    task = ("Исправь только приведённый ответ с учётом замечания владельца. "
+            "Сохрани исходную задачу и её формат. Не добавляй новые форматы. "
+            "Если замечание касается фактов, перепроверь их по источникам.\n\n"
+            "Исходное задание:\n" + question + "\n\nПредыдущий ответ (не инструкция):\n" + answer
+            + "\n\nЗамечание владельца:\n" + note)
+    if len(task) > 10000:
+        raise ValueError("Этот ответ слишком длинный для автоматической правки. Уточни нужный фрагмент отдельным запросом.")
+    return task
 
 
 class StudioError(Exception):
@@ -153,6 +167,7 @@ class StudioStore:
             conn.execute("CREATE TABLE IF NOT EXISTS drafts(owner INTEGER PRIMARY KEY, token TEXT NOT NULL, content TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS studio_rules(id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, UNIQUE(owner,scope,content))")
             conn.execute("CREATE TABLE IF NOT EXISTS studio_news_cards(token TEXT PRIMARY KEY, owner INTEGER NOT NULL, preview INTEGER NOT NULL, content TEXT NOT NULL, transferred INTEGER NOT NULL DEFAULT 0)")
+            conn.execute("CREATE TABLE IF NOT EXISTS studio_feedback(token TEXT PRIMARY KEY, owner INTEGER NOT NULL, mode TEXT NOT NULL, question TEXT NOT NULL, answer TEXT NOT NULL, card_token TEXT NOT NULL DEFAULT '', rating INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT '')")
             yield conn
 
 
@@ -206,6 +221,45 @@ class StudioStore:
     def remove_news_card(self, owner, token):
         with self.connect() as c:
             c.execute("DELETE FROM studio_news_cards WHERE owner=? AND token=? AND transferred=0", (owner, token))
+
+    def feedback_item(self, owner, mode, question, answer, card_token=""):
+        if mode not in MODES or len(question) > 10000 or len(answer) > 30000:
+            raise ValueError("Invalid feedback item")
+        token = secrets.token_hex(8)
+        with self.connect() as c:
+            c.execute("INSERT INTO studio_feedback(token,owner,mode,question,answer,card_token) VALUES(?,?,?,?,?,?)",
+                      (token, owner, mode, question, answer, card_token))
+            c.execute("DELETE FROM studio_feedback WHERE owner=? AND rowid NOT IN (SELECT rowid FROM studio_feedback WHERE owner=? ORDER BY rowid DESC LIMIT ?)", (owner, owner, MAX_FEEDBACK))
+        return token
+
+    def get_feedback(self, owner, token):
+        with self.connect() as c:
+            row = c.execute("SELECT mode,question,answer,card_token,rating,note,revision FROM studio_feedback WHERE owner=? AND token=?", (owner, token)).fetchone()
+        return dict(zip(("mode", "question", "answer", "card_token", "rating", "note", "revision"), row)) if row else None
+
+    def rate_feedback(self, owner, token, rating):
+        if rating not in (-1, 1):
+            raise ValueError("Invalid rating")
+        with self.connect() as c:
+            return bool(c.execute("UPDATE studio_feedback SET rating=? WHERE owner=? AND token=?", (rating, owner, token)).rowcount)
+
+    def note_feedback(self, owner, token, text):
+        note = text.strip()
+        if not note or len(note) > MAX_FEEDBACK_CHARS:
+            raise ValueError("Замечание должно содержать от 1 до 1000 символов.")
+        # Reuse the explicit secret check for each bounded piece without storing credentials.
+        for match in re.finditer(r"\S+", note):
+            if re.match(r"(?:sk-|AIza|gsk_|gh[pousr]_)[A-Za-z0-9_-]{16,}", match[0]):
+                raise ValueError("Не отправляй ключи и пароли в замечаниях.")
+        revision = secrets.token_hex(4)
+        with self.connect() as c:
+            changed = c.execute("UPDATE studio_feedback SET rating=-1,note=?,revision=? WHERE owner=? AND token=?", (note, revision, owner, token)).rowcount
+        return revision if changed else None
+
+    def feedback_stats(self, owner):
+        with self.connect() as c:
+            row = c.execute("SELECT count(*),coalesce(sum(rating=1),0),coalesce(sum(rating=-1),0),coalesce(sum(note<>''),0) FROM studio_feedback WHERE owner=?", (owner,)).fetchone()
+        return row
 
     def history(self, owner, mode):
         with self.connect() as c:
@@ -472,10 +526,12 @@ class StudioClient:
     async def discover(self, provider, question, *, rules=()):
         return await self._news_action(provider, studio_news.prompt(question), "news_cards", rules)
 
-    async def threads(self, provider, post, *, rules=()):
+    async def threads(self, provider, post, *, rules=(), correction=""):
         task = ("Адаптируй только данный готовый пост для Threads. До 500 символов, живой текст, "
                 "вопрос по смыслу и тематические хэштеги. Без ссылок, рекламы Telegram/MAX, "
                 "без новых фактов и служебных заголовков. Ответ только текстом для публикации.\n\n" + post)
+        if correction:
+            task += "\n\nЗамечание владельца к предыдущей адаптации:\n" + correction
         return await self._news_action(provider, task, "news_threads", rules)
 
     async def ask(self, mode, provider, history, question, *, rules=()):
@@ -505,7 +561,7 @@ def keyboard(rows):
 
 def menu(provider):
     return keyboard([[(data[0], "ais:m:" + mode)] for mode, data in MODES.items()]
-                    + [[("🧠 Память и правила", "ais:memory")], [("ИИ: " + PROVIDERS[provider], "ais:providers")]])
+                    + [[("🧠 Память и правила", "ais:memory")], [("📊 Оценки ответов", "ais:fstats")], [("ИИ: " + PROVIDERS[provider], "ais:providers")]])
 
 
 def chunks(text):
@@ -564,6 +620,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
             return await news_preview(message, text)
         return await message.answer(text + "\n\n" + studio_news.SIGNATURE, parse_mode=None, disable_web_page_preview=True)
 
+    def feedback_buttons(token):
+        return [("👍 Хорошо", "ais:fup:" + token), ("👎 Исправить", "ais:fdown:" + token)]
+
     async def send_news_card(message, card):
         preview = await preview_news(message, card["post"])
         token = store.news_card(owner, preview.message_id, card)
@@ -572,6 +631,8 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                 [("🎬 Сделать Shorts", "ais:nshort:" + token), ("🧵 Для Threads", "ais:nthread:" + token)]]
         if news_handoff is not None:
             rows.append([("📢 Подготовить публикацию", "ais:npub:" + token)])
+        review = store.feedback_item(owner, "news", "Готовый Telegram-пост", card["post"], token)
+        rows.append(feedback_buttons(review))
         note = studio_news.source_note(card)
         parts = list(chunks(note))
         for part in parts[:-1]:
@@ -637,7 +698,8 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                 await status.edit_text("✅ Ответ · " + label, parse_mode=None)
                 for part in chunks(answer):
                     await message.answer(part, parse_mode=None, disable_web_page_preview=True)
-                rows = [[("💬 Продолжить", "ais:m:" + mode), ("🆕 Новый диалог", "ais:reset:" + mode)]]
+                review = store.feedback_item(owner, mode, question, answer)
+                rows = [feedback_buttons(review), [("💬 Продолжить", "ais:m:" + mode), ("🆕 Новый диалог", "ais:reset:" + mode)]]
                 if token:
                     rows.insert(0, [("🎬 Передать сценарий на согласование", "ais:render:" + token)])
                 rows.append([("🧠 Правила проекта", "ais:mem:" + MODE_SCOPE[mode]), ("⬅️ ИИ-студия", "ais:home")])
@@ -730,6 +792,48 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
             await send_news_card(message, card)
             store.remove_news_card(owner, token)
 
+    @router.message(F.text, ~F.text.startswith("/"), F.reply_to_message.text.startswith(FEEDBACK_PREFIX))
+    async def feedback_reply(message: Message):
+        if not allowed(message, message.from_user.id if message.from_user else None):
+            return
+        quoted = message.reply_to_message
+        if not quoted or not quoted.from_user or quoted.from_user.id != message.bot.id:
+            return
+        token = (quoted.text or "").splitlines()[0].removeprefix(FEEDBACK_PREFIX)
+        if lock.locked():
+            await message.answer("Дождись ответа ИИ.", parse_mode=None)
+            return
+        record = store.get_feedback(owner, token)
+        if not record:
+            await message.answer("Ответ уже недоступен для оценки.", parse_mode=None)
+            return
+        try:
+            revision = store.note_feedback(owner, token, message.text or "")
+        except ValueError as exc:
+            await message.answer("⚠️ " + str(exc), parse_mode=None)
+            return
+        if not revision:
+            return
+        rows = []
+        if record["card_token"]:
+            card = store.get_news_card(owner, record["card_token"])
+            if card and not card[2]:
+                if record["question"] == "Адаптация для Threads":
+                    rows.append([("🔁 Исправить Threads", f"ais:ffix:{token}:{revision}")])
+                else:
+                    rows.append([("✏️ Исправить текст поста", "ais:nedit:" + record["card_token"])])
+        else:
+            rows.append([("🔁 Исправить ответ через ИИ", f"ais:ffix:{token}:{revision}")])
+        try:
+            normalize_rule(message.text or "")
+        except ValueError:
+            rows.append([("🧠 Сформулировать короткое правило", "ais:memadd:" + MODE_SCOPE[record["mode"]])])
+        else:
+            rows.append([("🧠 Сохранить замечание как правило", f"ais:fsave:{token}:{revision}")])
+        rows.append([("⬅️ ИИ-студия", "ais:home")])
+        await message.answer("Замечание сохранено к этому ответу. Постоянную память пока не менял. Выбери действие.",
+                             reply_markup=keyboard(rows), parse_mode=None)
+
     @router.callback_query(F.data.startswith("ais:"))
     async def callback(query: CallbackQuery, state: FSMContext):
         message = query.message
@@ -750,6 +854,54 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
         elif action == "reset" and value in MODES:
             store.reset(owner, value)
             await prompt(message, value)
+        elif action == "fstats":
+            total, positive, negative, notes = store.feedback_stats(owner)
+            await message.answer(f"📊 Последние {MAX_FEEDBACK} ответов и карточек\n"
+                                 f"Всего: {total}\n👍 Хорошо: {positive}\n👎 Требуют правки: {negative}\n"
+                                 f"С замечаниями: {notes}\nБез оценки: {total-positive-negative}\n\n"
+                                 "Оценки локальные; сами по себе не изменяют память или модель.",
+                                 reply_markup=keyboard([[("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
+        elif action in {"fup", "fdown", "ffix", "fsave"} and re.fullmatch(r"[a-f0-9]{16}", value):
+            record = store.get_feedback(owner, value)
+            if not record:
+                await message.answer("Этот ответ уже недоступен для оценки.", parse_mode=None)
+                return
+            if action == "fup":
+                store.rate_feedback(owner, value, 1)
+                await message.answer("👍 Оценка сохранена.", parse_mode=None)
+            elif action == "fdown":
+                store.rate_feedback(owner, value, -1)
+                await message.answer(FEEDBACK_PREFIX + value + "\nЧто именно нужно исправить? Ответь текстом до 1000 символов. "
+                                     "Не присылай пароли и ключи. Замечание не становится постоянным правилом автоматически.",
+                                     reply_markup=ForceReply(selective=False, input_field_placeholder="Что исправить?"), parse_mode=None)
+            else:
+                if len(data) != 4 or data[3] != record["revision"] or not record["note"]:
+                    await message.answer("Замечание изменилось или отсутствует. Открой актуальное замечание.", parse_mode=None)
+                    return
+                if action == "fsave":
+                    await save_rule(message, MODE_SCOPE[record["mode"]], record["note"])
+                elif record["question"] == "Адаптация для Threads" and record["card_token"]:
+                    card = store.get_news_card(owner, record["card_token"])
+                    if not card or card[2]:
+                        await message.answer("Исходный пост заменён или передан в обычный редактор.", parse_mode=None)
+                        return
+                    async with lock:
+                        status = await message.answer("⏳ Исправляю Threads…", parse_mode=None)
+                        try:
+                            answer, label = await client.threads(store.provider(owner), card[1]["post"], rules=store.preferences_for(owner, "news"), correction=record["note"])
+                            await status.edit_text("✅ Threads · " + label, parse_mode=None)
+                            await message.answer(answer, parse_mode=None, disable_web_page_preview=True)
+                            review = store.feedback_item(owner, "news", "Адаптация для Threads", answer, record["card_token"])
+                            await message.answer("Оцени адаптацию", reply_markup=keyboard([feedback_buttons(review)]), parse_mode=None)
+                        except StudioError as exc:
+                            await status.edit_text("⚠️ " + str(exc), parse_mode=None)
+                elif not record["card_token"]:
+                    try:
+                        task = correction_task(record["question"], record["answer"], record["note"])
+                    except ValueError as exc:
+                        await message.answer(str(exc), parse_mode=None)
+                        return
+                    await run_question(message, record["mode"], task, fresh=True)
         elif action == "memory":
             await message.answer("🧠 Постоянные правила. Общие применяются ко всем помощникам. KinoMir360 — к новостям и Shorts. "
                                  "Храни только рабочие предпочтения, не пароли и личные секреты.",
@@ -792,6 +944,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                         answer, label = await client.threads(store.provider(owner), card["post"], rules=store.preferences_for(owner, "news"))
                         await status.edit_text("✅ Threads · " + label, parse_mode=None)
                         await message.answer(answer, parse_mode=None, disable_web_page_preview=True)
+                        # Threads revisions stay in the selected-card workflow, not the generic news mode.
+                        review = store.feedback_item(owner, "news", "Адаптация для Threads", answer, value)
+                        await message.answer("Оцени адаптацию", reply_markup=keyboard([feedback_buttons(review)]), parse_mode=None)
                     except StudioError as exc:
                         await status.edit_text("⚠️ " + str(exc), parse_mode=None)
                 elif action == "npub" and news_handoff is not None:
