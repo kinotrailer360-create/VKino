@@ -685,6 +685,23 @@ def vision_reserve_available() -> bool:
         return False
 
 
+def studio_vision_available() -> bool:
+    """The already configured, independently quota-limited Open WebUI route."""
+    from pathlib import Path
+    from .ai_studio import read_key
+    return bool(read_key(Path(os.getenv("VKINO_DATA", "/data"))))
+
+
+async def _ask_studio_vision(prompt: str, image: Image.Image) -> Any:
+    from pathlib import Path
+    from .ai_studio import StudioClient
+    inline = _thumb(image, 1920)["inline_data"]
+    content = [{"type": "text", "text": prompt},
+               {"type": "image_url", "image_url": {"url": "data:" + inline["mime_type"] + ";base64," + inline["data"]}}]
+    answer, _ = await StudioClient(Path(os.getenv("VKINO_DATA", "/data"))).vision(content)
+    return _json_from(answer)
+
+
 async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: str,
                         image: Image.Image | None = None, premium: bool = False,
                         reserve_max_tokens: int = RESERVE_MAX_OUTPUT_TOKENS,
@@ -803,6 +820,15 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             return result
         except Exception as exc:  # noqa: BLE001
             failed("beat", exc, f"BeatAPI не ответил за {wait} с")
+    if vision_only and image is not None and studio_vision_available() and not skip("studio_vision"):
+        try:
+            result = await asyncio.wait_for(_ask_studio_vision(prompt, image), 45)
+            last_engine = "studio_vision"
+            return result
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                cooldown("studio_vision", PROVIDER_TIMEOUT_PAUSE, "тайм-аут")
+            failed("studio_vision", exc, "Open WebUI vision недоступен")
     if eligible_paid and LUMEAN_MODE == "balanced":  # only premium/essential, after free alternatives
         result = await ask_lumean()
         if result is not None:
@@ -1303,7 +1329,7 @@ async def describe_scenes(key: str, work: str, images: list[Image.Image]) -> lis
     except Exception as exc:  # noqa: BLE001
         log.warning("shorts: describe_scenes failed: %s", exc)
         return blank
-    last_model = MODEL if last_engine == "gemini" else RESERVE_MODEL if last_engine == "reserve" else "unknown"
+    last_model = {"gemini": MODEL, "reserve": RESERVE_MODEL, "studio_vision": "models/gemini-flash-lite-latest"}.get(last_engine, "unknown")
     for item in (data.get("scenes") if isinstance(data, dict) else None) or []:
         try:
             n = int(item.get("n"))
