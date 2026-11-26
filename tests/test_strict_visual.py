@@ -83,6 +83,7 @@ class StrictVisualTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(ai, "RESERVE_KEY", "test"), patch.object(ai, "BEAT_KEY", "test"), \
                     patch.object(ai, "RESERVE_MODEL", "openai/gpt-oss-120b"), \
                     patch.object(ai, "RESERVE_URL", "https://api.groq.com/openai/v1/chat/completions"), \
+                    patch.object(ai, "studio_vision_available", return_value=False), \
                     patch.object(ai, "_ask", AsyncMock(side_effect=ai.AIError("429"))), \
                     patch.object(ai, "_ask_reserve", AsyncMock()) as reserve, \
                     patch.object(ai, "_ask_beat", AsyncMock()) as beat:
@@ -110,3 +111,29 @@ class StrictVisualTests(unittest.IsolatedAsyncioTestCase):
         callbacks = [b.callback_data for row in send.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
         self.assertIn("ais:nphoto:" + "1" * 16, callbacks)
         self.assertIn("ais:npub:" + "1" * 16, callbacks)
+
+
+    async def test_openwebui_is_final_visual_reserve(self):
+        im = Image.new("RGB", (40, 40))
+        try:
+            with patch.object(ai, "RESERVE_KEY", ""), patch.object(ai, "BEAT_KEY", "test"), \
+                    patch.object(ai, "studio_vision_available", return_value=True), \
+                    patch.object(ai, "cooling", return_value=None), \
+                    patch.object(ai, "_ask", AsyncMock(side_effect=ai.AIError("429"))), \
+                    patch.object(ai, "_ask_studio_vision", AsyncMock(return_value={"fits": True})) as reserve, \
+                    patch.object(ai, "_ask_beat", AsyncMock()) as beat:
+                self.assertEqual(await ai._with_reserve("key", [{"text": "check"}, ai._thumb(im)], "check", im,
+                                                       vision_only=True), {"fits": True})
+                reserve.assert_awaited_once()
+                beat.assert_not_awaited()
+        finally:
+            im.close()
+
+    async def test_studio_vision_routes_only_to_multimodal_alias(self):
+        from shorts.ai_studio import StudioClient
+        with TemporaryDirectory() as directory:
+            client = StudioClient(Path(directory))
+            content = [{"type": "text", "text": "check"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}]
+            with patch.object(client, "_request", AsyncMock(return_value='{"fits":true}')) as request:
+                self.assertEqual(await client.vision(content), ('{"fits":true}', "Gemini"))
+                request.assert_awaited_once_with("models/gemini-flash-lite-latest", [{"role": "user", "content": content}], "vision")
