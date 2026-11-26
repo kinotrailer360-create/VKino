@@ -554,12 +554,12 @@ class StudioClient:
         key = read_key(self.data_dir)
         if not key:
             raise StudioError("Нужно подключить API-ключ Open WebUI на VPS.")
-        _, _, _, search, skill, tools = MODES["news" if mode in {"news_cards", "news_threads"} else mode]
+        _, _, _, search, skill, tools = MODES["personal" if mode == "vision" else "news" if mode in {"news_cards", "news_threads"} else mode]
         if mode == "news_threads":
             search = False
         payload = {
             "model": model, "messages": messages, "stream": False,
-            "features": {"web_search": search, "memory": True},
+            "features": {"web_search": search, "memory": mode != "vision"},
             "tool_ids": tools,
         }
         if skill:
@@ -648,6 +648,13 @@ class StudioClient:
             raise last_error
         raise StudioError("Нет доступной модели.")
 
+    async def vision(self, content):
+        """One verified multimodal alias, no text-model fallback, memory or web search."""
+        return await self._dispatch(
+            [("Gemini", MODES["personal"][1])],
+            [{"role": "user", "content": content}], "vision",
+        )
+
     async def _news_action(self, provider, question, mode, rules=()):
         messages = [{"role": "user", "content": memory_prompt(question, rules)}]
         return await self._dispatch(model_sequence("news", provider), messages, mode)
@@ -696,13 +703,15 @@ def chunks(text):
         text = text[end:].lstrip("\n")
 
 
-async def deliver_news_card(send, preview, store, owner, card, *, allow_handoff=True):
+async def deliver_news_card(send, preview, store, owner, card, *, allow_handoff=True, allow_photo=False):
     """Shared delivery for owner-only studio and scheduled editorial drafts."""
     message = await preview(card["post"])
     token = store.news_card(owner, message.message_id, card)
     rows = [[("📋 Текст для копирования", "ais:ncopy:" + token)],
             [("✏️ Редактировать", "ais:nedit:" + token)],
             [("🎬 Сделать Shorts", "ais:nshort:" + token), ("🧵 Для Threads", "ais:nthread:" + token)]]
+    if allow_photo:
+        rows.append([("🖼 Подобрать проверенное фото", "ais:nphoto:" + token)])
     if allow_handoff:
         rows.append([("📢 Подготовить публикацию", "ais:npub:" + token)])
     review = store.feedback_item(owner, "news", "Готовый Telegram-пост", card["post"], token)
@@ -714,7 +723,7 @@ async def deliver_news_card(send, preview, store, owner, card, *, allow_handoff=
     return token
 
 
-def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_preview=None, news_handoff=None):
+def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_preview=None, news_handoff=None, news_photo=None):
     router = Router(name="openwebui_ai_studio")
     owner = sole_owner(admin_ids, os.getenv("OPEN_WEBUI_TELEGRAM_OWNER_ID", "").strip())
     store = StudioStore(data_dir / "ai_studio.sqlite3")
@@ -765,7 +774,8 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
     async def send_news_card(message, card):
         async def preview(text):
             return await preview_news(message, text)
-        return await deliver_news_card(message.answer, preview, store, owner, card, allow_handoff=news_handoff is not None)
+        return await deliver_news_card(message.answer, preview, store, owner, card, allow_handoff=news_handoff is not None,
+                                       allow_photo=news_photo is not None)
 
     async def run_question(message, mode, question="", *, voice=False, fresh=False):
         question = question.strip()
@@ -1044,14 +1054,14 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
             removed = store.forget(owner, value, int(data[3]))
             await message.answer("Правило удалено из памяти ИИ-студии." if removed else "Правило уже отсутствует.", parse_mode=None)
             await show_memory(message, value)
-        elif action in {"ncopy", "nedit", "nshort", "nthread", "npub"} and re.fullmatch(r"[a-f0-9]{16}", value):
+        elif action in {"ncopy", "nedit", "nshort", "nthread", "npub", "nphoto"} and re.fullmatch(r"[a-f0-9]{16}", value):
             record = store.get_news_card(owner, value)
             if not record:
                 await message.answer("Карточка устарела. Выбери новый пост.", parse_mode=None)
                 return
             first, card, transferred = record
-            if transferred and action != "npub":
-                await message.answer("Этот пост уже передан в обычный редактор. Используй его актуальный текст.", parse_mode=None)
+            if transferred:
+                await message.answer("Этот пост уже передан в обычный редактор. Используй сохранённый черновик, чтобы не создавать дубликаты.", parse_mode=None)
                 return
             if action == "nshort":
                 task = ("Создай Shorts только по этой новости, не добавляй неподтверждённые детали. "
@@ -1076,6 +1086,14 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                         await message.answer("Оцени адаптацию", reply_markup=keyboard([feedback_buttons(review)]), parse_mode=None)
                     except StudioError as exc:
                         await status.edit_text("⚠️ " + str(exc), parse_mode=None)
+                elif action == "nphoto" and news_photo is not None:
+                    try:
+                        await message.answer("🖼 Ищу и проверяю фото из источников…", parse_mode=None)
+                        if await news_photo(message, card):
+                            store.mark_news_transferred(owner, value)
+                    except Exception:
+                        log.warning("AI Studio: source photo preparation failed")
+                        await message.answer("Не удалось подготовить фото. Пост не опубликован.", parse_mode=None)
                 elif action == "npub" and news_handoff is not None:
                     # Only create/open an existing native draft, never publish here.
                     try:
