@@ -39,7 +39,7 @@ class StudioTests(unittest.TestCase):
 
     def test_registration(self):
         r = build_router({123}, Path("/tmp/unused-ai-studio"), lambda text: {}, AsyncMock(), lambda: False)
-        self.assertEqual(len(r.message.handlers), 5)
+        self.assertEqual(len(r.message.handlers), 6)
         self.assertEqual(len(r.callback_query.handlers), 1)
 
     def test_models(self):
@@ -210,3 +210,88 @@ class MemoryClientTests(unittest.IsolatedAsyncioTestCase):
             for call in request.await_args_list:
                 self.assertIn("Кратко", call.args[1][-1]["content"])
                 self.assertTrue(call.args[1][-1]["content"].endswith("Для Threads"))
+
+
+class NewsCardTests(unittest.TestCase):
+    def fixture(self):
+        return {"sources": [{"source": {"type": "web_search"}, "citation_ids": [2,3,4], "metadata": [
+            {"source": "https://deadline.com/news/article-123/", "title": "Article"},
+            {"source": "https://en.wikipedia.org/wiki/Test", "title": "Wiki"},
+            {"source": "https://deadline.com/tag/test/", "title": "Tag"}
+        ]}]}
+
+    def test_discovery_not_factcheck_or_list(self):
+        from shorts.studio_news import is_discovery
+        self.assertTrue(is_discovery("Найди последние новости про Голодные игры"))
+        self.assertTrue(is_discovery("Что нового по Marvel?"))
+        self.assertFalse(is_discovery("Проверь новость"))
+        self.assertFalse(is_discovery("Найди новости списком"))
+        self.assertFalse(is_discovery("Найди новости и сделай Shorts"))
+
+    def test_card_source_identity(self):
+        import json
+        from datetime import date
+        from shorts.studio_news import parse_cards
+        raw = {"posts": [
+            {"date": "2026-11-26", "status": "СМИ", "post": "Заголовок\n\nТекст [2]", "source_ids": [2]},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Выдумка", "source_ids": [99]},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Википедия", "source_ids": [3]},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Страница тегов", "source_ids": [4]},
+            {"date": "2026-11-26", "status": "СМИ", "post": "Дубликат", "source_ids": [2]}
+        ]}
+        result = parse_cards(json.dumps(raw), self.fixture(), "Найди новости", current=date(2026,11,26))
+        self.assertEqual(len(result["cards"]), 1)
+        self.assertEqual(result["cards"][0]["sources"][0]["url"], "https://deadline.com/news/article-123/")
+        self.assertNotIn("[2]", result["cards"][0]["post"])
+        self.assertEqual(result["omitted"], 4)
+
+    def test_old_and_future_omitted(self):
+        import json
+        from datetime import date
+        from shorts.studio_news import parse_cards
+        raw = {"posts": [{"date": d, "status": "СМИ", "post": d, "source_ids": [2]} for d in ("2026-10-25","2026-11-27")]}
+        result = parse_cards(json.dumps(raw), self.fixture(), "Последние новости", current=date(2026,11,26))
+        self.assertEqual(result["cards"], [])
+
+    def test_card_ownership_and_revision(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = StudioStore(Path(d) / "memory.db")
+            token = s.news_card(1, 123, {"post":"Текст"})
+            self.assertIsNone(s.get_news_card(2, token))
+            self.assertEqual(s.get_news_card(1, token), (123, {"post":"Текст"}, False))
+            s.mark_news_transferred(1, token)
+            s.remove_news_card(1, token)
+            self.assertTrue(s.get_news_card(1, token)[2])
+            token2 = s.news_card(1, 124, {"post":"Новый"})
+            s.remove_news_card(1, token2)
+            self.assertIsNone(s.get_news_card(1, token2))
+
+
+class NewsActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_is_separate_request(self):
+        c = StudioClient(Path("/tmp"))
+        with patch.object(c, "_request", AsyncMock(return_value={"cards": [], "note": "", "omitted": 0})) as request:
+            await c.discover("gemini", "Найди новости про X")
+            self.assertEqual(request.await_args.args[2], "news_cards")
+            self.assertIn("source_ids", request.await_args.args[1][-1]["content"])
+
+    async def test_threads_selected_text(self):
+        c = StudioClient(Path("/tmp"))
+        with patch.object(c, "_request", AsyncMock(return_value="Готово")) as request:
+            self.assertEqual(await c.threads("groq", "Только выбранный пост"), ("Готово", "Groq"))
+            self.assertEqual(request.await_args.args[2], "news_threads")
+            self.assertIn("Только выбранный пост", request.await_args.args[1][-1]["content"])
+
+    async def test_handoff_does_not_publish(self):
+        import bot
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        message = SimpleNamespace(chat=SimpleNamespace(id=1), bot=MagicMock(), answer=AsyncMock())
+        fake_db = SimpleNamespace(fetchval=AsyncMock(side_effect=[None, 1]))
+        with patch.object(bot, "db", return_value=fake_db), patch.object(bot, "offer_post", AsyncMock()) as offer, \
+             patch.object(bot, "publish_post", AsyncMock()) as publish:
+            await bot.studio_news_handoff(message, 123)
+            await bot.studio_news_handoff(message, 123)
+            self.assertEqual(offer.await_count, 1)
+            self.assertEqual(offer.await_args.args[2], [123])
+            publish.assert_not_awaited()
