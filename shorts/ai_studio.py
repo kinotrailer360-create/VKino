@@ -20,7 +20,7 @@ import aiohttp
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from . import netsafe, studio_voice, studio_news
 
@@ -738,9 +738,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                              reply_markup=menu(store.provider(owner)), parse_mode=None)
 
     async def prompt(message, mode):
-        await message.answer(PREFIX + MODES[mode][0] + "\nОтветь текстом или запиши голосовое сообщение (до 2 минут). Голос распознаётся через Groq или Gemini.",
-                             reply_markup=ForceReply(selective=False, input_field_placeholder="Вопрос или задание"),
-                             parse_mode=None)
+        await message.answer(PREFIX + MODES[mode][0] + "\nСмахни это сообщение вправо (или выбери «Ответить») и напиши вопрос либо запиши голосовое до 2 минут. "
+                             f"Можно и сразу командой: /aistudio {mode} твой вопрос.\nОбычный ввод бота не переключается в режим ИИ.",
+                             reply_markup=keyboard([[("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
 
     async def show_memory(message, scope):
         records = store.rules(owner, scope)
@@ -1008,9 +1008,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                 await message.answer("👍 Оценка сохранена.", parse_mode=None)
             elif action == "fdown":
                 store.rate_feedback(owner, value, -1)
-                await message.answer(FEEDBACK_PREFIX + value + "\nЧто именно нужно исправить? Ответь текстом до 1000 символов. "
+                await message.answer(FEEDBACK_PREFIX + value + "\nЧто именно нужно исправить? Смахни это сообщение вправо и ответь текстом до 1000 символов. "
                                      "Не присылай пароли и ключи. Замечание не становится постоянным правилом автоматически.",
-                                     reply_markup=ForceReply(selective=False, input_field_placeholder="Что исправить?"), parse_mode=None)
+                                     reply_markup=keyboard([[("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
             else:
                 if len(data) != 4 or data[3] != record["revision"] or not record["note"]:
                     await message.answer("Замечание изменилось или отсутствует. Открой актуальное замечание.", parse_mode=None)
@@ -1047,9 +1047,9 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
         elif action == "mem" and value in MEMORY_SCOPES:
             await show_memory(message, value)
         elif action == "memadd" and value in MEMORY_SCOPES:
-            await message.answer(MEMORY_PREFIX + MEMORY_SCOPES[value] + "\nОтветь текстом: одно правило до 400 символов. "
+            await message.answer(MEMORY_PREFIX + MEMORY_SCOPES[value] + "\nСмахни это сообщение вправо и напиши одно правило до 400 символов. "
                                  "Не добавляй ключи, пароли и секреты. Правила передаются ИИ при запросах.",
-                                 reply_markup=ForceReply(selective=False, input_field_placeholder="Постоянное правило"), parse_mode=None)
+                                 reply_markup=keyboard([[("⬅️ Правила проекта", "ais:mem:" + value)]]), parse_mode=None)
         elif action == "memdel" and value in MEMORY_SCOPES and len(data) == 4 and data[3].isdigit() and len(data[3]) < 18:
             removed = store.forget(owner, value, int(data[3]))
             await message.answer("Правило удалено из памяти ИИ-студии." if removed else "Правило уже отсутствует.", parse_mode=None)
@@ -1073,8 +1073,8 @@ def build_router(admin_ids, data_dir, validate_script, handoff, busy, *, news_pr
                 if action == "ncopy":
                     await preview_news(message, card["post"])
                 elif action == "nedit":
-                    await message.answer(studio_news.EDIT_PREFIX + value + "\nПришли полный исправленный текст поста (до 1500 символов). Подпись добавится автоматически.",
-                                         reply_markup=ForceReply(selective=False, input_field_placeholder="Исправленный пост"), parse_mode=None)
+                    await message.answer(studio_news.EDIT_PREFIX + value + "\nСмахни это сообщение вправо и пришли полный исправленный текст поста (до 1500 символов). Подпись добавится автоматически.",
+                                         reply_markup=keyboard([[("⬅️ ИИ-студия", "ais:home")]]), parse_mode=None)
                 elif action == "nthread":
                     status = await message.answer("⏳ Готовлю текст для Threads…", parse_mode=None)
                     try:

@@ -463,3 +463,43 @@ class SmartRoutingTests(unittest.IsolatedAsyncioTestCase):
                 await c.ask("personal", "auto", [], "Привет")
             self.assertEqual(request.await_count, 1)
         self.assertEqual(c.routing.route_remaining("models/gemini-flash-lite-latest"), 0)
+
+
+class StudioInputUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompts_never_force_reply(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        from aiogram.types import Chat, Message, User, InlineKeyboardMarkup
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            store = StudioStore(folder / "ai_studio.sqlite3")
+            card = store.news_card(123, 42, {"post": "Текст"})
+            review = store.feedback_item(123, "news", "Вопрос", "Ответ")
+            router = build_router({123}, folder, lambda text: {}, AsyncMock(), lambda: False)
+            message = Message(message_id=7, date=datetime.now(timezone.utc), chat=Chat(id=123, type="private"),
+                              from_user=User(id=123, is_bot=False, first_name="Owner"), text="ИИ-студия")
+            callback = router.callback_query.handlers[0].callback
+            for data in ("ais:m:news", "ais:reset:personal", "ais:memadd:km360",
+                         "ais:nedit:" + card, "ais:fdown:" + review):
+                with self.subTest(data=data), patch.object(Message, "answer", new_callable=AsyncMock) as answer:
+                    query = SimpleNamespace(message=message, from_user=message.from_user, data=data, answer=AsyncMock())
+                    await callback(query, None)
+                    answer.assert_awaited_once()
+                    self.assertIsInstance(answer.await_args.kwargs["reply_markup"], InlineKeyboardMarkup)
+                    self.assertIn("Смахни", answer.await_args.args[0])
+
+    async def test_direct_command_does_not_require_reply(self):
+        from types import SimpleNamespace
+        from datetime import datetime, timezone
+        from aiogram.types import Chat, Message, User
+        with tempfile.TemporaryDirectory() as d:
+            router = build_router({123}, Path(d), lambda text: {}, AsyncMock(), lambda: False)
+            message = Message(message_id=8, date=datetime.now(timezone.utc), chat=Chat(id=123, type="private"),
+                              from_user=User(id=123, is_bot=False, first_name="Owner"), text="/aistudio personal Привет")
+            status = AsyncMock()
+            with patch("shorts.ai_studio.read_key", return_value="test"), \
+                    patch.object(StudioClient, "ask", AsyncMock(return_value=("Ответ", "Gemini"))) as ask, \
+                    patch.object(Message, "answer", new_callable=AsyncMock, return_value=status):
+                await router.message.handlers[0].callback(message, SimpleNamespace(args="personal Привет"))
+                ask.assert_awaited_once()
+                self.assertEqual(ask.await_args.args[3], "Привет")
