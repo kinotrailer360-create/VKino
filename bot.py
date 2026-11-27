@@ -14311,6 +14311,7 @@ async def hype_alert(bot: Bot, g: dict[str, Any], chat_ids: list[int]) -> bool:
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [_btn("📝 Черновик поста", f"hy:p:{hid}"), _btn("🎬 Сценарий Shorts", f"hy:s:{hid}")],
         [_btn("🧠 Проверить и оформить в ИИ-студии", f"hy:i:{hid}")],
+        [_btn("📄 Исходный материал без ИИ", f"hy:raw:{hid}")],
         [_btn("🎬 Тизер-ролик (Telegram и MAX)", f"hy:t:{hid}")],
         [_btn("📣 Текст для посева и Директа", f"hy:a:{hid}")]])
     delivered = False
@@ -14332,6 +14333,56 @@ async def _hype_remember(g: dict[str, Any]) -> None:
     await set_shorts_setting("hype_seen", json.dumps(seen[-80:], ensure_ascii=False))
 
 
+async def hype_raw_material(bot: Bot, g: dict[str, Any], chat_id: int, *, force: bool = False) -> bool:
+    """Private editorial packet only: no native draft, channel send, or AI request."""
+    from shorts.ai_studio import sole_owner
+    import tempfile
+
+    owner = sole_owner(ADMIN_IDS, os.getenv("OPEN_WEBUI_TELEGRAM_OWNER_ID", "").strip())
+    if owner is None or chat_id != owner or g.get("raw_pending"):
+        return False
+    if g.get("raw_delivered") and not force:
+        return True
+    item = shorts_hype.original_material(g)
+    if not item:
+        return False
+    g["raw_pending"] = True
+    try:
+        # Send text first, even if the image is unavailable. No publish markup.
+        text = ("⚠️ НЕ ПРОВЕРЕНО ИИ · исходный материал для редактора\n\n"
+                + item["title"] + "\n\n" + (item["excerpt"] + "\n\n" if item["excerpt"] else "")
+                + "Источник: " + item["source"] + "\n" + item["url"]
+                + "\n\nФрагмент из ленты на исходном языке. Проверь статью, дату, факты и право использования фото вручную.")
+        await bot.send_message(chat_id, text, parse_mode=None, disable_web_page_preview=True)
+        g["raw_delivered"] = True
+        if item["image"]:
+            try:
+                SHORTS_DIR.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix="hype-raw-", dir=SHORTS_DIR) as folder:
+                    work = Path(folder)
+                    files = await asyncio.wait_for(shorts_tgsearch.download_media(
+                        [{"image": item["image"]}], work, limit=1, prefix="raw"), timeout=15)
+                    if files:
+                        with Image.open(files[0]) as im:
+                            if im.width * im.height > 30_000_000:
+                                raise ValueError("image too large")
+                            image = im.convert("RGB")
+                            image.thumbnail((1280, 1280))
+                            path = work / "preview.jpg"
+                            image.save(path, "JPEG", quality=85)
+                            image.close()
+                        await bot.send_photo(chat_id, FSInputFile(path),
+                                             caption="⚠️ Фото из ленты · НЕ ПРОВЕРЕНО ИИ. Только для ручной проверки.",
+                                             parse_mode=None)
+                    else:
+                        await bot.send_message(chat_id, "Фото из ленты не загрузилось. Смотри исходную статью.", parse_mode=None)
+            except Exception:
+                logging.info("Hype: raw image not available")
+        return True
+    finally:
+        g.pop("raw_pending", None)
+
+
 async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automatic: bool = False) -> bool:
     """Prepare a text draft for the sole studio owner; never publish or render."""
     from shorts.ai_studio import StudioClient, StudioError, StudioStore, deliver_news_card, read_key, sole_owner
@@ -14340,8 +14391,6 @@ async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automa
     if owner is None or chat_id != owner:
         return False
     data_dir = Path(os.getenv("VKINO_DATA", "/data"))
-    if not read_key(data_dir):
-        return False
     if g.get("studio_draft_ready") or hype_draft_lock.locked() or shorts_lock.locked() or post_lock.locked():
         return False
     async with hype_draft_lock:
@@ -14357,12 +14406,16 @@ async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automa
             # Count attempts, not just successful drafts, to bound API consumption.
             day["n"] += 1
             await set_shorts_setting("hype_draft_day", json.dumps(day))
+        if not read_key(data_dir):
+            await hype_raw_material(bot, g, chat_id)
+            return False
         store = StudioStore(data_dir / "ai_studio.sqlite3")
         try:
             result, label = await StudioClient(data_dir).discover(store.provider(owner), shorts_hype.monitor_topic(g),
                                                                  rules=store.preferences_for(owner, "news"))
             card = next((c for c in result["cards"] if shorts_hype.monitor_match(c, g)), None)
             if not card:
+                await hype_raw_material(bot, g, chat_id)
                 return False
             # The editor gets a separate source note and existing approval buttons.
             async def send(text, **kwargs):
@@ -14377,6 +14430,7 @@ async def hype_studio_draft(bot: Bot, g: dict[str, Any], chat_id: int, *, automa
             return True
         except StudioError:
             logging.info("Hype: studio could not prepare a grounded draft")
+            await hype_raw_material(bot, g, chat_id)
             return False
         except Exception:
             logging.warning("Hype: studio draft failed")
@@ -14514,7 +14568,13 @@ async def hype_buttons(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer()
     bot, chat_id = callback.bot, callback.message.chat.id
-    if kind == "i":
+    if kind == "raw":
+        if callback.message.chat.type != "private" or chat_id != callback.from_user.id:
+            await bot.send_message(chat_id, "Исходный материал доступен владельцу в личном чате.")
+            return
+        if not await hype_raw_material(bot, g, chat_id, force=True):
+            await bot.send_message(chat_id, "Не удалось открыть исходный материал или он уже готовится.")
+    elif kind == "i":
         if callback.message.chat.type != "private":
             await bot.send_message(chat_id, "Открой ИИ-студию в личном чате с ботом.")
             return
@@ -14526,8 +14586,8 @@ async def hype_buttons(callback: CallbackQuery, state: FSMContext) -> None:
             await bot.send_message(chat_id, "🧠 Проверяю именно этот инфоповод и готовлю черновик…")
             if await hype_studio_draft(bot, g, chat_id):
                 g["studio_draft_ready"] = True
-            else:
-                await bot.send_message(chat_id, "Не удалось привязать черновик к исходной статье или ИИ занят. Попробуй позже либо используй обычный черновик поста.")
+            elif not g.get("raw_delivered"):
+                await bot.send_message(chat_id, "Не удалось привязать черновик к исходной статье или ИИ занят. Можно открыть исходный материал без ИИ.")
         finally:
             g.pop("studio_draft_pending", None)
     elif kind == "p":
@@ -14538,7 +14598,8 @@ async def hype_buttons(callback: CallbackQuery, state: FSMContext) -> None:
                 if not await make_tg_post(bot, [chat_id], "all", pool=g["posts"]):
                     await bot.send_message(chat_id, "Пост не собрался: похоже, об этом уже писали в канале.")
             except Exception as exc:  # noqa: BLE001
-                await bot.send_message(chat_id, f"❌ <code>{escape(_safe_err(exc)[:400])}</code>")
+                if not (callback.message.chat.type == "private" and chat_id == callback.from_user.id and await hype_raw_material(bot, g, chat_id)):
+                    await bot.send_message(chat_id, f"❌ <code>{escape(_safe_err(exc)[:400])}</code>")
         _run_job(post_job)
     elif kind == "s":
         message = callback.message
