@@ -1478,3 +1478,30 @@ def test_mood_buttons_in_picker():
     first = kb.inline_keyboard[0][0].callback_data
     assert first == f"rq:m:{bot.RQ_GENRES.index('комедия')}:-:-"
 
+
+
+def test_beat_truncation_retries_once_on_another_free_model(monkeypatch):
+    import asyncio
+    from shorts import ai
+
+    calls = []
+
+    async def beat(prompt, image, *, max_tokens, timeout, model=None):
+        calls.append((model, max_tokens))
+        if model is None:
+            raise ai.OutputTruncated("truncated")
+        return {"post": "complete"}
+
+    async def free():
+        return ["deepseek-v4.1-flash-free", "glm-5.3-flash-free"]
+
+    monkeypatch.setattr(ai, "_cool", {})
+    monkeypatch.setattr(ai, "RESERVE_KEY", "")
+    monkeypatch.setattr(ai, "BEAT_KEY", "test-beat")
+    monkeypatch.setattr(ai, "BEAT_MODEL", "")
+    monkeypatch.setattr(ai, "_beat_model", "deepseek-v4.1-flash-free")
+    monkeypatch.setattr(ai, "LUMEAN_MODE", "off")
+    monkeypatch.setattr(ai, "_ask_beat", beat)
+    monkeypatch.setattr(ai, "beat_free_models", free)
+    assert asyncio.run(ai._with_reserve("", [{"text": "post"}], "post")) == {"post": "complete"}
+    assert calls == [(None, 4000), ("glm-5.3-flash-free", 8000)]
