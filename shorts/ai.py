@@ -813,9 +813,31 @@ async def _with_reserve(key: str, gemini_parts: list[dict[str, Any]], prompt: st
             tokens = min(tokens, reserve_max_tokens)
         wait = BEAT_LONG_BUDGET if tokens > 4000 else BEAT_BUDGET
         try:
-            result = await asyncio.wait_for(_ask_beat(prompt, image, max_tokens=tokens, timeout=wait),
-                                            wait + BEAT_QUEUE_WAIT + BEAT_GAP + 10)
-            log.info("shorts: BeatAPI (%s) answered", _beat_model or BEAT_MODEL)
+            used_model = BEAT_MODEL or _beat_model
+            try:
+                result = await asyncio.wait_for(_ask_beat(prompt, image, max_tokens=tokens, timeout=wait),
+                                                wait + BEAT_QUEUE_WAIT + BEAT_GAP + 10)
+                used_model = BEAT_MODEL or _beat_model
+            except OutputTruncated:
+                # A reasoning model can exhaust its output budget before finishing JSON.
+                # Retry once on another currently free model, through the same rate-limit gate.
+                used_model = BEAT_MODEL or _beat_model
+                if image is not None or (BEAT_MODEL and not BEAT_MODEL.endswith("-free")):
+                    raise
+                free = await beat_free_models()
+                alternatives = [m for m in free if m != used_model and m.endswith("-free")]
+                if not alternatives:
+                    raise
+                alternative = next((m for m in alternatives if "glm" in m.lower()), alternatives[0])
+                retry_tokens = 8000 if tokens == 4000 and reserve_max_tokens == RESERVE_MAX_OUTPUT_TOKENS else tokens
+                retry_wait = BEAT_LONG_BUDGET if retry_tokens > 4000 else BEAT_BUDGET
+                log.warning("shorts: BeatAPI (%s) truncated; retry once on free %s (%d tokens)",
+                            used_model, alternative, retry_tokens)
+                result = await asyncio.wait_for(
+                    _ask_beat(prompt, image, model=alternative, max_tokens=retry_tokens, timeout=retry_wait),
+                    retry_wait + BEAT_QUEUE_WAIT + BEAT_GAP + 10)
+                used_model = alternative
+            log.info("shorts: BeatAPI (%s) answered", used_model)
             last_engine = "beat"
             return result
         except Exception as exc:  # noqa: BLE001
